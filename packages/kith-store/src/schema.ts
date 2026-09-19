@@ -189,9 +189,9 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
   },
   {
     version: 25,
-    name: "investments: archived_at, the import row key and the exchange rate a non-USD amount needs (ADM-3)",
+    name: "investments: archived_at, the unique live name, the import row key, the exchange rate a non-USD amount needs and the amount sign rule (ADM-3)",
     url: new URL(
-      "../migrations/024_investments_import_and_archive.sql",
+      "../migrations/025_investments_import_and_archive.sql",
       import.meta.url,
     ),
   },

@@ -69,6 +69,19 @@ export type DataTableProps<T> = {
    * is what every table before this one was.
    */
   getSubRows?: (row: T) => T[] | undefined;
+  /**
+   * Whether a row has children at all, independent of whether they have been
+   * loaded. Without it a row whose children arrive on expansion could never be
+   * expanded: TanStack decides from `getSubRows`, which is empty until the
+   * fetch that the expansion itself triggers.
+   */
+  canExpand?: (row: T) => boolean;
+  /**
+   * Called when a row is expanded or collapsed. The table still owns the
+   * expansion state; this only reports it, so a caller whose children are
+   * loaded on demand can fetch them.
+   */
+  onExpandChange?: (row: T, expanded: boolean) => void;
   /** Row actions behind the kebab in the last column. */
   actions?: readonly RowAction<T>[];
   /** Placeholder for the search box. Two or three words, never a sentence. */
@@ -137,6 +150,8 @@ export function DataTable<T>({
   initialSorting = [],
   groupBy,
   getSubRows,
+  canExpand,
+  onExpandChange,
   actions = [],
   searchPlaceholder = "Search",
   empty = "Nothing here",
@@ -158,6 +173,9 @@ export function DataTable<T>({
     onExpandedChange: setExpanded,
     onGlobalFilterChange: setSearch,
     ...(getSubRows === undefined ? {} : { getSubRows }),
+    ...(canExpand === undefined
+      ? {}
+      : { getRowCanExpand: (row: { original: T }) => canExpand(row.original) }),
     globalFilterFn: (row, _columnId, value: string) =>
       rowMatchesSearch(Object.values(row.original as object), value),
     ...(getSubRows === undefined ? {} : { getSubRows }),
@@ -317,7 +335,10 @@ export function DataTable<T>({
                         row.getCanExpand() ? (
                           <button
                             type="button"
-                            onClick={row.getToggleExpandedHandler()}
+                            onClick={() => {
+                              onExpandChange?.(row.original, !row.getIsExpanded());
+                              row.toggleExpanded();
+                            }}
                             aria-expanded={row.getIsExpanded()}
                             aria-label={row.getIsExpanded() ? "Collapse" : "Expand"}
                             className="mr-1 text-gray-400 hover:text-gray-700"

@@ -126,6 +126,7 @@ async function seedDocument(ctx, spaceId, input) {
   return { documentId, chunkId };
 }
 
+
 test("an investment is tied to one organization entity, found not duplicated", { skip }, async (t) => {
   const f = await fixture(t);
   const ctx = f.ctx(NOW);
@@ -136,8 +137,6 @@ test("an investment is tied to one organization entity, found not duplicated", {
     category: "Investment Fund",
     signedOn: "2024-03-04",
   });
-  // A second investment naming the same organization differently spelled: the
-  // entity is found, not created a second time.
   await createInvestment(ctx, {
     principal: f.principal,
     spaceId: f.spaceId,
@@ -150,14 +149,8 @@ test("an investment is tied to one organization entity, found not duplicated", {
   assert.equal(entities.rows.length, 2);
   assert.ok(entities.rows.every((row) => row.kind === "organization"));
 
-  const same = await createInvestment(ctx, {
-    principal: f.principal,
-    spaceId: f.spaceId,
-    name: "Northwind Ventures III",
-  });
-  assert.notEqual(same, first);
-
-  // The same name twice is refused rather than silently splitting the totals.
+  // The same name twice is refused by the unique index, not by a read that
+  // races with itself.
   await assert.rejects(
     createInvestment(ctx, {
       principal: f.principal,
@@ -167,13 +160,30 @@ test("an investment is tied to one organization entity, found not duplicated", {
     /An investment with that name exists/,
   );
 
-  // Find-or-create is the import's path and never makes the second row.
   const found = await findOrCreateInvestment(ctx, {
     principal: f.principal,
     spaceId: f.spaceId,
     name: "Northwind Ventures II",
   });
   assert.deepEqual(found, { id: first, created: false });
+
+  // Archiving frees the name; the partial index only covers live rows.
+  await archiveInvestment(ctx, { principal: f.principal, investmentId: first });
+  const reused = await createInvestment(ctx, {
+    principal: f.principal,
+    spaceId: f.spaceId,
+    name: "Northwind Ventures II",
+  });
+  assert.notEqual(reused, first);
+  // And restoring the archived one now collides, which is a named denial.
+  await assert.rejects(
+    archiveInvestment(ctx, {
+      principal: f.principal,
+      investmentId: first,
+      archived: false,
+    }),
+    /An investment with that name exists/,
+  );
 });
 
 test("totals are computed in numeric, per currency and in USD", { skip }, async (t) => {
@@ -223,6 +233,7 @@ test("totals are computed in numeric, per currency and in USD", { skip }, async 
     fees: "500.01",
     received: "12345.67",
     outstanding: "75000.11",
+    overCalled: "0",
   });
   const gbp = row.totals.byCurrency.find((total) => total.currency === "GBP");
   assert.deepEqual(gbp, {
@@ -231,18 +242,23 @@ test("totals are computed in numeric, per currency and in USD", { skip }, async 
     sent: "10000.00",
     fees: "0",
     received: "0",
-    outstanding: "0",
+    outstanding: "-10000.00",
+    overCalled: "10000.00",
   });
 
-  // 50000.44 + 10000.00 * 1.25 = 62500.44, to the cent.
-  assert.equal(row.totals.usd.sent, "62500.4400");
-  assert.equal(row.totals.usd.committed, "125000.55");
-  assert.equal(row.totals.usd.received, "12345.67");
-  assert.equal(row.totals.usd.fees, "500.01");
-  assert.equal(row.totals.usd.outstanding, "62500.1100");
+  // 50000.44 + 10000.00 * 1.25 = 62500.44, to the cent, rounded to two places
+  // because the product of an amount and a rate carries the rate's precision.
+  assert.deepEqual(row.totals.usd, {
+    committed: "125000.55",
+    sent: "62500.44",
+    fees: "500.01",
+    received: "12345.67",
+    outstanding: "62500.11",
+    overCalled: "0.00",
+  });
 });
 
-test("outstanding floors at zero and fees are never counted as sent", { skip }, async (t) => {
+test("an over-call is reported rather than floored away", { skip }, async (t) => {
   const f = await fixture(t);
   const ctx = f.ctx(NOW);
   const investmentId = await createInvestment(ctx, {
@@ -272,9 +288,73 @@ test("outstanding floors at zero and fees are never counted as sent", { skip }, 
     amount: "9999.00",
   });
   const [row] = await listInvestments(ctx, [f.spaceId]);
-  assert.equal(row.totals.usd.outstanding, "0");
+  // Signed, so "called more than committed" no longer reads the same as
+  // "fully called".
+  assert.equal(row.totals.usd.outstanding, "-500.00");
+  assert.equal(row.totals.usd.overCalled, "500.00");
+  // Fees are their own total and are never counted as sent.
   assert.equal(row.totals.usd.sent, "1500.00");
   assert.equal(row.totals.usd.fees, "9999.00");
+});
+
+test("only a commitment change may be negative", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ctx = f.ctx(NOW);
+  const investmentId = await createInvestment(ctx, {
+    principal: f.principal,
+    spaceId: f.spaceId,
+    name: "Reduced LP",
+  });
+  await createInvestmentEntry(ctx, {
+    principal: f.principal,
+    investmentId,
+    entryType: "commitment",
+    entryDate: "2024-01-01",
+    amount: "1000.00",
+  });
+  const { id: changeId } = await createInvestmentEntry(ctx, {
+    principal: f.principal,
+    investmentId,
+    entryType: "commitment_change",
+    entryDate: "2024-07-01",
+    amount: "-250.00",
+  });
+  const [row] = await listInvestments(ctx, [f.spaceId]);
+  assert.equal(row.totals.usd.committed, "750.00");
+
+  for (const entryType of ["capital_call_paid", "distribution", "fee", "other"]) {
+    await assert.rejects(
+      createInvestmentEntry(ctx, {
+        principal: f.principal,
+        investmentId,
+        entryType,
+        entryDate: "2024-08-01",
+        amount: "-10.00",
+      }),
+      /Only a commitment change may be negative/,
+      entryType,
+    );
+  }
+  // Retyping the negative change is refused too, rather than stored as a
+  // negative fee.
+  await assert.rejects(
+    updateInvestmentEntry(ctx, {
+      principal: f.principal,
+      entryId: changeId,
+      entryType: "fee",
+    }),
+    /Only a commitment change may be negative/,
+  );
+  // And the schema refuses it even when the service is bypassed.
+  await assert.rejects(
+    ctx.client.query(
+      `INSERT INTO kith.investment_entries
+         (id, space_id, investment_id, entry_type, entry_date, amount, currency)
+       VALUES ($1, $2, $3, 'capital_call_paid', '2025-02-02', -100, 'USD')`,
+      [newKithId(), f.spaceId, investmentId],
+    ),
+    /investment_entries_amount_sign_check/,
+  );
 });
 
 test("an investment with no entries reads as zero, not null", { skip }, async (t) => {
@@ -288,14 +368,16 @@ test("an investment with no entries reads as zero, not null", { skip }, async (t
   const [row] = await listInvestments(ctx, [f.spaceId]);
   assert.deepEqual(row.totals.byCurrency, []);
   assert.deepEqual(row.totals.usd, {
-    committed: "0",
-    sent: "0",
-    fees: "0",
-    received: "0",
-    outstanding: "0",
+    committed: "0.00",
+    sent: "0.00",
+    fees: "0.00",
+    received: "0.00",
+    outstanding: "0.00",
+    overCalled: "0.00",
   });
   assert.equal(row.entryCount, 0);
   assert.equal(row.documentCount, 0);
+  assert.deepEqual(row.linkedDocumentIds, []);
 });
 
 test("a non-USD amount without an exchange rate is refused twice over", { skip }, async (t) => {
@@ -386,10 +468,58 @@ test("an entry changes, moves currency with its rate, and deletes", { skip }, as
 
   const detail = await getInvestment(ctx, [f.spaceId], investmentId);
   assert.equal(detail.entries.length, 1);
-  assert.equal(detail.totals.usd.received, "4950.000");
+  assert.equal(detail.totals.usd.received, "4950.00");
 
-  await deleteInvestmentEntry(ctx, { principal: f.principal, entryId });
-  assert.deepEqual(await listInvestmentEntries(ctx, [f.spaceId]), []);
+  // An entry may only be reached through its own investment.
+  const other = await createInvestment(ctx, {
+    principal: f.principal,
+    spaceId: f.spaceId,
+    name: "Bystander",
+  });
+  await assert.rejects(
+    updateInvestmentEntry(ctx, {
+      principal: f.principal,
+      entryId,
+      investmentId: other,
+      amount: "1.00",
+    }),
+    /Investment entry not found/,
+  );
+  await assert.rejects(
+    deleteInvestmentEntry(ctx, {
+      principal: f.principal,
+      entryId,
+      investmentId: other,
+    }),
+    /Investment entry not found/,
+  );
+
+  await deleteInvestmentEntry(ctx, {
+    principal: f.principal,
+    entryId,
+    investmentId,
+  });
+  assert.deepEqual(
+    await listInvestmentEntries(ctx, [f.spaceId], [investmentId]),
+    [],
+  );
+});
+
+test("reading entries needs at least one investment and at most 25", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ctx = f.ctx(NOW);
+  await assert.rejects(
+    listInvestmentEntries(ctx, [f.spaceId], []),
+    /between one and 25/,
+  );
+  await assert.rejects(
+    listInvestmentEntries(
+      ctx,
+      [f.spaceId],
+      Array.from({ length: 26 }, () => newKithId()),
+    ),
+    /between one and 25/,
+  );
 });
 
 test("an import key makes a second import of the same row a no-op", { skip }, async (t) => {
@@ -406,20 +536,38 @@ test("an import key makes a second import of the same row a no-op", { skip }, as
     entryType: "capital_call_paid",
     entryDate: "2024-05-05",
     amount: "7500.00",
-    importKey: "Ledger|Imported LP|2024-05-05|-7500|",
+    importKey: "ledger:imported lp:2024-05-05:USD:-7500.00#1",
   };
   const first = await createInvestmentEntry(ctx, args);
   assert.equal(first.created, true);
   const second = await createInvestmentEntry(ctx, args);
   assert.deepEqual(second, { id: first.id, created: false });
-  assert.equal((await listInvestmentEntries(ctx, [f.spaceId])).length, 1);
+  assert.equal(
+    (await listInvestmentEntries(ctx, [f.spaceId], [investmentId])).length,
+    1,
+  );
+
+  // The same values under the next occurrence's key are a second entry: a
+  // sheet may legitimately hold the same call twice on the same day.
+  const twin = await createInvestmentEntry(ctx, {
+    ...args,
+    importKey: "ledger:imported lp:2024-05-05:USD:-7500.00#2",
+  });
+  assert.equal(twin.created, true);
+  assert.equal(
+    (await listInvestmentEntries(ctx, [f.spaceId], [investmentId])).length,
+    2,
+  );
 
   // Two entries without a key are two entries: only the import claims
   // uniqueness, and the owner may legitimately pay the same amount twice.
   const keyless = { ...args, importKey: null };
   await createInvestmentEntry(ctx, keyless);
   await createInvestmentEntry(ctx, keyless);
-  assert.equal((await listInvestmentEntries(ctx, [f.spaceId])).length, 3);
+  assert.equal(
+    (await listInvestmentEntries(ctx, [f.spaceId], [investmentId])).length,
+    4,
+  );
 });
 
 test("archive hides the investment without losing its entries", { skip }, async (t) => {
@@ -447,10 +595,7 @@ test("archive hides the investment without losing its entries", { skip }, async 
   assert.equal(archived.totals.usd.received, "10.00");
 
   // Archiving twice keeps the first archival's time.
-  await archiveInvestment(ctx, {
-    principal: f.principal,
-    investmentId,
-  });
+  await archiveInvestment(ctx, { principal: f.principal, investmentId });
   const [again] = await listInvestments(ctx, [f.spaceId], {
     includeArchived: true,
   });
@@ -525,6 +670,7 @@ test("another space's investments are invisible and unwritable", { skip }, async
     ["Mine Only"],
   );
   assert.equal(await getInvestment(ctx, [otherSpaceId], mine), null);
+  assert.deepEqual(await listInvestmentEntries(ctx, [otherSpaceId], [mine]), []);
   await assert.rejects(
     updateInvestment(ctx, {
       principal: stranger,
@@ -656,6 +802,7 @@ test("a document may only be linked from its own space", { skip }, async (t) => 
   });
   const [row] = await listInvestments(ctx, [f.spaceId]);
   assert.equal(row.documentCount, 1);
+  assert.deepEqual(row.linkedDocumentIds, [mine.documentId]);
   // Now linked, so it no longer counts as unlinked.
   assert.equal(row.unlinkedDocumentCount, 0);
 });

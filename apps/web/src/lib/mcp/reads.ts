@@ -437,7 +437,6 @@ async function prepareEmbedQuery(
  */
 function investmentToolRow(
   investment: admin.InvestmentRow,
-  entries: readonly admin.InvestmentEntry[],
 ): InvestmentToolRow {
   return {
     id: investment.id,
@@ -450,16 +449,9 @@ function investmentToolRow(
     notes: investment.notes,
     entryCount: investment.entryCount,
     totals: investment.totals,
-    linkedDocumentIds: [
-      ...new Set(
-        entries
-          .filter(
-            (entry) =>
-              entry.investmentId === investment.id && entry.documentId !== null,
-          )
-          .map((entry) => entry.documentId as string),
-      ),
-    ],
+    // From the same aggregation as the totals, so listing investments never
+    // pulls the household's whole ledger to find them.
+    linkedDocumentIds: investment.linkedDocumentIds,
     unlinkedDocumentCount: investment.unlinkedDocumentCount,
   };
 }
@@ -804,21 +796,15 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
         // readable space asked a question whose answer is "none", and the
         // tool boundary would mask the raise into "Internal error" anyway.
         if (authorized.length === 0) return { investments: [] };
+        // One read whatever the household holds: the linked document ids come
+        // from the same aggregation as the totals, so this never loads the
+        // entries themselves.
         const investments = await admin.listInvestments(
           ctx,
           authorized,
           filters,
         );
-        const entries = await admin.listInvestmentEntries(
-          ctx,
-          authorized,
-          investments.map((investment) => investment.id),
-        );
-        return {
-          investments: investments.map((investment) =>
-            investmentToolRow(investment, entries),
-          ),
-        };
+        return { investments: investments.map(investmentToolRow) };
       });
     },
     async getInvestment({ spaceIds, investmentId }) {
@@ -832,7 +818,7 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
         );
         if (!detail) return null;
         return {
-          ...investmentToolRow(detail, detail.entries),
+          ...investmentToolRow(detail),
           entries: detail.entries.map((entry) => ({
             id: entry.id,
             entryType: entry.entryType,

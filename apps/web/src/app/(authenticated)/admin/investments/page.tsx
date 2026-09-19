@@ -13,7 +13,7 @@ export default async function AdminInvestmentsPage() {
   if (data === null) redirect("/sign-in");
   return (
     <InvestmentsTable
-      initial={{ investments: data.investments, entries: data.entries }}
+      initial={data.investments}
       spaceId={data.spaceIds[0] ?? null}
     />
   );

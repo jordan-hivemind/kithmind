@@ -1538,7 +1538,7 @@ export function createMcpServer(
   // revoked between two calls denies on the second.
   const listInvestmentsTool = registerTool(
     MCP_TOOL_NAMES.listInvestments,
-    "List outside investments (angel, fund and AngelList) with computed totals: committed, sent (capital calls paid), fees, outstanding (committed minus sent, never below zero) and received (distributions). Totals are given per entry currency and separately converted to USD with each entry's own recorded exchange rate. Every amount is an exact decimal string, never a number: report them as given rather than reformatting or re-adding them. Archived investments are excluded unless includeArchived is set. linkedDocumentIds are the documents entries cite; unlinkedDocumentCount counts documents whose title names the investment and that no entry links to, which is a gap in filing rather than a total.",
+    "List outside investments (angel, fund and AngelList) with computed totals: committed, sent (capital calls paid), fees, outstanding and received (distributions). outstanding is committed minus sent and is SIGNED: a negative outstanding means the fund has called more than was committed, and overCalled reports that same excess as a positive number (0.00 when there is none). Totals are given per entry currency, unrounded, and separately in USD, converted with each entry's own recorded exchange rate and rounded to two places. Every amount is an exact decimal string, never a number: report them as given rather than reformatting or re-adding them. Archived investments are excluded unless includeArchived is set. linkedDocumentIds are the documents entries cite; unlinkedDocumentCount counts documents whose title names the investment and that no entry links to, which is a gap in filing rather than a total.",
     {
       spaceIds: readSpacesSchema,
       category: z.string().trim().min(1).max(100).optional(),
@@ -1557,7 +1557,7 @@ export function createMcpServer(
 
   const getInvestmentTool = registerTool(
     MCP_TOOL_NAMES.getInvestment,
-    "Read one investment with its entries and the documents they link to. Entry types are capital_call_paid, distribution, commitment, commitment_change, fee, write_off and other; the type carries the direction, so every amount is positive. exchangeRate is the rate to USD recorded with a non-USD entry. Amounts are exact decimal strings. An investment in a space this credential cannot read returns null, which is not evidence that it does not exist.",
+    "Read one investment with its entries and the documents they link to. Entry types are capital_call_paid, distribution, commitment, commitment_change, fee, write_off and other; the type carries the direction, so every amount is positive except a commitment_change, which is the one type that may be negative (a reduced commitment). exchangeRate is the rate to USD recorded with a non-USD entry. Totals follow list_investments, including the signed outstanding and overCalled. Amounts are exact decimal strings. An investment in a space this credential cannot read returns null, which is not evidence that it does not exist.",
     { investmentId: spaceIdSchema, spaceIds: readSpacesSchema },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.getInvestment],
     async ({ investmentId, spaceIds }) => {

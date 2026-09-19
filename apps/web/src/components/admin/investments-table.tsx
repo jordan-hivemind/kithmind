@@ -3,21 +3,31 @@
 // Screen 5 (Investments): every investment with its computed totals,
 // expanding into its entries.
 //
+// Two reads, not one. The investments and their totals come from
+// `["investments"]`; an investment's entries are fetched when its row is
+// expanded, under `["investment-entries", ...]`. Loading every entry in the
+// household up front was the earlier shape and had a ceiling the owner could
+// walk into and never clear.
+//
 // Reactive in both directions the owner asked for. Every add, edit and delete
 // applies to the cache before the request is sent and rolls back with a toast
 // if the server refuses it, so the frequent action (adding an entry) never
 // waits on a round trip. Changes made anywhere else -- the import, another
-// tab, the worker -- arrive through the change feed, which invalidates
-// `["investments"]` whenever `investments` or `investment_entries` changes.
+// tab, the worker -- arrive through the change feed.
 //
 // No total is computed here. `committed`, `sent`, `outstanding`, `fees` and
 // `received` are exact decimal strings produced by one SQL aggregation and
-// rendered as text; an optimistic row shows the entry immediately and lets the
-// refetch correct the totals, rather than doing money arithmetic in JavaScript
-// that would disagree with the database by a cent.
+// rendered as text; an optimistic write shows the entry immediately and lets
+// the refetch correct the totals, rather than doing money arithmetic in
+// JavaScript that would disagree with the database by a cent.
 
 import type { admin } from "@repo/kith-store";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  type QueryKey,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { type ColumnDef } from "@tanstack/react-table";
 import { useCallback, useMemo, useState } from "react";
 
@@ -28,28 +38,41 @@ import {
   EntryDrawer,
   type InvestmentDraft,
   InvestmentDrawer,
-  today,
 } from "@/components/admin/investment-drawers";
 import { ImportDrawer } from "@/components/admin/investment-import-drawer";
-import { DataTable, Detail, type RowAction, Tag } from "@/components/ui/data-table";
+import {
+  DataTable,
+  Detail,
+  type RowAction,
+  Tag,
+} from "@/components/ui/data-table";
 import { buttonClass, primaryButtonClass } from "@/components/ui/drawer";
-import type { ImportPreview } from "@/lib/kith/investment-import";
-import type { InvestmentsPageData } from "@/lib/kith/investments-data";
+import {
+  type ImportPreview,
+  type ImportWriter,
+  planImport,
+  runImport,
+} from "@/lib/kith/investment-import";
 import { useLiveChanges } from "@/lib/kith/use-live-changes";
 
 const WATCHED = {
   investments: ["investments", "investment_entries"],
+  "investment-entries": ["investment_entries"],
 } as const;
 
-type Payload = Omit<InvestmentsPageData, "spaceIds">;
+const INVESTMENTS_KEY: QueryKey = ["investments"];
+const ENTRIES_KEY: QueryKey = ["investment-entries"];
+
+type Investment = admin.InvestmentRow;
+type Entry = admin.InvestmentEntry;
 
 /** One table row: an investment, or one of its entries. The two kinds share a
  * table because an entry is only ever read under its investment. */
 type Row =
-  | ({ kind: "investment"; children: Row[] } & admin.InvestmentRow & {
+  | ({ kind: "investment"; children: Row[] } & Investment & {
         hasDocuments: "yes" | "no";
       })
-  | ({ kind: "entry" } & admin.InvestmentEntry);
+  | ({ kind: "entry" } & Entry);
 
 const STATUS_TONE: Record<string, "neutral" | "accent" | "warn"> = {
   active: "accent",
@@ -84,7 +107,7 @@ export function InvestmentsTable({
   initial,
   spaceId,
 }: {
-  initial: Payload;
+  initial: Investment[];
   /** Where a new investment is created. Absent when the session administers
    * no space, in which case the add buttons are disabled. */
   spaceId: string | null;
@@ -92,6 +115,7 @@ export function InvestmentsTable({
   useLiveChanges(WATCHED);
   const queryClient = useQueryClient();
   const [toast, setToast] = useState<string | null>(null);
+  const [expandedIds, setExpandedIds] = useState<string[]>([]);
   const [entryDraft, setEntryDraft] = useState<EntryDraft | null>(null);
   const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
   const [investmentDraft, setInvestmentDraft] =
@@ -101,68 +125,107 @@ export function InvestmentsTable({
   );
   const [importing, setImporting] = useState(false);
 
-  const { data } = useQuery({
-    queryKey: ["investments"],
-    queryFn: async (): Promise<Payload> => {
+  const { data: investments } = useQuery({
+    queryKey: INVESTMENTS_KEY,
+    queryFn: async (): Promise<Investment[]> => {
       const response = await fetch("/api/kith/investments", {
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
       });
       if (!response.ok) throw new Error("investments fetch failed");
-      return (await response.json()) as Payload;
+      return ((await response.json()) as { investments: Investment[] })
+        .investments;
     },
     initialData: initial,
+  });
+
+  // The entries of the rows that are open, and only those. The key carries the
+  // sorted id list, so opening a second row is a new query rather than a
+  // mutation of this one, and the change feed invalidates the whole prefix.
+  const openIds = useMemo(() => [...expandedIds].sort(), [expandedIds]);
+  const { data: entries } = useQuery({
+    queryKey: [...ENTRIES_KEY, openIds],
+    enabled: openIds.length > 0,
+    placeholderData: (previous) => previous,
+    queryFn: async (): Promise<Entry[]> => {
+      const pages = await Promise.all(
+        openIds.map(async (id) => {
+          const response = await fetch(`/api/kith/investments/${id}/entries`, {
+            headers: { "Content-Type": "application/json" },
+            cache: "no-store",
+          });
+          if (!response.ok) throw new Error("entries fetch failed");
+          return ((await response.json()) as { entries: Entry[] }).entries;
+        }),
+      );
+      return pages.flat();
+    },
   });
 
   /**
    * One optimistic mutation shape for all six writes.
    *
-   * `onMutate` cancels in-flight refetches, snapshots the cache and applies
-   * `apply` to it; `onError` puts the snapshot back and says why; `onSettled`
-   * invalidates so the server's own totals replace the optimistic rows. This
-   * is TanStack Query's documented rollback pattern, written once rather than
-   * six times.
+   * `onMutate` cancels in-flight refetches, snapshots every investments and
+   * entries query, then lets `apply` edit the caches; `onError` puts every
+   * snapshot back and says why; `onSettled` invalidates so the server's own
+   * totals replace the optimistic rows. Both caches are snapshotted because an
+   * entry write changes the entries list *and* the investment's totals, and a
+   * rollback that restored one of them would leave the screen inconsistent
+   * with itself.
    */
   const optimistic = useMutation<
     void,
     Error,
-    { apply: (current: Payload) => Payload; run: () => Promise<unknown> },
-    { previous: Payload | undefined }
+    { apply: () => void; run: () => Promise<unknown> },
+    { previous: [QueryKey, unknown][] }
   >({
     mutationFn: async ({ run }) => {
       await run();
     },
     onMutate: async ({ apply }) => {
-      await queryClient.cancelQueries({ queryKey: ["investments"] });
-      const previous = queryClient.getQueryData<Payload>(["investments"]);
-      if (previous) {
-        queryClient.setQueryData<Payload>(["investments"], apply(previous));
-      }
+      await queryClient.cancelQueries({ queryKey: INVESTMENTS_KEY });
+      await queryClient.cancelQueries({ queryKey: ENTRIES_KEY });
+      const previous = [
+        ...queryClient.getQueriesData({ queryKey: INVESTMENTS_KEY }),
+        ...queryClient.getQueriesData({ queryKey: ENTRIES_KEY }),
+      ];
+      apply();
       return { previous };
     },
     onError: (error, _variables, context) => {
-      if (context?.previous) {
-        queryClient.setQueryData(["investments"], context.previous);
+      for (const [key, value] of context?.previous ?? []) {
+        queryClient.setQueryData(key, value);
       }
       setToast(error.message);
       setTimeout(() => setToast(null), 6_000);
     },
     onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: ["investments"] });
+      void queryClient.invalidateQueries({ queryKey: INVESTMENTS_KEY });
+      void queryClient.invalidateQueries({ queryKey: ENTRIES_KEY });
     },
   });
 
+  const patchEntries = useCallback(
+    (change: (rows: Entry[]) => Entry[]) => {
+      queryClient.setQueriesData<Entry[]>({ queryKey: ENTRIES_KEY }, (rows) =>
+        rows === undefined ? rows : change(rows),
+      );
+    },
+    [queryClient],
+  );
+
   const rows = useMemo<Row[]>(
     () =>
-      data.investments.map((investment) => ({
+      investments.map((investment) => ({
         ...investment,
         kind: "investment" as const,
-        hasDocuments: investment.documentCount > 0 ? ("yes" as const) : ("no" as const),
-        children: data.entries
+        hasDocuments:
+          investment.documentCount > 0 ? ("yes" as const) : ("no" as const),
+        children: (entries ?? [])
           .filter((entry) => entry.investmentId === investment.id)
           .map((entry) => ({ ...entry, kind: "entry" as const })),
       })),
-    [data],
+    [investments, entries],
   );
 
   const saveEntry = useCallback(
@@ -179,14 +242,12 @@ export function InvestmentsTable({
       if (editingEntryId !== null) {
         const entryId = editingEntryId;
         await optimistic.mutateAsync({
-          apply: (current) => ({
-            ...current,
-            entries: current.entries.map((entry) =>
-              entry.id === entryId
-                ? { ...entry, ...body, exchangeRate: body.exchangeRate }
-                : entry,
+          apply: () =>
+            patchEntries((current) =>
+              current.map((entry) =>
+                entry.id === entryId ? { ...entry, ...body } : entry,
+              ),
             ),
-          }),
           run: () =>
             send(
               `/api/kith/investments/${draft.investmentId}/entries`,
@@ -201,24 +262,26 @@ export function InvestmentsTable({
       // ever writes against this id.
       const placeholder = `pending:${Date.now()}`;
       await optimistic.mutateAsync({
-        apply: (current) => ({
-          ...current,
-          entries: [
-            ...current.entries,
+        apply: () =>
+          patchEntries((current) => [
+            ...current,
             {
               id: placeholder,
               spaceId: "",
               investmentId: draft.investmentId,
               evidenceSpanId: null,
               ...body,
-            } as admin.InvestmentEntry,
-          ],
-        }),
+            } as Entry,
+          ]),
         run: () =>
-          send(`/api/kith/investments/${draft.investmentId}/entries`, "POST", body),
+          send(
+            `/api/kith/investments/${draft.investmentId}/entries`,
+            "POST",
+            body,
+          ),
       });
     },
-    [editingEntryId, optimistic],
+    [editingEntryId, optimistic, patchEntries],
   );
 
   const saveInvestment = useCallback(
@@ -233,111 +296,69 @@ export function InvestmentsTable({
       if (editingInvestmentId !== null) {
         const id = editingInvestmentId;
         await optimistic.mutateAsync({
-          apply: (current) => ({
-            ...current,
-            investments: current.investments.map((investment) =>
-              investment.id === id ? { ...investment, ...body } : investment,
+          apply: () =>
+            queryClient.setQueryData<Investment[]>(INVESTMENTS_KEY, (current) =>
+              current?.map((investment) =>
+                investment.id === id ? { ...investment, ...body } : investment,
+              ),
             ),
-          }),
           run: () => send("/api/kith/investments", "PATCH", { id, ...body }),
         });
         return;
       }
       if (spaceId === null) return;
       await optimistic.mutateAsync({
-        apply: (current) => current,
+        // Nothing to show optimistically: the new row's id and its computed
+        // totals are the server's to mint, and inventing a row without them
+        // would flicker a different row than the one that lands.
+        apply: () => {},
         run: () => send("/api/kith/investments", "POST", { spaceId, ...body }),
       });
     },
-    [editingInvestmentId, optimistic, spaceId],
+    [editingInvestmentId, optimistic, queryClient, spaceId],
   );
 
   /**
-   * The import, run from the approved preview.
+   * The import: plan it, then perform it row by row, then report every row.
    *
-   * Sequential rather than concurrent: the ledger rows need the investment ids
-   * the summary rows create, and 39 investments with a few hundred entries is
-   * not worth a dependency graph. Every write carries its row key, so a run
-   * interrupted halfway is resumed by importing the same file again.
+   * The orchestration itself is `runImport` in `lib/kith/investment-import.ts`
+   * and is tested there against a fake writer. What lives here is only the
+   * three things it needs from the network.
    */
-  const runImport = useCallback(
+  const performImport = useCallback(
     async (preview: ImportPreview) => {
-      const byName = new Map(
-        data.investments.map((investment) => [
-          investment.name.toLowerCase(),
-          investment.id,
-        ]),
-      );
-      let created = 0;
-      let entries = 0;
-
-      const ensure = async (
-        name: string,
-        fields?: Partial<InvestmentDraft>,
-      ): Promise<string | null> => {
-        const key = name.toLowerCase();
-        const known = byName.get(key);
-        if (known !== undefined) return known;
-        if (spaceId === null) return null;
-        try {
+      const writer: ImportWriter = {
+        existing: new Map(
+          investments.map((investment) => [
+            investment.name.toLowerCase(),
+            investment.id,
+          ]),
+        ),
+        createInvestment: async (fields) => {
+          if (spaceId === null) throw new Error("No space to import into");
           const response = await send("/api/kith/investments", "POST", {
             spaceId,
-            name,
-            category: fields?.category ?? null,
-            signedOn: fields?.signedOn === "" ? null : (fields?.signedOn ?? null),
-            status: fields?.status ?? "active",
-            notes: fields?.notes ?? null,
+            ...fields,
           });
           const { id } = (await response.json()) as { id: string };
-          byName.set(key, id);
-          created += 1;
-          return id;
-        } catch {
-          // Another run created it, or the name collided. Neither is a reason
-          // to stop: the rest of the file is still importable.
-          return null;
-        }
+          return { id, created: true };
+        },
+        createEntry: async (investmentId, entryBody) => {
+          const response = await send(
+            `/api/kith/investments/${investmentId}/entries`,
+            "POST",
+            entryBody,
+          );
+          const result = (await response.json()) as { created: boolean };
+          return { created: result.created };
+        },
       };
-
-      for (const investment of preview.summary) {
-        const id = await ensure(investment.name, {
-          category: investment.category ?? "",
-          signedOn: investment.signedOn ?? "",
-          status: investment.status,
-          notes: investment.notes ?? "",
-        });
-        if (id === null || investment.committed === null) continue;
-        await send(`/api/kith/investments/${id}/entries`, "POST", {
-          entryType: "commitment",
-          entryDate: investment.signedOn ?? today(),
-          amount: investment.committed,
-          currency: "USD",
-          importKey: investment.importKey,
-        }).then(() => {
-          entries += 1;
-        });
-      }
-
-      for (const entry of preview.ledger) {
-        const id = await ensure(entry.investmentName);
-        if (id === null) continue;
-        await send(`/api/kith/investments/${id}/entries`, "POST", {
-          entryType: entry.entryType,
-          entryDate: entry.entryDate,
-          amount: entry.amount,
-          currency: entry.currency,
-          exchangeRate: entry.exchangeRate,
-          note: entry.note,
-          importKey: entry.importKey,
-        }).then(() => {
-          entries += 1;
-        });
-      }
-
-      await queryClient.invalidateQueries({ queryKey: ["investments"] });
-      return { investments: created, entries };
+      const outcome = await runImport(planImport(preview), writer);
+      await queryClient.invalidateQueries({ queryKey: INVESTMENTS_KEY });
+      await queryClient.invalidateQueries({ queryKey: ENTRIES_KEY });
+      return outcome;
     },
-    [data.investments, queryClient, spaceId],
+    [investments, queryClient, spaceId],
   );
 
   const columns = useMemo<ColumnDef<Row, unknown>[]>(
@@ -349,10 +370,7 @@ export function InvestmentsTable({
         header: "Investment",
         cell: ({ row }) =>
           row.original.kind === "investment" ? (
-            <Detail
-              label={row.original.name}
-              detail={row.original.notes}
-            />
+            <Detail label={row.original.name} detail={row.original.notes} />
           ) : (
             <span className="tabular-nums text-gray-500">
               {row.original.entryDate}
@@ -398,11 +416,10 @@ export function InvestmentsTable({
           row.original.kind === "investment" ? (
             <Money value={row.original.totals.usd.committed} />
           ) : row.original.currency === "USD" ? null : (
-            // The USD value of a non-USD entry, at the rate stored with it.
             <Detail
               label={
                 <span className="tabular-nums text-gray-500">
-                  {row.original.currency} × {row.original.exchangeRate}
+                  x {row.original.exchangeRate}
                 </span>
               }
               detail="Converted at the rate recorded with this entry"
@@ -412,7 +429,8 @@ export function InvestmentsTable({
       {
         id: "sent",
         header: "Sent",
-        accessorFn: (row) => (row.kind === "investment" ? row.totals.usd.sent : ""),
+        accessorFn: (row) =>
+          row.kind === "investment" ? row.totals.usd.sent : "",
         cell: ({ row }) =>
           row.original.kind === "investment" ? (
             <Detail
@@ -430,13 +448,26 @@ export function InvestmentsTable({
         header: "Outstanding",
         accessorFn: (row) =>
           row.kind === "investment" ? row.totals.usd.outstanding : "",
-        cell: ({ row }) =>
-          row.original.kind === "investment" ? (
+        cell: ({ row }) => {
+          if (row.original.kind !== "investment") return null;
+          const { outstanding, overCalled } = row.original.totals.usd;
+          // An over-call is the one case a bare number reads backwards, so it
+          // gets a tag of its own rather than a minus sign to notice.
+          if (overCalled !== "0.00") {
+            return (
+              <Detail
+                label={<Tag tone="warn">over-called {overCalled}</Tag>}
+                detail="Computed: sent exceeds committed by this much"
+              />
+            );
+          }
+          return (
             <Detail
-              label={<Money value={row.original.totals.usd.outstanding} />}
-              detail="Computed: committed minus sent, never below zero"
+              label={<Money value={outstanding} />}
+              detail="Computed: committed minus sent"
             />
-          ) : null,
+          );
+        },
       },
       {
         id: "received",
@@ -457,7 +488,9 @@ export function InvestmentsTable({
           row.original.kind === "investment" ? (
             <Detail
               label={
-                <span className="tabular-nums">{row.original.documentCount}</span>
+                <span className="tabular-nums">
+                  {row.original.documentCount}
+                </span>
               }
               detail={
                 row.original.unlinkedDocumentCount === 0
@@ -490,7 +523,6 @@ export function InvestmentsTable({
     () => [
       {
         label: "Edit",
-        hidden: () => false,
         onSelect: (row) => {
           if (row.kind === "investment") {
             setEditingInvestmentId(row.id);
@@ -522,12 +554,12 @@ export function InvestmentsTable({
         onSelect: (row) => {
           if (row.kind !== "investment") return;
           void optimistic.mutateAsync({
-            apply: (current) => ({
-              ...current,
-              investments: current.investments.filter(
-                (investment) => investment.id !== row.id,
+            apply: () =>
+              queryClient.setQueryData<Investment[]>(
+                INVESTMENTS_KEY,
+                (current) =>
+                  current?.filter((investment) => investment.id !== row.id),
               ),
-            }),
             run: () => send("/api/kith/investments", "DELETE", { id: row.id }),
           });
         },
@@ -538,10 +570,10 @@ export function InvestmentsTable({
         onSelect: (row) => {
           if (row.kind !== "entry") return;
           void optimistic.mutateAsync({
-            apply: (current) => ({
-              ...current,
-              entries: current.entries.filter((entry) => entry.id !== row.id),
-            }),
+            apply: () =>
+              patchEntries((current) =>
+                current.filter((entry) => entry.id !== row.id),
+              ),
             run: () =>
               send(
                 `/api/kith/investments/${row.investmentId}/entries`,
@@ -552,7 +584,7 @@ export function InvestmentsTable({
         },
       },
     ],
-    [optimistic],
+    [optimistic, patchEntries, queryClient],
   );
 
   return (
@@ -561,10 +593,10 @@ export function InvestmentsTable({
         <button
           type="button"
           className={primaryButtonClass}
-          disabled={data.investments.length === 0}
+          disabled={investments.length === 0}
           onClick={() => {
             setEditingEntryId(null);
-            setEntryDraft(emptyEntry(data.investments[0]?.id ?? ""));
+            setEntryDraft(emptyEntry(investments[0]?.id ?? ""));
           }}
         >
           Add entry
@@ -602,7 +634,20 @@ export function InvestmentsTable({
       <DataTable
         data={rows}
         columns={columns}
-        getSubRows={(row) => (row.kind === "investment" ? row.children : undefined)}
+        getSubRows={(row) =>
+          row.kind === "investment" ? row.children : undefined
+        }
+        canExpand={(row) => row.kind === "investment" && row.entryCount > 0}
+        onExpandChange={(row, expanded) => {
+          if (row.kind !== "investment") return;
+          setExpandedIds((current) =>
+            expanded
+              ? current.includes(row.id)
+                ? current
+                : [...current, row.id]
+              : current.filter((id) => id !== row.id),
+          );
+        }}
         filterColumns={["category", "status", "hasDocuments"]}
         initialSorting={[{ id: "name", desc: false }]}
         actions={actions}
@@ -619,7 +664,7 @@ export function InvestmentsTable({
               setEditingEntryId(null);
             }
           }}
-          investments={data.investments}
+          investments={investments}
           initial={entryDraft}
           editingEntryId={editingEntryId}
           onSave={saveEntry}
@@ -644,7 +689,7 @@ export function InvestmentsTable({
       <ImportDrawer
         open={importing}
         onOpenChange={setImporting}
-        onImport={runImport}
+        onImport={performImport}
       />
     </div>
   );

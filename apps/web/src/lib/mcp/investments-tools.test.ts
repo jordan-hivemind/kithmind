@@ -52,10 +52,13 @@ type Fixture = {
   userId: string;
   keyA: string;
   keyBoth: string;
+  readerUserId: string;
+  readerKey: string;
   spaceA: string;
   spaceB: string;
   investmentA: string;
   investmentB: string;
+  overCalled: string;
 };
 
 describeWithDatabase("MCP investment read tools", () => {
@@ -193,14 +196,63 @@ describeWithDatabase("MCP investment read tools", () => {
           ...entry,
         });
       }
+      // An over-called investment, so the signed outstanding and the
+      // `overCalled` figure are both exercised through the tools.
+      const overCalled = await admin.createInvestment(ctx, {
+        principal: writer,
+        spaceId: spaceA,
+        name: "Overcalled LP",
+      });
+      for (const entry of [
+        { entryType: "commitment", entryDate: "2024-01-01", amount: "1000.00" },
+        {
+          entryType: "capital_call_paid",
+          entryDate: "2024-06-01",
+          amount: "1500.00",
+        },
+      ] as const) {
+        await admin.createInvestmentEntry(ctx, {
+          principal: writer,
+          investmentId: overCalled,
+          ...entry,
+        });
+      }
+
+      // A second member of space A with the `reader` role, and a read
+      // credential of their own. The admin screen excludes them; these tools
+      // must not, because they resolve the same set every other read tool
+      // does.
+      const readerSession = await signUp(ctx, {
+        email: `adm3-reader-${randomBytes(4).toString("hex")}@example.test`,
+        password: PASSWORD,
+      });
+      await ensurePersonalSpace(ctx, readerSession.userId);
+      await ctx.client.query(
+        `INSERT INTO kith.space_members (id, space_id, user_id, role)
+           VALUES ($1, $2, $3, 'reader')`,
+        [newKithId(), spaceA, readerSession.userId],
+      );
+      const readerKey = await createApiKey(ctx, {
+        principal: {
+          userId: readerSession.userId,
+          capabilities: ["read"] as const,
+        },
+        name: "Reader of space A",
+        capabilities: ["read"],
+        spaceIds: [spaceA],
+      });
+
       return {
         userId: session.userId,
         keyA: keyA.id,
         keyBoth: keyBoth.id,
+        readerUserId: readerSession.userId,
+        readerKey: readerKey.id,
         spaceA,
         spaceB,
         investmentA,
         investmentB,
+        overCalled,
       };
     });
   }, 90_000);
@@ -247,16 +299,23 @@ describeWithDatabase("MCP investment read tools", () => {
         };
       }[];
     };
-    expect(result.investments.map((row) => row.name)).toEqual(["Bramble Fund I"]);
+    expect(result.investments.map((row) => row.name)).toEqual([
+      "Bramble Fund I",
+      "Overcalled LP",
+    ]);
     const [investment] = result.investments;
     expect(investment!.entryCount).toBe(5);
-    // 30000.33 + 10000.00 * 1.25, computed in `numeric` and never in a float.
-    expect(investment!.totals.usd.sent).toBe("42500.3300");
+    // 30000.33 + 10000.00 * 1.25, computed in `numeric` and never in a float,
+    // and rounded to two places once, after the conversion and the sum.
+    expect(investment!.totals.usd.sent).toBe("42500.33");
     expect(investment!.totals.usd.committed).toBe("100000.00");
-    expect(investment!.totals.usd.outstanding).toBe("57499.6700");
+    expect(investment!.totals.usd.outstanding).toBe("57499.67");
+    expect(investment!.totals.usd.overCalled).toBe("0.00");
     expect(investment!.totals.usd.received).toBe("12345.67");
     // Fees are their own total and are not counted as sent.
     expect(investment!.totals.usd.fees).toBe("500.01");
+    // The per-currency totals are unrounded, so the exact figure is always
+    // still available beside the rounded USD one.
     expect(
       investment!.totals.byCurrency.find((total) => total.currency === "GBP"),
     ).toMatchObject({ sent: "10000.00", committed: "0" });
@@ -265,6 +324,59 @@ describeWithDatabase("MCP investment read tools", () => {
     for (const value of Object.values(investment!.totals.usd)) {
       expect(typeof value).toBe("string");
     }
+  });
+
+  test("an over-call is reported, not floored away", async () => {
+    const result = payload(
+      await call(credentialFor(fixture.keyA), "list_investments", {
+        nameContains: "Overcalled",
+      }),
+    ) as { investments: { totals: { usd: Record<string, string> } }[] };
+    const [investment] = result.investments;
+    // Signed, so a fund that has called more than was committed no longer
+    // reads the same as one that is exactly fully called.
+    expect(investment!.totals.usd.outstanding).toBe("-500.00");
+    expect(investment!.totals.usd.overCalled).toBe("500.00");
+  });
+
+  test("a reader member may read investments through the tools", async () => {
+    // The admin screen is owner and editor only. These tools are not: they
+    // resolve `getAuthorizedReadSpaceIds`, the same set every other read tool
+    // uses, so a reader may ask about what they can already see in the app.
+    const result = payload(
+      await call(
+        credentialFor(fixture.readerKey, fixture.readerUserId),
+        "list_investments",
+        {},
+      ),
+    ) as { investments: { name: string; spaceId: string }[] };
+    expect(result.investments.map((row) => row.name)).toEqual([
+      "Bramble Fund I",
+      "Overcalled LP",
+    ]);
+    expect(
+      result.investments.every((row) => row.spaceId === fixture.spaceA),
+    ).toBe(true);
+
+    const detail = payload(
+      await call(
+        credentialFor(fixture.readerKey, fixture.readerUserId),
+        "get_investment",
+        { investmentId: fixture.investmentA },
+      ),
+    ) as { name: string };
+    expect(detail.name).toBe("Bramble Fund I");
+
+    // And still only the space they are a member of.
+    expect(
+      payload(
+        await call(
+          credentialFor(fixture.readerKey, fixture.readerUserId),
+          "get_investment",
+          { investmentId: fixture.investmentB },
+        ),
+      ),
+    ).toBeNull();
   });
 
   test("filters narrow without widening the space set", async () => {

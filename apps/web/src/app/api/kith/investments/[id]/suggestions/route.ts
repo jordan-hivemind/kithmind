@@ -12,8 +12,12 @@
 
 import { admin } from "@repo/kith-store";
 
-import { noStoreJson, withPrincipalRead } from "@/lib/kith/api-route";
-import { parsedBody, suggestSchema } from "@/lib/kith/investment-schemas";
+import {
+  noStoreJson,
+  parsedBody,
+  withPrincipalRead,
+} from "@/lib/kith/api-route";
+import { suggestSchema } from "@/lib/kith/investment-schemas";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";

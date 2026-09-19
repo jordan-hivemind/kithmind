@@ -21,13 +21,13 @@ import { admin } from "@repo/kith-store";
 import {
   noContent,
   noStoreJson,
+  parsedBody,
   withPrincipal,
   withPrincipalRead,
 } from "@/lib/kith/api-route";
 import {
   archiveInvestmentSchema,
   createInvestmentSchema,
-  parsedBody,
   patchInvestmentSchema,
 } from "@/lib/kith/investment-schemas";
 
@@ -38,17 +38,21 @@ export async function GET(request: Request): Promise<Response> {
   return withPrincipalRead(request, async ({ ctx, principal }) => {
     const spaces = await admin.getAdminSpaceIds(ctx, principal);
     if (spaces.length === 0) {
-      return noStoreJson({ investments: [], entries: [] });
+      return noStoreJson({ investments: [] });
     }
     const includeArchived =
       new URL(request.url).searchParams.get("includeArchived") === "1";
-    // Both halves from one snapshot: an entry arriving between two reads would
-    // otherwise show under a total that does not contain it.
+    // Investments and their totals, never the entries. One investment's
+    // entries are read when its row is expanded
+    // (`GET /api/kith/investments/[id]/entries`), so this read's cost is the
+    // number of investments the owner has rather than the number of capital
+    // calls he has ever paid -- which is a number that only grows, and which
+    // the earlier single-list shape would eventually have refused to return
+    // at all.
     return noStoreJson({
       investments: await admin.listInvestments(ctx, spaces, {
         includeArchived,
       }),
-      entries: await admin.listInvestmentEntries(ctx, spaces),
     });
   });
 }

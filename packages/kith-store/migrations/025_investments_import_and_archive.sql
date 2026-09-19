@@ -1,4 +1,4 @@
--- ADM-3: the three things the investments screen needs that migration 022
+-- ADM-3: the five things the investments screen needs that migration 022
 -- could not know it would need, because the screen had not been designed yet.
 --
 -- 1. `investments.archived_at`. "Archive (soft delete)" is not one of
@@ -24,13 +24,28 @@
 --    the entry out of a sum the owner reads as complete. The schema refuses
 --    the row instead. Money correctness belongs in the constraint, not only in
 --    the drawer that usually fills the field.
+--
+-- 4. One investment per name per space. Two rows called the same thing split
+--    the owner's totals in half without saying so, and the service's read-then-
+--    insert check cannot see a concurrent insert. The unique index can, and it
+--    is what the duplicate error is raised from.
+--
+-- 5. Only a `commitment_change` may be negative. Every other entry type
+--    carries its direction in the type, so a negative capital call is a data
+--    error that would subtract from `sent`. A reduced commitment is the one
+--    real signed quantity, so it is the one exception.
+--
+-- The table is empty in production (the screen it serves lands with this
+-- migration), so both new constraints validate against no rows.
 
 ALTER TABLE kith.investments
   ADD COLUMN archived_at timestamptz;
 
--- The screen's default read: everything not archived, by name.
-CREATE INDEX investments_active_idx
-  ON kith.investments (space_id, name, id)
+-- The screen's default read: everything not archived, by name. Unique, so a
+-- second investment with the same name cannot exist rather than merely being
+-- refused by the read the service does first.
+CREATE UNIQUE INDEX investments_active_name_idx
+  ON kith.investments (space_id, lower(btrim(name)))
   WHERE archived_at IS NULL;
 
 ALTER TABLE kith.investment_entries
@@ -47,3 +62,7 @@ CREATE UNIQUE INDEX investment_entries_import_key_idx
 ALTER TABLE kith.investment_entries
   ADD CONSTRAINT investment_entries_exchange_rate_present_check
     CHECK (currency = 'USD' OR exchange_rate IS NOT NULL);
+
+ALTER TABLE kith.investment_entries
+  ADD CONSTRAINT investment_entries_amount_sign_check
+    CHECK (entry_type = 'commitment_change' OR amount >= 0);

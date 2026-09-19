@@ -4,8 +4,9 @@
 // it in, `loadAuthenticatedPage` reloads the principal inside the transaction,
 // and `null` means "not signed in" and only that.
 //
-// Investments and entries come from the same transaction so the totals and the
-// rows they expand into are one snapshot.
+// Investments and their totals only. An investment's entries are read when its
+// row is expanded, so the first paint's cost is the number of investments the
+// owner has rather than the number of capital calls he has ever paid.
 
 import { admin } from "@repo/kith-store";
 
@@ -13,7 +14,6 @@ import { loadAuthenticatedPage } from "@/lib/kith/page-session";
 
 export type InvestmentsPageData = {
   investments: admin.InvestmentRow[];
-  entries: admin.InvestmentEntry[];
   /** Where a new investment is created. The screen has no space picker: the
    * owner has one household. */
   spaceIds: string[];
@@ -24,12 +24,9 @@ export async function loadInvestments(
 ): Promise<InvestmentsPageData | null> {
   return await loadAuthenticatedPage(cookieHeader, async ({ ctx, principal }) => {
     const spaceIds = await admin.getAdminSpaceIds(ctx, principal);
-    if (spaceIds.length === 0) {
-      return { investments: [], entries: [], spaceIds };
-    }
+    if (spaceIds.length === 0) return { investments: [], spaceIds };
     return {
       investments: await admin.listInvestments(ctx, spaceIds),
-      entries: await admin.listInvestmentEntries(ctx, spaceIds),
       spaceIds,
     };
   });

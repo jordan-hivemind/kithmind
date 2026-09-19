@@ -4,16 +4,17 @@
 //
 // The operator picks two CSV files (the `Summary` and `Ledger` tabs, exported
 // from the sheet), sees exactly what will be created, flips any row whose type
-// was read wrong, and imports. Nothing leaves the browser until then: the
-// parse and the reconciliation are pure functions in
-// `lib/kith/investment-import.ts`, which is where their tests are.
+// was read wrong, acknowledges anything that does not add up, and imports.
+// Nothing leaves the browser until then: the parse, the reconciliation, the
+// plan and the run all live in `lib/kith/investment-import.ts`, which is where
+// their tests are.
 //
-// Idempotent by row key: a second import of the same file creates nothing.
-// The keys are computed here and stored on the entry, and the unique index in
-// migration 024 is what enforces it, so a double click or a retried network
-// call cannot double the owner's capital calls either.
+// Two things this screen must never do, both of which it did once: import a
+// row without saying what happened to it, and stop partway without saying it
+// stopped. Every row ends up in the result list as created, already imported,
+// or failed with a reason.
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 import {
   buttonClass,
@@ -24,12 +25,13 @@ import {
 } from "@/components/ui/drawer";
 import {
   buildPreview,
+  IMPORT_REIMPORT_NOTE,
   IMPORT_RULE,
+  type ImportOutcome,
   type ImportPreview,
   type LedgerDraft,
+  planImport,
 } from "@/lib/kith/investment-import";
-
-export type ImportResult = { investments: number; entries: number };
 
 export function ImportDrawer({
   open,
@@ -38,18 +40,20 @@ export function ImportDrawer({
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onImport: (preview: ImportPreview) => Promise<ImportResult>;
+  onImport: (preview: ImportPreview) => Promise<ImportOutcome>;
 }) {
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [summaryCsv, setSummaryCsv] = useState("");
   const [ledgerCsv, setLedgerCsv] = useState("");
+  const [acknowledged, setAcknowledged] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [done, setDone] = useState<ImportResult | null>(null);
+  const [outcome, setOutcome] = useState<ImportOutcome | null>(null);
 
   const rebuild = (summary: string, ledger: string) => {
     setSummaryCsv(summary);
     setLedgerCsv(ledger);
-    setDone(null);
+    setOutcome(null);
+    setAcknowledged(false);
     setPreview(
       summary === "" && ledger === "" ? null : buildPreview(summary, ledger),
     );
@@ -57,19 +61,40 @@ export function ImportDrawer({
 
   const flip = (index: number) => {
     if (preview === null) return;
-    const ledger = preview.ledger.map((row, position) =>
-      position !== index
-        ? row
-        : ({
-            ...row,
-            entryType:
-              row.entryType === "capital_call_paid"
-                ? "distribution"
-                : "capital_call_paid",
-          } satisfies LedgerDraft),
-    );
-    setPreview({ ...preview, ledger });
+    setAcknowledged(false);
+    setOutcome(null);
+    setPreview({
+      ...preview,
+      ledger: preview.ledger.map((row, position) =>
+        position !== index
+          ? row
+          : ({
+              ...row,
+              entryType:
+                row.entryType === "capital_call_paid"
+                  ? "distribution"
+                  : "capital_call_paid",
+            } satisfies LedgerDraft),
+      ),
+    });
   };
+
+  // Recomputed from the preview the operator is looking at, so the counts
+  // below are the counts of what will actually be sent.
+  const plan = useMemo(
+    () => (preview === null ? null : planImport(preview)),
+    [preview],
+  );
+
+  // Anything that does not add up has to be acknowledged before Import is
+  // enabled: not a warning to scroll past. These are the cases where the sheet
+  // contradicts itself, and importing one silently is how a wrong total
+  // becomes the system of record.
+  const needsAcknowledgement =
+    preview !== null &&
+    (preview.reconciliation.length > 0 ||
+      preview.suspectRates.length > 0 ||
+      (plan?.invalid.length ?? 0) > 0);
 
   return (
     <Drawer open={open} onOpenChange={onOpenChange} title="Import">
@@ -97,70 +122,80 @@ export function ImportDrawer({
           />
         </Field>
 
-        {preview === null ? null : (
+        {preview === null || plan === null ? null : (
           <>
-            {/* The rule the mapping applied, shown because the operator is
-                being asked to approve it, not merely told it happened. */}
+            {/* The rule the mapping applied, and what a re-import does. Shown
+                because the operator is being asked to approve them, not merely
+                told afterwards. */}
             <p className="rounded-tag border border-gray-200 bg-gray-50 p-2 text-[11px] text-gray-600">
               {IMPORT_RULE}
+            </p>
+            <p className="rounded-tag border border-gray-200 bg-gray-50 p-2 text-[11px] text-gray-600">
+              {IMPORT_REIMPORT_NOTE}
             </p>
 
             <table className="w-full text-[11px]">
               <tbody>
-                <tr className="border-b border-gray-100">
-                  <td className="h-row">Investments</td>
-                  <td className="h-row text-right tabular-nums">
-                    {preview.summary.length}
-                  </td>
-                </tr>
-                <tr className="border-b border-gray-100">
-                  <td className="h-row">Entries</td>
-                  <td className="h-row text-right tabular-nums">
-                    {preview.ledger.length}
-                  </td>
-                </tr>
-                <tr className="border-b border-gray-100">
-                  <td className="h-row">Not read</td>
-                  <td className="h-row text-right tabular-nums">
-                    {preview.skipped.length}
-                  </td>
-                </tr>
-                <tr>
-                  <td className="h-row">Differences</td>
-                  <td className="h-row text-right tabular-nums">
-                    {preview.reconciliation.length}
-                  </td>
-                </tr>
+                {(
+                  [
+                    ["Investments", preview.summary.length],
+                    [
+                      "Entries",
+                      plan.operations.filter((row) => row.kind === "entry")
+                        .length,
+                    ],
+                    ["Not read", preview.skipped.length],
+                    ["Cannot import", plan.invalid.length],
+                    ["Differences", preview.reconciliation.length],
+                    ["Rate looks wrong", preview.suspectRates.length],
+                  ] as const
+                ).map(([label, count]) => (
+                  <tr key={label} className="border-b border-gray-100">
+                    <td className="h-row">{label}</td>
+                    <td className="h-row text-right tabular-nums">{count}</td>
+                  </tr>
+                ))}
               </tbody>
             </table>
 
-            {preview.reconciliation.length === 0 ? null : (
-              <ul className="flex flex-col gap-0.5">
-                {preview.reconciliation.map((row) => (
-                  <li
-                    key={`${row.investmentName}:${row.field}`}
-                    className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] text-amber-800"
-                  >
-                    {row.investmentName} · {row.field} · sheet {row.stated} ·
-                    entries {row.imported} · {row.difference}
-                  </li>
-                ))}
-              </ul>
-            )}
+            {preview.reconciliation.map((row) => (
+              <p
+                key={`${row.investmentName}:${row.field}`}
+                className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] text-amber-800"
+              >
+                {row.label}
+              </p>
+            ))}
 
-            {preview.skipped.length === 0 ? null : (
-              <ul className="flex flex-col gap-0.5">
-                {preview.skipped.map((row) => (
-                  <li
-                    key={`${row.line}:${row.reason}`}
-                    className="truncate rounded-tag border border-gray-200 px-1.5 py-0.5 text-[11px] text-gray-500"
-                    title={row.raw}
-                  >
-                    {row.line} · {row.reason}
-                  </li>
-                ))}
-              </ul>
-            )}
+            {preview.suspectRates.map((row) => (
+              <p
+                key={row.importKey}
+                className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] text-amber-800"
+              >
+                {row.line}: {row.investmentName} {row.amount} {row.currency} x{" "}
+                {row.exchangeRate} = {row.rateCheck?.convertedUsd}, the sheet
+                says {row.rateCheck?.sheetUsd} — rate looks inverted or wrong
+              </p>
+            ))}
+
+            {plan.invalid.map((row) => (
+              <p
+                key={row.key}
+                className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] text-amber-800"
+              >
+                {row.label} — {row.reason}
+              </p>
+            ))}
+
+            {preview.skipped.map((row) => (
+              <p
+                key={`${row.line}:${row.reason}`}
+                className="truncate rounded-tag border border-gray-200 px-1.5 py-0.5 text-[11px] text-gray-500"
+                title={row.raw}
+              >
+                {row.line} · {row.reason}
+              </p>
+            ))}
 
             <ul className="flex max-h-64 flex-col gap-0.5 overflow-y-auto">
               {preview.ledger.map((row, index) => (
@@ -173,9 +208,16 @@ export function ImportDrawer({
                   </span>
                   <span className="min-w-0 flex-1 truncate">
                     {row.investmentName}
+                    {row.occurrence > 1 ? ` (${row.occurrence})` : ""}
                   </span>
-                  <span className="tabular-nums">
+                  <span
+                    className="tabular-nums"
+                    title={
+                      row.notes.length === 0 ? undefined : row.notes.join("; ")
+                    }
+                  >
                     {row.amount} {row.currency}
+                    {row.currency === "USD" ? "" : ` → ${row.usdAmount}`}
                   </span>
                   <button
                     type="button"
@@ -188,31 +230,57 @@ export function ImportDrawer({
                 </li>
               ))}
             </ul>
+
+            {needsAcknowledgement ? (
+              <label className="flex items-center gap-1.5 text-[11px] text-gray-700">
+                <input
+                  type="checkbox"
+                  checked={acknowledged}
+                  onChange={(event) => setAcknowledged(event.target.checked)}
+                />
+                Import anyway
+              </label>
+            ) : null}
           </>
         )}
 
+        {outcome === null ? null : (
+          <div className="flex flex-col gap-0.5 text-[11px]">
+            <p className="text-gray-700">
+              {outcome.investmentsCreated} investments · {outcome.entriesCreated}{" "}
+              entries · {outcome.entriesAlreadyImported} already imported ·{" "}
+              {outcome.failed.length} failed
+            </p>
+            {outcome.failed.map((row) => (
+              <p
+                key={row.key}
+                className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-amber-800"
+              >
+                {row.label} — {row.reason}
+              </p>
+            ))}
+          </div>
+        )}
+
         <div className="flex items-center justify-end gap-2 pt-1">
-          {done === null ? null : (
-            <span className="mr-auto text-[11px] text-gray-500">
-              {done.investments} · {done.entries}
-            </span>
-          )}
           <button
             type="button"
             className={buttonClass}
             onClick={() => onOpenChange(false)}
           >
-            Cancel
+            Close
           </button>
           <button
             type="button"
-            disabled={preview === null || busy}
+            disabled={
+              preview === null || busy || (needsAcknowledgement && !acknowledged)
+            }
             className={primaryButtonClass}
             onClick={async () => {
               if (preview === null) return;
               setBusy(true);
               try {
-                setDone(await onImport(preview));
+                setOutcome(await onImport(preview));
               } finally {
                 setBusy(false);
               }

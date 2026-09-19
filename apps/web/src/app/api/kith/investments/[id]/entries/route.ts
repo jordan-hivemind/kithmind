@@ -1,26 +1,30 @@
-// `/api/kith/investments/[id]/entries`: adding an entry is the frequent
-// action, so it is the smallest surface that can be.
+// `/api/kith/investments/[id]/entries`: one investment's entries.
 //
-// POST creates, PATCH edits and DELETE removes; the two that act on an
-// existing entry name it in the body rather than in a second path segment,
-// because the entry id is already unique and a nested `[entryId]` segment
-// would be a second file saying the same three lines.
+// GET reads them, which is what the screen calls when a row is expanded; POST
+// creates, PATCH edits and DELETE removes. The three that act on an existing
+// entry name it in the body rather than in a second path segment, because the
+// entry id is already unique and a nested `[entryId]` segment would be a
+// second file saying the same three lines.
 //
-// The store re-checks that the entry belongs to the investment's space and
-// that the caller may write there, so the `[id]` segment is not trusted as
-// authorization: it is the investment a create attaches to, and nothing else.
+// The `[id]` segment is not authorization -- the store checks write access
+// against the space the row itself names -- but it is not decoration either:
+// every handler passes it down, and the store refuses an entry that belongs to
+// a different investment. Without that, an entry could be edited through a URL
+// naming an investment it has nothing to do with, and the path would be a lie
+// about what was changed.
 
 import { admin } from "@repo/kith-store";
 
 import {
   noContent,
   noStoreJson,
+  parsedBody,
   withPrincipal,
+  withPrincipalRead,
 } from "@/lib/kith/api-route";
 import {
   createEntrySchema,
   deleteEntrySchema,
-  parsedBody,
   patchEntrySchema,
 } from "@/lib/kith/investment-schemas";
 
@@ -28,6 +32,21 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 type Params = { params: Promise<{ id: string }> };
+
+export async function GET(
+  request: Request,
+  { params }: Params,
+): Promise<Response> {
+  return withPrincipalRead(request, async ({ ctx, principal }) => {
+    const spaces = await admin.getAdminSpaceIds(ctx, principal);
+    if (spaces.length === 0) return noStoreJson({ entries: [] });
+    return noStoreJson({
+      entries: await admin.listInvestmentEntries(ctx, spaces, [
+        (await params).id,
+      ]),
+    });
+  });
+}
 
 export async function POST(
   request: Request,
@@ -47,21 +66,32 @@ export async function POST(
   });
 }
 
-export async function PATCH(request: Request): Promise<Response> {
+export async function PATCH(
+  request: Request,
+  { params }: Params,
+): Promise<Response> {
   return withPrincipal(request, async ({ ctx, principal }) => {
     const body = await parsedBody(request, patchEntrySchema);
     if ("response" in body) return body.response;
-    await admin.updateInvestmentEntry(ctx, { principal, ...body.value });
+    await admin.updateInvestmentEntry(ctx, {
+      principal,
+      investmentId: (await params).id,
+      ...body.value,
+    });
     return noContent();
   });
 }
 
-export async function DELETE(request: Request): Promise<Response> {
+export async function DELETE(
+  request: Request,
+  { params }: Params,
+): Promise<Response> {
   return withPrincipal(request, async ({ ctx, principal }) => {
     const body = await parsedBody(request, deleteEntrySchema);
     if ("response" in body) return body.response;
     await admin.deleteInvestmentEntry(ctx, {
       principal,
+      investmentId: (await params).id,
       entryId: body.value.entryId,
     });
     return noContent();

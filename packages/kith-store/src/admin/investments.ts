@@ -43,8 +43,20 @@ import {
 /** The owner tracks about 39 investments. The bound is for a runaway read. */
 const MAX_INVESTMENTS = 500;
 
-/** One investment's entries. A capital call a month for twenty years fits. */
+/**
+ * One investment's entries. A capital call a month for twenty years fits.
+ *
+ * Per investment, not per screen: the screen loads an investment's entries
+ * when the owner expands its row, so the bound is on one read of one
+ * investment rather than on the household's whole history. A single list of
+ * every entry was the earlier shape and would have started throwing on the
+ * thousandth entry across all 39 investments, which is a failure the owner
+ * would have had no way to clear.
+ */
 const MAX_ENTRIES = 1_000;
+
+/** Investments whose entries one call may read. The screen asks for one. */
+const MAX_ENTRY_INVESTMENTS = 25;
 
 /** How many documents one suggestion call ranks and how many it returns. */
 const MAX_SUGGESTION_CANDIDATES = 200;
@@ -57,11 +69,29 @@ const NAME_MAX_CHARS = 200;
 const NOTE_MAX_CHARS = 4_000;
 const IMPORT_KEY_MAX_CHARS = 512;
 
-/** `numeric`, non-negative, at most two decimal places more than money needs.
+/**
+ * `numeric`, at most two decimal places more than money needs.
+ *
  * The direction of an entry is its type, never the sign of its amount: a
- * distribution is a `distribution`, not a negative capital call. A signed
- * amount would make every `sum(...) FILTER (...)` below ambiguous. */
+ * distribution is a `distribution`, not a negative capital call, and a
+ * negative capital call would subtract from `sent`.
+ *
+ * `commitment_change` is the one exception: reducing a commitment is a
+ * genuinely signed quantity and there is no second entry type that means
+ * "commitment went down". `investment_entries_amount_sign_check` in migration
+ * 025 states the same rule in the schema, so a writer that bypasses this
+ * module cannot store a negative capital call either.
+ *
+ * Both patterns exist because the two uses differ: an entry's amount is
+ * parsed as signed and then judged against its type, while a document
+ * suggestion's amount is a magnitude to look for in a document's text and is
+ * never signed.
+ */
+const SIGNED_AMOUNT = /^-?\d{1,20}(\.\d{1,6})?$/;
 const AMOUNT = /^\d{1,20}(\.\d{1,6})?$/;
+
+/** The one entry type whose amount may be negative. */
+const SIGNED_ENTRY_TYPE: InvestmentEntryType = "commitment_change";
 const RATE = /^\d{1,10}(\.\d{1,10})?$/;
 const CURRENCY = /^[A-Z]{3}$/;
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -73,13 +103,35 @@ export type CurrencyTotals = {
   sent: string;
   fees: string;
   received: string;
+  /**
+   * `committed - sent`, signed.
+   *
+   * Signed rather than floored at zero, because flooring hides an over-call:
+   * an investment that has taken more money than it was committed is the one
+   * case the owner most needs to see, and "0 outstanding" is what a fully
+   * called fund looks like too. A negative outstanding reads as "they have
+   * called more than I committed", and `overCalled` states the same fact as a
+   * positive number for a caller that would rather not reason about the sign.
+   */
   outstanding: string;
+  /** `greatest(sent - committed, 0)`. Zero unless the fund over-called. */
+  overCalled: string;
 };
 
 export type InvestmentTotals = {
   /** The entries' own currencies. Never summed across currencies. */
   byCurrency: CurrencyTotals[];
-  /** The same five totals converted with each entry's own exchange rate. */
+  /**
+   * The same totals converted with each entry's own exchange rate, rounded to
+   * two decimal places.
+   *
+   * Rounded because a converted total carries the rate's precision, not
+   * money's: 10000.00 GBP at 1.2734 is 12734.000000 and no one holds
+   * six-decimal dollars. The per-currency totals above are unrounded, so the
+   * exact figure is always still available; this is the one the screen and the
+   * tools show. The rounding happens once, in SQL, after the conversion and
+   * the sum, so it is never applied twice to the same money.
+   */
   usd: Omit<CurrencyTotals, "currency">;
 };
 
@@ -96,6 +148,8 @@ export type InvestmentRow = {
   entryCount: number;
   /** Entries carrying a document. The screen's "documents" column. */
   documentCount: number;
+  /** The distinct documents those entries cite. */
+  linkedDocumentIds: string[];
   /** Section 6(c): published documents whose title names this investment and
    * that no entry links to. The number the owner should look at. */
   unlinkedDocumentCount: number;
@@ -195,15 +249,29 @@ function decimal(value: unknown, name: string, pattern: RegExp): string {
  * The amount, currency and rate as one decision, because the three are only
  * valid together: a non-USD amount without a rate cannot be converted, and the
  * USD totals would silently lose it. The schema refuses that row too
- * (`investment_entries_exchange_rate_check`, migration 024); this is the same
+ * (`investment_entries_exchange_rate_check`, migration 025); this is the same
  * rule where the caller can be told which field is wrong.
+ *
+ * `entryType` is here for the same reason: whether a negative amount is legal
+ * depends on it, and only `commitment_change` may be negative.
  */
 function money(args: {
   amount: unknown;
+  entryType: InvestmentEntryType;
   currency?: unknown;
   exchangeRate?: unknown;
 }): { amount: string; currency: string; exchangeRate: string | null } {
-  const amount = decimal(args.amount, "Amount", AMOUNT);
+  // Parsed as signed and then judged, rather than parsed with the unsigned
+  // pattern: a negative amount on the wrong type is a specific, nameable
+  // mistake, and "must be an exact decimal string" would be the wrong thing to
+  // tell a caller whose decimal string was perfectly well formed.
+  const amount = decimal(args.amount, "Amount", SIGNED_AMOUNT);
+  if (args.entryType !== SIGNED_ENTRY_TYPE && amount.startsWith("-")) {
+    typedError(
+      "negative_amount",
+      "Only a commitment change may be negative; every other type carries its direction in the type",
+    );
+  }
   const currency = args.currency === undefined ? "USD" : args.currency;
   if (typeof currency !== "string" || !CURRENCY.test(currency)) {
     typedError("invalid_input", "Currency must be an ISO 4217 code");
@@ -255,21 +323,26 @@ function calendarDate(value: Date | string | null): string | null {
  *   sent        capital_call_paid, and only that
  *   fees        fee, kept as its own total
  *   received    distribution
- *   outstanding greatest(committed - sent, 0)
+ *   outstanding committed - sent, signed
+ *   overCalled  greatest(sent - committed, 0)
  *
  * `fees` is separate rather than folded into `sent` because the owner's sheet
  * may or may not have counted a management fee as money sent, and a total that
  * quietly picks one answer is a total he cannot check. Both numbers are here
  * and `sent` means capital calls.
  *
- * `outstanding` is floored at zero: an over-call (sent above committed) is a
- * data question, not a negative obligation, and a negative outstanding read as
- * "they owe me" would be exactly backwards.
+ * `outstanding` is signed and not floored at zero. Flooring made an over-call
+ * indistinguishable from a fully called fund -- both read "0 outstanding" --
+ * and an over-call is exactly the thing the owner needs to be told about.
+ * `overCalled` is the same fact as a positive number, so a caller that would
+ * rather not reason about a sign has one to compare against zero.
  *
  * Two groupings, one statement. `by_currency` groups by currency and never
  * adds two currencies together. `usd` converts each entry with its own stored
  * rate and then sums, which is the only order that is right: converting a sum
- * would apply one row's rate to another row's money.
+ * would apply one row's rate to another row's money. The USD figures are
+ * rounded to two places after the sum, because the product of an amount and a
+ * rate carries the rate's precision rather than money's.
  */
 const TOTALS_CTE = `
   scoped AS (
@@ -292,6 +365,13 @@ const TOTALS_CTE = `
     SELECT investment_id,
            count(*) AS entry_count,
            count(document_id) AS document_count,
+           -- The linked documents, from the entries already scanned. Read
+           -- here rather than by loading every entry: a caller that wants the
+           -- ids should not have to pull the household's whole ledger to get
+           -- them.
+           coalesce(jsonb_agg(DISTINCT document_id)
+                      FILTER (WHERE document_id IS NOT NULL),
+                    '[]'::jsonb) AS linked_document_ids,
            coalesce(sum(usd_amount) FILTER (
              WHERE entry_type IN ('commitment', 'commitment_change')), 0) AS committed,
            coalesce(sum(usd_amount) FILTER (WHERE entry_type = 'capital_call_paid'), 0) AS sent,
@@ -303,18 +383,22 @@ const TOTALS_CTE = `
 const TOTALS_COLUMNS = `
   coalesce(u.entry_count, 0) AS entry_count,
   coalesce(u.document_count, 0) AS document_count,
-  coalesce(u.committed, 0)::text AS usd_committed,
-  coalesce(u.sent, 0)::text AS usd_sent,
-  coalesce(u.fees, 0)::text AS usd_fees,
-  coalesce(u.received, 0)::text AS usd_received,
-  greatest(coalesce(u.committed, 0) - coalesce(u.sent, 0), 0)::text AS usd_outstanding,
+  coalesce(u.linked_document_ids, '[]'::jsonb) AS linked_document_ids,
+  round(coalesce(u.committed, 0), 2)::text AS usd_committed,
+  round(coalesce(u.sent, 0), 2)::text AS usd_sent,
+  round(coalesce(u.fees, 0), 2)::text AS usd_fees,
+  round(coalesce(u.received, 0), 2)::text AS usd_received,
+  round(coalesce(u.committed, 0) - coalesce(u.sent, 0), 2)::text AS usd_outstanding,
+  round(greatest(coalesce(u.sent, 0) - coalesce(u.committed, 0), 0), 2)::text
+    AS usd_over_called,
   (SELECT jsonb_agg(jsonb_build_object(
             'currency', b.currency,
             'committed', b.committed::text,
             'sent', b.sent::text,
             'fees', b.fees::text,
             'received', b.received::text,
-            'outstanding', greatest(b.committed - b.sent, 0)::text)
+            'outstanding', (b.committed - b.sent)::text,
+            'overCalled', greatest(b.sent - b.committed, 0)::text)
           ORDER BY b.currency)
      FROM by_currency b WHERE b.investment_id = i.id) AS by_currency,
   -- Section 6(c). \`position\` rather than ILIKE so a name containing % or _ is
@@ -340,11 +424,13 @@ type InvestmentDbRow = {
   archived_at: Date | null;
   entry_count: string | number;
   document_count: string | number;
+  linked_document_ids: string[] | null;
   usd_committed: string;
   usd_sent: string;
   usd_fees: string;
   usd_received: string;
   usd_outstanding: string;
+  usd_over_called: string;
   by_currency: CurrencyTotals[] | null;
   unlinked_document_count: string | number;
 };
@@ -362,6 +448,7 @@ function toInvestmentRow(record: InvestmentDbRow): InvestmentRow {
     archivedAt: epoch(record.archived_at),
     entryCount: Number(record.entry_count),
     documentCount: Number(record.document_count),
+    linkedDocumentIds: record.linked_document_ids ?? [],
     unlinkedDocumentCount: Number(record.unlinked_document_count),
     totals: {
       byCurrency: record.by_currency ?? [],
@@ -371,6 +458,7 @@ function toInvestmentRow(record: InvestmentDbRow): InvestmentRow {
         fees: record.usd_fees,
         received: record.usd_received,
         outstanding: record.usd_outstanding,
+        overCalled: record.usd_over_called,
       },
     },
   };
@@ -470,30 +558,44 @@ function toEntry(record: EntryDbRow): InvestmentEntry {
   };
 }
 
-/** Every entry of the given investments, oldest first. One statement whatever
- * the screen expands, so opening a row is not a round trip. */
+/**
+ * The entries of the named investments, oldest first.
+ *
+ * `investmentIds` is required, and bounded. The screen calls this with one id
+ * when a row is expanded rather than loading the household's whole history up
+ * front: the earlier shape read every entry in the space and raised
+ * `entry_limit` once the thousandth existed anywhere, which would have broken
+ * the screen for good with no action the owner could take to fix it. Now the
+ * bound is one investment's entries, which is a number the owner controls.
+ */
 export async function listInvestmentEntries(
   ctx: IdentityCtx,
   spaceIds: readonly string[],
-  investmentIds?: readonly string[],
+  investmentIds: readonly string[],
 ): Promise<InvestmentEntry[]> {
+  if (
+    !Array.isArray(investmentIds) ||
+    investmentIds.length === 0 ||
+    investmentIds.length > MAX_ENTRY_INVESTMENTS
+  ) {
+    typedError("invalid_input", "Name between one and 25 investments");
+  }
   const predicate = spacePredicate(spaceIds, 1);
-  const ids =
-    investmentIds === undefined
-      ? null
-      : investmentIds.map((id) => assertKithId(id, "invalid_investment_id"));
+  const ids = investmentIds.map((id) =>
+    assertKithId(id, "invalid_investment_id"),
+  );
+  const limit = MAX_ENTRIES * ids.length;
   const records = await rows<EntryDbRow>(
     ctx,
     `SELECT id, space_id, investment_id, entry_type, entry_date, amount,
             currency, exchange_rate, note, document_id, evidence_span_id
        FROM kith.investment_entries
-      WHERE ${predicate.sql}
-        AND ($2::text[] IS NULL OR investment_id = ANY($2::text[]))
+      WHERE ${predicate.sql} AND investment_id = ANY($2::text[])
       ORDER BY entry_date, id
       LIMIT $3`,
-    [predicate.value, ids, MAX_ENTRIES + 1],
+    [predicate.value, ids, limit + 1],
   );
-  if (records.length > MAX_ENTRIES) {
+  if (records.length > limit) {
     typedError("entry_limit", "Too many entries; read one investment");
   }
   return records.map(toEntry);
@@ -691,12 +793,48 @@ async function writableInvestment(
     [id],
   );
   if (!record) investmentNotFound();
-  try {
-    await requireSpaceAccess(ctx, principal, record.space_id, "write");
-  } catch {
-    investmentNotFound();
-  }
+  await denyAsNotFound(
+    () => requireSpaceAccess(ctx, principal, record.space_id, "write"),
+    investmentNotFound,
+  );
   return { id, spaceId: record.space_id, name: record.name };
+}
+
+/**
+ * Turn the space denial, and only the space denial, into this module's own
+ * non-enumerating "not found".
+ *
+ * A bare `catch {}` here would have swallowed a lost connection, a
+ * serialization failure or a bug in `requireSpaceAccess` and reported all
+ * three as "not found", which is both a wrong answer and an invisible
+ * outage. `spaceNotFound()` raises exactly this message (see
+ * `identity/errors.ts`), so it is the one that is translated; everything else
+ * is rethrown for `mutationFailure` to turn into a 500 with a logged stack.
+ */
+async function denyAsNotFound(
+  work: () => Promise<unknown>,
+  notFound: () => never,
+): Promise<void> {
+  try {
+    await work();
+  } catch (error) {
+    if (error instanceof IdentityError && error.message === "Space not found") {
+      notFound();
+    }
+    throw error;
+  }
+}
+
+/** PostgreSQL's unique violation. */
+const UNIQUE_VIOLATION = "23505";
+
+function isUniqueViolation(error: unknown, constraint: string): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: unknown }).code === UNIQUE_VIOLATION &&
+    (error as { constraint?: unknown }).constraint === constraint
+  );
 }
 
 /**
@@ -736,16 +874,6 @@ export async function createInvestment(
       : oneOf(args.status, INVESTMENT_STATUSES, "Status");
   const notes = optionalText(args.notes, "Note", NOTE_MAX_CHARS);
 
-  const duplicate = await row<{ id: string }>(
-    ctx,
-    `SELECT id FROM kith.investments
-      WHERE space_id = $1 AND lower(btrim(name)) = lower(btrim($2))
-      LIMIT 1`,
-    [spaceId, name],
-  );
-  if (duplicate) {
-    typedError("duplicate_investment", "An investment with that name exists");
-  }
   // Find or create by exact normalized name: `resolveEntity` derives the key
   // from `normalizeEntityName(name)` and the key is unique per space, so the
   // second investment named the same organization reuses the first's entity
@@ -755,14 +883,25 @@ export async function createInvestment(
     name,
   });
 
+  // The duplicate is caught by `investments_active_name_idx`, not by a read
+  // this function does first: a read-then-insert cannot see a concurrent
+  // insert, and the import creates investments in a loop. The index can, so
+  // the insert is attempted and its unique violation is the denial.
   const id = newKithId();
-  await exec(
-    ctx,
-    `INSERT INTO kith.investments
-       (id, space_id, entity_id, name, category, signed_on, status, notes)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-    [id, spaceId, entity.id, name, category, signedOn, status, notes],
-  );
+  try {
+    await exec(
+      ctx,
+      `INSERT INTO kith.investments
+         (id, space_id, entity_id, name, category, signed_on, status, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [id, spaceId, entity.id, name, category, signedOn, status, notes],
+    );
+  } catch (error) {
+    if (isUniqueViolation(error, "investments_active_name_idx")) {
+      typedError("duplicate_investment", "An investment with that name exists");
+    }
+    throw error;
+  }
   return id;
 }
 
@@ -783,15 +922,31 @@ export async function findOrCreateInvestment(
   const spaceId = assertKithId(args.spaceId, "invalid_space_id");
   await requireSpaceAccess(ctx, args.principal, spaceId, "write");
   const name = boundedText(args.name, "Name", NAME_MAX_CHARS);
-  const existing = await row<{ id: string }>(
-    ctx,
-    `SELECT id FROM kith.investments
-      WHERE space_id = $1 AND lower(btrim(name)) = lower(btrim($2))
-      LIMIT 1`,
-    [spaceId, name],
-  );
+  const find = () =>
+    row<{ id: string }>(
+      ctx,
+      `SELECT id FROM kith.investments
+        WHERE space_id = $1 AND lower(btrim(name)) = lower(btrim($2))
+          AND archived_at IS NULL
+        LIMIT 1`,
+      [spaceId, name],
+    );
+  const existing = await find();
   if (existing) return { id: existing.id, created: false };
-  return { id: await createInvestment(ctx, args), created: true };
+  try {
+    return { id: await createInvestment(ctx, args), created: true };
+  } catch (error) {
+    // Someone else created it between the read and the insert. "Find or
+    // create" means the row exists afterwards, so this is a find.
+    if (
+      error instanceof IdentityError &&
+      error.data?.code === "duplicate_investment"
+    ) {
+      const raced = await find();
+      if (raced) return { id: raced.id, created: false };
+    }
+    throw error;
+  }
 }
 
 export async function updateInvestment(
@@ -815,42 +970,44 @@ export async function updateInvestment(
     args.name === undefined
       ? null
       : boundedText(args.name, "Name", NAME_MAX_CHARS);
-  if (name !== null) {
-    const duplicate = await row<{ id: string }>(
+  await guardDuplicateName(() =>
+    exec(
       ctx,
-      `SELECT id FROM kith.investments
-        WHERE space_id = $1 AND lower(btrim(name)) = lower(btrim($2))
-          AND id <> $3 LIMIT 1`,
-      [target.spaceId, name, target.id],
-    );
-    if (duplicate) {
+      `UPDATE kith.investments SET
+         name = coalesce($3, name),
+         category = CASE WHEN $4::boolean THEN $5 ELSE category END,
+         signed_on = CASE WHEN $6::boolean THEN $7 ELSE signed_on END,
+         status = coalesce($8, status),
+         notes = CASE WHEN $9::boolean THEN $10 ELSE notes END
+       WHERE id = $1 AND space_id = $2`,
+      [
+        target.id,
+        target.spaceId,
+        name,
+        args.category !== undefined,
+        optionalText(args.category ?? null, "Category", 100),
+        args.signedOn !== undefined,
+        optionalIsoDate(args.signedOn ?? null, "Signed date"),
+        args.status === undefined
+          ? null
+          : oneOf(args.status, INVESTMENT_STATUSES, "Status"),
+        args.notes !== undefined,
+        optionalText(args.notes ?? null, "Note", NOTE_MAX_CHARS),
+      ],
+    ),
+  );
+}
+
+/** A rename onto another investment's name is a named denial, not a 500. */
+async function guardDuplicateName(work: () => Promise<void>): Promise<void> {
+  try {
+    await work();
+  } catch (error) {
+    if (isUniqueViolation(error, "investments_active_name_idx")) {
       typedError("duplicate_investment", "An investment with that name exists");
     }
+    throw error;
   }
-  await exec(
-    ctx,
-    `UPDATE kith.investments SET
-       name = coalesce($3, name),
-       category = CASE WHEN $4::boolean THEN $5 ELSE category END,
-       signed_on = CASE WHEN $6::boolean THEN $7 ELSE signed_on END,
-       status = coalesce($8, status),
-       notes = CASE WHEN $9::boolean THEN $10 ELSE notes END
-     WHERE id = $1 AND space_id = $2`,
-    [
-      target.id,
-      target.spaceId,
-      name,
-      args.category !== undefined,
-      optionalText(args.category ?? null, "Category", 100),
-      args.signedOn !== undefined,
-      optionalIsoDate(args.signedOn ?? null, "Signed date"),
-      args.status === undefined
-        ? null
-        : oneOf(args.status, INVESTMENT_STATUSES, "Status"),
-      args.notes !== undefined,
-      optionalText(args.notes ?? null, "Note", NOTE_MAX_CHARS),
-    ],
-  );
 }
 
 /**
@@ -869,14 +1026,19 @@ export async function archiveInvestment(
     args.investmentId,
   );
   const archived = args.archived ?? true;
-  await exec(
-    ctx,
-    `UPDATE kith.investments
-        SET archived_at = CASE WHEN $3::boolean
-                               THEN coalesce(archived_at, $4)
-                               ELSE NULL END
-      WHERE id = $1 AND space_id = $2`,
-    [target.id, target.spaceId, archived, new Date(ctx.now)],
+  // Restoring can collide: the name freed by archiving may have been taken
+  // since. `investments_active_name_idx` catches it and the caller is told
+  // which, rather than getting a 500 out of a constraint it cannot see.
+  await guardDuplicateName(() =>
+    exec(
+      ctx,
+      `UPDATE kith.investments
+          SET archived_at = CASE WHEN $3::boolean
+                                 THEN coalesce(archived_at, $4)
+                                 ELSE NULL END
+        WHERE id = $1 AND space_id = $2`,
+      [target.id, target.spaceId, archived, new Date(ctx.now)],
+    ),
   );
 }
 
@@ -928,7 +1090,7 @@ export async function createInvestmentEntry(
   );
   const entryType = oneOf(args.entryType, INVESTMENT_ENTRY_TYPES, "Entry type");
   const entryDate = isoDate(args.entryDate, "Entry date");
-  const amounts = money(args);
+  const amounts = money({ ...args, entryType });
   const note = optionalText(args.note ?? null, "Note", NOTE_MAX_CHARS);
   const importKey = optionalText(
     args.importKey ?? null,
@@ -975,24 +1137,44 @@ export async function createInvestmentEntry(
   return { id: existing.id, created: false };
 }
 
+/**
+ * The entry the caller may write.
+ *
+ * `investmentId`, when given, must be the entry's own. The routes carry an
+ * investment id in the path and the entry id in the body, and without this an
+ * entry could be edited through a path naming a different investment: the
+ * space check would still pass (same space), but the URL would then be a lie
+ * about what was changed, and a caller that authorized "edit this
+ * investment's entries" would have edited another's.
+ */
 async function writableEntry(
   ctx: IdentityCtx,
   principal: Principal,
   entryId: string,
-): Promise<{ id: string; spaceId: string }> {
+  investmentId?: string,
+): Promise<{ id: string; spaceId: string; investmentId: string }> {
   const id = assertKithId(entryId, "invalid_entry_id");
-  const record = await row<{ space_id: string }>(
+  const record = await row<{ space_id: string; investment_id: string }>(
     ctx,
-    "SELECT space_id FROM kith.investment_entries WHERE id = $1",
+    "SELECT space_id, investment_id FROM kith.investment_entries WHERE id = $1",
     [id],
   );
   if (!record) entryNotFound();
-  try {
-    await requireSpaceAccess(ctx, principal, record.space_id, "write");
-  } catch {
+  if (
+    investmentId !== undefined &&
+    assertKithId(investmentId, "invalid_investment_id") !== record.investment_id
+  ) {
     entryNotFound();
   }
-  return { id, spaceId: record.space_id };
+  await denyAsNotFound(
+    () => requireSpaceAccess(ctx, principal, record.space_id, "write"),
+    entryNotFound,
+  );
+  return {
+    id,
+    spaceId: record.space_id,
+    investmentId: record.investment_id,
+  };
 }
 
 /**
@@ -1008,6 +1190,8 @@ export async function updateInvestmentEntry(
   args: {
     principal: Principal;
     entryId: string;
+    /** The investment the caller believes this entry belongs to. */
+    investmentId?: string;
     entryType?: InvestmentEntryType;
     entryDate?: string;
     amount?: string;
@@ -1017,7 +1201,12 @@ export async function updateInvestmentEntry(
     documentId?: string | null;
   },
 ): Promise<void> {
-  const target = await writableEntry(ctx, args.principal, args.entryId);
+  const target = await writableEntry(
+    ctx,
+    args.principal,
+    args.entryId,
+    args.investmentId,
+  );
   const current = await row<EntryDbRow>(
     ctx,
     `SELECT id, space_id, investment_id, entry_type, entry_date, amount,
@@ -1026,8 +1215,16 @@ export async function updateInvestmentEntry(
     [target.id, target.spaceId],
   );
   if (!current) entryNotFound();
+  // The merged type decides whether the merged amount may be negative: a
+  // patch that changes a `commitment_change` of -5000 to a `fee` has to be
+  // refused, not stored as a negative fee.
+  const entryType =
+    args.entryType === undefined
+      ? (current.entry_type as InvestmentEntryType)
+      : oneOf(args.entryType, INVESTMENT_ENTRY_TYPES, "Entry type");
   const amounts = money({
     amount: args.amount ?? current.amount,
+    entryType,
     currency: args.currency ?? current.currency,
     exchangeRate:
       args.exchangeRate === undefined ? current.exchange_rate : args.exchangeRate,
@@ -1041,7 +1238,7 @@ export async function updateInvestmentEntry(
   await exec(
     ctx,
     `UPDATE kith.investment_entries SET
-       entry_type = coalesce($3, entry_type),
+       entry_type = $3,
        entry_date = coalesce($4, entry_date),
        amount = $5,
        currency = $6,
@@ -1052,9 +1249,7 @@ export async function updateInvestmentEntry(
     [
       target.id,
       target.spaceId,
-      args.entryType === undefined
-        ? null
-        : oneOf(args.entryType, INVESTMENT_ENTRY_TYPES, "Entry type"),
+      entryType,
       args.entryDate === undefined ? null : isoDate(args.entryDate, "Entry date"),
       amounts.amount,
       amounts.currency,
@@ -1070,9 +1265,14 @@ export async function updateInvestmentEntry(
  * investment is what gets archived. */
 export async function deleteInvestmentEntry(
   ctx: IdentityCtx,
-  args: { principal: Principal; entryId: string },
+  args: { principal: Principal; entryId: string; investmentId?: string },
 ): Promise<void> {
-  const target = await writableEntry(ctx, args.principal, args.entryId);
+  const target = await writableEntry(
+    ctx,
+    args.principal,
+    args.entryId,
+    args.investmentId,
+  );
   await exec(
     ctx,
     "DELETE FROM kith.investment_entries WHERE id = $1 AND space_id = $2",

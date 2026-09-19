@@ -160,17 +160,62 @@ rather than into a second intake path, so the watcher stays the one way a
 document enters the system and a file added from the UI is ingested, hashed and
 deduplicated exactly like one dropped in by hand.
 
+### Totals
+
+| Total | Rule |
+| --- | --- |
+| committed | `commitment` plus `commitment_change` |
+| sent | `capital_call_paid`, and only that |
+| fees | `fee`, its own total, never folded into sent |
+| received | `distribution` |
+| outstanding | committed minus sent, **signed** |
+| overCalled | sent minus committed when that is positive, else zero |
+
+`outstanding` is signed rather than floored at zero: flooring made an
+over-called fund read exactly like a fully called one, and an over-call is the
+case the owner most needs shown. The screen renders it as an `over-called` tag
+with a tooltip.
+
+Only a `commitment_change` may be negative. Every other type carries its
+direction in the type, so a negative capital call would subtract from `sent`.
+The rule is enforced in the request schema, in the store, and by
+`investment_entries_amount_sign_check` in migration 025.
+
+Per-currency totals keep the money column's own precision. The USD totals are
+converted with each entry's own recorded rate and rounded to two places once,
+after the sum.
+
+An investment's entries are read when its row is expanded, not with the list,
+so the screen's cost is the number of investments rather than the number of
+capital calls ever paid.
+
 ### Import
 
 The one-time spreadsheet import takes CSV exports of the `Summary` and `Ledger`
 tabs, client side, with no Google API. Its sign and currency rule is stated in
-the preview the operator approves: a negative `Amount` is a capital call paid
-and a positive one a distribution; a value in the `GBP` column makes the entry
-GBP with that column as its amount and `Exchange Rate` as the rate to USD, and
-otherwise the entry is USD. Every type can be flipped per row before importing.
-Before importing, the preview reconciles each investment's imported entry
-totals against the `Summary` tab's own `Sent` and `Received` and reports
-differences rather than trusting either side. The import is idempotent: each
-source row carries a stable key stored on the entry
-(`investment_entries.import_key`, migration 024), and a second import of the
-same file creates nothing.
+the preview the operator approves: the sign comes from the `Amount` (USD)
+column when it has a value and from `GBP` otherwise, negative being money out
+(capital call paid) and positive money in (distribution); a value in the `GBP`
+column makes the entry GBP with that column as its amount and `Exchange Rate`
+as the rate to USD, and otherwise the entry is USD. Every type can be flipped
+per row before importing.
+
+Each GBP row is checked against the sheet's own USD `Amount`: GBP times rate
+must agree within 1% or $1, and a row outside that is flagged as a rate that
+looks inverted or wrong. The preview then reconciles each investment's imported
+entry totals, in USD and including the GBP rows, against the `Summary` tab's
+own `Sent` and `Received`, and reports differences rather than trusting either
+side. Import stays disabled until the operator acknowledges any difference,
+flagged rate or unimportable row, and every row ends the run reported as
+created, already imported, or failed with a reason.
+
+The import is idempotent: each source row carries a stable key stored on the
+entry (`investment_entries.import_key`, migration 025) that includes an
+occurrence ordinal, so two genuinely identical rows are two entries while a
+second import of the same file creates nothing. A row corrected in the sheet is
+a different row and imports as a new entry; the preview says so, and the old
+entry is deleted by hand.
+
+A `Summary` row with a committed amount but no `Docs Signed` date is reported
+as unimportable rather than given today's date: a fabricated date in a
+financial record is worse than a missing entry.
