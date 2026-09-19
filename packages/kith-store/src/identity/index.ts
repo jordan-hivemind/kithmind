@@ -23,6 +23,7 @@ export {
   reloadPrincipal,
   principalFromApiKey,
   principalRef,
+  principalMaxSensitivity,
   webPrincipal,
   hasNoOAuthLifecycle,
   // Personal space bootstrap and write destination.
