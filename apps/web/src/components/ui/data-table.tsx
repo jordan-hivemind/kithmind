@@ -53,6 +53,17 @@ export type DataTableProps<T> = {
   initialSorting?: SortingState;
   /** Column id to group by, with one expandable header row per group. */
   groupBy?: string;
+  /**
+   * A row's children, for a table whose groups are rows of their own rather
+   * than headers over aggregated cells (ADM-2's institutions screen).
+   *
+   * `groupBy` derives its group rows from the data and can only render
+   * aggregates in them; this renders the parent as an ordinary row of the same
+   * type, so a group's columns are read from the group's own record. Omitted,
+   * nothing changes: `getSubRows` is undefined and every row is a leaf, which
+   * is what every table before this one was.
+   */
+  getSubRows?: (row: T) => T[] | undefined;
   /** Row actions behind the kebab in the last column. */
   actions?: readonly RowAction<T>[];
   /** Placeholder for the search box. Two or three words, never a sentence. */
@@ -120,6 +131,7 @@ export function DataTable<T>({
   filterColumns = [],
   initialSorting = [],
   groupBy,
+  getSubRows,
   actions = [],
   searchPlaceholder = "Search",
   empty = "Nothing here",
@@ -142,6 +154,7 @@ export function DataTable<T>({
     onGlobalFilterChange: setSearch,
     globalFilterFn: (row, _columnId, value: string) =>
       rowMatchesSearch(Object.values(row.original as object), value),
+    ...(getSubRows === undefined ? {} : { getSubRows }),
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
@@ -162,18 +175,24 @@ export function DataTable<T>({
     [data, filterColumns],
   );
 
-  const rows = table
-    .getRowModel()
-    .rows.filter((row) =>
-      filterColumns.every((columnId) =>
-        row.getIsGrouped()
-          ? true
-          : matchesChipFilter(
-              (row.original as Record<string, unknown>)[columnId],
-              chips[columnId] ?? [],
-            ),
+  // Chips apply to top-level rows. A `getSubRows` child is shown or hidden
+  // with its parent -- the row model emits children right after the parent
+  // they were expanded from, so a parent a chip excluded would otherwise leave
+  // its children on screen with nothing above them. Without `getSubRows` every
+  // row has depth 0 and this is the same filter it always was.
+  const hiddenParents = new Set<string>();
+  const rows = table.getRowModel().rows.filter((row) => {
+    if (row.getIsGrouped()) return true;
+    if (row.depth > 0) return !hiddenParents.has(row.parentId ?? "");
+    const kept = filterColumns.every((columnId) =>
+      matchesChipFilter(
+        (row.original as Record<string, unknown>)[columnId],
+        chips[columnId] ?? [],
       ),
     );
+    if (!kept) hiddenParents.add(row.id);
+    return kept;
+  });
 
   const toggleChip = (columnId: string, value: string) => {
     setChips((current) => {
@@ -279,10 +298,30 @@ export function DataTable<T>({
               rows.map((row) => (
                 <tr
                   key={row.id}
-                  className="border-b border-gray-100 hover:bg-accent-50/40"
+                  className={`border-b border-gray-100 hover:bg-accent-50/40 ${
+                    row.depth > 0 ? "bg-gray-50/60 text-gray-600" : ""
+                  }`}
                 >
-                  {row.getVisibleCells().map((cell) => (
+                  {row.getVisibleCells().map((cell, cellIndex) => (
                     <td key={cell.id} className="h-row px-2 align-middle">
+                      {/* The expander for a `getSubRows` table: on the first
+                          column only, so the tree reads down one edge, and a
+                          child is indented rather than given a dead toggle. */}
+                      {cellIndex === 0 && getSubRows !== undefined ? (
+                        row.getCanExpand() ? (
+                          <button
+                            type="button"
+                            onClick={row.getToggleExpandedHandler()}
+                            aria-expanded={row.getIsExpanded()}
+                            aria-label={row.getIsExpanded() ? "Collapse" : "Expand"}
+                            className="mr-1 text-gray-400 hover:text-gray-700"
+                          >
+                            {row.getIsExpanded() ? "▾" : "▸"}
+                          </button>
+                        ) : (
+                          <span aria-hidden className="mr-1 inline-block w-3" />
+                        )
+                      ) : null}
                       {cell.getIsGrouped() ? (
                         <button
                           type="button"
@@ -294,7 +333,13 @@ export function DataTable<T>({
                           {flexRender(cell.column.columnDef.cell, cell.getContext())}
                           <span className="text-gray-400">({row.subRows.length})</span>
                         </button>
-                      ) : cell.getIsAggregated() || cell.getIsPlaceholder() ? null : (
+                      ) : (groupBy !== undefined && cell.getIsAggregated()) ||
+                        cell.getIsPlaceholder() ? null : (
+                        // `getIsAggregated` is true for any row that has
+                        // sub-rows, whether or not the table is grouping, so a
+                        // `getSubRows` parent would render nothing at all if
+                        // this were not gated on `groupBy`. A grouped table
+                        // behaves exactly as it did.
                         flexRender(cell.column.columnDef.cell, cell.getContext())
                       )}
                     </td>

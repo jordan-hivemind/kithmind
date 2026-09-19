@@ -15,7 +15,13 @@
 
 import { randomBytes } from "node:crypto";
 
-import { applyKithSchema, createKithPool, memory, withKithTransaction } from "@repo/kith-store";
+import {
+  applyKithSchema,
+  createKithPool,
+  memory,
+  newKithId,
+  withKithTransaction,
+} from "@repo/kith-store";
 import {
   createSharedSpace,
   ensurePersonalSpace,
@@ -25,9 +31,22 @@ import {
   signUp,
 } from "@repo/kith-store/identity";
 import pg from "pg";
-import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 
 import { setKithPool } from "@/lib/kith/pool";
+
+// ADM-2. Only `resolveFinanceArchive` is replaced: `readFinanceArchive` stays
+// real, so the membership check, the contract's own `authorizeFinanceRead-
+// Request` and `parseAuthorizedFinanceReadExchange` all run for these tests
+// rather than being mocked away. A test that stubbed the read itself would
+// prove nothing about who is allowed to make it.
+const financeMock = vi.hoisted(() => ({
+  resolve: vi.fn<() => unknown>(() => null),
+}));
+vi.mock("@/lib/mcp/finance", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  resolveFinanceArchive: () => financeMock.resolve(),
+}));
 
 const adminUrl = process.env.KITH_STORE_DATABASE_URL;
 const describeWithDatabase = adminUrl ? describe : describe.skip;
@@ -38,6 +57,8 @@ const secret = randomBytes(32).toString("hex");
 type Fixture = {
   userA: { userId: string; cookie: string; spaceId: string; sharedSpaceId: string };
   userB: { userId: string; cookie: string; spaceId: string };
+  /** A `reader` member of userA's shared space, for the ADM-2 admin loaders. */
+  readerC: { userId: string; cookie: string; spaceId: string };
 };
 
 describeWithDatabase("i5 page loaders on PostgreSQL", () => {
@@ -170,9 +191,22 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
       });
     });
 
+    // ADM-2: a member of userA's shared space who may only read it. The
+    // admin loaders must show them nothing at all, which is what the panel's
+    // layout turns into a 404.
+    const readerC = await signedInUser();
+    await inTransaction((ctx) =>
+      ctx.client.query(
+        `INSERT INTO kith.space_members (id, space_id, user_id, role)
+         VALUES ($1, $2, $3, 'reader')`,
+        [newKithId(), shared.spaceId, readerC.userId],
+      ),
+    );
+
     fixture = {
       userA: { ...userA, sharedSpaceId: shared.spaceId },
       userB,
+      readerC,
     };
   }, 120_000);
 
@@ -322,5 +356,228 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
   test("loadFamilyOverview denies an unauthenticated request", async () => {
     const { loadFamilyOverview } = await import("./family-data");
     expect(await loadFamilyOverview(null, undefined)).toBeNull();
+  });
+
+  // --- ADM-2: the health, institutions and coverage loaders ----------------
+
+  test("loadHealth reports every check, with no archive configured saying so", async () => {
+    resetLog();
+    const { loadHealth } = await import("./admin-data");
+    const data = await loadHealth(fixture.userA.cookie);
+    expect(data).not.toBeNull();
+    const byId = new Map(data!.checks.map((check) => [check.id, check]));
+    expect([...byId.keys()]).toEqual([
+      "documents_watcher",
+      "search_index",
+      "background_jobs",
+      "review_queue",
+      "finance_archive",
+      "database_backup",
+    ]);
+    // No source account in the fixture, so nothing is being watched, and that
+    // is `not_configured` rather than a failure.
+    expect(byId.get("documents_watcher")!.status).toBe("not_configured");
+    // No FINANCE_ARCHIVE_* environment in this suite: an unconfigured archive
+    // must never read as an empty one.
+    expect(byId.get("finance_archive")!.status).toBe("not_configured");
+    expect(byId.get("finance_archive")!.detail).toBe("not configured");
+    // The backup lives on the owner's machine; the row exists and reports no
+    // data rather than claiming the backup is fine.
+    expect(byId.get("database_backup")!.status).toBe("unknown");
+    expect(transactionLog).toEqual([
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    ]);
+  });
+
+  test("loadCoverage lists every life area, all empty, in one read-only transaction", async () => {
+    resetLog();
+    const { loadCoverage } = await import("./admin-data");
+    const data = await loadCoverage(fixture.userA.cookie);
+    expect(data).not.toBeNull();
+    expect(data!.areas.map((area) => area.area)).toContain("taxes");
+    // userA has a thought and a fact, so memory is the one area with anything.
+    const memoryArea = data!.areas.find(
+      (area) => area.area === "notes and facts",
+    );
+    expect(memoryArea!.records).toBe(2);
+    expect(memoryArea!.status).toBe("covered");
+    expect(
+      data!.areas.filter((area) => area.area !== "notes and facts").every(
+        (area) => area.status === "empty",
+      ),
+    ).toBe(true);
+    expect(transactionLog).toEqual([
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    ]);
+  });
+
+  test("another space's memory never reaches the caller's coverage", async () => {
+    const { loadCoverage } = await import("./admin-data");
+    // userB has exactly one thought and one fact of their own, and userA has
+    // exactly one of each. Neither sees three.
+    const forA = await loadCoverage(fixture.userA.cookie);
+    const forB = await loadCoverage(fixture.userB.cookie);
+    const memoryOf = (data: Awaited<ReturnType<typeof loadCoverage>>) =>
+      data!.areas.find((area) => area.area === "notes and facts")!.records;
+    expect(memoryOf(forA)).toBe(2);
+    expect(memoryOf(forB)).toBe(2);
+  });
+
+  test("a reader-role member administers nothing, so every admin loader is empty", async () => {
+    const { loadCoverage, loadHealth, loadInstitutions } = await import(
+      "./admin-data"
+    );
+    const health = await loadHealth(fixture.readerC.cookie);
+    expect(
+      health!.checks.find((check) => check.id === "documents_watcher")!.status,
+    ).toBe("not_configured");
+    expect(
+      health!.checks.find((check) => check.id === "search_index")!.detail,
+    ).toBe("nothing eligible");
+
+    const coverage = await loadCoverage(fixture.readerC.cookie);
+    // The reader has a personal space of their own, which they own, so their
+    // own memory is theirs to see; what they must never see is userA's shared
+    // space, which they only read.
+    expect(
+      coverage!.areas.every(
+        (area) => area.documents === 0 && area.sources === 0,
+      ),
+    ).toBe(true);
+
+    const institutions = await loadInstitutions(fixture.readerC.cookie);
+    expect(institutions!.institutions).toEqual([]);
+    expect(institutions!.state).toBe("not_configured");
+  });
+
+  test("the admin loaders deny an unauthenticated request", async () => {
+    const { loadCoverage, loadHealth, loadInstitutions } = await import(
+      "./admin-data"
+    );
+    expect(await loadHealth(null)).toBeNull();
+    expect(await loadInstitutions(null)).toBeNull();
+    expect(await loadCoverage(null)).toBeNull();
+    expect(await loadHealth("__Host-kith_session=v1.bad.bad")).toBeNull();
+  });
+
+  // --- ADM-2: who may read the finance archive ----------------------------
+  //
+  // Every test above runs with no FINANCE_ARCHIVE_* environment, so their
+  // `not_configured` assertions would hold for anybody and prove nothing about
+  // the gate. These bind a synthetic archive to userA's shared space and check
+  // that the gate in `admin-data.ts` -- membership in the archive's own space,
+  // narrowed to the spaces the caller administers -- is what decides.
+
+  /** One account, as the archive's read contract requires it to be shaped. */
+  function inventoryResponse(spaceId: string) {
+    return {
+      contractVersion: 1 as const,
+      operation: "list_account_inventory" as const,
+      spaceId,
+      datasetRevision: "rev-synthetic-adm2",
+      coverage: { status: "complete" as const, asOf: 1_788_800_000_000 },
+      completeness: "complete" as const,
+      truncated: false,
+      issues: [],
+      items: [
+        {
+          account: {
+            accountId: "account-synthetic-adm2",
+            sourceId: "source-synthetic-adm2",
+            institutionName: "Example Broker",
+            accountLast4: "1234",
+            displayLabel: "Income",
+            accountType: "brokerage",
+            baseCurrency: "USD",
+            disclosures: [],
+          },
+          statementCount: 4,
+          recordCount: 40,
+          activityFrom: "2025-01-02",
+          activityTo: "2026-08-31",
+          latestSnapshotAsOf: "2026-08-31",
+          openReviewCount: 2,
+        },
+      ],
+    };
+  }
+
+  /** Binds the mocked archive to `spaceId`, and counts every read of it. */
+  function archiveOn(spaceId: string) {
+    const read = vi.fn(async () =>
+      Promise.resolve(inventoryResponse(spaceId)),
+    );
+    financeMock.resolve.mockReturnValue({ spaceId, read });
+    return read;
+  }
+
+  afterEach(() => {
+    financeMock.resolve.mockReset();
+    financeMock.resolve.mockReturnValue(null);
+  });
+
+  test("an owner of the archive's space sees its inventory", async () => {
+    const read = archiveOn(fixture.userA.sharedSpaceId);
+    const { loadInstitutions } = await import("./admin-data");
+    const data = await loadInstitutions(fixture.userA.cookie);
+    expect(data!.state).toBe("read");
+    expect(data!.truncated).toBe(false);
+    expect(data!.institutions.map((group) => group.name)).toEqual([
+      "Example Broker",
+    ]);
+    expect(data!.institutions[0]!.openReviews).toBe(2);
+    expect(read).toHaveBeenCalledTimes(1);
+  });
+
+  test("an editor of another space is refused, and the archive is never read", async () => {
+    // userB owns their own personal space, so they administer one and reach
+    // the archive gate; they are not a member of the space the archive holds.
+    const read = archiveOn(fixture.userA.sharedSpaceId);
+    const { loadCoverage, loadHealth, loadInstitutions } = await import(
+      "./admin-data"
+    );
+    const institutions = await loadInstitutions(fixture.userB.cookie);
+    expect(institutions!.institutions).toEqual([]);
+    expect(institutions!.state).toBe("not_configured");
+
+    const health = await loadHealth(fixture.userB.cookie);
+    expect(
+      health!.checks.find((check) => check.id === "finance_archive")!.status,
+    ).toBe("not_configured");
+
+    // And the brokerage row gets no contribution it was not entitled to.
+    const coverage = await loadCoverage(fixture.userB.cookie);
+    expect(
+      coverage!.areas.find((area) => area.area === "brokerage")!.sources,
+    ).toBe(0);
+
+    // Refused before the archive is touched: not filtered out afterwards.
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  test("a reader of the archive's own space is refused too", async () => {
+    // readerC *is* a member of the space the archive holds, and may only read
+    // it. `getAdminSpaceIds` drops it, so the gate never sees it.
+    const read = archiveOn(fixture.userA.sharedSpaceId);
+    const { loadInstitutions } = await import("./admin-data");
+    const data = await loadInstitutions(fixture.readerC.cookie);
+    expect(data!.institutions).toEqual([]);
+    expect(data!.state).toBe("not_configured");
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  test("an archive that answers for a different space than it claims is refused", async () => {
+    // The contract's own exchange check, reached through the real
+    // `readFinanceArchive`: a backend cannot answer for a space the request
+    // did not name, and the screen reports unavailable rather than showing it.
+    financeMock.resolve.mockReturnValue({
+      spaceId: fixture.userA.sharedSpaceId,
+      read: async () =>
+        Promise.resolve(inventoryResponse(fixture.userB.spaceId)),
+    });
+    const { loadInstitutions } = await import("./admin-data");
+    const data = await loadInstitutions(fixture.userA.cookie);
+    expect(data!.state).toBe("unavailable");
+    expect(data!.institutions).toEqual([]);
   });
 });

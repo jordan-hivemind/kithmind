@@ -84,7 +84,7 @@ describe("canonical finance decimals and currencies", () => {
 
 describe("closed requests and trusted authorization", () => {
   it("accepts every operation fixture through the paired gateway validator", () => {
-    assert.equal(syntheticFinanceReadExchanges.length, 8);
+    assert.equal(syntheticFinanceReadExchanges.length, 9);
     for (const exchange of syntheticFinanceReadExchanges) {
       const parsed = parseExchange(exchange, {
         expectedDatasetRevision: "dataset-revision-synthetic-001",
@@ -652,5 +652,66 @@ describe("structured field evidence", () => {
     const empty = clone(syntheticFinanceReadExchanges[1]);
     empty.response.items[0].evidence = [];
     rejects("invalid_response", () => parseExchange(empty));
+  });
+});
+
+// --- ADM-2: list_account_inventory -----------------------------------------
+
+describe("list_account_inventory (ADM-2)", () => {
+  const inventory = () => clone(syntheticFinanceReadExchanges[8]);
+
+  it("takes no filters", () => {
+    rejects("invalid_request", () =>
+      parseFinanceReadRequest({
+        contractVersion: 1,
+        spaceId: "space-synthetic-001",
+        limit: 10,
+        operation: "list_account_inventory",
+        accountLast4: "1234",
+      }),
+    );
+  });
+
+  it("refuses a row that claims it matched a last-four filter", () => {
+    const exchange = inventory();
+    exchange.response.items[0].account.matchedAccountLast4 = "1234";
+    rejects("invalid_response", () => parseExchange(exchange));
+  });
+
+  it("refuses activity that ends before it began", () => {
+    const exchange = inventory();
+    exchange.response.items[0].activityFrom = "2026-08-01";
+    rejects("invalid_response", () => parseExchange(exchange));
+  });
+
+  it("refuses one endpoint without the other", () => {
+    const exchange = inventory();
+    delete exchange.response.items[0].activityTo;
+    rejects("invalid_response", () => parseExchange(exchange));
+  });
+
+  it("refuses a snapshot outside the activity the same row reports", () => {
+    const exchange = inventory();
+    exchange.response.items[0].latestSnapshotAsOf = "2026-09-30";
+    rejects("invalid_response", () => parseExchange(exchange));
+
+    const unranged = inventory();
+    unranged.response.items[1].latestSnapshotAsOf = "2026-07-31";
+    rejects("invalid_response", () => parseExchange(unranged));
+  });
+
+  it("refuses a negative count", () => {
+    const exchange = inventory();
+    exchange.response.items[0].openReviewCount = -1;
+    rejects("invalid_response", () => parseExchange(exchange));
+  });
+
+  it("keeps an empty account's row, with no dates rather than invented ones", () => {
+    const parsed = parseExchange(inventory());
+    assert.equal(parsed.response.items.length, 2);
+    const empty = parsed.response.items[1];
+    assert.equal(empty.statementCount, 0);
+    assert.equal(empty.activityFrom, undefined);
+    assert.equal(empty.latestSnapshotAsOf, undefined);
   });
 });

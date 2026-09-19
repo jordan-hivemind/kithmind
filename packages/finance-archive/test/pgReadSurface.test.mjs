@@ -2361,3 +2361,94 @@ test(
     assert.ok(withdrawn.coverage.reasons.includes("unresolved_identity"));
   },
 );
+
+// --- ADM-2: list_account_inventory -----------------------------------------
+
+test(
+  "list_account_inventory reports one row per account, with the counts and dates the archive actually holds (ADM-2)",
+  { skip },
+  async (t) => {
+    const { reader: r, seeded } = await fixture(t);
+    const response = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 100,
+    });
+    assert.equal(response.operation, "list_account_inventory");
+    const byAccount = new Map(
+      response.items.map((item) => [item.account.accountId, item]),
+    );
+
+    // The seeded institution has one statement document and five
+    // transactions, dated 2026-01-10 through 2026-01-23.
+    const settled = byAccount.get(seeded.settled.accountIds[0]);
+    assert.ok(settled, "expected the settled account to be inventoried");
+    assert.equal(settled.statementCount, 1);
+    assert.equal(settled.recordCount, 5);
+    assert.equal(settled.activityFrom, "2026-01-10");
+    assert.equal(settled.activityTo, "2026-01-23");
+    // No positions were seeded for it, so there is no snapshot to report.
+    assert.equal(settled.latestSnapshotAsOf, undefined);
+    assert.equal(settled.openReviewCount, 0);
+
+    // The one open review item in the fixture is on the under-review account,
+    // and it is the only account that reports one.
+    const underReview = byAccount.get(seeded.underReview.accountIds[0]);
+    assert.equal(underReview.openReviewCount, 1);
+    assert.equal(
+      response.items.filter((item) => item.openReviewCount > 0).length,
+      1,
+    );
+
+    // An institution with accounts and nothing acquired is a row of zeros and
+    // no dates, never an absent row: that is the whole point of the screen
+    // this operation feeds.
+    const empty = response.items.filter(
+      (item) => item.account.institutionName.includes("quiet-harbor"),
+    );
+    assert.equal(empty.length, 1);
+    assert.equal(empty[0].statementCount, 0);
+    assert.equal(empty[0].recordCount, 0);
+    assert.equal(empty[0].activityFrom, undefined);
+    assert.equal(empty[0].activityTo, undefined);
+  },
+);
+
+test(
+  "list_account_inventory pages on a signed cursor and refuses another space (ADM-2)",
+  { skip },
+  async (t) => {
+    const { reader: r } = await fixture(t);
+    const first = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 1,
+    });
+    assert.equal(first.items.length, 1);
+    assert.equal(first.truncated, true);
+    assert.ok(first.nextCursor);
+    const second = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 1,
+      cursor: first.nextCursor,
+    });
+    assert.equal(second.items.length, 1);
+    assert.notEqual(
+      second.items[0].account.accountId,
+      first.items[0].account.accountId,
+    );
+
+    const parsed = parseFinanceReadRequest({
+      contractVersion: 1,
+      spaceId: "space-synthetic-other",
+      limit: 10,
+      operation: "list_account_inventory",
+    });
+    await assert.rejects(
+      serveFinanceRead(r.client, parsed, SPACE, {
+        principalId: TRUSTED.principalId,
+        cursorSigningSecret:
+          "synthetic-finance-cursor-secret-at-least-32-bytes",
+      }),
+      /not_authorized/,
+    );
+  },
+);

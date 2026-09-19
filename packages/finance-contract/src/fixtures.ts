@@ -392,6 +392,52 @@ export const syntheticFinanceReadExchanges = [
       ],
     },
   },
+  {
+    request: {
+      ...requestBase,
+      operation: "list_account_inventory",
+    },
+    response: {
+      ...responseBase,
+      operation: "list_account_inventory",
+      items: [
+        {
+          account: {
+            accountId: "account-synthetic-001",
+            sourceId: "source-synthetic-001",
+            institutionName: "Example Broker",
+            accountLast4: "1234",
+            displayLabel: "Income",
+            accountType: "brokerage",
+            baseCurrency: "USD",
+            disclosures: [],
+          },
+          statementCount: 12,
+          recordCount: 340,
+          activityFrom: "2026-01-01",
+          activityTo: "2026-07-31",
+          latestSnapshotAsOf: "2026-07-31",
+          openReviewCount: 0,
+        },
+        // An account the archive has nothing for: counted, never omitted, and
+        // with no dates to report rather than invented ones.
+        {
+          account: {
+            accountId: "account-synthetic-002",
+            sourceId: "source-synthetic-001",
+            institutionName: "Example Broker",
+            disclosures: [
+              { field: "accountLast4", reason: "not_reported" },
+              { field: "baseCurrency", reason: "not_reported" },
+            ],
+          },
+          statementCount: 0,
+          recordCount: 0,
+          openReviewCount: 0,
+        },
+      ],
+    },
+  },
 ] as const;
 
 export const syntheticRetainedTextSpanEvidence = evidence;
