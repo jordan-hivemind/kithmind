@@ -83,14 +83,14 @@ function goodShape(kind) {
         field: receipt ? "vendor" : "vendor",
         value: receipt ? "Bracken Tools" : "Halloway Joinery",
         line_items: null,
-        page: 0,
+        page: 1,
         quote: receipt ? "Bracken Tools" : "Halloway Joinery",
       },
       {
         field: receipt ? "purchase_date" : "invoice_date",
         value: receipt ? "2026-04-02" : "2026-04-09",
         line_items: null,
-        page: 0,
+        page: 1,
         quote: receipt ? "Date: 2026-04-02" : "Invoice date: 2026-04-09",
       },
       {
@@ -105,7 +105,7 @@ function goodShape(kind) {
               { description: "Planing", amount: "120.00" },
               { description: "Fitting", amount: "45.00" },
             ],
-        page: 0,
+        page: 1,
         quote: receipt
           ? "Chisel\n  12.00\nMallet\n  8.00"
           : "Planing\n  120.00\nFitting\n  45.00",
@@ -114,14 +114,14 @@ function goodShape(kind) {
         field: "subtotal",
         value: receipt ? "$20.00" : "$165.00",
         line_items: null,
-        page: 0,
+        page: 1,
         quote: receipt ? "Subtotal $20.00" : "Subtotal $165.00",
       },
       {
         field: "total",
         value: receipt ? "$20.00" : "$165.00",
         line_items: null,
-        page: 0,
+        page: 1,
         quote: receipt ? "Total due $20.00" : "Amount due $165.00",
       },
     ],
@@ -150,8 +150,8 @@ function badShapes(kind) {
       kind,
       summary: good.summary,
       statements: [
-        { description: "Chisel", amount: "12.00", page: 0, quote: "Chisel" },
-        { description: "Mallet", amount: "8.00", page: 0, quote: "Mallet" },
+        { description: "Chisel", amount: "12.00", page: 1, quote: "Chisel" },
+        { description: "Mallet", amount: "8.00", page: 1, quote: "Mallet" },
       ],
     },
     /** A nested object where a name was asked for. */
@@ -308,7 +308,7 @@ test("only a named field survives the parser, and the rest are counted", () => {
         kind: "receipt",
         summary: "",
         statements: [
-          { [key]: "vendor", value: "Bracken Tools", page: 0, quote: "Bracken Tools" },
+          { [key]: "vendor", value: "Bracken Tools", page: 1, quote: "Bracken Tools" },
         ],
       }),
     );
@@ -344,9 +344,14 @@ test("the schema makes the field name unrepresentable when absent", { skip }, as
     "value",
     "line_items",
   ]);
+  // ADM-5e: both count from 1, and the schema says so.
   assert.deepEqual(statement.properties.lines, {
     type: "array",
-    items: { type: "integer" },
+    items: { type: "integer", minimum: 1 },
+  });
+  assert.deepEqual(statement.properties.page, {
+    type: "integer",
+    minimum: 1,
   });
   assert.equal(statement.additionalProperties, false);
   assert.ok(statement.properties.field.enum.includes("vendor"));
@@ -484,7 +489,7 @@ test("one stray field among good ones is a correction, not a retry", { skip }, a
     field: "warranty_months",
     value: "12",
     line_items: null,
-    page: 0,
+    page: 1,
     quote: "Bracken Tools",
   });
   const outcome = await f.extract(fakeModel(shape), ids, 0);

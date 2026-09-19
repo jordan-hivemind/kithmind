@@ -227,13 +227,17 @@ export function extractionSchema(request: ExtractionRequest): unknown {
           required: ["field", "page", "lines", "value", "line_items"],
           properties: {
             field: { type: "string", enum: [...request.fields] },
-            page: { type: "integer" },
+            /** 1-based, like the headings the pages are shown under. */
+            page: { type: "integer", minimum: 1 },
             /**
              * One to three line ids from the numbered page. Not a quote: the
              * server builds the quote from these, which is what makes a
              * citation checkable rather than reproducible.
              */
-            lines: { type: "array", items: { type: "integer" } },
+            lines: {
+              type: "array",
+              items: { type: "integer", minimum: 1 },
+            },
             /** The value of every field except a `line_item_list` one, which
              * passes null here and fills `line_items` instead. */
             value: { type: ["string", "null"] },

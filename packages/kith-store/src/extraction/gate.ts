@@ -67,7 +67,12 @@ export const CORRECTION_REASONS = [
   "extraction_model_refused",
   /** The model's output was not the shape the prompt asks for. */
   "malformed_statement",
-  /** The statement cited a page or line ids the page does not have, or a
+  /** The statement cited a page number that is not in the document as shown.
+   * Distinct from a bad line id on purpose: this one means the model and the
+   * server disagree about how pages are numbered, which is a fault in the
+   * prompt or the presentation rather than in the reading. */
+  "citation_page_unknown",
+  /** The statement cited line ids the page does not have, or a
    * range too wide to be a citation. A citation, unlike a quote, is either in
    * range or it is not: the server builds the text, so there is nothing left
    * for the model to get wrong except the numbers. */

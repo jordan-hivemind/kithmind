@@ -46,6 +46,27 @@ export type PageLine = {
  * a citation spanning half a page is not a citation. */
 export const MAX_CITATION_SPAN = 4;
 
+/**
+ * How long a citable unit may be before it is split.
+ *
+ * The live page statistics are lopsided: a receipt's median line is 7
+ * characters and its longest is over 300, and some pages carry a single line
+ * of about 2,000. A 2,000-character line is a poor citation -- it holds dozens
+ * of numbers, so "the value appears in the cited text" stops meaning much, and
+ * every one of those numbers would satisfy a check meant for one of them.
+ *
+ * So a long line becomes several citable sub-lines, cut at whitespace. The
+ * offsets stay exact and adjacent pieces stay contiguous, so a span is still a
+ * real range of the sealed text and citing two pieces gives exactly their
+ * union.
+ */
+export const MAX_LINE_CHARS = 240;
+
+/** How far back from the bound to look for a space before giving up and
+ * cutting mid-word. A line with no whitespace at all is a barcode or a hash,
+ * and cutting it anywhere is as good as anywhere. */
+const SPLIT_LOOKBACK = 80;
+
 /** Lines shown per page. A page past this is presented truncated, and the ids
  * still address the page's real lines -- so a citation into the unshown tail
  * resolves correctly if the model somehow makes one. The document is marked
@@ -66,12 +87,42 @@ export function pageLines(text: string): PageLine[] {
   for (;;) {
     const brk = text.indexOf("\n", start);
     const end = brk < 0 ? text.length : brk;
-    lines.push({ id, start, end, text: text.slice(start, end) });
+    for (const piece of splitLongLine(text, start, end)) {
+      lines.push({ id, ...piece, text: text.slice(piece.start, piece.end) });
+      id += 1;
+    }
     if (brk < 0) break;
     start = brk + 1;
-    id += 1;
   }
   return lines;
+}
+
+/** One physical line as one or more citable pieces, cut at whitespace when it
+ * is longer than {@link MAX_LINE_CHARS}. Pieces are contiguous and cover the
+ * line exactly, so nothing is lost and no offset moves. */
+function splitLongLine(
+  text: string,
+  start: number,
+  end: number,
+): Array<{ start: number; end: number }> {
+  if (end - start <= MAX_LINE_CHARS) return [{ start, end }];
+  const pieces: Array<{ start: number; end: number }> = [];
+  let at = start;
+  while (end - at > MAX_LINE_CHARS) {
+    const bound = at + MAX_LINE_CHARS;
+    let cut = -1;
+    for (let probe = bound; probe > bound - SPLIT_LOOKBACK && probe > at; probe -= 1) {
+      if (/\s/.test(text[probe - 1]!)) {
+        cut = probe;
+        break;
+      }
+    }
+    if (cut <= at) cut = bound;
+    pieces.push({ start: at, end: cut });
+    at = cut;
+  }
+  if (at < end) pieces.push({ start: at, end });
+  return pieces;
 }
 
 /** How the page is shown to the model: one line per line, its id in front. */

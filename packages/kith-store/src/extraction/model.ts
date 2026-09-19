@@ -322,7 +322,24 @@ export function dateOrderSetting(examples: unknown): DateOrder | null {
 
 type LoadedPage = {
   id: string;
+  /**
+   * The page's own ordinal in the sealed text. **Never shown to the model and
+   * never used to resolve a citation.**
+   *
+   * In production these are 0-based and need not be dense: a single-page
+   * document is one row at ordinal 0. The first version of line citations
+   * printed this number as the page heading while numbering lines from 1, so
+   * the model read "page 0" beside "1| ..." and answered `page: 1` -- which
+   * matched no page at all on a single-page document, and the wrong page on a
+   * multi-page one. Stored fields fell on every document in the trial.
+   *
+   * `shown` is the number the model sees and cites. This one is only for the
+   * span, which indexes the real page row.
+   */
   ordinal: number;
+  /** This page's 1-based position in the list actually shown to the model.
+   * The only number a citation is resolved through. */
+  shown: number;
   text: string;
   /** The page's lines and their offsets, computed once: the prompt numbers
    * them and a citation resolves against them. */
@@ -339,6 +356,7 @@ type Loaded = {
   processingGenerationId: string;
   pages: LoadedPage[];
   pagesTotal: number;
+  pagesWithText: number;
   types: LoadedType[];
   /** The kind the last extraction of this document settled on, when there was
    * one. Only used to pick the model before the reply names a kind. */
@@ -393,16 +411,27 @@ async function loadDocument(
       [generation.source_text_version_id, spaceId],
     )
   ).rows;
-  const pages = pageRows.map((row) => {
+  const all = pageRows.map((row) => {
     const text = String(row.text ?? "");
     return {
       id: String(row.id),
       ordinal: Number(row.ordinal),
+      shown: 0,
       text,
       lines: pageLines(text),
     };
   });
-  if (pages.length === 0) return null;
+  if (all.length === 0) return null;
+  // A page with no words on it is not shown. A scanned letter's blank verso
+  // comes through as one empty line, and offering it as a citable page is an
+  // invitation to cite it. Numbering is by position in the shown list, so
+  // leaving one out shifts nothing: there is no hole to shift over.
+  const withText = all.filter((page) => page.text.trim().length > 0);
+  const shownPages = boundPages(withText).map((page, index) => ({
+    ...page,
+    shown: index + 1,
+  }));
+  if (shownPages.length === 0) return null;
   return {
     spaceId,
     userId: item.created_by,
@@ -411,8 +440,13 @@ async function loadDocument(
     sourceRevisionId: generation.source_revision_id,
     sourceTextVersionId: generation.source_text_version_id,
     processingGenerationId: String(generation.id),
-    pages: boundPages(pages),
-    pagesTotal: pages.length,
+    pages: shownPages,
+    /** Every page the document has, blank ones included: this is what the
+     * extraction row reports, and a document's page count is its page count. */
+    pagesTotal: all.length,
+    /** Pages with words on them, which is what "was anything dropped?" is
+     * measured against. Leaving out a blank page loses nothing. */
+    pagesWithText: withText.length,
     types: await loadTypes(client, spaceId, now),
     priorKind:
       (
@@ -528,12 +562,12 @@ export function buildRequest(loaded: Loaded): ExtractionRequest {
     .join("\n");
   const body = loaded.pages
     .map(
-      (page) => `=== page ${page.ordinal} ===\n${numberedPage(page.lines)}`,
+      (page) => `=== page ${page.shown} ===\n${numberedPage(page.lines)}`,
     )
     .join("\n\n");
   const longest = Math.max(0, ...loaded.pages.map((p) => p.lines.length));
   const truncated = [
-    loaded.pages.length < loaded.pagesTotal
+    loaded.pages.length < loaded.pagesWithText
       ? `Only the first ${loaded.pages.length} of ${loaded.pagesTotal} pages are shown.`
       : "",
     longest > MAX_PAGE_LINES
@@ -551,6 +585,8 @@ export function buildRequest(loaded: Loaded): ExtractionRequest {
   const prompt = `Read this document and report what it says. Do not infer, calculate, or convert anything.
 
 Each page is shown as numbered lines, like "7| Subtotal    10.00". Cite the lines a value comes from by their numbers. Do not copy text back.
+
+Pages and lines both count from 1. "page" is the number in the "=== page N ===" heading above the lines you are citing, and "lines" are the numbers to the left of the bars on that page.
 
 Reply with JSON only, in exactly this shape:
 {"kind": "<one kind below, or other>",
@@ -774,7 +810,8 @@ async function prepare(
     occurrence: { precision: "unknown" },
   };
   const fields = new Map(type ? type.fields.map((f) => [f.name, f]) : []);
-  const pages = new Map(loaded.pages.map((page) => [page.ordinal, page]));
+  // Keyed by the number the model was shown, never by the page's ordinal.
+  const pages = new Map(loaded.pages.map((page) => [page.shown, page]));
   const unknownFields: string[] = [];
 
   // Pass one: gate every statement. Nothing is materialised yet, because
@@ -810,9 +847,16 @@ async function prepare(
     prepared.named += 1;
     const page = pages.get(statement.page);
     if (!page) {
+      // Its own reason, not `citation_out_of_range`. A citation into a page
+      // that does not exist is a model reading the page numbering differently
+      // from the server, and that is a different bug from a line id off the
+      // end of a page it can see -- one the counts have to be able to tell
+      // apart, because the first time it happened it looked like ordinary
+      // model error. Nothing is shifted to make it fit: a guess at which page
+      // was meant is a wrong value with a citation.
       prepared.failures.push({
         field: field.name,
-        reason: "citation_out_of_range",
+        reason: "citation_page_unknown",
         reading: statement.value,
       });
       continue;
@@ -1197,7 +1241,7 @@ async function store(
   // Partially read either way: fewer pages shown than the document has, or a
   // page longer than the model was shown. A limitation the owner cannot see is
   // the same as no limitation at all.
-  const droppedPages = loaded.pages.length < loaded.pagesTotal;
+  const droppedPages = loaded.pages.length < loaded.pagesWithText;
   const droppedLines = loaded.pages.some(
     (page) => page.lines.length > MAX_PAGE_LINES,
   );
