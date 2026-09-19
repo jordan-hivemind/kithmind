@@ -58,6 +58,7 @@ export * as workers from "./workers/index.js";
 export * as records from "./records/index.js";
 export * as sources from "./sources/index.js";
 export * as deferred from "./deferred/index.js";
+export * as admin from "./admin/index.js";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const UUID =
@@ -307,6 +308,21 @@ export async function grantProofAppRole(
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.ingest_requests, kith.inline_work, kith.ingest_rate_limits,
     kith.source_fetch_requests TO "${appRole}"`);
+  // The admin panel (ADM-1, migrations 022 and 023): the seven configuration
+  // and investment tables the admin screens own, plus the change feed.
+  //
+  // `kith.changes` needs INSERT because `kith.record_change()` is a plain
+  // trigger function, not `SECURITY DEFINER`: it runs as whoever made the
+  // write, so a role that may write `kith.source_accounts` but not
+  // `kith.changes` would have every one of those writes fail at the trigger.
+  // DELETE is the prune sweep's (`removeExpiredChanges`, src/deferred/sweeps.ts).
+  // No sequence grant is needed: `changes.id` is an identity column, whose
+  // sequence is owned by the column and covered by the table's own INSERT.
+  await owner.query(`GRANT INSERT, UPDATE, DELETE ON
+    kith.document_types, kith.document_type_fields,
+    kith.source_roots, kith.source_root_reports,
+    kith.investments, kith.investment_entries, kith.corrections,
+    kith.changes TO "${appRole}"`);
   // Deliberately still absent, and each one is a table an application write
   // would be a bug on: `kith.schema_version`, which only a migration runner
   // writes; the `proof_*` prototype pair, which only the owner role seeds; and

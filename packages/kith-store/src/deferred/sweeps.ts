@@ -287,3 +287,55 @@ export async function removeExpiredAuthRateLimits(
   );
   return { removed: doomed.length, remaining: doomed.length === limit };
 }
+
+/**
+ * How long a change row is kept. Section 4: "Rows older than a few days are
+ * pruned by the deferred-work daemon."
+ *
+ * Three days, so a client that was closed over a weekend gets a cursor miss
+ * (and refetches everything, which is correct) rather than a silently
+ * incomplete catch-up. The feed is an invalidation hint, never a log: nothing
+ * reads history out of it, so keeping more would only cost index.
+ */
+export const CHANGE_FEED_RETENTION_MS = 3 * 86_400_000;
+
+const CHANGE_SWEEP_BATCH_SIZE = 2_000;
+
+/**
+ * One bounded pass deleting change rows older than
+ * `CHANGE_FEED_RETENTION_MS`, over `changes_committed_at_idx`.
+ *
+ * Same shape as `removeExpiredAuthRateLimits` above: a bounded `DELETE ...
+ * USING` over an ordered candidate set, and `remaining` true when the batch
+ * filled, so the next tick continues rather than this one holding a large
+ * delete open. `kith.changes` is the one table in the schema whose row count
+ * is driven by how much the *worker* writes rather than by how much the owner
+ * stores, so the bound matters more here than the retention does.
+ */
+export async function removeExpiredChanges(
+  ctx: DeferredCtx,
+  options: { limit?: number; retentionMs?: number } = {},
+): Promise<SweepResult> {
+  const limit = options.limit ?? CHANGE_SWEEP_BATCH_SIZE;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 20_000) {
+    throw new Error("Change feed sweep limit is invalid");
+  }
+  const retentionMs = options.retentionMs ?? CHANGE_FEED_RETENTION_MS;
+  if (!Number.isFinite(retentionMs) || retentionMs <= 0) {
+    throw new Error("Change feed retention is invalid");
+  }
+  const doomed = await rows<{ id: string }>(
+    ctx,
+    `WITH doomed AS (
+       SELECT id FROM kith.changes
+        WHERE committed_at <= $1
+        ORDER BY committed_at, id
+        LIMIT $2
+     )
+     DELETE FROM kith.changes c USING doomed d
+      WHERE c.id = d.id
+      RETURNING c.id::text AS id`,
+    [at(ctx.now - retentionMs), limit],
+  );
+  return { removed: doomed.length, remaining: doomed.length === limit };
+}

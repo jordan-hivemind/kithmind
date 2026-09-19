@@ -55,6 +55,16 @@ const GRANTED = Object.freeze({
     "record_query_space_state",
   ],
   coverage: ["coverage_windows", "coverage_gaps"],
+  admin: [
+    "document_types",
+    "document_type_fields",
+    "source_roots",
+    "source_root_reports",
+    "investments",
+    "investment_entries",
+    "corrections",
+    "changes",
+  ],
 });
 
 /** Tables no application write may reach. The control for the list above. */
@@ -255,6 +265,31 @@ test(
           [newKithId(), spaceId],
         ),
         null,
+      );
+
+      // The admin panel (ADM-1), and with it the change trigger every one of
+      // its writes fires. `kith.record_change()` is not `SECURITY DEFINER`, so
+      // it inserts as the app role: without INSERT on `kith.changes` this
+      // `INSERT INTO kith.investments` fails at the trigger, not at the row.
+      const investmentId = newKithId();
+      assert.equal(
+        await attempt(
+          app,
+          `INSERT INTO kith.investments (id, space_id, name)
+             VALUES ($1, $2, 'Synthetic Fund I')`,
+          [investmentId, spaceId],
+        ),
+        null,
+      );
+      assert.equal(
+        (
+          await app.query(
+            `SELECT count(*)::int AS n FROM kith.changes
+              WHERE table_name = 'investments' AND row_id = $1`,
+            [investmentId],
+          )
+        ).rows[0].n,
+        1,
       );
 
       // Every table in every group, including the ones no write above reaches.
