@@ -48,6 +48,7 @@ import {
   type DeferredWorkRow,
   type ScheduleResult,
 } from "../deferred/core.js";
+import { ProofError } from "../errors.js";
 import { KITH_ID, newKithId } from "../ids.js";
 import { locateCardQuote } from "../provenance/model.js";
 import { sha256Utf8 } from "../provenance/sql.js";
@@ -67,7 +68,11 @@ import {
   normalizeForMatch,
   type CorrectionReason,
 } from "./gate.js";
-import type { ExtractionModel, ModelReading } from "./provider.js";
+import type {
+  ExtractionModel,
+  ExtractionRequest,
+  ModelReading,
+} from "./provider.js";
 
 // ---------------------------------------------------------------------------
 // Bounds. A document past them is extracted from its first pages and says so.
@@ -81,6 +86,15 @@ export const MAX_EXTRACTION_PAGES = 12;
 export const MAX_EXTRACTION_CHARS = 60_000;
 /** Statements stored per document. */
 export const MAX_EXTRACTION_STATEMENTS = 96;
+
+/**
+ * What a job reports when the model's reply named no field this kind has.
+ *
+ * A named code because an operator reads it out of `deferred_work.last_error`
+ * and because it is the one extraction failure that is worth looking at: the
+ * document is fine, the prompt or the schema is not.
+ */
+export const EXTRACTION_REPLY_UNREADABLE = "extraction_reply_unreadable";
 
 const PLACEHOLDER_ENTITY_KEY = "other:document";
 const EVENT_KEY = "document_statement:v1";
@@ -401,7 +415,7 @@ async function loadTypes(
  * a model that ignores the prompt produces correction items rather than wrong
  * facts, and lengthening the prompt buys precision the gate already provides.
  */
-export function buildPrompt(loaded: Loaded): string {
+export function buildRequest(loaded: Loaded): ExtractionRequest {
   const catalog = loaded.types
     .map((type) => {
       const fields = type.fields
@@ -424,19 +438,40 @@ export function buildPrompt(loaded: Loaded): string {
     loaded.pages.length < loaded.pagesTotal
       ? `\nOnly the first ${loaded.pages.length} of ${loaded.pagesTotal} pages are shown.\n`
       : "";
-  return `Read this document and report what it says. Do not infer, calculate, or convert anything.
+  // Every field name of every active kind, deduplicated. The schema's enum and
+  // the prompt's catalog are two statements of one contract.
+  const fields = [
+    ...new Set(loaded.types.flatMap((type) => type.fields.map((f) => f.name))),
+  ];
+  const prompt = `Read this document and report what it says. Do not infer, calculate, or convert anything.
 
-Reply with JSON only:
+Reply with JSON only, in exactly this shape:
 {"kind": "<one kind below, or other>",
  "summary": "<one line>",
- "statements": [{"field": "<field name>", "value": <value>, "page": <page number>, "quote": "<text copied from that page>"}]}
+ "statements": [
+   {"field": "<a field name listed under the kind you chose>",
+    "value": "<the value, as a string>",
+    "line_items": null,
+    "page": <page number>,
+    "quote": "<text copied from that page>"}]}
 
 Rules:
+- Every statement names a field in "field". Never leave it out, never rename it, and never use the field name as a key of its own.
 - Every statement needs a quote copied exactly from the page it cites. If you cannot copy a quote, omit the statement.
 - Only use fields listed under the kind you chose. Omit a field the document does not state.
 - Dates are YYYY-MM-DD. Money keeps the document's own digits, including the currency symbol if there is one.
-- A line_item_list value is [{"description": "...", "amount": "..."}].
+- A line_item_list field puts its lines in "line_items" and sets "value" to null. Every other field puts its value in "value" and sets "line_items" to null.
 - Names, diagnoses and descriptions are copied as written. Do not normalize them.
+
+Worked example, for a receipt that reads "Bracken Tools / 2 Apr 2026 / Chisel 12.00 / Mallet 8.00 / Total $20.00":
+{"kind": "receipt",
+ "summary": "Hardware receipt from Bracken Tools for $20.00.",
+ "statements": [
+   {"field": "vendor", "value": "Bracken Tools", "line_items": null, "page": 0, "quote": "Bracken Tools"},
+   {"field": "purchase_date", "value": "2026-04-02", "line_items": null, "page": 0, "quote": "2 Apr 2026"},
+   {"field": "line_items", "value": null, "page": 0, "quote": "Chisel 12.00 / Mallet 8.00",
+    "line_items": [{"description": "Chisel", "amount": "12.00"}, {"description": "Mallet", "amount": "8.00"}]},
+   {"field": "total", "value": "$20.00", "line_items": null, "page": 0, "quote": "Total $20.00"}]}
 
 Kinds:
 ${catalog}
@@ -444,6 +479,7 @@ ${catalog}
 Document:
 ${truncated}${body}
 `;
+  return { prompt, kinds: loaded.types.map((type) => type.kind), fields };
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +509,13 @@ export type StoredStatement = {
 };
 
 type Prepared = {
+  /** Reply entries that resolved to a field this kind declares, whether or
+   * not the reading then passed its gate. Zero of these with entries in the
+   * reply is a reply in the wrong shape, not a document that says nothing. */
+  named: number;
+  /** Reply entries that named no field, or named something this kind has no
+   * column for. */
+  unusable: number;
   statements: StoredStatement[];
   observations: Array<{
     key: string;
@@ -558,6 +601,12 @@ async function prepare(
   type: LoadedType | undefined,
 ): Promise<Prepared> {
   const prepared: Prepared = {
+    named: 0,
+    // The reply's own unnamed entries start the count: `parseModelReading`
+    // dropped them before this function ever saw them, and a dropped entry
+    // nobody counts is how the live trial's two documents extracted to
+    // nothing while reporting one vague correction.
+    unusable: reading.unnamed,
     statements: [],
     observations: [],
     failures: [],
@@ -593,8 +642,10 @@ async function prepare(
     if (!field || !isObservationFieldName(field.name)) {
       const named = (field?.name ?? statement.field) || "(unnamed)";
       if (!unknownFields.includes(named)) unknownFields.push(named);
+      prepared.unusable += 1;
       continue;
     }
+    prepared.named += 1;
     const page = pages.get(statement.page);
     if (!page || !statement.quote.trim()) {
       prepared.failures.push({
@@ -650,14 +701,21 @@ async function prepare(
     });
   }
 
-  if (unknownFields.length > 0) {
+  if (prepared.unusable > 0) {
     // One row for the whole document, not one per name: this is a sign the
     // kind is wrong or the guidance is stale, and it is one thing for the
-    // owner to look at, not fifteen.
+    // owner to look at, not fifteen. The count is on it because the names
+    // alone cannot distinguish one stray field from a reply where every
+    // entry was unreadable -- which is the difference the live trial could
+    // not see.
     prepared.failures.push({
       field: null,
       reason: "unknown_field",
-      reading: { fields: unknownFields.slice(0, 64) },
+      reading: {
+        fields: unknownFields.slice(0, 64),
+        unnamed: reading.unnamed,
+        unusable: prepared.unusable,
+      },
     });
   }
 
@@ -850,11 +908,22 @@ async function store(
   reading: ModelReading,
   modelName: string,
   now: number,
+  retryUnreadable: boolean,
 ): Promise<ExtractionOutcome> {
   const type = loaded.types.find(
     (candidate) => candidate.kind === reading.kind,
   );
   const prepared = await prepare(client, loaded, reading, type);
+  // A reply with entries in it, not one of which named a field this kind has,
+  // is a model that answered in a shape nobody asked for. That is a different
+  // thing from a document that states nothing, and it is worth one more call
+  // before it is written down as the document's answer: the trial that found
+  // this saw it on two documents out of five and a second attempt costs a
+  // third of a cent. Throwing rolls the transaction back, so the retry starts
+  // from the same clean state, and `fail`'s backoff schedules it.
+  if (retryUnreadable && prepared.named === 0 && prepared.unusable > 0) {
+    throw new ProofError(EXTRACTION_REPLY_UNREADABLE);
+  }
   const entityId = await placeholderEntityId(
     client,
     loaded.spaceId,
@@ -1090,7 +1159,7 @@ export async function runDocumentExtractionJob(
   // its own job.
   if (!loaded || loaded.types.length === 0) return null;
 
-  const reading = await model.read(buildPrompt(loaded));
+  const reading = await model.read(buildRequest(loaded));
 
   return await withKithTransaction(pool, async (client) => {
     // The generation may have been replaced while the model was reading. Write
@@ -1102,6 +1171,17 @@ export async function runDocumentExtractionJob(
     ) {
       return null;
     }
-    return await store(client, current, reading, model.name, now);
+    // One retry, and only one: `attempts` is still 0 on a job's first run
+    // (`claim` increments it only for a reclaim), so the second run settles
+    // for the correction rather than looping on a model that will answer the
+    // same way every time.
+    return await store(
+      client,
+      current,
+      reading,
+      model.name,
+      now,
+      job.attempts === 0,
+    );
   });
 }
