@@ -70,6 +70,44 @@ ALTER TABLE kith.corrections
   ADD CONSTRAINT corrections_snoozed_check
     CHECK ((state = 'snoozed') = (snoozed_until IS NOT NULL));
 
+-- Backfill: an `open` row extraction wrote before this migration has no
+-- `dedupe_key` -- the column is new, and nothing before this filled it in.
+-- Left alone, the first re-extraction after this migration cannot find such
+-- a row by `openCorrection`'s dedupe_key lookup (`NULL` never equals a
+-- computed key), so it reads as a stale row, gets cleared by
+-- `supersedeOpenCorrections`, and a fresh duplicate is opened right beside
+-- it with the very same reading. The formula matches
+-- `extractionDedupeKey()` in src/extraction/corrections.ts exactly, so a
+-- backfilled row and one a fresh run would open for the same failure always
+-- agree. Only `open` rows: a `resolved` row is either the owner's own fix
+-- (`applyCorrection`, whose free-text `reason` is never looked up by this
+-- formula) or already cleared, and dedupe_key is never read for either.
+UPDATE kith.corrections
+   SET dedupe_key = 'extraction:' || target_id || ':' ||
+                     coalesce(field_name, '_') || ':' || reason
+ WHERE target_kind = 'document' AND state = 'open' AND dedupe_key IS NULL
+   AND reason IS NOT NULL;
+
+-- The backfill above can only collide if two `open` rows already shared
+-- (target_id, field_name, reason) before this migration, which the pre-030
+-- code's own de-duplication (the same tuple, scoped to `state = 'open'`)
+-- should never have allowed -- this is the belt for that suspenders. Keep
+-- the newest per key, and resolve the rest exactly the way a real
+-- re-extraction would: `resolved`, reason `cleared`.
+WITH ranked AS (
+  SELECT id,
+         row_number() OVER (
+           PARTITION BY space_id, dedupe_key
+           ORDER BY created_at DESC, id DESC
+         ) AS rank
+    FROM kith.corrections
+   WHERE state = 'open' AND dedupe_key IS NOT NULL
+)
+UPDATE kith.corrections c
+   SET state = 'resolved', resolved_at = transaction_timestamp(), reason = 'cleared'
+  FROM ranked
+ WHERE c.id = ranked.id AND ranked.rank > 1;
+
 -- At most one open-or-snoozed row per key. A dismissed or resolved row keeps
 -- its key (for history and for the "never reopen" check) but frees it, so the
 -- same problem can open again after it is auto-cleared -- only a `dismissed`

@@ -87,10 +87,14 @@ function extractionDedupeKey(
  *
  * Two ADM-8a rules on top of that:
  *
- *   * A mute on the `extraction` detector (`kith.attention_mutes`,
- *     space-wide) refuses the whole write. Prospective, the same as every
- *     mute: it stops a row from being opened, it does not go looking for one
- *     already open.
+ *   * A mute on the `extraction` detector, on this document's kind, or on
+ *     this document's source root (`kith.attention_mutes`) refuses the whole
+ *     write. Prospective, the same as every mute: it stops a row from being
+ *     opened, it does not go looking for one already open. `documentKind`
+ *     and `sourceRootId` are the caller's (`model.ts` already knows the
+ *     kind it read the document as, and resolves the root -- see
+ *     `resolveUnambiguousSourceRoot`); neither is required, so a caller that
+ *     cannot supply one simply cannot be muted on it.
  *   * A row the owner dismissed ("not worth backfilling" or one of the other
  *     closed reasons) is never reopened, however many times the same field
  *     fails the gate again. A row this function itself auto-cleared
@@ -106,9 +110,17 @@ export async function openCorrection(
     fieldName: string | null;
     reason: CorrectionReason;
     reading: unknown;
+    documentKind?: string | null;
+    sourceRootId?: string | null;
   },
 ): Promise<string | null> {
-  if (await isAttentionMuted(client, input.spaceId, { detector: EXTRACTION_DETECTOR })) {
+  if (
+    await isAttentionMuted(client, input.spaceId, {
+      detector: EXTRACTION_DETECTOR,
+      documentKind: input.documentKind,
+      sourceRootId: input.sourceRootId,
+    })
+  ) {
     return null;
   }
   const dedupeKey = extractionDedupeKey(
@@ -147,12 +159,26 @@ export async function openCorrection(
     );
     return existing.id;
   }
+  // `ON CONFLICT`, not a bare INSERT: the SELECT above and this INSERT are
+  // two statements, so two concurrent extractions of the same document can
+  // both pass the SELECT seeing nothing, then both reach here. Without the
+  // conflict clause the second INSERT would hit
+  // `corrections_dedupe_key_idx` and abort its whole transaction over a
+  // race that is not actually an error -- both writers agree on the row
+  // that should exist. The target matches that partial index exactly, so
+  // PostgreSQL can infer it; a `dismissed` row (never in it) still cannot
+  // conflict here, which is correct -- that case already returned above.
+  // `reason` needs no update on conflict: `dedupe_key` encodes it, so the
+  // winner already has the same one.
   const id = newKithId();
-  await client.query(
+  const written = await client.query<{ id: string }>(
     `INSERT INTO kith.corrections
        (id, space_id, target_kind, target_id, field_name, original_value,
         reason, state, dedupe_key)
-     VALUES ($1,$2,'document',$3,$4,$5,$6,'open',$7)`,
+     VALUES ($1,$2,'document',$3,$4,$5,$6,'open',$7)
+     ON CONFLICT (space_id, dedupe_key) WHERE state IN ('open', 'snoozed')
+     DO UPDATE SET original_value = EXCLUDED.original_value
+     RETURNING id`,
     [
       id,
       input.spaceId,
@@ -163,7 +189,7 @@ export async function openCorrection(
       dedupeKey,
     ],
   );
-  return id;
+  return written.rows[0]!.id;
 }
 
 /**
