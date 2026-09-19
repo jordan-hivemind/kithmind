@@ -20,6 +20,7 @@ import type { ClientBase } from "pg";
 
 import {
   amountsInText,
+  valueSignature,
   compareDecimalsSafely,
   foldTextForMatch,
   parseAmount,
@@ -28,49 +29,7 @@ import {
 } from "./gate.js";
 import { areContiguous, pageLines } from "./lines.js";
 
-/** The widest a signature gets. Long enough to see a shape, short enough that
- * it cannot carry a sentence. */
-const MAX_SIGNATURE_CHARS = 24;
-
-/** Punctuation a signature keeps, because the shape of an amount or a date is
- * the point. Everything else becomes `.`-free: letters fold to `a`, digits to
- * `9`, and anything else is dropped. */
-const KEPT_IN_SIGNATURE = new Set([
-  "$",
-  ".",
-  ",",
-  "/",
-  "-",
-  ":",
-  " ",
-]);
-
-/**
- * The character-class shape of a value.
- *
- * `"$1,234.56"` becomes `"$9,999.99"` and `"Bracken Tools"` becomes
- * `"aaaaaaa aaaaa"`. Enough to see that a money field came back as words, or
- * that a date came back with a time on it; not enough to learn anything about
- * the household.
- */
-export function valueSignature(value: unknown): string {
-  const text =
-    typeof value === "string"
-      ? value
-      : typeof value === "number" || typeof value === "boolean"
-        ? String(value)
-        : value === null || value === undefined
-          ? ""
-          : JSON.stringify(value).slice(0, 200);
-  let signature = "";
-  for (const unit of text.normalize("NFKC")) {
-    if (signature.length >= MAX_SIGNATURE_CHARS) break;
-    if (/[0-9]/.test(unit)) signature += "9";
-    else if (/[A-Za-z]/.test(unit)) signature += "a";
-    else if (KEPT_IN_SIGNATURE.has(unit)) signature += unit;
-  }
-  return signature;
-}
+export { valueSignature } from "./gate.js";
 
 type RecordedCitation = {
   shownPage?: unknown;
@@ -101,6 +60,20 @@ export type StatementDiagnosis = {
   contiguous: boolean;
   /** The shape of what the model returned. Never its content. */
   signature: string;
+  /**
+   * For a list, each entry's amount and description shapes on their own.
+   *
+   * The whole-list signature reads as one run of folded JSON, which is how a
+   * live trial could see that something was wrong with the line items and not
+   * what: `aaaaaa:9999,aaaaaaaaaaa:` hides that the amount had lost its
+   * decimal point. Split out, `{amount: "9999"}` says it at a glance.
+   */
+  itemSignatures?: Array<{
+    amount: string;
+    description: string;
+    lines: number[];
+    reason?: string;
+  }>;
   /** Whether the value occurs anywhere on the page it cited. */
   onCitedPage: boolean;
   /** Which line ids of that page carry it. The answer to "did it cite the
@@ -301,6 +274,34 @@ export async function diagnoseExtractions(
           index + 1 !== shownPage &&
           linesCarrying(candidate.text, value, order).length > 0,
       );
+      // A list records the shape of each entry that failed, because a whole
+      // list folded into one signature hides which half of an entry was
+      // wrong. A reading that is itself a list is folded entry by entry here.
+      const recorded = (value ?? null) as { failedShapes?: unknown } | null;
+      const shapes =
+        recorded !== null &&
+        typeof recorded === "object" &&
+        Array.isArray(recorded.failedShapes)
+          ? recorded.failedShapes
+          : Array.isArray(value)
+            ? value
+            : undefined;
+      const items = shapes
+        ? shapes.slice(0, 32).map((entry) => {
+            const item = (entry ?? {}) as Record<string, unknown>;
+            const folded = typeof item.reason === "string";
+            return {
+              amount: folded
+                ? String(item.amount ?? "")
+                : valueSignature(item.amount),
+              description: folded
+                ? String(item.description ?? "")
+                : valueSignature(item.description),
+              lines: integers(item.lines),
+              ...(folded ? { reason: String(item.reason) } : {}),
+            };
+          })
+        : undefined;
       const diagnosis: StatementDiagnosis = {
         field: correction.field_name === null ? null : String(correction.field_name),
         reason,
@@ -313,6 +314,7 @@ export async function diagnoseExtractions(
             ? citation.contiguous
             : areContiguous(cited),
         signature: valueSignature(value),
+        ...(items ? { itemSignatures: items } : {}),
         onCitedPage: onLines.length > 0,
         onLines,
         onOtherPage,

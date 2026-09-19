@@ -61,7 +61,11 @@ import {
 } from "./lines.js";
 import { sha256Utf8 } from "../provenance/sql.js";
 import { occurrenceColumns, occurrenceSortKey } from "../records/model.js";
-import type { ObservationValue, Occurrence } from "../records/values.js";
+import {
+  addDecimals,
+  type ObservationValue,
+  type Occurrence,
+} from "../records/values.js";
 import { withKithTransaction } from "../schema.js";
 import {
   openCorrection,
@@ -72,7 +76,10 @@ import {
 import { seedDocumentTypes } from "./seed.js";
 import {
   candidatesFor,
+  checkLineItem,
   checkValue,
+  readLineItems,
+  valueSignature,
   type Candidate,
   type DateOrder,
   isObservationFieldName,
@@ -607,13 +614,15 @@ Rules:
 - Only use fields listed under the kind you chose. Omit a field the document does not state.
 - Copy a value exactly as the line prints it, including the currency symbol. Dates may be copied as printed.
 - A line_item_list field puts its lines in "line_items" and sets "value" to null. Every other field puts its value in "value" and sets "line_items" to null.
+- Each entry of "line_items" has its own "lines". Items sit on different lines; cite the line each one is printed on.
+- An amount is the decimal string the line prints, with its decimal point: "12.99", never "1299" and never rounded. A trailing tax letter such as "12.99T" may be kept or dropped.
 - Names, diagnoses and descriptions are copied as written. Do not normalize them.
 
 Worked example. Given this page:
 1| Bracken Tools
 2| 2 Apr 2026
-3| Chisel            12.00
-4| Mallet             8.00
+3| Chisel            12.00 T
+4| Mallet              8.00
 5| Subtotal
 6| Tax
 7| Total
@@ -627,7 +636,8 @@ the reply is:
    {"field": "vendor", "value": "Bracken Tools", "line_items": null, "page": 1, "lines": [1]},
    {"field": "purchase_date", "value": "2 Apr 2026", "line_items": null, "page": 1, "lines": [2]},
    {"field": "line_items", "value": null, "page": 1, "lines": [3, 4],
-    "line_items": [{"description": "Chisel", "amount": "12.00"}, {"description": "Mallet", "amount": "8.00"}]},
+    "line_items": [{"description": "Chisel", "amount": "12.00", "lines": [3]},
+                   {"description": "Mallet", "amount": "8.00", "lines": [4]}]},
    {"field": "subtotal", "value": "20.00", "line_items": null, "page": 1, "lines": [5, 8]},
    {"field": "tax", "value": "1.60", "line_items": null, "page": 1, "lines": [6, 9]},
    {"field": "total", "value": "21.60", "line_items": null, "page": 1, "lines": [7, 10]}]}
@@ -772,7 +782,9 @@ function resolveCitation(
     return { cited };
   }
   if (!quoted.trim()) {
-    return { cited: [], reason: "quote_not_found" };
+    // No lines and no quote: the statement cited nothing at all, which is a
+    // different fault from a quote that is not on the page.
+    return { cited: [], reason: "citation_missing" };
   }
   const located = locateCardQuote(page.text, quoted);
   if (
@@ -846,6 +858,146 @@ async function findOrCreateSpan(
     ],
   );
   return id;
+}
+
+type GatedLineItems = {
+  values: ObservationValue[];
+  spanIds: string[];
+  /** The sum of the entries that passed. A partial list must not be compared
+   * against a stated total, so the caller only carries this when nothing
+   * failed. */
+  itemsTotal?: string;
+  currencyAssumed?: true;
+  quote: string;
+  failed: number;
+  total: number;
+  /**
+   * The shape of each entry that failed, and why.
+   *
+   * Signatures, not content: letters folded to `a` and digits to `9`, the
+   * same projection the diagnostic prints. The owner's count stays a count;
+   * this is what lets an operator see that the amounts arrived without their
+   * decimal point without anyone opening the receipt.
+   */
+  failedShapes: Array<{
+    amount: string;
+    description: string;
+    lines: number[];
+    reason: CorrectionReason;
+  }>;
+};
+
+/**
+ * Every entry of a list, gated on its own citation and stored on its own.
+ *
+ * A failing entry no longer takes the list down with it. A receipt with six
+ * good lines and one the model garbled used to store nothing, which is how a
+ * strong model still lost every line item on both trial documents; now the
+ * six store and one correction says one is missing.
+ *
+ * `itemsTotal` is deliberately absent when anything failed. The sum of some of
+ * the lines is not the sum of the lines, and comparing a partial sum against
+ * the document's stated total would raise a mismatch that says nothing.
+ */
+async function gateLineItems(
+  client: ClientBase,
+  loaded: Loaded,
+  page: LoadedPage,
+  input: {
+    field: TypeField;
+    /** What the model put in `line_items`, already parsed off the wire. */
+    value: unknown;
+    cited: readonly PageLine[];
+    defaultCurrency: string;
+  },
+): Promise<GatedLineItems> {
+  const empty: GatedLineItems = {
+    values: [],
+    spanIds: [],
+    quote: "",
+    failed: 1,
+    total: 1,
+    failedShapes: [
+      {
+        amount: valueSignature(input.value),
+        description: "",
+        lines: [],
+        reason: "malformed_statement",
+      },
+    ],
+  };
+  const entries = readLineItems(input.value);
+  if (!entries) return empty;
+
+  const values: ObservationValue[] = [];
+  const spanIds: string[] = [];
+  let itemsTotal = "0";
+  let currencyAssumed: true | undefined;
+  let quote = "";
+  let failed = 0;
+  const failedShapes: GatedLineItems["failedShapes"] = [];
+  const note = (
+    item: { amount?: unknown; description?: unknown; lines?: number[] },
+    reason: CorrectionReason,
+  ): void => {
+    failed += 1;
+    if (failedShapes.length < 32) {
+      failedShapes.push({
+        amount: valueSignature(item.amount),
+        description: valueSignature(item.description),
+        lines: item.lines ?? [],
+        reason,
+      });
+    }
+  };
+
+  for (const entry of entries) {
+    if (!entry.ok) {
+      note({}, entry.reason);
+      continue;
+    }
+    // The entry's own lines when it gave any, the statement's otherwise: a
+    // one-line list is ordinary and re-citing it per entry is noise.
+    const own =
+      entry.item.lines.length > 0
+        ? citedLines(page.lines, entry.item.lines)
+        : [...input.cited];
+    if (!own || own.length === 0) {
+      note(entry.item, "citation_missing");
+      continue;
+    }
+    const checked = checkLineItem({
+      item: entry.item,
+      cited: own,
+      pageText: page.text,
+      defaultCurrency: input.defaultCurrency,
+    });
+    if (!checked.ok) {
+      note(entry.item, checked.reason);
+      continue;
+    }
+    const spanId = await findOrCreateSpan(client, loaded, page, checked.span);
+    if (!spanId) {
+      note(entry.item, "span_unresolved");
+      continue;
+    }
+    values.push(checked.value);
+    spanIds.push(spanId);
+    itemsTotal = addDecimals(itemsTotal, checked.amount);
+    if (checked.currencyAssumed) currencyAssumed = true;
+    if (!quote) quote = checked.span.text;
+  }
+
+  return {
+    values,
+    spanIds,
+    ...(failed === 0 ? { itemsTotal } : {}),
+    ...(currencyAssumed ? { currencyAssumed } : {}),
+    quote,
+    failed,
+    total: entries.length,
+    failedShapes,
+  };
 }
 
 /**
@@ -934,6 +1086,63 @@ async function prepare(
         reading: statement.value,
         citation,
       });
+      continue;
+    }
+    // A list is gated entry by entry, each against its own cited lines.
+    if (field.valueType === "line_item_list") {
+      // On the legacy quote path there are no line ids, so the located range
+      // stands in as the one line every entry is checked against.
+      const fallback: PageLine[] =
+        located.cited.length > 0
+          ? [...located.cited]
+          : located.legacy
+            ? [
+                {
+                  id: 0,
+                  ...located.legacy,
+                  text: page.text.slice(
+                    located.legacy.start,
+                    located.legacy.end,
+                  ),
+                },
+              ]
+            : [];
+      const listed = await gateLineItems(client, loaded, page, {
+        field,
+        value: statement.value,
+        cited: fallback,
+        defaultCurrency: "USD",
+      });
+      if (listed.failed > 0) {
+        prepared.failures.push({
+          field: field.name,
+          reason:
+            listed.values.length === 0
+              ? "value_not_in_quote"
+              : "line_items_partial",
+          // Counts only. Which entries failed is the diagnostic's business,
+          // and the owner's question is "how much of this list is missing".
+          reading: {
+            failedItems: listed.failed,
+            totalItems: listed.total,
+            failedShapes: listed.failedShapes,
+          },
+          citation,
+        });
+      }
+      if (listed.values.length > 0) {
+        accepted.push({
+          field,
+          page: statement.page,
+          quote: listed.quote,
+          lines: [...(statement.lines ?? [])],
+          citation,
+          spanIds: listed.spanIds,
+          values: listed.values,
+          itemsTotal: listed.itemsTotal,
+          ...(listed.currencyAssumed ? { currencyAssumed: true as const } : {}),
+        });
+      }
       continue;
     }
     // Each cited line on its own, and for a text field each adjacent pair.

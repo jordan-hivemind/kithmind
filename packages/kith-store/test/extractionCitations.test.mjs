@@ -392,8 +392,8 @@ test("a column receipt stores every money field it cites", { skip }, async (t) =
         statement("purchase_date", "09/18/26", [3]),
         statement("line_items", null, [4, 5], {
           line_items: [
-            { description: "Chisel", amount: "12.00" },
-            { description: "Mallet", amount: "8.00" },
+            { description: "Chisel", amount: "12.00", lines: [4] },
+            { description: "Mallet", amount: "8.00", lines: [5] },
           ],
         }),
         statement("subtotal", "20.00", [6, 7]),
@@ -444,8 +444,8 @@ test("a pipe-rendered table receipt reads the same way", { skip }, async (t) => 
         statement("purchase_date", "09/18/26", [2]),
         statement("line_items", null, [4, 5], {
           line_items: [
-            { description: "Chisel", amount: "12.00" },
-            { description: "Mallet", amount: "8.00" },
+            { description: "Chisel", amount: "12.00", lines: [4] },
+            { description: "Mallet", amount: "8.00", lines: [5] },
           ],
         }),
         statement("subtotal", "20.00", [6]),
@@ -473,8 +473,8 @@ test("OCR artifacts and a foreign decimal still read", { skip }, async (t) => {
         statement("invoice_date", "9 Apr 2026", [3]),
         statement("line_items", null, [4, 5], {
           line_items: [
-            { description: "Planing", amount: "120.00" },
-            { description: "Fitting", amount: "45.00" },
+            { description: "Planing", amount: "120.00", lines: [4] },
+            { description: "Fitting", amount: "45.00", lines: [5] },
           ],
         }),
         statement("subtotal", "$ 165 .00", [6]),
@@ -1084,10 +1084,12 @@ test("a column receipt stores its money fields from far-apart lines", { skip }, 
         // may span.
         statement("vendor", "BRACKEN TOOLS LTD.", [1, 2]),
         statement("purchase_date", "09/18/26 14:32", [4]),
+        // Each item cites the line with its description and the line with
+        // its amount: on this receipt they are different lines.
         statement("line_items", null, [6, 8], {
           line_items: [
-            { description: "Chisel", amount: "12.00" },
-            { description: "Mallet", amount: "8.00" },
+            { description: "Chisel", amount: "12.00", lines: [5, 6] },
+            { description: "Mallet", amount: "8.00", lines: [7, 8] },
           ],
         }),
         // Label and amount, five lines apart. Every one of these was
@@ -1527,4 +1529,218 @@ test("the diagnostic survives a correction with a scalar reading", { skip }, asy
   // still say the document prints it.
   assert.equal(failure.onCitedPage, false);
   assert.equal(failure.onOtherPage, true);
+});
+
+// ---------------------------------------------------------------------------
+// Line items, entry by entry (ADM-5g).
+//
+// With a strong model the remaining failures on the owner's documents were
+// both line items: a whole list refused because one entry was garbled, an
+// amount that arrived as "1299" for a printed 12.99, and an amount carrying a
+// tax letter. Each entry is now gated on its own citation and stored on its
+// own.
+// ---------------------------------------------------------------------------
+
+/** A receipt whose items print their description and amount on separate
+ * lines, one description wrapping onto a second line, and one amount
+ * carrying a tax flag. */
+const ITEMISED_RECEIPT = [
+  "BRACKEN TOOLS",          // 1
+  "09/18/26",               // 2
+  "Chisel",                 // 3
+  "12.99 T",                // 4
+  "Mallet, rubber faced",   // 5
+  "two pound",              // 6
+  "8.00",                   // 7
+  "Screws box of 100",      // 8
+  "4.25",                   // 9
+  "Total",                  // 10
+  "25.24",                  // 11
+].join("\n");
+
+test("each line item stores on its own citation", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-itemised");
+  await f.client.query(
+    `UPDATE kith.document_types
+        SET examples = '[{"setting":"date_order","value":"MDY"}]'::jsonb
+      WHERE space_id = $1 AND kind = 'receipt'`,
+    [f.spaceId],
+  );
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS", [1]),
+        statement("purchase_date", "09/18/26", [2]),
+        statement("line_items", null, [3, 4], {
+          line_items: [
+            // Description and amount on different lines.
+            { description: "Chisel", amount: "12.99 T", lines: [3, 4] },
+            // A description wrapped over two adjacent lines.
+            {
+              description: "Mallet, rubber faced two pound",
+              amount: "8.00",
+              lines: [5, 6, 7],
+            },
+            { description: "Screws box of 100", amount: "4.25", lines: [8, 9] },
+          ],
+        }),
+        statement("total", "25.24", [10, 11]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.failed, 0, "no corrections");
+  const stored = await f.stored();
+  assert.deepEqual(
+    stored.map((row) => row.observation_key).sort(),
+    [
+      "line_items:0",
+      "line_items:1",
+      "line_items:2",
+      "purchase_date",
+      "total",
+      "vendor",
+    ],
+  );
+  // The tax letter is a flag, not a digit.
+  assert.deepEqual(
+    stored
+      .filter((row) => row.observation_key.startsWith("line_items:"))
+      .map((row) => row.value.amount),
+    ["12.99", "8", "4.25"],
+  );
+  // Each item's span is the line that prints its own amount, so three
+  // different spans.
+  const spans = await f.rows(
+    `SELECT DISTINCT s."start" FROM kith.observations o
+       JOIN kith.evidence_spans s ON s.id = (o.value_evidence->>0)
+      WHERE o.space_id = $1 AND o.observation_type = 'line_items'`,
+    [f.spaceId],
+  );
+  assert.equal(spans.length, 3);
+});
+
+test("a bad entry is one entry, and the rest still store", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-partial-items");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("line_items", null, [3, 4], {
+          line_items: [
+            { description: "Chisel", amount: "12.99 T", lines: [3, 4] },
+            // The decimal point dropped: 1299 is not what line 4 prints.
+            { description: "Mallet, rubber faced", amount: "1299", lines: [5, 7] },
+            { description: "Screws box of 100", amount: "4.25", lines: [8, 9] },
+          ],
+        }),
+      ],
+    }),
+    ids,
+  );
+  // Two of three stored, and one row saying one is missing.
+  assert.equal(outcome.stored, 2);
+  assert.deepEqual(
+    (await f.stored()).map((row) => row.value.amount),
+    ["12.99", "4.25"],
+  );
+  const corrections = await f.rows(
+    "SELECT reason, original_value FROM kith.corrections WHERE space_id = $1",
+    [f.spaceId],
+  );
+  assert.equal(corrections.length, 1);
+  assert.equal(corrections[0].reason, "line_items_partial");
+  // Counts only: which entries failed is the diagnostic's business.
+  assert.equal(corrections[0].original_value.value.failedItems, 1);
+  assert.equal(corrections[0].original_value.value.totalItems, 3);
+  // The shape of the entry that failed, folded: enough to see the decimal
+  // point is missing, and not enough to read the receipt.
+  assert.deepEqual(corrections[0].original_value.value.failedShapes, [
+    {
+      amount: "9999",
+      description: "aaaaaa, aaaaaa aaaaa",
+      lines: [5, 7],
+      reason: "value_not_in_quote",
+    },
+  ]);
+  // A partial list is never compared against a stated total, which would
+  // raise a mismatch that says nothing.
+  assert.equal(
+    (
+      await f.rows(
+        "SELECT id FROM kith.corrections WHERE space_id = $1 AND reason = 'line_items_mismatch'",
+        [f.spaceId],
+      )
+    ).length,
+    0,
+  );
+});
+
+test("a statement that cites nothing says so by name", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-no-citation");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        { field: "total", value: "25.24", page: 1, lines: [] },
+        statement("vendor", "BRACKEN TOOLS", [1]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  // Its own reason: "the model forgot to cite" is not "the quote is not on
+  // the page", and the counts have to separate them.
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "total", reason: "citation_missing" },
+  ]);
+});
+
+test("the diagnostic shows each entry's amount and description apart", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-item-signatures");
+  await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("line_items", null, [3, 4], {
+          line_items: [
+            { description: "Chisel", amount: "1299", lines: [3, 4] },
+            { description: "Mallet", amount: "8.00", lines: [5, 7] },
+          ],
+        }),
+      ],
+    }),
+    ids,
+  );
+  const summary = await withKithTransaction(f.pool, (client) =>
+    diagnoseExtractions(client, { kind: "receipt", limit: 5 }),
+  );
+  const failure = summary.documents[0].failures.find(
+    (entry) => entry.field === "line_items",
+  );
+  assert.ok(failure);
+  // The whole-list signature reads as one run of folded JSON. Split out, the
+  // missing decimal point is visible at a glance.
+  assert.deepEqual(failure.itemSignatures, [
+    {
+      amount: "9999",
+      description: "aaaaaa",
+      lines: [3, 4],
+      reason: "value_not_in_quote",
+    },
+  ]);
+  // And still nothing the document says.
+  const printed = JSON.stringify(summary);
+  for (const secret of ["BRACKEN", "Chisel", "Mallet", "Screws"]) {
+    assert.equal(printed.includes(secret), false, secret);
+  }
 });
