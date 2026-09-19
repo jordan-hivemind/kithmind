@@ -22,6 +22,7 @@ import { useState } from "react";
 import {
   readAuthorizeRequest,
   submitConsent,
+  submitDenial,
 } from "@/components/authorize-request";
 import {
   type GrantableSpace,
@@ -32,6 +33,7 @@ import {
   authButtonClass,
   AuthCard,
   authInputClass,
+  authSecondaryButtonClass,
   linkClass,
 } from "@/components/ui/controls";
 
@@ -63,13 +65,15 @@ export function KithAuthorizeFlow({
     );
   }
 
-  async function handleAuthorize() {
+  async function decide(deny: boolean) {
     if (!request) return;
     setError("");
     setLoading(true);
     try {
       window.location.assign(
-        await submitConsent(request, { spaceIds, capabilities }),
+        await (deny
+          ? submitDenial(request)
+          : submitConsent(request, { spaceIds, capabilities })),
       );
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Authorization failed");
@@ -205,13 +209,24 @@ export function KithAuthorizeFlow({
           {error}
         </p>
       )}
-      <button
-        onClick={handleAuthorize}
-        disabled={loading || !spaceIds.length || !capabilities.length}
-        className={authButtonClass}
-      >
-        {loading ? "Authorizing..." : "Authorize"}
-      </button>
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={() => decide(true)}
+          disabled={loading}
+          className={authSecondaryButtonClass}
+        >
+          Deny
+        </button>
+        <button
+          type="button"
+          onClick={() => decide(false)}
+          disabled={loading || !spaceIds.length || !capabilities.length}
+          className={authButtonClass}
+        >
+          {loading ? "Authorizing..." : "Authorize"}
+        </button>
+      </div>
     </AuthCard>
   );
 }

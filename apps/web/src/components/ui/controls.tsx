@@ -145,7 +145,11 @@ export function AuthCard({
 export const authInputClass =
   "h-9 w-full rounded-tag border border-gray-300 bg-white px-2 text-sm text-gray-900 outline-none focus:border-accent-600 focus:ring-1 focus:ring-accent-600";
 
-export const authButtonClass = `inline-flex h-9 w-full items-center justify-center rounded-tag border border-accent-600 bg-accent-600 px-3 text-sm font-medium text-white hover:bg-accent-700 disabled:cursor-not-allowed disabled:opacity-50 ${focusRing}`;
+const authButtonBase = `inline-flex h-9 w-full items-center justify-center rounded-tag border px-3 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-50 ${focusRing}`;
+
+export const authButtonClass = `${authButtonBase} ${variants.primary}`;
+
+export const authSecondaryButtonClass = `${authButtonBase} ${variants.secondary}`;
 
 export const linkClass =
   "text-accent-700 underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-accent-600";
