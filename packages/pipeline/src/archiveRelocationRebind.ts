@@ -576,7 +576,7 @@ export type ArchiveRelocationRebindResult<
   relocationId: string;
   previousWatcherId: string;
   currentWatcherId: string;
-  watcherIdentityChanged: true;
+  watcherIdentityChanged: false;
 };
 
 export async function resumeArchiveRelocationRebind<
@@ -648,7 +648,15 @@ export async function resumeArchiveRelocationRebind<
     const finalConfig = await readProtected(args.configPath, MAX_CONFIG_BYTES);
     if (finalConfig.identity.sha256 !== intent.proposedConfigSha256)
       fail("config_conflict");
-    if (journal.watcherId === intent.previousWatcherId) fail("rebind_failed");
+    // ADM-10 inverted this. The watcher id used to be derived from the
+    // configuration fingerprint, so a rebind necessarily minted a new one and
+    // this asserted that it had. It is now derived from the journal salt and
+    // the authority binding (journal.ts `mintWatcherId`), and a relocation
+    // changes neither: the same installation is watching the same account from
+    // a new archive root. The rebind is proved by the config digest above and
+    // by `rebindForArchiveRelocation`; an id that moved here would mean the
+    // journal was replaced under us.
+    if (journal.watcherId !== intent.previousWatcherId) fail("rebind_failed");
   } catch (error) {
     await journal.close();
     throw error;
@@ -659,7 +667,7 @@ export async function resumeArchiveRelocationRebind<
     relocationId: intent.relocationId,
     previousWatcherId: intent.previousWatcherId,
     currentWatcherId: journal.watcherId,
-    watcherIdentityChanged: true,
+    watcherIdentityChanged: false,
   };
 }
 
@@ -719,7 +727,7 @@ export async function recoverArchiveRelocationRebind<
       relocationId: result.relocationId,
       previousWatcherId: result.previousWatcherId,
       currentWatcherId: result.currentWatcherId,
-      watcherIdentityChanged: true,
+      watcherIdentityChanged: false,
     };
   } finally {
     await journal.close();

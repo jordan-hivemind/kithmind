@@ -46,6 +46,7 @@ type Routes = {
   invitationAccept: (r: Request) => Promise<Response>;
   memberPatch: (r: Request, ctx: { params: Promise<{ id: string }> }) => Promise<Response>;
   memberRemove: (r: Request, ctx: { params: Promise<{ id: string }> }) => Promise<Response>;
+  watcherReregister: (r: Request) => Promise<Response>;
 };
 
 describeWithDatabase("the /api/kith/* mutation routes", () => {
@@ -176,6 +177,7 @@ describeWithDatabase("the /api/kith/* mutation routes", () => {
       invitationAccept: (await import("./family/invitations/accept/route")).POST,
       memberPatch: (await import("./family/members/[id]/route")).PATCH,
       memberRemove: (await import("./family/members/[id]/route")).DELETE,
+      watcherReregister: (await import("./watcher/route")).POST,
     };
   }, 60_000);
 
@@ -565,5 +567,94 @@ describeWithDatabase("the /api/kith/* mutation routes", () => {
     );
     expect(leaveDenied.status).toBe(400);
     expect((await bodyOf(leaveDenied)).code).toBe("space_not_found");
+  });
+
+  // ADM-10. Re-registering a watcher clears its binding so the next heartbeat
+  // claims the source. It is the only way out of `identity_review_required`,
+  // and the protocol reserves it to the owner: "Only a current-session owner
+  // operation may replace or clear the binding."
+  test("only an owner may re-register a watcher", async () => {
+    const owner = await signedInUser();
+    const editor = await signedInUser();
+    const reader = await signedInUser();
+    const outsider = await signedInUser();
+    await addMember(owner.spaceId, editor.userId, "editor");
+    await addMember(owner.spaceId, reader.userId, "reader");
+
+    const sourceAccountId = newKithId();
+    await pool.query(
+      `INSERT INTO kith.source_accounts
+         (id, space_id, created_at, connector, account_id, name, enabled,
+          cursor_version, freshness_ms, created_by)
+       VALUES ($1,$2,transaction_timestamp(),'fs',$3,'Provider folder',true,0,60000,$4)`,
+      [sourceAccountId, owner.spaceId, `acct-${sourceAccountId}`, owner.userId],
+    );
+    const watcherId = "3f1e2d3c-4b5a-5968-8776-655443322113";
+    await pool.query(
+      `INSERT INTO kith.worker_watcher_states
+         (id, space_id, source_account_id, watcher_id, state, created_at,
+          created_at_field, updated_at)
+       VALUES ($1,$2,$3,$4,'awaiting_heartbeat',transaction_timestamp(),
+               transaction_timestamp(),transaction_timestamp())`,
+      [newKithId(), owner.spaceId, sourceAccountId, watcherId],
+    );
+
+    const call = (cookie: string | null) =>
+      routes.watcherReregister(
+        jsonRequest(
+          `${ORIGIN}/api/kith/watcher`,
+          "POST",
+          { sourceAccountId, requestId: newKithId() },
+          cookie,
+        ),
+      );
+
+    // An editor holds `write` on the space and is still refused; a reader and
+    // a user with no membership get the identical answer, so neither can map
+    // the other's accounts from the denial.
+    for (const who of [editor, reader, outsider]) {
+      const denied = await call(who.cookie);
+      expect(denied.status).toBe(400);
+      expect((await bodyOf(denied)).error).toBe("Source account not found");
+    }
+    const unauthenticated = await call(null);
+    expect(unauthenticated.status).toBe(401);
+    expect(
+      (
+        await pool.query(
+          "SELECT watcher_id FROM kith.worker_watcher_states WHERE source_account_id = $1",
+          [sourceAccountId],
+        )
+      ).rows[0].watcher_id,
+    ).toBe(watcherId);
+
+    const allowed = await call(owner.cookie);
+    expect(allowed.status).toBe(200);
+    expect(await allowed.json()).toMatchObject({
+      sourceAccountId,
+      clearedWatcherId: watcherId,
+    });
+    expect(
+      (
+        await pool.query(
+          "SELECT count(*)::int AS n FROM kith.worker_watcher_states WHERE source_account_id = $1",
+          [sourceAccountId],
+        )
+      ).rows[0].n,
+    ).toBe(0);
+
+    // Audited: the reset receipt names the owner who did it.
+    const receipt = (
+      await pool.query(
+        `SELECT actor_user_id, expected_watcher_id, next_watcher_id
+           FROM kith.worker_watcher_reset_receipts WHERE source_account_id = $1`,
+        [sourceAccountId],
+      )
+    ).rows[0];
+    expect(receipt).toMatchObject({
+      actor_user_id: owner.userId,
+      expected_watcher_id: watcherId,
+      next_watcher_id: null,
+    });
   });
 });

@@ -10,10 +10,15 @@
 
 import type { admin } from "@repo/kith-store";
 import { type ColumnDef } from "@tanstack/react-table";
-import { useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 
 import { useAdminScreen } from "@/components/admin/admin-query";
-import { DataTable, Detail, Tag } from "@/components/ui/data-table";
+import {
+  DataTable,
+  Detail,
+  type RowAction,
+  Tag,
+} from "@/components/ui/data-table";
 
 type Check = admin.HealthCheck;
 
@@ -77,6 +82,15 @@ export function HealthTable({ initial }: { initial: { checks: Check[] } }) {
                 {row.original.pass.state}
               </Tag>
             )}
+            {/* ADM-10: a heartbeat being refused is not the same failure as
+                one that stopped arriving, and it has a different fix -- "Re-
+                register watcher", in this row's kebab. The code is the
+                tooltip, as the pass pill's is. */}
+            {row.original.watcher?.identity && (
+              <Tag tone="warn" title="identity_review_required">
+                identity
+              </Tag>
+            )}
           </span>
         ),
       },
@@ -103,14 +117,58 @@ export function HealthTable({ initial }: { initial: { checks: Check[] } }) {
     [],
   );
 
+  // ADM-10. Clearing the registration so the next heartbeat claims the source.
+  // Owner-only, enforced by the route's store function and not by hiding the
+  // kebab: an editor who calls it anyway gets the same "not found" a stranger
+  // does. Offered only on a watcher that has actually stopped reporting, so a
+  // healthy registration cannot be cleared by a slip of the mouse.
+  const [failure, setFailure] = useState<string | null>(null);
+  const reregister = useCallback(async (check: Check) => {
+    setFailure(null);
+    for (const sourceAccountId of check.watcher?.stuck ?? []) {
+      const response = await fetch("/api/kith/watcher", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sourceAccountId,
+          requestId: crypto.randomUUID(),
+        }),
+      });
+      if (!response.ok) {
+        setFailure("Could not re-register the watcher");
+        return;
+      }
+    }
+  }, []);
+
+  const actions = useMemo<RowAction<Check>[]>(
+    () => [
+      {
+        label: "Re-register watcher",
+        danger: true,
+        hidden: (row) => (row.watcher?.stuck.length ?? 0) === 0,
+        onSelect: (row) => void reregister(row),
+      },
+    ],
+    [reregister],
+  );
+
   return (
-    <DataTable
-      id="admin-health"
-      data={data.checks}
-      columns={columns}
-      filterColumns={["status"]}
-      searchPlaceholder="Search checks"
-      empty="No checks"
-    />
+    <>
+      <DataTable
+        id="admin-health"
+        data={data.checks}
+        columns={columns}
+        actions={actions}
+        filterColumns={["status"]}
+        searchPlaceholder="Search checks"
+        empty="No checks"
+      />
+      {failure === null ? null : (
+        <p role="alert" className="mt-2 text-xs text-red-700">
+          {failure}
+        </p>
+      )}
+    </>
   );
 }

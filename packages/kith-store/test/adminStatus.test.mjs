@@ -323,3 +323,111 @@ test("an area with configuration and no contents is still empty", () => {
   assert.equal(area({ sources: 1, documents: 4 }), "covered");
   assert.equal(area({ documents: 4, gaps: 1 }), "gaps");
 });
+
+// ADM-10. A refused heartbeat and an absent one are the same silence on this
+// row, and the screen has to tell them apart: one needs the host looked at,
+// the other needs "Re-register watcher" clicked.
+//
+// What separates them is work the refused host still does. A heartbeat carries
+// a `watcherId` and is refused; a processing assessment carries none and
+// lands. So an assessment newer than the heartbeat deadline the watcher missed
+// means a host that is up, reachable and authorized, talking to this server
+// under an identity it does not recognise.
+
+test("a heartbeat that is refused reads differently from one that stopped", () => {
+  // The owner's case: the heartbeat froze seventeen hours ago and the passes
+  // never stopped.
+  const refused = checkById(
+    deriveHealthChecks(
+      facts({
+        watchers: [
+          watcher({
+            lastSeenAt: NOW - 17 * HOUR,
+            nextExpectedAt: NOW - 17 * HOUR + 3 * MINUTE,
+            assessmentAt: NOW - 4 * MINUTE,
+          }),
+        ],
+      }),
+      NOW,
+    ),
+    "documents_watcher",
+  );
+  assert.equal(refused.status, "problem");
+  assert.deepEqual(refused.watcher, { stuck: ["src-1"], identity: true });
+
+  // A host that is simply switched off: nothing has arrived from it at all.
+  const silent = checkById(
+    deriveHealthChecks(
+      facts({
+        watchers: [
+          watcher({
+            lastSeenAt: NOW - 17 * HOUR,
+            nextExpectedAt: NOW - 17 * HOUR + 3 * MINUTE,
+            assessmentAt: NOW - 17 * HOUR,
+          }),
+        ],
+      }),
+      NOW,
+    ),
+    "documents_watcher",
+  );
+  assert.equal(silent.status, "problem");
+  assert.deepEqual(silent.watcher, { stuck: ["src-1"], identity: false });
+
+  // An assessment written in the same pass as the last accepted ping proves
+  // nothing about the window since, so it must not read as a refusal.
+  const borderline = checkById(
+    deriveHealthChecks(
+      facts({
+        watchers: [
+          watcher({
+            lastSeenAt: NOW - 17 * HOUR,
+            nextExpectedAt: NOW - 17 * HOUR + 3 * MINUTE,
+            assessmentAt: NOW - 17 * HOUR + MINUTE,
+          }),
+        ],
+      }),
+      NOW,
+    ),
+    "documents_watcher",
+  );
+  assert.equal(borderline.watcher.identity, false);
+});
+
+test("a healthy watcher offers nothing to re-register", () => {
+  // The kebab is hidden on an empty `stuck`, so a registration that is working
+  // cannot be cleared by a slip of the mouse.
+  const healthy = checkById(
+    deriveHealthChecks(facts({ watchers: [watcher()] }), NOW),
+    "documents_watcher",
+  );
+  assert.equal(healthy.status, "ok");
+  assert.equal(healthy.watcher, undefined);
+
+  // Nor can a disabled source's, which is not supposed to be watched at all.
+  const disabled = checkById(
+    deriveHealthChecks(
+      facts({
+        watchers: [watcher({ enabled: false, nextExpectedAt: NOW - DAY })],
+      }),
+      NOW,
+    ),
+    "documents_watcher",
+  );
+  assert.equal(disabled.watcher, undefined);
+
+  // Two sources, one of them stuck: only the stuck one is offered.
+  const mixed = checkById(
+    deriveHealthChecks(
+      facts({
+        watchers: [
+          watcher(),
+          watcher({ sourceAccountId: "src-2", nextExpectedAt: NOW - MINUTE }),
+        ],
+      }),
+      NOW,
+    ),
+    "documents_watcher",
+  );
+  assert.deepEqual(mixed.watcher.stuck, ["src-2"]);
+});
