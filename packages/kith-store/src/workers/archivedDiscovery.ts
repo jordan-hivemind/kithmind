@@ -604,10 +604,25 @@ async function resolveCurrentArchivedWork(
 ): Promise<CurrentDiscovery> {
   if (!KITH_ID.test(identity.sourceItemId))
     workerProtocolError("invalid_request");
+  // P2-104c: `state <> 'obsolete'`, exactly as `currentDiscoveryWork` in
+  // entries.ts selects the current row. Without it this asks "the work row for
+  // this item at this observation epoch" and gets every row ever written at
+  // that epoch, including superseded ones.
+  //
+  // That is not a rare shape, it is what re-parsing looks like. A parser
+  // change moves `processingIdentityDigest` and not
+  // `inventoryMetadataDigest`, so the processing epoch advances while the
+  // observation epoch deliberately stays put: the bytes did not change. The
+  // re-queue therefore leaves the superseded row and the new `queued` row
+  // sharing this key, two matches are returned, and every archived operation
+  // for that document answers `stale_observation` forever. The document can
+  // never be re-parsed, and no retry or lease expiry clears it, because
+  // nothing here depends on time.
   const matches = (
     await rows<Record<string, unknown>>(
       ctx,
-      `SELECT * FROM kith.worker_discovery_work WHERE source_item_id = $1 AND observation_epoch = $2
+      `SELECT * FROM kith.worker_discovery_work
+        WHERE source_item_id = $1 AND observation_epoch = $2 AND state <> 'obsolete'
         ORDER BY created_at, id LIMIT 2 FOR UPDATE`,
       [identity.sourceItemId, identity.observationEpoch],
     )
