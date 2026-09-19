@@ -41,6 +41,7 @@ import {
   runReconcileReceipts,
 } from "../dist/reconcileReceipts.js";
 import { parseRunnerCheckpoint } from "../dist/runnerState.js";
+import { MAX_WORKER_SCAN_PAGES } from "@repo/worker-protocol/request";
 
 const HASH = "a".repeat(64);
 
@@ -5861,6 +5862,7 @@ async function identityPass({
   // `lookupFailure` stay the single-root spelling every existing case uses.
   roots = [],
   overrides = {},
+  acceptRetirement,
   providers = [
     { rootAlias: "fixture", ids, ...(lookupFailure ? { lookupFailure } : {}) },
   ],
@@ -5883,7 +5885,7 @@ async function identityPass({
       journal,
       identityTransport({ failAt, entries, requests }),
       undefined,
-      {},
+      acceptRetirement === undefined ? {} : { acceptRetirement },
       providers.map((provider) => ({
         rootAlias: provider.rootAlias,
         async lookup(relativePaths) {
@@ -6508,22 +6510,51 @@ test("removing a root turns its items into ordinary gaps, not a failed pass", as
         { rootAlias: "fixture", ids: { "statement.txt": "id:file_a" } },
       ],
     });
+    // Removing a root is a removal the owner has to mean: the breaker holds
+    // the pass until they say so. See the escape-hatch cases below.
+    assert.equal(pass.result.code, "root_selection_would_retire_items");
+    assert.deepEqual(
+      pass.bindings.map((row) => row.relativePath).sort(),
+      ["gone-0.txt", "gone-1.txt", "statement.txt"],
+      "and nothing was forgotten in the meantime",
+    );
+
+    const confirmed = await identityPass({
+      setup,
+      acceptRetirement: "root_selection_would_retire_items",
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "statement.txt",
+          externalId: kept,
+          providerFileId: "id:file_a",
+        },
+        ...dropped.map((externalId, index) => ({
+          rootAlias: "investing",
+          relativePath: `gone-${index}.txt`,
+          externalId,
+          providerFileId: `id:gone_${index}`,
+        })),
+      ],
+      providers: [
+        { rootAlias: "fixture", ids: { "statement.txt": "id:file_a" } },
+      ],
+    });
     assert.equal(
-      pass.mode,
+      confirmed.mode,
       "normal",
       "items that went away with their root are removals, not lost identities",
     );
     assert.equal(
-      pass.entries.length,
+      confirmed.entries.length,
       1,
       "the removed root contributes nothing to the scan",
     );
-    assert.equal(pass.entries[0].uri, "fs://fixture/statement.txt");
-    assert.equal(bindingAt(pass.bindings, "statement.txt").externalId, kept);
+    assert.equal(confirmed.entries[0].uri, "fs://fixture/statement.txt");
     assert.equal(
-      pass.result.code,
+      confirmed.result.code,
       "source_unavailable",
-      "the only failure is the one this transport injects at append",
+      "the only failure left is the one this transport injects at append",
     );
   } finally {
     await rm(setup.base, { recursive: true, force: true });
@@ -6537,9 +6568,10 @@ test("a whole root's worth of vanished items does not exhaust binding capacity",
     const pass = await identityPass({
       setup,
       // 600 files deleted from a root this pass still reads. Summed with the
-      // surviving plan that used to refuse the pass outright. They are under a
-      // watched root, so this is a real removal and the retirement circuit
-      // breaker is not what is being measured here.
+      // surviving plan, that used to refuse the pass outright on capacity.
+      // The collapse breaker would hold it too, so the operator confirms the
+      // deletion; capacity is what is being measured here.
+      acceptRetirement: "root_contents_collapsed",
       bindings: [
         {
           rootAlias: "fixture",
@@ -7062,12 +7094,16 @@ test("a pass that would retire most of the account refuses to scan", async () =>
   }
 });
 
-test("files vanishing from a root this pass still reads are an ordinary removal", async () => {
+// Second review, blocker 1. `watchedLocation` only catches a root leaving the
+// list. A root that is still listed, still resolves and is simply empty --
+// a disk that did not mount, a Dropbox folder mid-sync on a host the watcher
+// has just moved to -- gives `retiring = 0`, and every document under it is
+// retired by an account-wide reconcile. That is the scenario this project is
+// about to run into, so it gets its own refusal.
+test("a root that is still watched but has lost its contents refuses", async () => {
   const setup = await fixture(0);
   await writeFile(join(setup.root, "statement.txt"), "synthetic");
   try {
-    // The same forty gone items, but under a root that is still watched: they
-    // really were deleted, and the breaker must not stand in the way.
     const pass = await identityPass({
       setup,
       bindings: [
@@ -7084,45 +7120,134 @@ test("files vanishing from a root this pass still reads are an ordinary removal"
       ],
       providers: [],
     });
-    assert.equal(
-      pass.result.code,
-      "source_unavailable",
-      "the only failure is the one this transport injects at append",
-    );
-    assert.equal(
-      pass.mode,
-      "normal",
-      "nothing took their place, so this is a plain removal",
-    );
+    assert.equal(pass.result.state, "incomplete");
+    assert.equal(pass.result.code, "root_contents_collapsed");
+    assert.equal(pass.mode, undefined, "the scan never opened");
+    assert.equal(pass.bindings.length, 41, "and nothing was forgotten");
   } finally {
     await rm(setup.base, { recursive: true, force: true });
   }
 });
 
-test("a small source can still have a whole folder removed on purpose", async () => {
+test("a watched root that has gone completely empty refuses", async () => {
   const setup = await fixture(0);
-  await writeFile(join(setup.root, "statement.txt"), "synthetic");
   try {
-    // Nine items under a root that is gone: under the floor of ten, so the
-    // pass proceeds and the server retires them as it always has.
+    // Four remembered items, nothing on disk. This is the half-synced host.
+    const pass = await identityPass({
+      setup,
+      bindings: Array.from({ length: 4 }, (_, index) => ({
+        rootAlias: "fixture",
+        relativePath: `document-${index}.pdf`,
+        externalId: randomUUID(),
+      })),
+      providers: [],
+    });
+    assert.equal(pass.result.code, "root_contents_collapsed");
+    assert.equal(pass.bindings.length, 4);
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a root that loses two of ten proceeds: that is an ordinary edit", async () => {
+  const setup = await fixture(0);
+  for (let index = 0; index < 8; index += 1) {
+    await writeFile(join(setup.root, `kept-${index}.txt`), "synthetic");
+  }
+  try {
     const pass = await identityPass({
       setup,
       bindings: [
-        {
+        ...Array.from({ length: 8 }, (_, index) => ({
           rootAlias: "fixture",
-          relativePath: "statement.txt",
+          relativePath: `kept-${index}.txt`,
           externalId: randomUUID(),
-        },
-        ...Array.from({ length: 9 }, (_, index) => ({
-          rootAlias: "investing",
+        })),
+        ...Array.from({ length: 2 }, (_, index) => ({
+          rootAlias: "fixture",
           relativePath: `gone-${index}.txt`,
           externalId: randomUUID(),
         })),
       ],
       providers: [],
     });
+    assert.equal(
+      pass.result.code,
+      "source_unavailable",
+      "the only failure is the one this transport injects at append",
+    );
+    assert.equal(pass.mode, "normal");
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a brand-new empty root is a folder with nothing in it yet, not a collapse", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  const added = await secondRoot(setup, "investing", {});
+  try {
+    const pass = await identityPass({
+      setup,
+      roots: [added],
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "statement.txt",
+          externalId: randomUUID(),
+        },
+      ],
+      providers: [],
+    });
     assert.equal(pass.result.code, "source_unavailable");
-    assert.notEqual(pass.mode, undefined, "the scan opened");
+    assert.equal(pass.mode, "normal", "there was nothing there to lose");
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// Second review, blocker 2. The floor of ten could never trip for an account
+// of ten items or fewer, which is the owner's account today and exactly when
+// a mistake is least recoverable.
+test("a small source is not exempt: one item of four leaving refuses", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  try {
+    const bindings = [
+      {
+        rootAlias: "fixture",
+        relativePath: "statement.txt",
+        externalId: randomUUID(),
+      },
+      ...Array.from({ length: 3 }, (_, index) => ({
+        rootAlias: "investing",
+        relativePath: `gone-${index}.txt`,
+        externalId: randomUUID(),
+      })),
+    ];
+    const pass = await identityPass({ setup, bindings, providers: [] });
+    assert.equal(pass.result.code, "root_selection_would_retire_items");
+
+    // And the way through, which must name the exact code it is accepting.
+    const wrongCode = await identityPass({
+      setup,
+      bindings,
+      providers: [],
+      acceptRetirement: "root_contents_collapsed",
+    });
+    assert.equal(
+      wrongCode.result.code,
+      "root_selection_would_retire_items",
+      "confirming one kind of removal never confirms the other",
+    );
+    const confirmed = await identityPass({
+      setup,
+      bindings,
+      providers: [],
+      acceptRetirement: "root_selection_would_retire_items",
+    });
+    assert.equal(confirmed.result.code, "source_unavailable");
+    assert.equal(confirmed.mode, "normal", "the scan opened");
   } finally {
     await rm(setup.base, { recursive: true, force: true });
   }
@@ -7168,6 +7293,80 @@ test("a subtree selection that watches nothing it used to also refuses", async (
         "root_selection_would_retire_items",
         "narrowing a root away from where the items are is the same mistake",
       );
+    } finally {
+      await journal.close();
+    }
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// Second review, item 6. The two bounds the round-one work moved that had no
+// test of their own.
+
+test("the checkpoint accepts every page ordinal the protocol allows, and no more", () => {
+  const plan = pdfPlan();
+  const base = {
+    version: 1,
+    phase: "append",
+    mode: "normal",
+    scanId: "scan-1",
+    inventoryEpoch: 1,
+    manifestVersion: 1,
+    missingBindings: [],
+    files: [plan],
+    identities: [],
+    reviewSeen: false,
+  };
+  // 64 was hardcoded here while the protocol allowed 64 pages. Raising the
+  // protocol without this made a scan past 256 files write a checkpoint its
+  // own validator then refused, mid-pass, with nothing to clear it.
+  assert.equal(
+    parseRunnerCheckpoint({ ...base, nextOrdinal: 80 }).nextOrdinal,
+    80,
+    "80 pages is 320 files, which the old bound refused",
+  );
+  assert.equal(
+    parseRunnerCheckpoint({ ...base, nextOrdinal: MAX_WORKER_SCAN_PAGES })
+      .nextOrdinal,
+    MAX_WORKER_SCAN_PAGES,
+  );
+  assert.throws(() =>
+    parseRunnerCheckpoint({ ...base, nextOrdinal: MAX_WORKER_SCAN_PAGES + 1 }),
+  );
+});
+
+test("the seal check re-enumerates from the same roots the scan was planned from", async () => {
+  const setup = await fixture(0);
+  await mkdir(join(setup.root, "investing"), { mode: 0o700 });
+  await writeFile(join(setup.root, "investing", "kept.txt"), "synthetic");
+  await writeFile(join(setup.root, "outside.txt"), "synthetic");
+  try {
+    const row = folderRow({ rootAlias: "fixture", relativePath: "investing" });
+    const journal = await openJournal(setup.journalDir, terminalCheckpoint([]));
+    try {
+      let rootsCalls = 0;
+      const runner = new PipelineRunner(setup.config, journal, {
+        async call(request) {
+          if (request.operation === "source.roots") {
+            rootsCalls += 1;
+            return {
+              operation: "source.roots",
+              sourceAccountId: "source",
+              roots: [row],
+            };
+          }
+          throw new Error(`unexpected operation ${request.operation}`);
+        },
+      });
+      const first = await runner.currentRoots();
+      assert.deepEqual(first[0].includePrefixes, ["investing"]);
+      // The seal check calls this again. Given the allow-list instead of the
+      // selection it would find `outside.txt`, disagree with the sealed
+      // manifest, and end the scan `unstable` -- on every pass, forever.
+      const second = await runner.currentRoots();
+      assert.equal(second, first, "resolved once, reused");
+      assert.equal(rootsCalls, 1, "and the server is asked once per pass");
     } finally {
       await journal.close();
     }

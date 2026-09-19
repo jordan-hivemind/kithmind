@@ -440,14 +440,77 @@ function watchedLocation(roots: SafeRoot[], binding: IdentityBinding): boolean {
 }
 
 /**
- * ADM-4c review. How many remembered items may leave the watched set in one
- * pass before the pass refuses instead: ten, or a quarter of what the journal
- * remembers, whichever is larger. Ten so a small source can still have a
- * folder removed on purpose; a quarter so a large one cannot lose a
- * meaningful share of itself to one bad answer.
+ * ADM-4c review. The share of what the journal remembers that may leave the
+ * watched set in one pass before the pass refuses instead: a quarter, and at
+ * least one.
+ *
+ * The first cut of this had a floor of ten, which could never trip for an
+ * account of ten items or fewer -- which is the owner's account today, and
+ * exactly when a mistake is least recoverable because there is nothing else
+ * left to notice it by.
  */
 function retirementCircuitBreaker(remembered: number): number {
-  return Math.max(10, Math.ceil(remembered * 0.25));
+  return Math.max(1, Math.ceil(remembered * 0.25));
+}
+
+/**
+ * ADM-4c review. A watched root whose contents collapsed, rather than whose
+ * location changed.
+ *
+ * `watchedLocation` catches a root leaving the list. It cannot catch a root
+ * that is still listed, still resolves, and is simply *empty* -- a disk that
+ * did not mount, a Dropbox folder mid-sync on a host the watcher just moved
+ * to, a folder the owner renamed on the provider side. Discovery reports no
+ * files, the scan opens with none, and `reconcileWorkerScan` retires every
+ * document under it.
+ *
+ * Two shapes, per root, against what the journal remembers for that root:
+ * it held items and now holds no files at all, or more than half of its
+ * remembered items are gone and at least three of them. Three so a folder of
+ * four losing two is an ordinary edit rather than a standing refusal; a half
+ * so a large folder cannot quietly lose most of itself.
+ *
+ * A root with nothing remembered cannot collapse: a brand-new empty folder is
+ * a folder with nothing in it yet. Nor can a root the pass no longer watches,
+ * which `watchedLocation` and the retirement breaker above already answer for.
+ */
+function collapsedRoots(
+  roots: SafeRoot[],
+  prior: IdentityBinding[],
+  plans: FilePlan[],
+  matched: Map<FilePlan, IdentityBinding>,
+): string[] {
+  // Only roots this pass actually looks at. A root that left the list, or an
+  // item narrowed out of one, is the other breaker's business, and counting
+  // it here would refuse a removal the operator has already confirmed.
+  const remembered = new Map<string, number>();
+  for (const binding of prior) {
+    if (!watchedLocation(roots, binding)) continue;
+    remembered.set(
+      binding.rootAlias,
+      (remembered.get(binding.rootAlias) ?? 0) + 1,
+    );
+  }
+  const seen = new Map<string, number>();
+  const kept = new Map<string, number>();
+  for (const plan of plans) {
+    seen.set(plan.rootAlias, (seen.get(plan.rootAlias) ?? 0) + 1);
+    if (matched.has(plan)) {
+      kept.set(plan.rootAlias, (kept.get(plan.rootAlias) ?? 0) + 1);
+    }
+  }
+  const collapsed: string[] = [];
+  for (const [rootAlias, held] of remembered) {
+    if (held < 1) continue;
+    const found = seen.get(rootAlias) ?? 0;
+    if (found === 0) {
+      collapsed.push(rootAlias);
+      continue;
+    }
+    const lost = held - (kept.get(rootAlias) ?? 0);
+    if (lost >= 3 && lost * 2 > held) collapsed.push(rootAlias);
+  }
+  return collapsed.sort();
 }
 
 /** ADM-4c. What one pass will tell the server about one of its roots. */
@@ -1310,6 +1373,8 @@ export class PipelineRunner {
   private preparedPdfProfile: PreparedPdfDocQaProfile | undefined;
   /** ADM-4c review: resolved once per pass; see `currentRoots`. */
   private effectiveRoots: SafeRoot[] | undefined;
+  /** ADM-4c review: opened once per pass; see `scanCache`. */
+  private openScanCache: JournalScanCache | undefined;
   private pendingRootReports: SourceRootReport[] = [];
   private archiveCatalog: ArchiveCatalog | undefined;
   /** P2-31f: receipts `--operator-clear` has retired in this pass. */
@@ -1325,6 +1390,11 @@ export class PipelineRunner {
       retryParked?: boolean;
       operatorClear?: boolean;
       maxClears?: number;
+      /**
+       * ADM-4c review. The one retirement code this pass is allowed to go
+       * through with, named exactly. See `refuseRetirement`.
+       */
+      acceptRetirement?: string;
     } = {},
     /**
      * ADM-4a, a list since ADM-4c. The provider identity sources, when the
@@ -2100,7 +2170,17 @@ export class PipelineRunner {
    */
   private async currentRoots(): Promise<SafeRoot[]> {
     if (this.effectiveRoots) return this.effectiveRoots;
-    const allowed = await canonicalRoots(this.config);
+    // ADM-4c review: the provider original config already says which roots a
+    // provider backs, and that is the only place an entry with no blocks is
+    // read as "not downloaded yet" rather than as a compressed file.
+    const backed = new Set(
+      providerRootsOf(this.config.pdfDocQa?.providerOriginal).map(
+        (root) => root.rootAlias,
+      ),
+    );
+    const allowed = (await canonicalRoots(this.config)).map((root) =>
+      backed.has(root.alias) ? { ...root, providerBacked: true } : root,
+    );
     const rows = await this.serverRoots();
     const plan =
       rows === undefined
@@ -2180,6 +2260,26 @@ export class PipelineRunner {
     }
   }
 
+  /**
+   * ADM-4c review. The scan cache, opened once per pass and shared by every
+   * phase that enumerates.
+   *
+   * The seal check used to re-discover without it, which meant every byte was
+   * still read and hashed once per pass -- the cost the cache exists to
+   * remove -- and, worse, that a cache entry discovery trusted and the seal
+   * check did not would make the two disagree and end the scan `unstable` on
+   * every pass until the daily rehash cleared it. One cache, one answer.
+   */
+  private async scanCache(): Promise<JournalScanCache | undefined> {
+    if (this.openScanCache === undefined) {
+      this.openScanCache = await JournalScanCache.open({
+        journalDir: this.config.journalDir,
+        authority: `${this.config.spaceId}\0${this.config.sourceAccountId}`,
+      }).catch(() => undefined);
+    }
+    return this.openScanCache;
+  }
+
   private async discoverPlans(roots: SafeRoot[]): Promise<FilePlan[]> {
     if (this.config.pdfDocQa === undefined) {
       return (await discoverFiles(this.config, roots)).map(filePlan);
@@ -2187,12 +2287,7 @@ export class PipelineRunner {
     if (this.preparedPdfProfile === undefined) {
       throw new PipelineWorkerError("parser_profile_unverified");
     }
-    // ADM-4c review: the scan cache spares an unchanged file its read and its
-    // hash. It is advisory only; see `scanCache.ts`.
-    const cache = await JournalScanCache.open({
-      journalDir: this.config.journalDir,
-      authority: `${this.config.spaceId}\0${this.config.sourceAccountId}`,
-    }).catch(() => undefined);
+    const cache = await this.scanCache();
     try {
       return (await discoverSourceObservations(this.config, roots, cache)).map(
         (observation) => observationPlan(observation, this.config.pdfDocQa!),
@@ -2212,7 +2307,11 @@ export class PipelineRunner {
     if (this.preparedPdfProfile === undefined) {
       throw new PipelineWorkerError("parser_profile_unverified");
     }
-    const observations = await discoverSourceObservations(this.config, roots);
+    const observations = await discoverSourceObservations(
+      this.config,
+      roots,
+      await this.scanCache(),
+    );
     return (
       observations.length === plans.length &&
       observations.every((observation, index) => {
@@ -2896,6 +2995,60 @@ export class PipelineRunner {
     return matched;
   }
 
+  /**
+   * ADM-4c review. Ends the pass rather than opening a scan that would retire
+   * documents, and leaves the owner a way forward.
+   *
+   * Nothing is written but the terminal checkpoint: every binding the journal
+   * held is kept, so the next pass sees exactly what this one did. The code
+   * travels out in `PipelineRunResult`, which is what the health check reads,
+   * so a refusal is visible on the health page rather than only in a log.
+   *
+   * `--accept-retirement <code>` is the way through. It is per pass, it must
+   * name the exact code being accepted, and it is recorded here with the
+   * counts it is overriding, because "the owner confirmed this deletion" is a
+   * thing a later reader has to be able to check.
+   */
+  private async refuseRetirement(input: {
+    code: "root_selection_would_retire_items" | "root_contents_collapsed";
+    detail: string;
+    prior: IdentityBinding[];
+    roots?: string[];
+  }): Promise<FilePlan[] | undefined> {
+    if (this.options.acceptRetirement === input.code) {
+      console.warn(
+        `[pipeline] operator accepted ${input.code} for this pass: ${input.detail}`,
+      );
+      return undefined;
+    }
+    console.warn(
+      `[pipeline] ${input.detail}; refusing the scan rather than retiring them. Re-run with --accept-retirement ${input.code} to confirm this is a real removal.`,
+    );
+    // The sources screen should name the folder, not just the pass.
+    if (input.roots?.length) {
+      const reports = this.pendingRootReports.filter(
+        (report) =>
+          report.rootAlias !== undefined &&
+          input.roots!.includes(report.rootAlias),
+      );
+      if (reports.length > 0) await this.reportRoots(reports, []);
+    }
+    await this.journal.transitionCheckpoint({
+      checkpoint: {
+        version: 1,
+        phase: "terminal",
+        outcome: "incomplete",
+        credentialSessionActive: false,
+        code: input.code,
+        scanned: 0,
+        published: 0,
+        bindings: input.prior,
+      },
+      credentialSessionActive: false,
+    });
+    return [];
+  }
+
   private async startCycle(
     roots: SafeRoot[],
     status: Record<string, unknown>,
@@ -2942,36 +3095,36 @@ export class PipelineRunner {
         "identity binding capacity exceeded",
       );
     }
+    // ADM-4c review. `reconcileWorkerScan` marks every item not in the scan
+    // unavailable, and it runs over the whole account. So a scan that is
+    // missing a root, or missing a root's contents, is indistinguishable to
+    // the server from every file under it being deleted at once. Neither a
+    // config edit, nor a server answer, nor a half-synced disk may be able to
+    // say that by accident.
+    //
+    // Two refusals, because they are two different mistakes. The first is
+    // about where the watcher was told to look; the second is about what it
+    // found when it looked there.
     const retiring = missingBindings.filter(
       (binding) => !watchedLocation(roots, binding),
     ).length;
-    if (retiring > retirementCircuitBreaker(prior.length)) {
-      // ADM-4c review. `reconcileWorkerScan` marks every item not in the scan
-      // unavailable, and it runs over the whole account. So a root that is
-      // simply not in this pass's list is indistinguishable, to the server,
-      // from every file under it being deleted at once. A server answer or a
-      // config edit must never be able to say that by accident.
-      //
-      // Only items whose *location* stopped being watched count here. Files
-      // that vanished from a location this pass still reads are an ordinary
-      // removal and go through as they always have, however many there are.
-      console.warn(
-        `[pipeline] ${retiring} of ${prior.length} remembered items are no longer under any watched root; refusing the scan rather than retiring them`,
-      );
-      await this.journal.transitionCheckpoint({
-        checkpoint: {
-          version: 1,
-          phase: "terminal",
-          outcome: "incomplete",
-          credentialSessionActive: false,
-          code: "root_selection_would_retire_items",
-          scanned: 0,
-          published: 0,
-          bindings: prior,
-        },
-        credentialSessionActive: false,
+    if (retiring >= retirementCircuitBreaker(prior.length)) {
+      const refused = await this.refuseRetirement({
+        code: "root_selection_would_retire_items",
+        detail: `${retiring} of ${prior.length} remembered items are no longer under any watched root`,
+        prior,
       });
-      return [];
+      if (refused) return refused;
+    }
+    const collapsed = collapsedRoots(roots, prior, plans, matched);
+    if (collapsed.length > 0) {
+      const refused = await this.refuseRetirement({
+        code: "root_contents_collapsed",
+        detail: `watched ${collapsed.length === 1 ? "root" : "roots"} ${collapsed.join(", ")} held documents but this pass found few or none of them`,
+        prior,
+        roots: collapsed,
+      });
+      if (refused) return refused;
     }
     await this.journal.transitionCheckpoint({
       checkpoint: {

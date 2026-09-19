@@ -33,7 +33,7 @@ import type { RunnerCheckpoint } from "./runnerState.js";
 
 function usage(): never {
   throw new Error(
-    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked [--operator-clear --max-clears <n>]], or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
+    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked [--operator-clear --max-clears <n>]] and [--accept-retirement <root_selection_would_retire_items|root_contents_collapsed>], or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
   );
 }
 export function argumentsFor(argv: string[]):
@@ -43,6 +43,7 @@ export function argumentsFor(argv: string[]):
       retryParked: boolean;
       operatorClear: boolean;
       maxClears?: number;
+      acceptRetirement?: string;
     }
   | { command: "watch"; configPath: string }
   | { command: "doctor"; configPath: string; json: boolean }
@@ -112,6 +113,7 @@ export function argumentsFor(argv: string[]):
   // it comes out before the remainder is checked against the bare-flag list.
   const extra: string[] = [];
   let maxClearsText: string | undefined;
+  let acceptRetirement: string | undefined;
   for (let index = 0; index < rest.length; index += 1) {
     if (command === "run" && rest[index] === "--max-clears") {
       if (maxClearsText !== undefined) usage();
@@ -119,8 +121,23 @@ export function argumentsFor(argv: string[]):
       index += 1;
       continue;
     }
+    // ADM-4c review: the way through a refused pass. It names the exact code
+    // it is accepting, so confirming one kind of removal cannot silently
+    // confirm the other, and it lasts one pass.
+    if (command === "run" && rest[index] === "--accept-retirement") {
+      if (acceptRetirement !== undefined) usage();
+      acceptRetirement = rest[index + 1];
+      index += 1;
+      continue;
+    }
     extra.push(rest[index]!);
   }
+  if (
+    acceptRetirement !== undefined &&
+    acceptRetirement !== "root_selection_would_retire_items" &&
+    acceptRetirement !== "root_contents_collapsed"
+  )
+    usage();
   const allowed =
     command === "doctor"
       ? ["--json"]
@@ -152,7 +169,7 @@ export function argumentsFor(argv: string[]):
   if (command === "doctor")
     return { command, configPath, json: extra.includes("--json") };
   if (command !== "run") {
-    if (maxClearsText !== undefined) usage();
+    if (maxClearsText !== undefined || acceptRetirement !== undefined) usage();
     return { command, configPath };
   }
   const retryParked = extra.includes("--retry-parked");
@@ -166,8 +183,9 @@ export function argumentsFor(argv: string[]):
   // re-admitted there, so the operator states how many clears they meant,
   // from the dry run's count. No flag, no relaxed rules.
   if (operatorClear !== (maxClearsText !== undefined)) usage();
+  const accepted = acceptRetirement === undefined ? {} : { acceptRetirement };
   if (maxClearsText === undefined)
-    return { command, configPath, retryParked, operatorClear };
+    return { command, configPath, retryParked, operatorClear, ...accepted };
   if (!/^[1-9][0-9]{0,3}$/.test(maxClearsText)) usage();
   return {
     command,
@@ -175,6 +193,7 @@ export function argumentsFor(argv: string[]):
     retryParked,
     operatorClear,
     maxClears: Number(maxClearsText),
+    ...accepted,
   };
 }
 
@@ -218,6 +237,7 @@ async function executeConfig(
     retryParked?: boolean;
     operatorClear?: boolean;
     maxClears?: number;
+    acceptRetirement?: string;
   } = {},
 ): Promise<PipelineRunResult> {
   const ownedJournal =
@@ -249,6 +269,7 @@ async function execute(
     retryParked?: boolean;
     operatorClear?: boolean;
     maxClears?: number;
+    acceptRetirement?: string;
   } = {},
 ): Promise<PipelineRunResult> {
   const config = await loadPipelineConfig(configPath);
@@ -464,6 +485,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       ...(parsed.maxClears === undefined
         ? {}
         : { maxClears: parsed.maxClears }),
+      ...(parsed.acceptRetirement === undefined
+        ? {}
+        : { acceptRetirement: parsed.acceptRetirement }),
     });
     process.stdout.write(`${JSON.stringify(result)}\n`);
     if (result.state !== "complete") process.exitCode = 1;

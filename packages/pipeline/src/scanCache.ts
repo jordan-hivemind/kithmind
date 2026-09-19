@@ -24,6 +24,8 @@ import { constants } from "node:fs";
 import { open, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 
+import { BINARY_CLASSES, type BinaryMediaType } from "@repo/worker-protocol";
+
 import {
   SCAN_CACHE_REHASH_MS,
   type ScanCache,
@@ -35,6 +37,11 @@ const CACHE_FILE = "scan-cache.json";
 const MAX_CACHE_BYTES = 8 * 1024 * 1024;
 const MAX_ENTRIES = 8_192;
 const HEX_64 = /^[a-f0-9]{64}$/;
+const BINARY_MEDIA_TYPES = new Set<string>(
+  Object.values(BINARY_CLASSES).map((value) => value.mediaType),
+);
+const isBinaryMediaType = (value: string): value is BinaryMediaType =>
+  BINARY_MEDIA_TYPES.has(value);
 
 const keyOf = (key: ScanCacheKey) =>
   `${key.device}:${key.inode}:${key.size}:${Math.trunc(key.mtimeMs)}`;
@@ -49,39 +56,47 @@ function validValue(raw: unknown): ScanCacheValue | undefined {
       ? ({ kind: "gap", code: row.code } as ScanCacheValue)
       : undefined;
   }
+  // ADM-4c review: this file is on disk and supplies content hashes, so every
+  // field is checked, not merely present. A row that is not exactly right is
+  // dropped and its file re-read.
   if (
+    row.kind !== "binary" ||
     typeof row.sha256 !== "string" ||
     !HEX_64.test(row.sha256) ||
     !Number.isSafeInteger(row.byteLength) ||
-    (row.byteLength as number) < 0
+    (row.byteLength as number) < 1 ||
+    row.linkCount !== 1 ||
+    typeof row.mediaType !== "string" ||
+    !isBinaryMediaType(row.mediaType)
   ) {
     return undefined;
   }
-  if (row.kind === "utf8") {
-    return typeof row.text === "string"
-      ? ({
-          kind: "utf8",
-          sha256: row.sha256,
-          byteLength: row.byteLength as number,
-          text: row.text,
-        } as ScanCacheValue)
-      : undefined;
-  }
-  if (row.kind === "binary" && typeof row.mediaType === "string") {
+  if (row.permissionsRestricted !== undefined) {
+    if (
+      row.permissionsRestricted !== true ||
+      !Number.isSafeInteger(row.encryptionRevision) ||
+      (row.encryptionRevision as number) < 2 ||
+      (row.encryptionRevision as number) > 6
+    ) {
+      return undefined;
+    }
     return {
       kind: "binary",
       sha256: row.sha256,
       byteLength: row.byteLength as number,
+      linkCount: 1,
       mediaType: row.mediaType,
-      ...(row.permissionsRestricted === true
-        ? {
-            permissionsRestricted: true,
-            encryptionRevision: row.encryptionRevision,
-          }
-        : {}),
-    } as ScanCacheValue;
+      permissionsRestricted: true,
+      encryptionRevision: row.encryptionRevision as number,
+    };
   }
-  return undefined;
+  return {
+    kind: "binary",
+    sha256: row.sha256,
+    byteLength: row.byteLength as number,
+    linkCount: 1,
+    mediaType: row.mediaType,
+  };
 }
 
 /**

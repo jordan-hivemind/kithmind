@@ -52,25 +52,31 @@ export function enumerationDeadlineMs(maxFiles: number): number {
  * moved, costs one stale pass a day rather than forever.
  */
 export const SCAN_CACHE_REHASH_MS = 24 * 60 * 60 * 1000;
+/** Below this a file is read rather than judged a placeholder; see below. */
+export const PLACEHOLDER_MIN_BYTES = 4 * 1024;
 export type ScanCacheKey = {
   device: number;
   inode: number;
   size: number;
   mtimeMs: number;
 };
-/** The classification a cache hit stands in for. */
+/**
+ * The classification a cache hit stands in for.
+ *
+ * ADM-4c review: deliberately no file text. The first cut cached the decoded
+ * UTF-8 of every text file, so a sidecar next to a journal that holds only
+ * hashes and paths held document contents at rest for a day, and a large
+ * enough pass silently stopped persisting anything at all. A text file is
+ * bounded by `maxFileBytes` and costs nothing to read again; the bytes worth
+ * not reading are the binary ones, which are bounded by 16 MiB each.
+ */
 export type ScanCacheValue =
   | { kind: "gap"; code: DiscoveryGap["code"] }
-  | {
-      kind: "utf8";
-      sha256: string;
-      byteLength: number;
-      text: string;
-    }
   | {
       kind: "binary";
       sha256: string;
       byteLength: number;
+      linkCount: number;
       mediaType: BinaryMediaType;
       permissionsRestricted?: boolean;
       encryptionRevision?: number;
@@ -94,6 +100,14 @@ export type SafeRoot = RootConfig & {
   canonicalPath: string;
   device: number;
   inode: number;
+  /**
+   * ADM-4c review. Whether this root is a provider-synced directory, which is
+   * the only place an entry with no blocks is read as "not downloaded yet"
+   * rather than as a compressed or sparse file. Set from the provider
+   * original configuration, which is where the operator already says which
+   * roots the provider backs.
+   */
+  providerBacked?: boolean;
   /**
    * ADM-4c. Subtrees of this root the pass may read, as normalized paths
    * relative to the root. Absent means the whole root, which is what every
@@ -417,15 +431,21 @@ function leafGap(
  * originals means downloading the folder on every pass, or hanging when the
  * provider is unreachable.
  *
- * `st_blocks === 0` with a nonzero length is what macOS reports for a dataless
- * file and what every network and sparse-placeholder filesystem reports too.
- * Node does not expose `st_flags`, so `SF_DATALESS` cannot be read directly;
- * this is the same observation by its effect, and it needs no native code.
+ * `st_blocks === 0` with a length is what macOS reports for a dataless file
+ * and what every network and sparse-placeholder filesystem reports too. Node
+ * does not expose `st_flags`, so `SF_DATALESS` cannot be read directly; this
+ * is the same observation by its effect, and it needs no native code.
+ *
+ * ADM-4c review: it also matches a transparently compressed file and a fully
+ * sparse one, neither of which is a placeholder. Two things narrow it. It is
+ * only consulted under a root the operator has declared provider-backed, and
+ * only past `PLACEHOLDER_MIN_BYTES`, because a file small enough to be a
+ * compressed stub is small enough to just read.
  */
 export function isProviderPlaceholder(
   entry: Pick<Stats, "size" | "blocks">,
 ): boolean {
-  return entry.size > 0 && entry.blocks === 0;
+  return entry.size > PLACEHOLDER_MIN_BYTES && entry.blocks === 0;
 }
 
 async function readFileBytes(
@@ -521,7 +541,11 @@ async function readFileBytes(
     // ADM-4c review. Before any byte is read: a placeholder is reported, not
     // fetched, and a cache hit answers without a read at all. Everything that
     // proves the file did not move or change underneath still runs below.
-    if (sourceMaxTextBytes !== undefined && isProviderPlaceholder(before)) {
+    if (
+      sourceMaxTextBytes !== undefined &&
+      root.providerBacked === true &&
+      isProviderPlaceholder(before)
+    ) {
       return leafGap(root, relativePath, before, "not_downloaded");
     }
     if (sourceMaxTextBytes !== undefined && cache) {
@@ -541,12 +565,16 @@ async function readFileBytes(
           "enumeration_interrupted",
           "file stat timed out",
         );
+        // ADM-4c review: the binary lane refuses a file with more than one
+        // hard link, and skipping the read must not skip that. `nlink` is on
+        // the stat this hit was matched against, so it costs nothing.
         if (
           after.dev === before.dev &&
           after.ino === before.ino &&
           after.size === before.size &&
           after.mtimeMs === before.mtimeMs &&
-          after.ctimeMs === before.ctimeMs
+          after.ctimeMs === before.ctimeMs &&
+          (hit.kind !== "binary" || (after.nlink === 1 && hit.linkCount === 1))
         ) {
           const sourceModifiedAt = Math.trunc(before.mtimeMs);
           if (Number.isSafeInteger(sourceModifiedAt) && sourceModifiedAt >= 0) {
@@ -1416,38 +1444,28 @@ function cachedObservation(file: SafeCachedFile): SourceObservation {
   if (cached.kind === "gap") {
     return { kind: "gap", gap: gapAt(descriptor, cached.code) };
   }
-  if (cached.kind === "utf8") {
-    return {
-      kind: "utf8",
-      file: {
-        ...descriptor,
-        sha256: cached.sha256,
-        byteLength: cached.byteLength,
-        text: cached.text,
-      },
-    };
-  }
-  const { kind: _binary, ...rest } = cached;
+  const { kind: _binary, linkCount: _linkCount, ...rest } = cached;
   return { kind: "pdf", file: { ...descriptor, ...rest } };
 }
 
-/** The classification of one observation, as the cache remembers it. */
-function cacheValue(observation: SourceObservation): ScanCacheValue {
+/**
+ * The classification of one observation, as the cache remembers it, or
+ * `undefined` for one it deliberately does not: retained text, which is
+ * cheap to read and must not sit in a sidecar.
+ */
+function cacheValue(
+  observation: SourceObservation,
+  linkCount: number,
+): ScanCacheValue | undefined {
   if (observation.kind === "gap")
     return { kind: "gap", code: observation.gap.code };
-  if (observation.kind === "utf8") {
-    return {
-      kind: "utf8",
-      sha256: observation.file.sha256,
-      byteLength: observation.file.byteLength,
-      text: observation.file.text,
-    };
-  }
+  if (observation.kind === "utf8") return undefined;
   const file = observation.file;
   return {
     kind: "binary",
     sha256: file.sha256,
     byteLength: file.byteLength,
+    linkCount,
     mediaType: file.mediaType,
     ...(file.permissionsRestricted === undefined
       ? {}
@@ -1477,7 +1495,8 @@ async function readSourceObservation(
   if (result.kind === "cached") return cachedObservation(result);
   const file = result;
   const remember = (observation: SourceObservation): SourceObservation => {
-    cache?.set(file.cacheKey, cacheValue(observation), Date.now());
+    const value = cacheValue(observation, file.linkCount);
+    if (value) cache?.set(file.cacheKey, value, Date.now());
     return observation;
   };
   if (file.bytes.subarray(0, 5).equals(Buffer.from("%PDF-"))) {

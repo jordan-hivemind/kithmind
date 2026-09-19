@@ -12,7 +12,6 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Stats } from "node:fs";
 import { promisify } from "node:util";
 import test from "node:test";
 
@@ -26,6 +25,7 @@ import {
   FilesystemFailure,
   isProviderPlaceholder,
   MAX_DISCOVERED_PDF_BYTES,
+  PLACEHOLDER_MIN_BYTES,
   readPdfFile,
   readUtf8File,
   SCAN_CACHE_REHASH_MS,
@@ -894,22 +894,28 @@ test("an unchanged file is classified from the cache without reading its bytes",
   const cache = countingCache();
   const first = await discoverSourceObservations(localConfig, roots, cache);
   assert.equal(cache.hits, 0);
-  assert.equal(cache.writes, 2);
+  assert.equal(
+    cache.writes,
+    1,
+    "the PDF only; retained text is never cached, so a sidecar beside the journal never holds document contents at rest",
+  );
   const second = await discoverSourceObservations(localConfig, roots, cache);
-  assert.equal(cache.hits, 2, "both files answered from the cache");
+  assert.equal(cache.hits, 1, "the PDF answered from the cache");
   assert.deepEqual(second, first, "and answered identically");
 
   // A changed file is not a hit: the size and mtime move with the bytes.
-  await writeFile(join(root, "notes.txt"), "synthetic and then some", {
-    mode: 0o600,
-  });
+  await writeFile(
+    join(root, "document.pdf"),
+    Buffer.from("%PDF-1.7\nlonger\n%%EOF\n"),
+    { mode: 0o600 },
+  );
   cache.hits = 0;
   const third = await discoverSourceObservations(localConfig, roots, cache);
-  assert.equal(cache.hits, 1, "only the file that did not change");
-  const changed = third.find((o) => o.file?.relativePath === "notes.txt");
+  assert.equal(cache.hits, 0, "the file that changed is read again");
+  const changed = third.find((o) => o.file?.relativePath === "document.pdf");
   assert.notEqual(
     changed.file.sha256,
-    first.find((o) => o.file?.relativePath === "notes.txt").file.sha256,
+    first.find((o) => o.file?.relativePath === "document.pdf").file.sha256,
   );
 
   // And the daily safety net: an entry older than the rehash window is ignored.
@@ -957,37 +963,55 @@ test("a cache entry never contradicts what a read would have said", async () => 
   );
 });
 
-test("a provider placeholder is a named gap, not a download", async () => {
+// Second review, item 7. `blocks === 0` with a length also matches a
+// transparently compressed file and a fully sparse one, neither of which is a
+// placeholder. Two things narrow it: the root must be one the operator
+// declared provider-backed, and the file must be big enough that reading it
+// would actually cost something.
+test("the placeholder rule is scoped to provider-backed roots and real files", async () => {
   const { root, journal } = await setup();
   const localConfig = config(root, journal);
   await writeFile(
-    join(root, "online-only.pdf"),
+    join(root, "ordinary.pdf"),
     Buffer.from("%PDF-1.7\nx\n%%EOF\n"),
     { mode: 0o600 },
   );
   const roots = await canonicalRoots(localConfig);
-  // Dataless files cannot be staged in a temp directory, so the observation
-  // they produce is injected: `st_blocks === 0` with a nonzero length.
-  const realStat = Stats.prototype.isFile;
-  const observations = await discoverSourceObservations(localConfig, roots, {
-    get: () => undefined,
-    set: () => {},
-  });
+  const observations = await discoverSourceObservations(localConfig, roots);
   assert.equal(
     observations[0].kind,
     "pdf",
     "an ordinary file is read as usual",
   );
-  assert.equal(typeof realStat, "function");
+
+  // A dataless file cannot be staged in a temp directory, so the rule itself
+  // is exercised directly.
   assert.equal(isProviderPlaceholder({ size: 1_048_576, blocks: 0 }), true);
-  assert.equal(isProviderPlaceholder({ size: 1_048_576, blocks: 2048 }), false);
+  assert.equal(
+    isProviderPlaceholder({ size: 1_048_576, blocks: 2_048 }),
+    false,
+  );
   assert.equal(
     isProviderPlaceholder({ size: 0, blocks: 0 }),
     false,
     "an empty file is `empty`, not `not_downloaded`",
   );
+  assert.equal(
+    isProviderPlaceholder({ size: PLACEHOLDER_MIN_BYTES, blocks: 0 }),
+    false,
+    "and a file small enough to be a compressed stub is simply read",
+  );
+  assert.equal(
+    isProviderPlaceholder({ size: PLACEHOLDER_MIN_BYTES + 1, blocks: 0 }),
+    true,
+  );
+  // The scope: only a root the provider config names is read this way. Every
+  // root in this suite is a plain directory, so none of them is.
+  assert.equal(
+    roots.every((candidate) => candidate.providerBacked === undefined),
+    true,
+  );
 });
-
 test("the enumeration deadline scales with the configured file ceiling", () => {
   assert.equal(enumerationDeadlineMs(1), 30_000, "never below the old floor");
   assert.equal(enumerationDeadlineMs(256), 30_720);
