@@ -65,6 +65,7 @@ const GRANTED = Object.freeze({
     "corrections",
   ],
   extraction: ["document_extractions"],
+  attention: ["attention_mutes"],
 });
 
 /**

@@ -33,7 +33,7 @@ import {
   type SortingState,
   useReactTable,
 } from "@tanstack/react-table";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { buttonClass } from "@/components/ui/drawer";
 import {
@@ -43,9 +43,15 @@ import {
 } from "@/lib/kith/table-filters";
 import {
   applyNowrapSizing,
+  applyRangeSelection,
   hasActiveSelection,
   isInteractiveTarget,
+  pruneSelection,
   resolveRowClickIntent,
+  selectionHeaderState,
+  shouldToggleSelectionOnKey,
+  toggleSelectAll,
+  toggleSelection,
 } from "@/lib/kith/table-interactions";
 
 declare module "@tanstack/react-table" {
@@ -133,6 +139,30 @@ export type DataTableProps<T> = {
    * `resolveRowClickIntent`.
    */
   onRowClick?: (row: T) => void;
+  /**
+   * Turns on a leading checkbox column: a fixed-width, non-resizable,
+   * non-sortable column the way the trailing kebab column already is (both
+   * sit outside TanStack's own column model, sized and rendered by this
+   * component directly, for the same reason -- neither is a value of the
+   * row's, so neither should be sortable, filterable or resizable like one).
+   *
+   * Off by default, so a table that does not pass this is unchanged: the
+   * decision logic lives in `lib/kith/table-interactions.ts` and is unit
+   * tested there (no DOM test environment exists to click a real checkbox
+   * in), the same way `resolveRowClickIntent` and friends already are.
+   */
+  selectable?: boolean;
+  /** A stable id for a row, used as the selection's key. Defaults to the
+   * row's own `id` field; required via a thrown error at select-time if a
+   * row shape has none, since a table row usually does. */
+  getRowId?: (row: T) => string;
+  /** Bulk actions over the current selection, shown in the toolbar only
+   * while something is selected -- beside the "N selected" pill and the
+   * clear control -- and only meaningful with `selectable`. Same shape as
+   * `RowAction`, over the array of selected rows instead of one: a `danger`
+   * action still confirms first, with the count in the prompt. Selection is
+   * cleared after any bulk action runs, confirmed or not. */
+  bulkActions?: readonly RowAction<T[]>[];
 };
 
 /** Square tags (2px), gray by default, blue when they carry the selection. */
@@ -190,6 +220,50 @@ export function Detail({
 
 const WIDTHS_KEY_PREFIX = "kith:table-widths:";
 
+/** The default `getRowId`: a row's own `id` field, the shape every row type
+ * in this app already has. Thrown lazily (only when `selectable` actually
+ * needs an id) rather than at the type level, so a table with no `id` field
+ * that never turns `selectable` on is unaffected. */
+function defaultRowId<T>(row: T): string {
+  const value = (row as { id?: unknown }).id;
+  if (typeof value !== "string") {
+    throw new Error(
+      "DataTable: selectable requires getRowId, or rows with a string id field",
+    );
+  }
+  return value;
+}
+
+/** A checkbox that can show the indeterminate (dash) state, which plain HTML
+ * has no attribute for -- it is a DOM property, set imperatively. */
+function SelectionCheckbox({
+  checked,
+  indeterminate = false,
+  onChange,
+  label,
+}: {
+  checked: boolean;
+  indeterminate?: boolean;
+  onChange: (event: React.MouseEvent) => void;
+  label: string;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (ref.current) ref.current.indeterminate = indeterminate;
+  }, [indeterminate]);
+  return (
+    <input
+      ref={ref}
+      type="checkbox"
+      aria-label={label}
+      checked={checked}
+      onChange={() => {}}
+      onClick={onChange}
+      className="h-3.5 w-3.5 accent-accent-600"
+    />
+  );
+}
+
 /** Reads a table's saved column widths. Wrapped in `try`/`catch`: private
  * browsing, a full quota or a disabled store all throw rather than return
  * nothing, and the table must render correctly either way. */
@@ -219,6 +293,9 @@ export function DataTable<T>({
   onSearchChange,
   id,
   onRowClick,
+  selectable = false,
+  getRowId = defaultRowId,
+  bulkActions = [],
 }: DataTableProps<T>) {
   const [sorting, setSorting] = useState<SortingState>(initialSorting);
   const [search, setSearch] = useState("");
@@ -230,6 +307,15 @@ export function DataTable<T>({
   const [confirming, setConfirming] = useState<{ action: RowAction<T>; row: T } | null>(
     null,
   );
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [confirmingBulk, setConfirmingBulk] = useState<{
+    action: RowAction<T[]>;
+    rows: T[];
+  } | null>(null);
+  // The shift-click anchor: the index of the last plain (non-shift) click,
+  // so a shift-click range-selects from there rather than from wherever
+  // selection happened to start.
+  const anchorRef = useRef<number | null>(null);
   const grouping = useMemo<GroupingState>(
     () => (groupBy === undefined ? [] : [groupBy]),
     [groupBy],
@@ -317,6 +403,28 @@ export function DataTable<T>({
     return kept;
   });
 
+  // The current filtered view's ids, in display order: what "select all"
+  // selects, what a shift-click ranges over, and what a stale selection is
+  // pruned against when a search or chip filter changes what's in view.
+  const rowIdList = useMemo(
+    () => (selectable ? rows.map((row) => getRowId(row.original)) : []),
+    [selectable, rows, getRowId],
+  );
+  useEffect(() => {
+    if (!selectable) return;
+    setSelected((current) => pruneSelection(current, new Set(rowIdList)));
+  }, [selectable, rowIdList]);
+  const selectionState = selectionHeaderState(rowIdList, selected);
+  const selectedRows = useMemo(
+    () =>
+      selectable
+        ? rows
+            .filter((row) => selected.has(getRowId(row.original)))
+            .map((row) => row.original)
+        : [],
+    [selectable, rows, selected, getRowId],
+  );
+
   const toggleChip = (columnId: string, value: string) => {
     setChips((current) => {
       const selected = current[columnId] ?? [];
@@ -330,6 +438,8 @@ export function DataTable<T>({
   };
 
   const kebabWidth = actions.length > 0 ? 32 : 0;
+  const selectWidth = selectable ? 28 : 0;
+  const extraColumns = (actions.length > 0 ? 1 : 0) + (selectable ? 1 : 0);
 
   return (
     <Tooltip.Provider delayDuration={200}>
@@ -367,17 +477,63 @@ export function DataTable<T>({
               );
             }),
           )}
+          {selectable && selected.size > 0 ? (
+            <>
+              <Tag tone="accent">{selected.size} selected</Tag>
+              <button
+                type="button"
+                onClick={() => setSelected(new Set())}
+                className="text-[11px] text-gray-500 hover:text-gray-700"
+              >
+                Clear
+              </button>
+              {bulkActions
+                .filter((action) => !(action.hidden?.(selectedRows) ?? false))
+                .map((action) => (
+                  <button
+                    key={action.label}
+                    type="button"
+                    disabled={action.disabled?.(selectedRows) ?? false}
+                    onClick={() =>
+                      action.danger
+                        ? setConfirmingBulk({ action, rows: selectedRows })
+                        : (action.onSelect(selectedRows), setSelected(new Set()))
+                    }
+                    className={
+                      action.danger
+                        ? "h-7 rounded-tag border border-red-200 px-2 text-xs text-red-600 hover:border-red-400 disabled:text-gray-300"
+                        : buttonClass
+                    }
+                  >
+                    {action.label}
+                  </button>
+                ))}
+            </>
+          ) : null}
           {toolbar}
         </div>
 
         <div className="overflow-x-auto">
           <table
-            style={{ width: table.getTotalSize() + kebabWidth }}
+            style={{ width: table.getTotalSize() + kebabWidth + selectWidth }}
             className="table-fixed border-collapse text-xs"
           >
             <thead>
               {table.getHeaderGroups().map((headerGroup) => (
                 <tr key={headerGroup.id} className="border-b border-gray-200">
+                  {selectable ? (
+                    <th className="h-row w-7 px-1 align-middle">
+                      <SelectionCheckbox
+                        label="Select all"
+                        checked={selectionState === "all"}
+                        indeterminate={selectionState === "some"}
+                        onChange={(event) => {
+                          event.stopPropagation();
+                          setSelected((current) => toggleSelectAll(rowIdList, current));
+                        }}
+                      />
+                    </th>
+                  ) : null}
                   {headerGroup.headers.map((header) => {
                     const sorted = header.column.getIsSorted();
                     return (
@@ -435,18 +591,24 @@ export function DataTable<T>({
               {rows.length === 0 ? (
                 <tr>
                   <td
-                    colSpan={table.getAllLeafColumns().length + (actions.length > 0 ? 1 : 0)}
+                    colSpan={table.getAllLeafColumns().length + extraColumns}
                     className="h-row px-2 text-gray-500"
                   >
                     {empty}
                   </td>
                 </tr>
               ) : (
-                rows.map((row) => {
+                rows.map((row, rowIndex) => {
                   const intent = resolveRowClickIntent({
                     canExpand: row.getCanExpand(),
                     hasRowClick: onRowClick !== undefined,
                   });
+                  // Selectable but otherwise inert (no expand, no
+                  // onRowClick): still focusable, so Space can reach its
+                  // checkbox from the keyboard. `trigger` below is a no-op
+                  // for such a row either way.
+                  const focusable = intent !== "none" || selectable;
+                  const rowId = selectable ? getRowId(row.original) : "";
                   const trigger = (event: { target: unknown }) => {
                     if (isInteractiveTarget(event.target)) return;
                     if (hasActiveSelection(window.getSelection())) return;
@@ -460,17 +622,22 @@ export function DataTable<T>({
                   return (
                     <tr
                       key={row.id}
-                      tabIndex={intent === "none" ? undefined : 0}
-                      onClick={intent === "none" ? undefined : trigger}
+                      tabIndex={focusable ? 0 : undefined}
+                      onClick={focusable ? trigger : undefined}
                       onKeyDown={
-                        intent === "none"
-                          ? undefined
-                          : (event) => {
+                        focusable
+                          ? (event) => {
                               if (event.key !== "Enter" && event.key !== " ") return;
                               if (isInteractiveTarget(event.target)) return;
                               event.preventDefault();
+                              if (shouldToggleSelectionOnKey(event.key, selectable)) {
+                                anchorRef.current = rowIndex;
+                                setSelected((current) => toggleSelection(current, rowId));
+                                return;
+                              }
                               trigger(event);
                             }
+                          : undefined
                       }
                       className={`border-b border-gray-100 hover:bg-accent-50/40 ${
                         row.depth > 0 ? "bg-gray-50/60 text-gray-600" : ""
@@ -480,6 +647,33 @@ export function DataTable<T>({
                           : "cursor-pointer focus-visible:-outline-offset-2 focus-visible:outline-2 focus-visible:outline-accent-600"
                       }`}
                     >
+                      {selectable ? (
+                        <td
+                          data-row-click-ignore
+                          className="h-row px-1 align-middle"
+                        >
+                          <SelectionCheckbox
+                            label={`Select row ${rowIndex + 1}`}
+                            checked={selected.has(rowId)}
+                            onChange={(event) => {
+                              event.stopPropagation();
+                              if (event.shiftKey && anchorRef.current !== null) {
+                                setSelected((current) =>
+                                  applyRangeSelection(
+                                    rowIdList,
+                                    current,
+                                    anchorRef.current!,
+                                    rowIndex,
+                                  ),
+                                );
+                              } else {
+                                anchorRef.current = rowIndex;
+                                setSelected((current) => toggleSelection(current, rowId));
+                              }
+                            }}
+                          />
+                        </td>
+                      ) : null}
                       {row.getVisibleCells().map((cell, cellIndex) => (
                         <td
                           key={cell.id}
@@ -616,6 +810,39 @@ export function DataTable<T>({
                 className="h-7 rounded-tag border border-red-600 bg-red-600 px-2 text-xs text-white hover:bg-red-700"
               >
                 {confirming?.action.label}
+              </AlertDialog.Action>
+            </div>
+          </AlertDialog.Content>
+        </AlertDialog.Portal>
+      </AlertDialog.Root>
+
+      <AlertDialog.Root
+        open={confirmingBulk !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmingBulk(null);
+        }}
+      >
+        <AlertDialog.Portal>
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-gray-900/20" />
+          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-tag border border-gray-200 bg-white p-4 shadow-xl">
+            <AlertDialog.Title className="text-sm font-medium text-gray-900">
+              {confirmingBulk?.action.label}?
+            </AlertDialog.Title>
+            <AlertDialog.Description className="mt-1 text-xs text-gray-600">
+              This can&apos;t be undone. Affects {confirmingBulk?.rows.length ?? 0}{" "}
+              item{confirmingBulk?.rows.length === 1 ? "" : "s"}.
+            </AlertDialog.Description>
+            <div className="mt-3 flex justify-end gap-2">
+              <AlertDialog.Cancel className={buttonClass}>Cancel</AlertDialog.Cancel>
+              <AlertDialog.Action
+                onClick={() => {
+                  if (confirmingBulk) confirmingBulk.action.onSelect(confirmingBulk.rows);
+                  setConfirmingBulk(null);
+                  setSelected(new Set());
+                }}
+                className="h-7 rounded-tag border border-red-600 bg-red-600 px-2 text-xs text-white hover:bg-red-700"
+              >
+                {confirmingBulk?.action.label}
               </AlertDialog.Action>
             </div>
           </AlertDialog.Content>

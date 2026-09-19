@@ -324,6 +324,11 @@ export async function grantProofAppRole(
   // already granted above with the records group.
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.document_extractions TO "${appRole}"`);
+  // The attention queue (ADM-8a, migration 029). `kith.corrections` is
+  // already granted above with the admin panel; `kith.attention_mutes` is
+  // the one new table this slice adds.
+  await owner.query(`GRANT INSERT, UPDATE, DELETE ON
+    kith.attention_mutes TO "${appRole}"`);
   // The change feed (migration 023) is deliberately not in the list above.
   //
   // Nothing in the application writes `kith.changes`: rows arrive only through
