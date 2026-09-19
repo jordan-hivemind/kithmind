@@ -237,7 +237,12 @@ in the map is `citation_page_unknown` and nothing is shifted to make it fit.
 
 A line longer than 240 characters is split into citable pieces at whitespace,
 with exact offsets, so a 2,000-character line does not become one citation
-holding dozens of numbers.
+holding dozens of numbers. No cut falls inside a number or a date: a cut that
+would land in one moves to the token's edge, taking a leading `(` or currency
+symbol and a trailing `)` or `CR` with it, and the bound softens by up to 64
+characters rather than divide a value. A dot leader is filler, not a number,
+so an invoice line still splits. A single token wider than the allowance
+leaves its line whole.
 
 **Cited lines need not be adjacent.** A column receipt prints its labels in
 one block and its amounts in another, so the only honest citation of a total

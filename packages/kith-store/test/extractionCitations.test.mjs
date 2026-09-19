@@ -1024,7 +1024,8 @@ test("a very long line becomes several citable pieces", { skip }, async (t) => {
   assert.equal(lines.map((line) => line.text).join(""), page);
   for (const line of lines) {
     assert.equal(page.slice(line.start, line.end), line.text);
-    assert.ok(line.end - line.start <= 240);
+    // ADM-5f: the bound softens rather than cut a value in half.
+    assert.ok(line.end - line.start <= 240 + 64);
   }
   // A value on a far piece is not supported by citing the first one.
   assert.deepEqual(
@@ -1292,4 +1293,238 @@ test("a value signature keeps the shape and drops the content", () => {
     valueSignature({ type: "money", amount: "1.00" }),
     "aaaa:aaaaa,aaaaaa:9.99",
   );
+});
+
+// ---------------------------------------------------------------------------
+// A cut that lands inside a value (ADM-5f). Shipped in ADM-5e and live.
+// ---------------------------------------------------------------------------
+
+/** The token class a cut must never land inside. */
+const TOKEN_CHAR = /[0-9.,:/'-]/;
+
+/**
+ * Which positions of a line belong to a value rather than to filler.
+ *
+ * A dot leader is made of the same characters a decimal point is, so a naive
+ * reading would call every leader one enormous token and no invoice line
+ * could ever be split. Three or more identical punctuation characters in a
+ * row are a rule on the page, not a number -- the same judgement
+ * `fillerPositions` makes in `lines.ts`, restated here so the property is
+ * checked against its own definition rather than against the implementation.
+ */
+function tokenPositions(text) {
+  const token = new Set();
+  let runStart = 0;
+  for (let at = 1; at <= text.length; at += 1) {
+    if (at === text.length || text[at] !== text[runStart]) {
+      const filler = at - runStart >= 3 && /[^\w\s]/.test(text[runStart]);
+      if (!filler) {
+        for (let index = runStart; index < at; index += 1) {
+          if (TOKEN_CHAR.test(text[index])) token.add(index);
+        }
+      }
+      runStart = at;
+    }
+  }
+  return token;
+}
+
+/** Whether any piece boundary has value characters on both sides, which is
+ * the shape of a number or a date cut in half. */
+function cutsThroughToken(line, pieces) {
+  const token = tokenPositions(line.text);
+  for (let index = 1; index < pieces.length; index += 1) {
+    const at = pieces[index].start - line.start;
+    if (token.has(at - 1) && token.has(at)) return true;
+  }
+  return false;
+}
+
+test("a long line is never cut through a number or a date", () => {
+  // The three reproductions. Each is a 240-plus character line whose only
+  // whitespace is far to the left, so the old splitter fell back to cutting
+  // at the bound -- which landed inside the value.
+  const reproductions = {
+    amount: ["Consulting services", ".".repeat(220), "1,234.56"],
+    date: ["Statement period ending", ".".repeat(216), "09/18/2026"],
+    credit: ["Adjustment for prior period", ".".repeat(210), "(1,234.56)"],
+    trailingCr: ["Balance carried forward", ".".repeat(214), "1,234.56 CR"],
+  };
+  for (const [name, [label, leader, value]] of Object.entries(reproductions)) {
+    const line = `${label}${leader}${value}`;
+    assert.ok(line.length > 240, name);
+    const pieces = pageLines(line);
+    // Exact cover, as always.
+    assert.equal(pieces.map((piece) => piece.text).join(""), line, name);
+    // And the value survives whole on one piece.
+    assert.ok(
+      pieces.some((piece) => piece.text.includes(value)),
+      `${name}: the value is whole on one piece`,
+    );
+    assert.equal(
+      cutsThroughToken({ start: 0, text: line }, pieces),
+      false,
+      name,
+    );
+    // The dot leader is filler, not a token, so the line still splits rather
+    // than being abandoned whole.
+    assert.ok(pieces.length > 1, `${name}: still split`);
+  }
+});
+
+test("a value cut in half cannot be stored", { skip }, async (t) => {
+  const f = await fixture(t);
+  const page = [
+    "HALLOWAY JOINERY",
+    `Consulting services${".".repeat(220)}1,234.56`,
+    `Statement period ending${".".repeat(216)}09/18/2026`,
+    `Adjustment for prior period${".".repeat(210)}(1,234.56)`,
+  ].join("\n");
+  const ids = await f.ingest(TABLE_RECEIPT, "synthetic-cut-token");
+  await repaginate(f, ids, [[0, page]]);
+  await f.client.query(
+    `UPDATE kith.document_types
+        SET examples = '[{"setting":"date_order","value":"MDY"}]'::jsonb
+      WHERE space_id = $1 AND kind = 'invoice'`,
+    [f.spaceId],
+  );
+  // What the old splitter offered the model as whole lines, and what a model
+  // would then cite in good faith. None of these is what the document says.
+  const model = fakeModel({
+    kind: "invoice",
+    summary: "Joinery invoice.",
+    statements: [
+      statement("vendor", "HALLOWAY JOINERY", [1]),
+      statement("total", "234.56", [3]),
+      statement("invoice_date", "09/18/2020", [4]),
+      statement("subtotal", "1234.56", [5]),
+    ],
+  });
+  const outcome = await f.extract(model, ids);
+  // Only the vendor: the three fabricated readings have no line that prints
+  // them, because no line was ever cut through a value.
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(
+    (await f.stored()).map((row) => row.observation_key),
+    ["vendor"],
+  );
+  for (const row of await f.corrections()) {
+    assert.equal(row.reason, "value_not_in_quote", row.field_name);
+  }
+  // And the page as shown never offers a partial value as a line.
+  const shown = model.requests[0].prompt;
+  assert.doesNotMatch(shown, /^\d+\| 234\.56$/m);
+  assert.doesNotMatch(shown, /^\d+\| 09\/18\/20$/m);
+});
+
+test("pieces always cover the line and never split a token", () => {
+  // Property-style, over the shapes a parsed line actually takes: words, dot
+  // leaders, amounts, dates and long unbroken runs.
+  const parts = [
+    "Consulting",
+    "services",
+    "Statement period ending",
+    " ",
+    "   ",
+    ".".repeat(4),
+    ".".repeat(40),
+    "-".repeat(12),
+    "1,234.56",
+    "(9,876.54)",
+    "09/18/2026",
+    "2026-09-18T14:32:00",
+    "42",
+    "0.07",
+    "INV-0012",
+    "x".repeat(70),
+    "$1,000.00 CR",
+  ];
+  // A deterministic pseudo-random walk, so a failure is reproducible.
+  let seed = 20260919;
+  const next = (bound) => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed % bound;
+  };
+  for (let round = 0; round < 400; round += 1) {
+    let line = "";
+    while (line.length < 300 + next(400)) line += parts[next(parts.length)];
+    const pieces = pageLines(line);
+    assert.equal(
+      pieces.map((piece) => piece.text).join(""),
+      line,
+      `round ${round}: exact cover`,
+    );
+    for (const piece of pieces) {
+      assert.equal(line.slice(piece.start, piece.end), piece.text);
+      assert.ok(piece.end > piece.start, `round ${round}: no empty piece`);
+    }
+    assert.equal(
+      cutsThroughToken({ start: 0, text: line }, pieces),
+      false,
+      `round ${round}: no cut inside a token`,
+    );
+  }
+});
+
+test("an identifier is stored as the document spells it", { skip }, async (t) => {
+  const f = await fixture(t);
+  const page = ["HALLOWAY JOINERY", "Invoice No. INV-0012", "Total $20.00"].join(
+    "\n",
+  );
+  const ids = await f.ingest(TABLE_RECEIPT, "synthetic-identifier-spelling");
+  await repaginate(f, ids, [[0, page]]);
+  for (const spelling of ["INV.0012", "INV 0012", "inv 0012"]) {
+    await f.extract(
+      fakeModel({
+        kind: "invoice",
+        summary: "Joinery invoice.",
+        statements: [statement("invoice_number", spelling, [2])],
+      }),
+      ids,
+      NOW + 2_000,
+    );
+    const stored = (await f.stored()).find(
+      (row) => row.observation_key === "invoice_number",
+    );
+    // The fold accepts all three, and what is stored is the page's own.
+    assert.equal(stored.value.value, "INV-0012", spelling);
+  }
+});
+
+test("the diagnostic survives a correction with a scalar reading", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(TABLE_RECEIPT, "synthetic-legacy-correction");
+  await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [statement("vendor", "BRACKEN TOOLS", [1])],
+    }),
+    ids,
+  );
+  // A row written before ADM-5f recorded citations: the reading is the bare
+  // value, with no envelope around it. `"value" in original` threw on this,
+  // and the CLI aborted on the first one it met.
+  await f.client.query(
+    `INSERT INTO kith.corrections
+       (id, space_id, target_kind, target_id, field_name, original_value,
+        reason, state)
+     VALUES ($1,$2,'document',$3,'total','"21.60"'::jsonb,
+             'value_not_in_quote','open')`,
+    [newKithId(), f.spaceId, ids.sourceItemId],
+  );
+  const summary = await withKithTransaction(f.pool, (client) =>
+    diagnoseExtractions(client, { limit: 5 }),
+  );
+  const failure = summary.documents[0].failures.find(
+    (entry) => entry.field === "total",
+  );
+  assert.ok(failure, "the legacy row is reported rather than fatal");
+  assert.equal(failure.shownPage, null);
+  assert.deepEqual(failure.citedLines, []);
+  assert.equal(failure.signature, "99.99");
+  // With no citation recorded there is no cited page, but the diagnostic can
+  // still say the document prints it.
+  assert.equal(failure.onCitedPage, false);
+  assert.equal(failure.onOtherPage, true);
 });

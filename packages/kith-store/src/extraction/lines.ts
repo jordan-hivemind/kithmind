@@ -97,32 +97,126 @@ export function pageLines(text: string): PageLine[] {
   return lines;
 }
 
-/** One physical line as one or more citable pieces, cut at whitespace when it
- * is longer than {@link MAX_LINE_CHARS}. Pieces are contiguous and cover the
- * line exactly, so nothing is lost and no offset moves. */
+/** How far past the bound a piece may run rather than cut a token in half.
+ * A cut inside a number is not a smaller piece, it is a different number. */
+const MAX_LINE_OVERFLOW = 64;
+
+/** The characters a number or a date is made of. A cut with one of these on
+ * both sides is a cut through the middle of a value. */
+const TOKEN_CHAR = /[0-9.,:/'-]/;
+
+/** What may stand immediately before a number and belong to it. Separating
+ * `(` from its digits turns a credit into a charge. */
+const OPENERS = new Set(["(", "$", "\u20ac", "\u00a3", "\u00a5", "\u20b9", "\u20a9", "+", "-"]);
+
+/**
+ * Positions covered by filler rather than by a value.
+ *
+ * A dot leader (`Consulting services .......... 1,234.56`) is made of the same
+ * characters a number is, so without this every leader would read as one
+ * enormous token and no line with one could ever be split. Three or more
+ * identical punctuation characters in a row are a rule, not a number.
+ */
+function fillerPositions(text: string, from: number, to: number): Set<number> {
+  const filler = new Set<number>();
+  let runStart = from;
+  for (let at = from + 1; at <= to; at += 1) {
+    if (at === to || text[at] !== text[runStart]) {
+      const unit = text[runStart]!;
+      if (at - runStart >= 3 && /[^\w\s]/.test(unit)) {
+        for (let index = runStart; index < at; index += 1) filler.add(index);
+      }
+      runStart = at;
+    }
+  }
+  return filler;
+}
+
+/**
+ * One physical line as one or more citable pieces, cut at whitespace when it
+ * is longer than {@link MAX_LINE_CHARS}.
+ *
+ * Pieces are contiguous and cover the line exactly, so nothing is lost and no
+ * offset moves. **And no cut falls inside a number or a date.** The first
+ * version of this cut at the bound whenever the lookback found no space, which
+ * split `1,234.56` into `1,` and `234.56` -- and the second piece is then
+ * shown to the model as a line of its own, cited in good faith, and stored as
+ * 234.56 with a valid span on a document that says 1,234.56. A fabricated
+ * value with a real citation is the one outcome this whole gate exists to
+ * prevent, and it shipped.
+ *
+ * So a cut that would land inside a token walks forward past the whole token,
+ * including a closing parenthesis or a trailing `CR`. The bound softens by up
+ * to {@link MAX_LINE_OVERFLOW}; a single token longer than that leaves the
+ * line unsplit, because one long citation is a weak check and a wrong number
+ * is a wrong number.
+ */
 function splitLongLine(
   text: string,
   start: number,
   end: number,
 ): Array<{ start: number; end: number }> {
   if (end - start <= MAX_LINE_CHARS) return [{ start, end }];
+  const filler = fillerPositions(text, start, end);
+  const tokenAt = (at: number): boolean =>
+    at >= start && at < end && TOKEN_CHAR.test(text[at]!) && !filler.has(at);
+
+  /** Whether a cut here would separate a value from part of itself. */
+  const insideToken = (cut: number): boolean => {
+    if (cut <= start || cut >= end) return false;
+    const before = text[cut - 1]!;
+    if (tokenAt(cut - 1) && tokenAt(cut)) return true;
+    if (OPENERS.has(before) && tokenAt(cut)) return true;
+    if (tokenAt(cut - 1) && text[cut] === ")") return true;
+    return false;
+  };
+
+  /** The first cut at or after this one that is not inside a token. */
+  const clear = (cut: number): number => {
+    let at = cut;
+    while (at < end && insideToken(at)) at += 1;
+    // A trailing `CR` belongs to the amount before it: leaving it behind
+    // turns a credit into a charge just as a lost parenthesis does.
+    if (at < end && (tokenAt(at - 1) || text[at - 1] === ")")) {
+      const trailing = /^(\s*)CR(?![A-Za-z])/i.exec(text.slice(at, at + 5));
+      if (trailing) at += trailing[0].length;
+    }
+    return at;
+  };
+
   const pieces: Array<{ start: number; end: number }> = [];
   let at = start;
   while (end - at > MAX_LINE_CHARS) {
     const bound = at + MAX_LINE_CHARS;
     let cut = -1;
-    for (let probe = bound; probe > bound - SPLIT_LOOKBACK && probe > at; probe -= 1) {
+    for (
+      let probe = bound;
+      probe > bound - SPLIT_LOOKBACK && probe > at;
+      probe -= 1
+    ) {
       if (/\s/.test(text[probe - 1]!)) {
         cut = probe;
         break;
       }
     }
     if (cut <= at) cut = bound;
+    if (insideToken(cut)) {
+      // Backwards first: the start of the token is a cut that splits nothing
+      // and keeps the piece under the bound. Forwards only when the token
+      // begins at or before where this piece does.
+      let back = cut;
+      while (back > at && insideToken(back)) back -= 1;
+      cut = back > at ? back : clear(cut);
+    }
+    // One token wider than the allowance: leave the line whole rather than
+    // cut it somewhere that changes what it says.
+    if (cut > bound + MAX_LINE_OVERFLOW) return [{ start, end }];
+    if (cut <= at || cut >= end) break;
     pieces.push({ start: at, end: cut });
     at = cut;
   }
   if (at < end) pieces.push({ start: at, end });
-  return pieces;
+  return pieces.length > 0 ? pieces : [{ start, end }];
 }
 
 /** How the page is shown to the model: one line per line, its id in front. */

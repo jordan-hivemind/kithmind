@@ -279,11 +279,18 @@ export async function diagnoseExtractions(
     const failures: StatementDiagnosis[] = [];
     for (const correction of corrections) {
       const reason = correction.reason === null ? null : String(correction.reason);
-      const original = correction.original_value as
-        | { value?: unknown; citation?: RecordedCitation }
-        | null;
-      const citation = original?.citation ?? {};
-      const value = original && "value" in original ? original.value : original;
+      // A scalar here is every correction row written before ADM-5f, and
+      // this version's own document-level rows (an unknown field, a truncated
+      // input, a refused model). `in` throws on a string, so the first such
+      // row used to abort the whole run.
+      const raw = correction.original_value;
+      const structured =
+        raw !== null && typeof raw === "object" && !Array.isArray(raw)
+          ? (raw as { value?: unknown; citation?: RecordedCitation })
+          : null;
+      const citation = structured?.citation ?? {};
+      const value =
+        structured && "value" in structured ? structured.value : raw;
       const shownPage = integer(citation.shownPage);
       const cited = integers(citation.lines);
       const page =

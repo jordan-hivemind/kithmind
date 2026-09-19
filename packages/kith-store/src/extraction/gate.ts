@@ -719,10 +719,56 @@ export function candidatesFor(
  * exact reading.
  */
 export function foldTextForMatch(value: string): string {
-  return normalizeForMatch(value)
-    .replace(/[.,;:!?'"`()[\]{}*_+\\/|-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  return foldTextWithOffsets(value).folded;
+}
+
+/**
+ * The same fold, keeping where each folded character came from.
+ *
+ * An identifier is stored as the *document* spells it, not as the model
+ * spells it, and that needs the original offsets: `INV.0012`, `INV 0012` and
+ * `inv 0012` all fold to the same thing as the page's `INV-0012`, and storing
+ * whichever of them the model happened to type makes the stored identifier
+ * disagree with the document it cites.
+ */
+export function foldTextWithOffsets(value: string): {
+  folded: string;
+  starts: number[];
+  ends: number[];
+} {
+  const normalized = value.normalize("NFKC");
+  const units: string[] = [];
+  const starts: number[] = [];
+  const ends: number[] = [];
+  let at = 0;
+  let pendingSpace = false;
+  while (at < normalized.length) {
+    const unit = normalized[at]!;
+    const run = /[\s.,;:!?'"`()[\]{}*_+\\/|-]/.test(unit);
+    if (run) {
+      let ahead = at;
+      while (
+        ahead < normalized.length &&
+        /[\s.,;:!?'"`()[\]{}*_+\\/|-]/.test(normalized[ahead]!)
+      ) {
+        ahead += 1;
+      }
+      pendingSpace = units.length > 0;
+      at = ahead;
+      continue;
+    }
+    if (pendingSpace) {
+      units.push(" ");
+      starts.push(at);
+      ends.push(at);
+      pendingSpace = false;
+    }
+    units.push(unit.toLowerCase());
+    starts.push(at);
+    ends.push(at + 1);
+    at += 1;
+  }
+  return { folded: units.join(""), starts, ends };
 }
 
 /**
@@ -838,9 +884,17 @@ export function checkValue(input: GateInput): GateResult {
       if (!folded) return fail("malformed_statement");
       const at = firstMatch((text) => foldTextForMatch(text).includes(folded));
       if (at < 0) return fail("value_not_in_quote");
+      // An identifier is stored as the document spells it. A name may be
+      // stored as the model wrote it -- a vendor read off a logo has no one
+      // spelling -- but an identifier is a key, and `INV 0012` is not the key
+      // a page printing `INV-0012` carries.
+      const stored =
+        valueType === "identifier"
+          ? (printedFormOf(candidates[at]!.text, folded) ?? literal)
+          : literal;
       return {
         ok: true,
-        values: [{ type: "text", value: literal }],
+        values: [{ type: "text", value: stored }],
         support: [at],
       };
     }
@@ -858,6 +912,22 @@ export function compareDecimalsSafely(
   } catch {
     return null;
   }
+}
+
+/**
+ * The substring of the cited line whose fold equals `folded`.
+ *
+ * Undefined when the fold does not occur, which the caller has already ruled
+ * out; the fallback keeps it total rather than relying on that.
+ */
+function printedFormOf(text: string, folded: string): string | undefined {
+  const mapped = foldTextWithOffsets(text);
+  const at = mapped.folded.indexOf(folded);
+  if (at < 0 || folded.length === 0) return undefined;
+  const from = mapped.starts[at];
+  const to = mapped.ends[at + folded.length - 1];
+  if (from === undefined || to === undefined || to <= from) return undefined;
+  return text.normalize("NFKC").slice(from, to);
 }
 
 /** Zero tolerance, by design. A receipt whose items do not sum to its total is
