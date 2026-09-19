@@ -166,18 +166,19 @@ const EMPTY_DRAFT: Draft = {
   area: "",
 };
 
-async function send(method: string, body: unknown): Promise<void> {
+async function send(method: string, body: unknown): Promise<unknown> {
   const response = await fetch("/api/kith/source-roots", {
     method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  if (response.status === 204) return undefined;
+  const parsed: unknown = await response.json().catch(() => undefined);
   if (!response.ok) {
-    const failure = (await response.json().catch(() => ({}))) as {
-      error?: string;
-    };
+    const failure = (parsed ?? {}) as { error?: string };
     throw new Error(failure.error ?? "Request failed");
   }
+  return parsed;
 }
 
 export function SourcesTable({
@@ -192,6 +193,9 @@ export function SourcesTable({
   useLiveChanges(WATCHED);
   const queryClient = useQueryClient();
   const [failure, setFailure] = useState<string | null>(null);
+  /** Set when Add folder named a folder this space already watches. A pill,
+   * because the add otherwise looks like it did nothing. */
+  const [alreadyWatched, setAlreadyWatched] = useState(false);
   const [draft, setDraft] = useState<Draft | null>(null);
 
   const { data } = useQuery({
@@ -211,7 +215,7 @@ export function SourcesTable({
   const optimistic = useMutation<
     void,
     Error,
-    { apply: (page: Page) => Page; run: () => Promise<void> },
+    { apply: (page: Page) => Page; run: () => Promise<unknown> },
     { previous: Page | undefined }
   >({
     mutationFn: async ({ run }) => {
@@ -252,6 +256,7 @@ export function SourcesTable({
     [optimistic],
   );
 
+  /** Remove is retire: the row leaves this list, the server keeps it. */
   const remove = useCallback(
     (id: string) => {
       optimistic.mutate({
@@ -268,18 +273,26 @@ export function SourcesTable({
   const add = useCallback(
     (values: Draft) => {
       setDraft(null);
+      setAlreadyWatched(false);
       optimistic.mutate({
         // The row's id is the server's to mint, and a placeholder row would
         // flicker a different row than the one that lands. The refetch in
         // `onSettled` is what shows it.
         apply: (page) => page,
-        run: () =>
-          send("POST", {
+        run: async () => {
+          const result = (await send("POST", {
             sourceAccountId: values.sourceAccountId,
             rootAlias: values.rootAlias.trim(),
             relativePath: values.relativePath.trim(),
-            area: values.area === "" ? null : values.area,
-          }),
+            ...(values.area === "" ? {} : { area: values.area }),
+          })) as { created?: boolean } | undefined;
+          // Adding a folder already on the list changes nothing, which without
+          // this reads as a dialog that closed and did not work.
+          if (result?.created === false) {
+            setAlreadyWatched(true);
+            setTimeout(() => setAlreadyWatched(false), 6_000);
+          }
+        },
       });
     },
     [optimistic],
@@ -392,6 +405,7 @@ export function SourcesTable({
       },
       {
         label: "Remove",
+        danger: true,
         hidden: (row) => row.rowKind !== "root",
         onSelect: (row) => remove(row.id),
       },
@@ -411,14 +425,17 @@ export function SourcesTable({
         searchPlaceholder="Search sources"
         empty="No sources"
         toolbar={
-          <button
-            type="button"
-            className={primaryButtonClass}
-            disabled={data.sources.length === 0}
-            onClick={() => setDraft(EMPTY_DRAFT)}
-          >
-            Add folder
-          </button>
+          <>
+            {alreadyWatched ? <Tag>already watched</Tag> : null}
+            <button
+              type="button"
+              className={primaryButtonClass}
+              disabled={data.sources.length === 0}
+              onClick={() => setDraft(EMPTY_DRAFT)}
+            >
+              Add folder
+            </button>
+          </>
         }
       />
       {failure === null ? null : (

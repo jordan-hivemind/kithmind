@@ -1,6 +1,7 @@
 // `/api/kith/source-roots`: the sources screen's four writes (ADM-4b).
 //
-// POST adds a watched folder, PATCH pauses or resumes one, DELETE removes one.
+// POST adds a watched folder, PATCH pauses or resumes one, DELETE retires one
+// (the row and its reports stay; it leaves the screen and the watcher's list).
 // The read is `GET /api/kith/sources`, which returns the roots beside the
 // accounts they hang off, because the screen shows them as one table.
 //
@@ -58,13 +59,28 @@ const patchSchema = z.object({
   state: z.enum(["active", "paused"]),
 });
 
-const deleteSchema = z.object({ sourceRootId: kithId });
+/** DELETE retires: the row and its reports stay. See `retireSourceRoot`. */
+const retireSchema = z.object({ sourceRootId: kithId });
 
+/**
+ * Add a folder, or answer that it is already watched.
+ *
+ * `201` with `created: true` for a folder this space was not watching, `200`
+ * with `created: false` for one it already was. The second writes nothing the
+ * caller did not name: it does not clear the provider folder id the watcher
+ * resolved, does not clear an area the dialog left blank, and does not resume
+ * a paused folder (see `upsertSourceRoot`). A retired folder is the one thing
+ * re-adding does revive, because that is what re-adding a removed folder has
+ * to mean.
+ *
+ * `area` is forwarded only when the request carried one, so "add the folder I
+ * am already watching" is not also "clear its area".
+ */
 export async function POST(request: Request): Promise<Response> {
   return withPrincipal(request, async ({ ctx, principal }) => {
     const body = await parsedBody(request, createSchema);
     if ("response" in body) return body.response;
-    const id = await admin.upsertSourceRoot(ctx, {
+    const result = await admin.upsertSourceRoot(ctx, {
       principal,
       sourceAccountId: body.value.sourceAccountId,
       // The UI adds folders. An institution or a manual source is not
@@ -72,9 +88,11 @@ export async function POST(request: Request): Promise<Response> {
       kind: "folder",
       rootAlias: body.value.rootAlias,
       relativePath: body.value.relativePath,
-      area: body.value.area ?? null,
+      ...(body.value.area === undefined || body.value.area === null
+        ? {}
+        : { area: body.value.area }),
     });
-    return noStoreJson({ id }, 201);
+    return noStoreJson(result, result.created ? 201 : 200);
   });
 }
 
@@ -89,9 +107,9 @@ export async function PATCH(request: Request): Promise<Response> {
 
 export async function DELETE(request: Request): Promise<Response> {
   return withPrincipal(request, async ({ ctx, principal }) => {
-    const body = await parsedBody(request, deleteSchema);
+    const body = await parsedBody(request, retireSchema);
     if ("response" in body) return body.response;
-    await admin.deleteSourceRoot(ctx, { principal, ...body.value });
+    await admin.retireSourceRoot(ctx, { principal, ...body.value });
     return noContent();
   });
 }

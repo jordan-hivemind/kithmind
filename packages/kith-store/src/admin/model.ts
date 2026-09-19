@@ -13,6 +13,7 @@
 
 import {
   FS_ROOT_ALIAS,
+  MAX_WORKER_SOURCE_ROOTS,
   SOURCE_ROOT_REPORT_STATES,
   type SourceRootReportState,
 } from "@repo/worker-protocol/request";
@@ -30,6 +31,15 @@ import { watcherStaleness, type WatcherStaleness } from "../workers/diagnostics.
 
 /** The same bound `listSourceAccounts` applies, for the same reason. */
 const MAX_LISTED = 200;
+
+/**
+ * How many watched folders one source account contributes to a read.
+ *
+ * The same number the worker protocol bounds `source.roots` at, because it is
+ * the same fact seen from the two sides: what one account may hand a watcher
+ * in one pass is what it may show on one screen.
+ */
+const MAX_ROOTS_PER_ACCOUNT = MAX_WORKER_SOURCE_ROOTS;
 
 const NAME_MAX_CHARS = 200;
 const PATH_MAX_CHARS = 1024;
@@ -561,11 +571,20 @@ function toSourceRoot(record: SourceRootDbRow): SourceRoot {
 
 /**
  * The desired list the watcher pulls each pass (section 5), with the latest
- * thing the watcher host said about each root.
+ * thing the watcher host said about each root, and without the retired ones.
  *
  * The report is joined here rather than fetched per row because the sources
  * screen renders one pill per root from it, and a screen that issued one query
  * per root would issue as many as the owner has folders.
+ *
+ * Bounded per source account rather than per read. `MAX_LISTED` is a bound on
+ * *accounts* -- the sources inventory refuses past 200 of them -- and reusing
+ * it for roots meant the 201st watched folder in the household made the
+ * Sources page throw instead of render. A per-account cap cannot do that: the
+ * accounts are already capped, so the rows this can return are capped with
+ * them, and the failure it keeps (an account's 101st folder not listed) is one
+ * no folder count this system has can reach, while the failure it removes (a
+ * page that 500s) was reachable by adding folders.
  */
 export async function listSourceRoots(
   ctx: IdentityCtx,
@@ -576,26 +595,33 @@ export async function listSourceRoots(
   const predicate = spacePredicate(spaces, 1, "r.space_id");
   const records = await rows<SourceRootDbRow>(
     ctx,
-    `SELECT r.id, r.space_id, r.source_account_id, r.kind, r.root_alias,
-            r.relative_path, r.provider_folder_id, r.last_known_path,
-            r.expected_types, r.area, r.state,
-            p.state AS report_state, p.observed_at AS reported_at,
-            p.item_count AS report_item_count
-       FROM kith.source_roots r
-       LEFT JOIN LATERAL (
-         SELECT q.state, q.observed_at, q.item_count
-           FROM kith.source_root_reports q
-          WHERE q.source_root_id = r.id AND q.space_id = r.space_id
-          ORDER BY q.observed_at DESC, q.id DESC
-          LIMIT 1
-       ) p ON true
-      WHERE ${predicate.sql}
-      ORDER BY r.space_id, r.source_account_id, r.created_at, r.id LIMIT $2`,
-    [predicate.value, MAX_LISTED + 1],
+    `SELECT id, space_id, source_account_id, kind, root_alias, relative_path,
+            provider_folder_id, last_known_path, expected_types, area, state,
+            report_state, reported_at, report_item_count
+       FROM (
+         SELECT r.id, r.space_id, r.source_account_id, r.kind, r.root_alias,
+                r.relative_path, r.provider_folder_id, r.last_known_path,
+                r.expected_types, r.area, r.state, r.created_at,
+                p.state AS report_state, p.observed_at AS reported_at,
+                p.item_count AS report_item_count,
+                row_number() OVER (
+                  PARTITION BY r.space_id, r.source_account_id
+                  ORDER BY r.created_at, r.id
+                ) AS rank
+           FROM kith.source_roots r
+           LEFT JOIN LATERAL (
+             SELECT q.state, q.observed_at, q.item_count
+               FROM kith.source_root_reports q
+              WHERE q.source_root_id = r.id AND q.space_id = r.space_id
+              ORDER BY q.observed_at DESC, q.id DESC
+              LIMIT 1
+           ) p ON true
+          WHERE ${predicate.sql} AND r.state <> 'retired'
+       ) ranked
+      WHERE rank <= $2
+      ORDER BY space_id, source_account_id, created_at, id`,
+    [predicate.value, MAX_ROOTS_PER_ACCOUNT],
   );
-  if (records.length > MAX_LISTED) {
-    typedError("source_limit", "Too many source roots; filter spaces");
-  }
   return records.map(toSourceRoot);
 }
 
@@ -607,7 +633,24 @@ export async function listSourceRoots(
  * the owner adding a folder in the UI, and the watcher writing back the path
  * it resolved this pass -- wants "make this location say this" rather than
  * "make one" or "change one". Adding the same folder twice is therefore the
- * same row twice, not a duplicate and not an error.
+ * same row twice, not a duplicate and not an error. `created` in the result is
+ * how the caller tells the two apart, so the UI can say the folder is already
+ * watched rather than silently appearing to do nothing.
+ *
+ * What an update touches is deliberately narrow, because "add this folder" and
+ * "overwrite this folder's row" are not the same request (ADM-4b review,
+ * finding 1):
+ *
+ *   * `provider_folder_id` and `last_known_path` are the watcher's cache, and
+ *     the provider folder id is the identity that survives a rename
+ *     (section 6). A caller that passes neither keeps both, rather than
+ *     erasing the one thing that makes the folder findable again.
+ *   * `expected_types` and `area` are only written when the caller passed
+ *     them. Re-adding a folder from a dialog that left the area blank must not
+ *     clear the area it already had.
+ *   * `state` is never written by an update except to revive a retired root,
+ *     so re-adding a *paused* folder does not silently resume it, and
+ *     re-adding a retired one brings it back (finding 3).
  *
  * Before migration 028 an account had exactly one root, so a caller that
  * passes no location still upserts that one row: `coalesce(alias, '')` in the
@@ -632,7 +675,7 @@ export async function upsertSourceRoot(
     area?: string | null;
     state?: SourceRootState;
   },
-): Promise<string> {
+): Promise<{ id: string; created: boolean }> {
   const sourceAccountId = assertKithId(
     args.sourceAccountId,
     "invalid_source_account_id",
@@ -696,11 +739,22 @@ export async function upsertSourceRoot(
        kind = EXCLUDED.kind,
        root_alias = EXCLUDED.root_alias,
        relative_path = EXCLUDED.relative_path,
-       provider_folder_id = EXCLUDED.provider_folder_id,
-       last_known_path = EXCLUDED.last_known_path,
-       expected_types = EXCLUDED.expected_types,
-       area = EXCLUDED.area,
-       state = EXCLUDED.state,
+       -- The watcher's cache: kept unless this caller resolved a new value.
+       provider_folder_id =
+         coalesce(EXCLUDED.provider_folder_id, kith.source_roots.provider_folder_id),
+       last_known_path =
+         coalesce(EXCLUDED.last_known_path, kith.source_roots.last_known_path),
+       -- Written only when the caller passed them ($13, $14).
+       expected_types =
+         CASE WHEN $13 THEN EXCLUDED.expected_types
+              ELSE kith.source_roots.expected_types END,
+       area = CASE WHEN $14 THEN EXCLUDED.area ELSE kith.source_roots.area END,
+       -- Never resumed or paused by an add. A retired root is revived, which
+       -- is what re-adding a folder that was removed has to mean.
+       state =
+         CASE WHEN $15 THEN EXCLUDED.state
+              WHEN kith.source_roots.state = 'retired' THEN 'active'
+              ELSE kith.source_roots.state END,
        updated_at = EXCLUDED.updated_at`,
     [
       id,
@@ -715,9 +769,12 @@ export async function upsertSourceRoot(
       args.area ?? null,
       state,
       new Date(ctx.now),
+      args.expectedTypes !== undefined,
+      args.area !== undefined,
+      args.state !== undefined,
     ],
   );
-  return id;
+  return { id, created: existing === null };
 }
 
 /**
@@ -777,16 +834,25 @@ export async function setSourceRootState(
 }
 
 /**
- * Remove one root (the kebab's third action).
+ * Remove one root (the kebab's third action): retire it, never delete it.
  *
- * It deletes the configuration row and the reports about it, and nothing else:
- * documents, source items, evidence and the archived originals are keyed by
- * source account and are not reachable from here. Un-watching a folder is
- * forgetting where to look, never forgetting what was found there -- section 6
- * of the plan, where even a deleted folder "shows a problem in the UI. Nothing
- * is deleted."
+ * This was a `DELETE` and the cascade took `source_root_reports` with it
+ * (ADM-4b review, finding 3), which is the one thing section 6 of the plan
+ * says does not happen -- a folder that is gone "shows a problem in the UI.
+ * Nothing is deleted." The history of what the watcher saw at a folder is
+ * evidence about the household's records, and un-watching a folder is
+ * forgetting where to look, never forgetting what was found there.
+ *
+ * So the row stays, its reports stay, and `listSourceRoots` and `source.roots`
+ * both filter `retired` out: it leaves the screen and the watcher's list
+ * without leaving the database. Adding the same folder again revives this row
+ * rather than making a second one (`upsertSourceRoot`), so the reports before
+ * and after the gap are one history.
+ *
+ * Documents, source items, evidence and the archived originals were never
+ * reachable from here in any case: they are keyed by source account.
  */
-export async function deleteSourceRoot(
+export async function retireSourceRoot(
   ctx: IdentityCtx,
   args: { principal: Principal; sourceRootId: string },
 ): Promise<void> {
@@ -797,8 +863,9 @@ export async function deleteSourceRoot(
   );
   await exec(
     ctx,
-    "DELETE FROM kith.source_roots WHERE id = $1 AND space_id = $2",
-    [root.id, root.spaceId],
+    `UPDATE kith.source_roots SET state = 'retired', updated_at = $1
+      WHERE id = $2 AND space_id = $3`,
+    [new Date(ctx.now), root.id, root.spaceId],
   );
 }
 

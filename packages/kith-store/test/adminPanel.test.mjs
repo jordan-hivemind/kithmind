@@ -29,6 +29,11 @@ import {
   skip,
 } from "./helpers/identityFixture.mjs";
 
+/** `upsertSourceRoot` returns `{ id, created }`; most callers want the id. */
+async function addRootId(ctx, args) {
+  return (await upsertSourceRoot(ctx, args)).id;
+}
+
 const NOW = Date.parse("2026-09-18T12:00:00Z");
 
 async function makeSourceAccount(ctx, fields) {
@@ -112,7 +117,7 @@ test("the sources inventory joins root, items, watcher and report", { skip }, as
     forgottenAt: new Date(NOW),
   });
 
-  const rootId = await upsertSourceRoot(ctx, {
+  const rootId = await addRootId(ctx, {
     principal: f.principal,
     sourceAccountId: f.sourceAccountId,
     kind: "folder",
@@ -143,8 +148,11 @@ test("the sources inventory joins root, items, watcher and report", { skip }, as
   assert.equal(source.status, "pending");
 
   // The root is an upsert: a second call rewrites the same row, which is what
-  // the watcher does every pass when a folder has been renamed.
-  const again = await upsertSourceRoot(ctx, {
+  // the watcher does every pass when a folder has been renamed. It rewrites
+  // what this caller named and leaves the rest alone (ADM-4b review, finding
+  // 1), so the expected types set when the root was added survive a pass that
+  // only resolved a new path.
+  const again = await addRootId(ctx, {
     principal: f.principal,
     sourceAccountId: f.sourceAccountId,
     kind: "folder",
@@ -156,13 +164,13 @@ test("the sources inventory joins root, items, watcher and report", { skip }, as
   const roots = await listSourceRoots(ctx, { principal: f.principal });
   assert.equal(roots.length, 1);
   assert.equal(roots[0].lastKnownPath, "/synthetic/renamed");
-  assert.deepEqual(roots[0].expectedTypes, []);
+  assert.deepEqual(roots[0].expectedTypes, ["statement"]);
 });
 
 test("a reported problem and a disabled source get their own status", { skip }, async (t) => {
   const f = await fixture(t);
   const ctx = f.ctx(NOW);
-  const rootId = await upsertSourceRoot(ctx, {
+  const rootId = await addRootId(ctx, {
     principal: f.principal,
     sourceAccountId: f.sourceAccountId,
     kind: "folder",
@@ -260,7 +268,7 @@ test("the change feed records every write and never another space's", { skip }, 
   });
   const cursor = await latestChangeId(ctx, [f.spaceId]);
 
-  const rootId = await upsertSourceRoot(ctx, {
+  const rootId = await addRootId(ctx, {
     principal: f.principal,
     sourceAccountId: f.sourceAccountId,
     kind: "folder",

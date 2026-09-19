@@ -1,7 +1,7 @@
 // ADM-4b: the watched-folder list, from both sides.
 //
 // The owner's side (`upsertSourceRoot`, `setSourceRootState`,
-// `deleteSourceRoot`, `listSourceRoots`) and the watcher's side
+// `retireSourceRoot`, `listSourceRoots`) and the watcher's side
 // (`source.roots`, `source.rootReport`). Against a real database, because
 // every claim here is a claim about migration 028's columns, its unique index
 // and the composite foreign keys that make a cross-space row unrepresentable.
@@ -18,9 +18,9 @@ import test from "node:test";
 import { newKithId } from "../dist/index.js";
 import {
   assertSourceRootLocation,
-  deleteSourceRoot,
   listSourceRoots,
   listSourcesInventory,
+  retireSourceRoot,
   setSourceRootState,
   upsertSourceRoot,
 } from "../dist/admin/index.js";
@@ -38,6 +38,11 @@ import {
   makeUser,
   skip,
 } from "./helpers/identityFixture.mjs";
+
+/** `upsertSourceRoot` returns `{ id, created }`; most callers want the id. */
+async function addRootId(ctx, args) {
+  return (await upsertSourceRoot(ctx, args)).id;
+}
 
 const NOW = Date.parse("2026-09-18T12:00:00Z");
 const PROTOCOL = { protocolVersion: 1 };
@@ -156,7 +161,7 @@ test("a relative path may not escape the host root", { skip: false }, () => {
 test("an owner adds, pauses and removes a folder", { skip }, async (t) => {
   const f = await fixture(t);
   const ctx = f.ctx(NOW);
-  const first = await upsertSourceRoot(ctx, {
+  const first = await addRootId(ctx, {
     principal: f.principal,
     sourceAccountId: f.sourceAccountId,
     kind: "folder",
@@ -164,7 +169,7 @@ test("an owner adds, pauses and removes a folder", { skip }, async (t) => {
     relativePath: "Finance/Investing",
     area: "outside investments",
   });
-  const second = await upsertSourceRoot(ctx, {
+  const second = await addRootId(ctx, {
     principal: f.principal,
     sourceAccountId: f.sourceAccountId,
     kind: "folder",
@@ -173,8 +178,8 @@ test("an owner adds, pauses and removes a folder", { skip }, async (t) => {
   });
   assert.notEqual(first, second, "one account may hold several roots");
 
-  // The same location again is the same row, not a second one.
-  assert.equal(
+  // The same location again is the same row, not a second one, and it says so.
+  assert.deepEqual(
     await upsertSourceRoot(ctx, {
       principal: f.principal,
       sourceAccountId: f.sourceAccountId,
@@ -183,7 +188,7 @@ test("an owner adds, pauses and removes a folder", { skip }, async (t) => {
       relativePath: "Finance/Investing",
       area: "taxes",
     }),
-    first,
+    { id: first, created: false },
   );
 
   await setSourceRootState(ctx, {
@@ -218,7 +223,7 @@ test("an owner adds, pauses and removes a folder", { skip }, async (t) => {
     1,
   );
 
-  await deleteSourceRoot(ctx, {
+  await retireSourceRoot(ctx, {
     principal: f.principal,
     sourceRootId: second,
   });
@@ -249,7 +254,7 @@ test("a path that escapes the host root is never stored", { skip }, async (t) =>
 test("a reader may neither list nor change a root", { skip }, async (t) => {
   const f = await fixture(t);
   const ctx = f.ctx(NOW);
-  const rootId = await upsertSourceRoot(ctx, {
+  const rootId = await addRootId(ctx, {
     principal: f.principal,
     sourceAccountId: f.sourceAccountId,
     kind: "folder",
@@ -273,7 +278,7 @@ test("a reader may neither list nor change a root", { skip }, async (t) => {
     /Source root not found/,
   );
   await assert.rejects(
-    deleteSourceRoot(ctx, { principal: reader, sourceRootId: rootId }),
+    retireSourceRoot(ctx, { principal: reader, sourceRootId: rootId }),
     /Source root not found/,
   );
 });
@@ -281,7 +286,7 @@ test("a reader may neither list nor change a root", { skip }, async (t) => {
 test("removing a root leaves the documents alone", { skip }, async (t) => {
   const f = await fixture(t);
   const ctx = f.ctx(NOW);
-  const rootId = await upsertSourceRoot(ctx, {
+  const rootId = await addRootId(ctx, {
     principal: f.principal,
     sourceAccountId: f.sourceAccountId,
     kind: "folder",
@@ -295,7 +300,7 @@ test("removing a root leaves the documents alone", { skip }, async (t) => {
      VALUES ($1,$2,transaction_timestamp(),$3,$4)`,
     [itemId, f.spaceId, f.sourceAccountId, `ext-${itemId}`],
   );
-  await deleteSourceRoot(ctx, { principal: f.principal, sourceRootId: rootId });
+  await retireSourceRoot(ctx, { principal: f.principal, sourceRootId: rootId });
   assert.equal(
     (await f.client.query("SELECT count(*)::int AS n FROM kith.source_items"))
       .rows[0].n,
@@ -303,10 +308,171 @@ test("removing a root leaves the documents alone", { skip }, async (t) => {
   );
 });
 
+// ADM-4b review, finding 1. "Add this folder" was an upsert that overwrote
+// every column from the request, so re-adding a folder wiped the provider
+// folder id the watcher had resolved -- the identity that survives a rename --
+// cleared the area if the dialog left it blank, and silently resumed a paused
+// folder.
+test("re-adding a watched folder keeps what it already knows", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ctx = f.ctx(NOW);
+  const rootId = await addRootId(ctx, {
+    principal: f.principal,
+    sourceAccountId: f.sourceAccountId,
+    kind: "folder",
+    rootAlias: "dropbox",
+    relativePath: "Finance",
+    area: "taxes",
+    expectedTypes: ["tax_return"],
+  });
+  // What the watcher resolved and reported, and a pause the owner set.
+  await recordWorkerSourceRootReport(workerCtx(f.client, NOW), f.worker, {
+    ...PROTOCOL,
+    operation: "source.rootReport",
+    spaceId: f.spaceId,
+    sourceAccountId: f.sourceAccountId,
+    sourceRootId: rootId,
+    observedAt: NOW,
+    itemCount: 4,
+    state: "ok",
+    providerFolderId: "provider-9",
+  });
+  await setSourceRootState(ctx, {
+    principal: f.principal,
+    sourceRootId: rootId,
+    state: "paused",
+  });
+
+  // The Add folder dialog, posting the same folder with no area chosen: what
+  // the route sends when the owner does not pick one.
+  assert.deepEqual(
+    await upsertSourceRoot(ctx, {
+      principal: f.principal,
+      sourceAccountId: f.sourceAccountId,
+      kind: "folder",
+      rootAlias: "dropbox",
+      relativePath: "Finance",
+    }),
+    { id: rootId, created: false },
+  );
+
+  const stored = (
+    await f.client.query(
+      `SELECT provider_folder_id, area, state, expected_types
+         FROM kith.source_roots WHERE id = $1`,
+      [rootId],
+    )
+  ).rows[0];
+  assert.equal(stored.provider_folder_id, "provider-9", "the id survives");
+  assert.equal(stored.area, "taxes", "a blank area does not clear one");
+  assert.equal(stored.state, "paused", "an add does not resume a paused root");
+  assert.deepEqual(stored.expected_types, ["tax_return"]);
+});
+
+// ADM-4b review, finding 3. Remove was a DELETE and the cascade took the
+// watcher's reports with it, which is the one thing section 6 of the plan says
+// does not happen.
+test("removing a root keeps its history and re-adding revives it", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ctx = f.ctx(NOW);
+  const rootId = await addRootId(ctx, {
+    principal: f.principal,
+    sourceAccountId: f.sourceAccountId,
+    kind: "folder",
+    rootAlias: "dropbox",
+    relativePath: "Finance",
+    area: "taxes",
+  });
+  await recordWorkerSourceRootReport(workerCtx(f.client, NOW), f.worker, {
+    ...PROTOCOL,
+    operation: "source.rootReport",
+    spaceId: f.spaceId,
+    sourceAccountId: f.sourceAccountId,
+    sourceRootId: rootId,
+    observedAt: NOW,
+    itemCount: 4,
+    state: "ok",
+  });
+
+  await retireSourceRoot(ctx, { principal: f.principal, sourceRootId: rootId });
+  assert.deepEqual(
+    await listSourceRoots(ctx, { principal: f.principal }),
+    [],
+    "a retired root leaves the screen",
+  );
+  assert.deepEqual(
+    (
+      await getWorkerSourceRoots(workerCtx(f.client, NOW), f.worker, {
+        ...PROTOCOL,
+        operation: "source.roots",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+      })
+    ).roots,
+    [],
+    "and leaves the watcher's list",
+  );
+  assert.equal(
+    (
+      await f.client.query(
+        "SELECT count(*)::int AS n FROM kith.source_root_reports WHERE source_root_id = $1",
+        [rootId],
+      )
+    ).rows[0].n,
+    1,
+    "but its reports are still there",
+  );
+
+  // Adding it again revives the same row, so the reports before and after the
+  // gap are one history rather than two folders.
+  assert.deepEqual(
+    await upsertSourceRoot(ctx, {
+      principal: f.principal,
+      sourceAccountId: f.sourceAccountId,
+      kind: "folder",
+      rootAlias: "dropbox",
+      relativePath: "Finance",
+    }),
+    { id: rootId, created: false },
+  );
+  const [revived] = await listSourceRoots(ctx, { principal: f.principal });
+  assert.equal(revived.id, rootId);
+  assert.equal(revived.state, "active");
+  assert.equal(revived.area, "taxes");
+  assert.equal(revived.reportItemCount, 4);
+});
+
+// ADM-4b review, finding 4. The roots read borrowed `MAX_LISTED`, which is a
+// bound on source *accounts*, so the 201st watched folder made the Sources
+// page throw instead of render.
+test("many folders on one account render rather than throw", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ctx = f.ctx(NOW);
+  // Inserted in one statement: 220 round trips through the store would make
+  // this the slowest test in the package for no extra coverage. The shape is
+  // what `upsertSourceRoot` writes.
+  const paths = Array.from({ length: 220 }, (_, index) => `Finance/${index}`);
+  await f.client.query(
+    `INSERT INTO kith.source_roots
+       (id, space_id, source_account_id, kind, root_alias, relative_path,
+        created_at, updated_at)
+     SELECT unnest($1::text[]), $2, $3, 'folder', 'dropbox',
+            unnest($4::text[]), transaction_timestamp(),
+            transaction_timestamp()`,
+    [paths.map(() => newKithId()), f.spaceId, f.sourceAccountId, paths],
+  );
+  const roots = await listSourceRoots(ctx, { principal: f.principal });
+  assert.equal(roots.length, 100, "capped per account, not refused");
+  assert.equal(
+    new Set(roots.map((root) => root.sourceAccountId)).size,
+    1,
+  );
+});
+
 test("a worker reads only its own account's roots", { skip }, async (t) => {
   const f = await fixture(t);
   const ctx = f.ctx(NOW);
-  const mine = await upsertSourceRoot(ctx, {
+  const mine = await addRootId(ctx, {
     principal: f.principal,
     sourceAccountId: f.sourceAccountId,
     kind: "folder",
@@ -314,7 +480,7 @@ test("a worker reads only its own account's roots", { skip }, async (t) => {
     relativePath: "Finance/Investing",
     area: "outside investments",
   });
-  const paused = await upsertSourceRoot(ctx, {
+  const paused = await addRootId(ctx, {
     principal: f.principal,
     sourceAccountId: f.sourceAccountId,
     kind: "folder",
@@ -405,21 +571,21 @@ test("a worker reads only its own account's roots", { skip }, async (t) => {
 test("a worker reports only on its own account's roots", { skip }, async (t) => {
   const f = await fixture(t);
   const ctx = f.ctx(NOW);
-  const mine = await upsertSourceRoot(ctx, {
+  const mine = await addRootId(ctx, {
     principal: f.principal,
     sourceAccountId: f.sourceAccountId,
     kind: "folder",
     rootAlias: "dropbox",
     relativePath: "Finance",
   });
-  const sibling = await upsertSourceRoot(ctx, {
+  const sibling = await addRootId(ctx, {
     principal: f.principal,
     sourceAccountId: f.siblingAccountId,
     kind: "folder",
     rootAlias: "sibling",
     relativePath: "Finance",
   });
-  const elsewhere = await upsertSourceRoot(ctx, {
+  const elsewhere = await addRootId(ctx, {
     principal: f.principal,
     sourceAccountId: f.otherAccountId,
     kind: "folder",
@@ -504,7 +670,7 @@ test("a worker reports only on its own account's roots", { skip }, async (t) => 
 test("a watcher's state reaches the sources screen", { skip }, async (t) => {
   const f = await fixture(t);
   const ctx = f.ctx(NOW);
-  const rootId = await upsertSourceRoot(ctx, {
+  const rootId = await addRootId(ctx, {
     principal: f.principal,
     sourceAccountId: f.sourceAccountId,
     kind: "folder",
