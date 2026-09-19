@@ -82,3 +82,102 @@ export function applyNowrapSizing<T>(
       : column,
   );
 }
+
+// Row-selection decision logic (ADM-8a's `selectable` prop on `DataTable`),
+// pure for the same reason as everything above: no DOM test environment, so
+// what would otherwise be exercised by clicking checkboxes is exercised as
+// plain functions over arrays and sets instead.
+
+/** Toggles one id in a selection, without mutating the set passed in. */
+export function toggleSelection(
+  selected: ReadonlySet<string>,
+  id: string,
+): Set<string> {
+  const next = new Set(selected);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  return next;
+}
+
+/**
+ * A shift-click range select: every id between `anchorIndex` and
+ * `clickedIndex` (inclusive, whichever order they fall in) is added to the
+ * selection. Matches the usual file-manager convention -- a range is always
+ * added, never toggled off, so a second shift-click over an overlapping range
+ * cannot un-select rows the first one selected.
+ */
+export function applyRangeSelection(
+  ids: readonly string[],
+  selected: ReadonlySet<string>,
+  anchorIndex: number,
+  clickedIndex: number,
+): Set<string> {
+  const start = Math.max(0, Math.min(anchorIndex, clickedIndex));
+  const end = Math.min(ids.length - 1, Math.max(anchorIndex, clickedIndex));
+  const next = new Set(selected);
+  for (let i = start; i <= end; i += 1) next.add(ids[i]!);
+  return next;
+}
+
+/**
+ * The header checkbox's own click: the usual tri-state toggle. Every id in
+ * the current filtered view is already selected -> clear; anything else
+ * (none selected, or some) -> select every id in view. A header checkbox
+ * showing "indeterminate" therefore always selects the rest on click rather
+ * than clearing, which is the behaviour people expect from it.
+ */
+export function toggleSelectAll(
+  ids: readonly string[],
+  selected: ReadonlySet<string>,
+): Set<string> {
+  if (ids.length > 0 && ids.every((id) => selected.has(id))) return new Set();
+  return new Set(ids);
+}
+
+export type SelectionHeaderState = "all" | "some" | "none";
+
+/** What the header checkbox should show: checked, indeterminate, or empty. */
+export function selectionHeaderState(
+  ids: readonly string[],
+  selected: ReadonlySet<string>,
+): SelectionHeaderState {
+  if (ids.length === 0) return "none";
+  const count = ids.filter((id) => selected.has(id)).length;
+  if (count === 0) return "none";
+  return count === ids.length ? "all" : "some";
+}
+
+/**
+ * Drops any selected id that is no longer in view -- "selection ... cleared
+ * when the filtered set no longer contains a row" -- so a row hidden by a
+ * new search term or chip filter cannot be bulk-acted-on invisibly.
+ *
+ * Returns the identical set instance when nothing needed pruning, so a caller
+ * (a `useEffect` keyed on this) can skip the state update, and therefore the
+ * re-render, on every filter keystroke that doesn't actually affect the
+ * selection.
+ */
+export function pruneSelection(
+  selected: ReadonlySet<string>,
+  visibleIds: ReadonlySet<string>,
+): Set<string> {
+  let changed = false;
+  const next = new Set<string>();
+  for (const id of selected) {
+    if (visibleIds.has(id)) next.add(id);
+    else changed = true;
+  }
+  return changed ? next : (selected as Set<string>);
+}
+
+/** Whether a keydown on a row should toggle its checkbox rather than fall
+ * through to the row's own Enter/expand/activate behaviour: Space, and only
+ * when the table is `selectable`. Enter is left for activation even on a
+ * selectable table, the same split a checkbox list and a link list agree on
+ * everywhere else. */
+export function shouldToggleSelectionOnKey(
+  key: string,
+  selectable: boolean,
+): boolean {
+  return selectable && key === " ";
+}
