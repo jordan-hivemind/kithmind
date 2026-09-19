@@ -127,6 +127,34 @@ test("the quote's sign has to agree with the value's", () => {
   assert.equal(parseAmount("(+5)"), undefined);
 });
 
+test("a separator hyphen is not a minus sign", () => {
+  // A document uses a hyphen as a separator far more often than as a sign.
+  for (const quote of [
+    "Total - 42.00",
+    "Invoice 12-42.00",
+    "Item 1 - 42.00",
+  ]) {
+    assert.deepEqual(
+      gate({ valueType: "money", value: "-42.00", quote }),
+      { ok: false, reason: "value_not_in_quote" },
+      quote,
+    );
+    assert.equal(
+      gate({ valueType: "money", value: "42.00", quote }).ok,
+      true,
+      quote,
+    );
+  }
+  // Pressed against the digits, it still is a sign.
+  assert.deepEqual(amountsInText("-$42.00"), ["-42"]);
+  assert.deepEqual(amountsInText("$-42.00"), ["-42"]);
+  assert.deepEqual(amountsInText("USD 42.00-"), ["-42"]);
+  assert.deepEqual(amountsInText("Refund -42.00"), ["-42"]);
+  // And a separator is not, from either side.
+  assert.deepEqual(amountsInText("Total - 42.00"), ["42"]);
+  assert.deepEqual(amountsInText("Item 1 - 42.00"), ["1", "42"]);
+});
+
 test("a date needs its month as well as its year and day", () => {
   const value = "2026-01-02";
   // Every one of these used to pass on the year and the day alone.
@@ -169,6 +197,44 @@ test("a date needs its month as well as its year and day", () => {
     gate({ valueType: "date", value: "2026-03-04", quote: "4 Market St, 2026" }),
     { ok: false, reason: "value_not_in_quote" },
   );
+});
+
+test("a date's parts have to be written together as a date", () => {
+  // Three digit runs scattered across a line are not a date.
+  assert.deepEqual(
+    gate({
+      valueType: "date",
+      value: "2026-01-02",
+      quote: "Page 1 of 2 (c) 2026",
+    }),
+    { ok: false, reason: "value_not_in_quote" },
+  );
+  assert.deepEqual(
+    gate({
+      valueType: "date",
+      value: "2026-01-02",
+      quote: "Order 2 shipped in 1 box, warranty ends 2026",
+    }),
+    { ok: false, reason: "value_not_in_quote" },
+  );
+  // A month word only counts inside a date-shaped window, so prose does not.
+  assert.deepEqual(
+    gate({
+      valueType: "date",
+      value: "2026-05-02",
+      quote: "delivery may be late; see item 2 of order 2026",
+    }),
+    { ok: false, reason: "value_not_in_quote" },
+  );
+  // The windows themselves still read.
+  for (const quote of [
+    "Invoiced 02.01.2026 in full",
+    "Billed 1/2/2026",
+    "Signed May 2, 2026 at noon",
+  ]) {
+    const value = quote.includes("May") ? "2026-05-02" : "2026-01-02";
+    assert.equal(gate({ valueType: "date", value, quote }).ok, true, quote);
+  }
 });
 
 test("a percentage keeps its decimal comma", () => {

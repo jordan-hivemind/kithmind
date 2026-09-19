@@ -241,26 +241,43 @@ function realIsoDate(value: string): boolean {
  * contains things like `4471` that are not amounts.
  *
  * The sign lives around the token, not in it, because that is where a document
- * puts it: a leading minus or open parenthesis before the digits, a closing
- * parenthesis, a trailing minus or a `CR` after them. Reading it is what lets
- * the caller refuse `-42.00` cited to "Payment 42.00".
+ * puts it. Reading it is what lets the caller refuse `-42.00` cited to
+ * "Payment 42.00".
+ *
+ * A hyphen is the hard case, because a document uses it as a separator far
+ * more often than as a minus: "Total - 42.00", "Invoice 12-42.00" and
+ * "Item 1 - 42.00" are all positive forty-two. So a leading minus counts only
+ * when it is pressed against the digits -- at most one currency symbol may sit
+ * between them, and no whitespace -- and only when what precedes it is not
+ * alphanumeric. A trailing minus counts only immediately after the digits and
+ * only when no digit follows it, which is the same rule read from the other
+ * side. Parentheses and `CR` keep their whitespace tolerance: neither is ever
+ * a separator.
  */
 export function amountsInText(text: string): string[] {
   const normalized = text.normalize("NFKC");
+  const symbols = new Set(["$", "\u20ac", "\u00a3", "\u00a5", "\u20b9", "\u20a9"]);
   const found: string[] = [];
   const runs = /\d[\d.,]*/g;
   let match: RegExpExecArray | null;
   while ((match = runs.exec(normalized)) !== null) {
     const amount = parseAmount(match[0].replace(/[.,]+$/, ""));
     if (amount === undefined) continue;
-    const before = normalized.slice(Math.max(0, match.index - 12), match.index);
-    const after = normalized.slice(
-      match.index + match[0].length,
-      match.index + match[0].length + 4,
-    );
+    const start = match.index;
+    const end = start + match[0].length;
+    let signAt = start - 1;
+    if (signAt >= 0 && symbols.has(normalized[signAt]!)) signAt -= 1;
+    const leadingMinus =
+      signAt >= 0 &&
+      normalized[signAt] === "-" &&
+      (signAt === 0 || !/[A-Za-z0-9]/.test(normalized[signAt - 1]!));
+    const trailingMinus =
+      normalized[end] === "-" && !/\d/.test(normalized[end + 1] ?? "");
+    const after = normalized.slice(end, end + 4);
     const negative =
-      /[-(]\s*(?:[$\u20ac\u00a3\u00a5\u20b9\u20a9]|[A-Z]{3})?\s*$/.test(before) ||
-      /^\s*[)-]/.test(after) ||
+      leadingMinus ||
+      trailingMinus ||
+      /^\s*\)/.test(after) ||
       /^\s*CR\b/i.test(after);
     found.push(negative ? negate(amount) : amount);
   }
@@ -301,28 +318,45 @@ const MONTH_NAMES = [
   "december",
 ] as const;
 
-/** Whether the quote names this month in words. A word counts when the month's
- * full name starts with it and it is at least three letters, so `Sep`, `Sept`
- * and `September` all name September and `Market` does not name March. */
-function monthNamed(month: number, quote: string): boolean {
+/** Whether one word names this month. A word counts when the month's full name
+ * starts with it and it is at least three letters, so `Sep`, `Sept` and
+ * `September` all name September and `Market` does not name March. */
+function namesMonth(month: number, word: string): boolean {
   const name = MONTH_NAMES[month - 1]!;
-  return (quote.toLowerCase().match(/[a-z]+/g) ?? []).some(
-    (word) => word.length >= 3 && name.startsWith(word),
-  );
+  const cleaned = word.toLowerCase();
+  return cleaned.length >= 3 && name.startsWith(cleaned);
 }
+
+/** Three digit runs written as one date: `09/01/2026`, `2026-11-02`, `1.2.26`.
+ * At most two non-word characters between the parts, so "2 pages of 3 in 2026"
+ * is not a date. */
+const NUMERIC_DATE = /\d+[^\w]{1,2}\d+[^\w]{1,2}\d+/g;
+/** `September 1, 2026`, `Sep 1 2026`, `Sept. 1st, 2026`. */
+const MONTH_FIRST_DATE =
+  /([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})/g;
+/** `1 September 2026`, `1st Sep. 2026`. */
+const DAY_FIRST_DATE =
+  /(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})/g;
 
 /**
  * Whether the quote prints this ISO date.
  *
- * All three parts have to be there: the year, the day of the month and the
- * month, each as its own digit run, or the month as a word. Without the month
- * `2026-01-02` was supported by "Due 2026-11-02" and by "Feb 2, 2026", which
- * is a wrong date with a citation that looks right -- the one failure this
- * gate exists to prevent.
+ * Two rules, and the second is the one that matters.
  *
- * The runs are consumed as they are matched, so a day and a month that are the
- * same number need two runs of it, or one run and the month's name. A quote
- * that prints the ISO date outright is taken as it stands.
+ * All three parts have to be there: the year, the day of the month and the
+ * month. Without the month, `2026-01-02` was supported by "Due 2026-11-02" and
+ * by "Feb 2, 2026" -- a wrong date under a citation that looks right, which is
+ * the one failure this gate exists to prevent.
+ *
+ * And they have to be there *together*, inside one run of text shaped like a
+ * date. Three digit runs scattered across a line are not a date: "Page 1 of 2
+ * (c) 2026" carries a 1, a 2 and a 2026 and says nothing about January the
+ * second. A month written as a word counts only inside such a window too,
+ * which is what keeps "may be late" and a street called March out of it.
+ *
+ * Within a window the parts are consumed as they are matched, so a day and a
+ * month that are the same number need two runs of it. A quote that prints the
+ * ISO date outright is taken as it stands.
  *
  * Deliberately strict. A date this refuses opens a correction the owner
  * resolves in a moment; a date it wrongly accepts is a stored fact nobody
@@ -332,16 +366,39 @@ function dateInQuote(iso: string, quote: string): boolean {
   const [year, month, day] = iso.split("-") as [string, string, string];
   const text = quote.normalize("NFKC");
   if (text.includes(iso)) return true;
-  const runs = (text.match(/\d+/g) ?? []).slice(0, 64);
-  const take = (candidates: readonly string[]): boolean => {
-    const at = runs.findIndex((run) => candidates.includes(run));
-    if (at < 0) return false;
-    runs.splice(at, 1);
-    return true;
-  };
-  if (!take([year])) return false;
-  if (!take([day, String(Number(day))])) return false;
-  return monthNamed(Number(month), text) || take([month, String(Number(month))]);
+  const days = [day, String(Number(day))];
+  const months = [month, String(Number(month))];
+
+  for (const window of text.match(NUMERIC_DATE) ?? []) {
+    const runs = window.match(/\d+/g) ?? [];
+    const take = (candidates: readonly string[]): boolean => {
+      const at = runs.findIndex((run) => candidates.includes(run));
+      if (at < 0) return false;
+      runs.splice(at, 1);
+      return true;
+    };
+    if (take([year]) && take(days) && take(months)) return true;
+  }
+
+  for (const [pattern, order] of [
+    [MONTH_FIRST_DATE, "month"],
+    [DAY_FIRST_DATE, "day"],
+  ] as const) {
+    pattern.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(text)) !== null) {
+      const word = order === "month" ? match[1]! : match[2]!;
+      const dayPart = order === "month" ? match[2]! : match[1]!;
+      if (
+        namesMonth(Number(month), word) &&
+        days.includes(dayPart) &&
+        match[3] === year
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function asLineItems(value: unknown): LineItem[] | undefined {

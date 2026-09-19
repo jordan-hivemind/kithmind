@@ -954,8 +954,15 @@ async function store(
     loaded.spaceId,
     loaded.sourceItemId,
   );
+  // A correction may name a scalar field or one line's observation key, so a
+  // field counts as settled when either names it. The three readers of this
+  // map -- here, `read.ts` and `writeThrough` -- have to agree about that or a
+  // fixed field keeps re-opening.
+  const settled = (field: string): boolean =>
+    corrected.has(field) ||
+    [...corrected.keys()].some((key) => key.startsWith(`${field}:`));
   for (const failure of prepared.failures) {
-    if (failure.field !== null && corrected.has(failure.field)) continue;
+    if (failure.field !== null && settled(failure.field)) continue;
     await openCorrection(client, {
       spaceId: loaded.spaceId,
       sourceItemId: loaded.sourceItemId,

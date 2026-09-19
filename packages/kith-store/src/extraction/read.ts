@@ -97,20 +97,39 @@ export async function readDocumentExtraction(
       .filter((item) => item.state === "resolved" && item.fieldName !== null)
       .map((item) => [item.fieldName!, item.correctedValue]),
   );
+  // A correction targets one observation, so it is looked up by observation
+  // key first. A scalar field's key is its own name, so the fallback to the
+  // field name is the same lookup said the other way -- and it is what finds a
+  // correction the owner made before the field was ever extracted, which has
+  // no key to be found by.
+  const used = new Set<string>();
+  const fixFor = (key: string, field?: string): unknown => {
+    for (const candidate of field === undefined ? [key] : [key, field]) {
+      if (!corrected.has(candidate)) continue;
+      used.add(candidate);
+      return corrected.get(candidate);
+    }
+    return undefined;
+  };
+
   const statements: ExtractionStatement[] = stored.map((statement) => {
-    const read =
-      statement.observationKeys.length === 1
-        ? values.get(statement.observationKeys[0]!)
-        : statement.observationKeys.map((key) => values.get(key));
-    const fix = corrected.get(statement.field);
+    const scalar = statement.observationKeys.length === 1;
+    const fixes = statement.observationKeys.map((key) =>
+      fixFor(key, scalar ? statement.field : undefined),
+    );
+    const readings = statement.observationKeys.map((key) => values.get(key));
+    const merged = readings.map((reading, index) =>
+      fixes[index] === undefined ? reading : fixes[index],
+    );
+    const anyFix = fixes.some((fix) => fix !== undefined);
     return {
       field: statement.field,
       valueType: statement.valueType,
-      // The correction wins. `read` is the observation, which the correction
-      // was written through to, so the two agree; the correction row is read
-      // anyway because a field the owner settled before it was ever extracted
-      // has no observation to carry it.
-      value: fix === undefined ? read : fix,
+      // The correction wins. `readings` are the observations, which the
+      // correction was written through to, so the two already agree; the
+      // correction row is consulted anyway, because a line the owner fixed
+      // that the newest run gated out has only the row to carry it.
+      value: scalar ? merged[0] : merged,
       page: statement.page,
       quote: statement.quote,
       evidenceSpanId: statement.evidenceSpanId,
@@ -118,15 +137,15 @@ export async function readDocumentExtraction(
       // The model's own reading, from the extraction row rather than from the
       // observation: the observation now carries the correction, so it is no
       // longer a record of what was corrected.
-      ...(fix === undefined
-        ? {}
-        : { corrected: true as const, originalValue: statement.modelValue }),
+      ...(anyFix
+        ? { corrected: true as const, originalValue: statement.modelValue }
+        : {}),
     };
   });
-  // A corrected field the model never read at all is still a fact the owner
+  // A correction the model's reading never covered is still a fact the owner
   // asserted, so it belongs in the reply.
   for (const [field, value] of corrected) {
-    if (statements.some((statement) => statement.field === field)) continue;
+    if (used.has(field)) continue;
     statements.push({
       field,
       valueType: "text",

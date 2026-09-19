@@ -23,7 +23,10 @@
 
 import type { ClientBase } from "pg";
 
+import { ProofError } from "../errors.js";
 import { newKithId } from "../ids.js";
+import { occurrenceSortKey } from "../records/model.js";
+import type { Occurrence } from "../records/values.js";
 import {
   canonicalizeObservationValue,
   type ObservationValue,
@@ -105,9 +108,18 @@ export async function openCorrection(
 }
 
 /**
- * Records the owner's fix for one field of one document.
+ * Records the owner's fix for one reading of one document.
  *
- * Idempotent per field: a second correction of the same field replaces the
+ * `fieldName` names **one observation**, not a group of them. For a scalar
+ * field the two are the same word: `total`'s observation key is `total`. A
+ * `line_item_list` field has one observation per line, keyed `line_items:0`,
+ * `line_items:1`, and a correction must name the line it fixes. Naming the
+ * bare list field is refused with `correction_target_is_a_list_field` rather
+ * than accepted and then silently matching nothing, which is what it did
+ * before: the row was written, the screen showed the fix, and every reader of
+ * the numbers went on seeing the model's.
+ *
+ * Idempotent per target: a second correction of the same one replaces the
  * first rather than stacking, and the original reading is preserved from
  * whichever row was already there (an open gate failure keeps the model's
  * reading; a first correction of a field that passed the gate records the
@@ -126,6 +138,7 @@ export async function applyCorrection(
   },
 ): Promise<string> {
   const at = new Date(input.now ?? Date.now());
+  await requireSingleTarget(client, input);
   const existing = (
     await client.query<{ id: string; original_value: unknown }>(
       `SELECT id, original_value FROM kith.corrections
@@ -184,6 +197,40 @@ export async function applyCorrection(
 }
 
 /**
+ * Refuses a correction that names a group of observations rather than one.
+ *
+ * A field with no observation of its own key, but observations carrying its
+ * name as their type, is a list: `line_items` with `line_items:0` and
+ * `line_items:1` under it. Correcting "the line items" has no single meaning,
+ * so it is an error the caller sees rather than a write that lands nowhere.
+ * A field with no observations at all is allowed through: it is an ordinary
+ * correction of something the gate refused, and the value is stored for when
+ * the extraction next runs.
+ */
+async function requireSingleTarget(
+  client: ClientBase,
+  input: { spaceId: string; sourceItemId: string; fieldName: string },
+): Promise<void> {
+  const exact = await client.query(
+    `SELECT 1 FROM kith.observations
+      WHERE space_id = $1 AND source_item_id = $2
+        AND event_type = 'document_statement' AND observation_key = $3 LIMIT 1`,
+    [input.spaceId, input.sourceItemId, input.fieldName],
+  );
+  if (exact.rowCount) return;
+  const grouped = await client.query(
+    `SELECT 1 FROM kith.observations
+      WHERE space_id = $1 AND source_item_id = $2
+        AND event_type = 'document_statement' AND observation_type = $3
+      LIMIT 1`,
+    [input.spaceId, input.sourceItemId, input.fieldName],
+  );
+  if (grouped.rowCount) {
+    throw new ProofError("correction_target_is_a_list_field");
+  }
+}
+
+/**
  * Pushes the corrected value onto the observation the correction replaces, in
  * the same transaction as the correction row.
  *
@@ -238,7 +285,85 @@ async function writeThrough(
         AND event_type = 'document_statement' AND observation_key = $3`,
     [input.spaceId, input.sourceItemId, input.fieldName, JSON.stringify(value)],
   );
-  return updated.rowCount ?? 0;
+  if (updated.rowCount) return updated.rowCount;
+  // Nothing to update: the run that produced this document gated that field
+  // out, so the owner's value is the only reading there is. Without the insert
+  // below `get_document` would show it (it reads the correction row) while
+  // `sum_money` and `latest_observation` would not see it at all -- and a
+  // corrected field is the one the owner is most certain about.
+  return await insertCorrected(client, input, value);
+}
+
+/**
+ * Hangs a corrected value off the document's existing statement event as a new
+ * observation.
+ *
+ * Every column but the value and the key is copied from the event version the
+ * extraction already wrote, so the row sits on the same generation, the same
+ * sealed text and the same occurrence as its siblings and satisfies
+ * `validateStoredObservation` on the way back out. Its evidence is the event's
+ * own anchor span: the document does not say this, the owner does, and the
+ * span says which document the claim is about.
+ *
+ * A document with no statement event has nothing to hang it on -- extraction
+ * has not run, or refused everything -- and the correction row stands alone
+ * until it does.
+ */
+async function insertCorrected(
+  client: ClientBase,
+  input: { spaceId: string; sourceItemId: string; fieldName: string },
+  value: ObservationValue,
+): Promise<number> {
+  const observationType = input.fieldName.split(":")[0]!;
+  if (!/^[a-z][a-z0-9_]{0,63}$/.test(observationType)) return 0;
+  const version = (
+    await client.query<Record<string, unknown>>(
+      `SELECT * FROM kith.event_versions
+        WHERE space_id = $1 AND source_item_id = $2
+          AND event_type = 'document_statement' LIMIT 1`,
+      [input.spaceId, input.sourceItemId],
+    )
+  ).rows[0];
+  if (!version) return 0;
+  const evidence = (version.field_evidence as { occurrence?: string[] })
+    ?.occurrence;
+  if (!Array.isArray(evidence) || evidence.length === 0) return 0;
+  await client.query(
+    `INSERT INTO kith.observations
+       (id,space_id,created_at,source_account_id,source_item_id,
+        source_revision_id,source_text_version_id,processing_generation_id,
+        event_id,event_version_id,entity_id,event_type,occurrence,
+        occurrence_date,occurrence_instant,occurrence_sort_key,observation_key,
+        observation_type,schema_version,value,value_evidence,bound_entity_id,
+        user_id)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,$10,
+             'document_statement',$11,$12,$13,$14,$15,$16,1,$17,$18,NULL,$19)`,
+    [
+      newKithId(),
+      input.spaceId,
+      version.source_account_id,
+      input.sourceItemId,
+      version.source_revision_id,
+      version.source_text_version_id,
+      version.processing_generation_id,
+      version.event_id,
+      version.id,
+      version.entity_id,
+      version.occurrence,
+      version.occurrence_date,
+      version.occurrence_instant,
+      occurrenceSortKey(
+        version.occurrence as Occurrence,
+        `${version.event_id}|${input.fieldName}|${version.processing_generation_id}`,
+      ),
+      input.fieldName,
+      observationType,
+      JSON.stringify(value),
+      JSON.stringify(evidence.slice(0, 1)),
+      version.user_id,
+    ],
+  );
+  return 1;
 }
 
 /**

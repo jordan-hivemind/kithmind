@@ -958,3 +958,131 @@ test("correcting one line item leaves the others alone", { skip }, async (t) => 
     ],
   );
 });
+
+test("a correction must name one observation, not a list of them", { skip }, async (t) => {
+  const f = await fixture(t);
+  await f.seed();
+  const ingested = await f.ingest();
+  await f.extract(
+    stubModel(goodReading()),
+    ingested.sourceItemId,
+    ingested.generationId,
+  );
+  // The bare list field is refused rather than written and then matching
+  // nothing: the screen would have shown a fix that no reader of the numbers
+  // could see.
+  await assert.rejects(
+    withKithTransaction(f.pool, (client) =>
+      applyCorrection(client, {
+        spaceId: f.spaceId,
+        sourceItemId: ingested.sourceItemId,
+        fieldName: "line_items",
+        correctedValue: { type: "money", amount: "1.00", currency: "USD" },
+        actorUserId: f.userId,
+        now: NOW + 4_000,
+      }),
+    ),
+    (error) => error.code === "correction_target_is_a_list_field",
+  );
+  assert.equal(
+    (await f.rows("SELECT id FROM kith.corrections WHERE space_id = $1", [f.spaceId]))
+      .length,
+    0,
+  );
+  // One line is fine, and the document read shows it in place.
+  await withKithTransaction(f.pool, (client) =>
+    applyCorrection(client, {
+      spaceId: f.spaceId,
+      sourceItemId: ingested.sourceItemId,
+      fieldName: "line_items:0",
+      correctedValue: { type: "money", amount: "11.00", currency: "USD" },
+      actorUserId: f.userId,
+      now: NOW + 5_000,
+    }),
+  );
+  const document = await getDocument(f.client, [f.spaceId], ingested.documentId);
+  const items = document.extraction.statements.find(
+    (statement) => statement.field === "line_items",
+  );
+  assert.equal(items.corrected, true);
+  assert.deepEqual(
+    items.value.map((value) => value.amount),
+    ["11.00", "5.5"],
+  );
+});
+
+test("a corrected field the newest run dropped still reaches sum_money", { skip }, async (t) => {
+  const f = await fixture(t);
+  await f.seed();
+  const ingested = await f.ingest();
+  await f.extract(
+    stubModel(goodReading()),
+    ingested.sourceItemId,
+    ingested.generationId,
+  );
+  await withKithTransaction(f.pool, (client) =>
+    applyCorrection(client, {
+      spaceId: f.spaceId,
+      sourceItemId: ingested.sourceItemId,
+      fieldName: "total",
+      correctedValue: { type: "money", amount: "16.50", currency: "USD" },
+      actorUserId: f.userId,
+      now: NOW + 4_000,
+    }),
+  );
+  // Re-extract a reading that no longer states the total at all. The owner's
+  // value is now the only one there is, and it must not vanish from the exact
+  // side while the document read goes on showing it.
+  const withoutTotal = goodReading();
+  withoutTotal.statements = withoutTotal.statements.filter(
+    (statement) => statement.field !== "total",
+  );
+  await f.extract(
+    stubModel(withoutTotal),
+    ingested.sourceItemId,
+    ingested.generationId,
+    NOW + 5_000,
+  );
+  const stored = await f.rows(
+    `SELECT value, value_evidence FROM kith.observations
+      WHERE space_id = $1 AND observation_key = 'total'`,
+    [f.spaceId],
+  );
+  assert.equal(stored.length, 1);
+  assert.deepEqual(stored[0].value, {
+    type: "money",
+    amount: "16.5",
+    currency: "USD",
+  });
+  // It carries the document's own anchor span, so the row hydrates.
+  assert.equal(stored[0].value_evidence.length, 1);
+  const entityId = (
+    await f.rows(
+      "SELECT id FROM kith.entities WHERE space_id = $1 AND key = 'other:document'",
+      [f.spaceId],
+    )
+  )[0].id;
+  const latest = await withKithTransaction(f.pool, (client) =>
+    executeRecordQuery(
+      { client, now: NOW + 6_000 },
+      {
+        principal: {
+          userId: f.userId,
+          credentialId: f.principal.credentialId,
+        },
+        query: {
+          operation: "latest_observation",
+          spaceId: f.spaceId,
+          entityId,
+          observationType: "total",
+        },
+      },
+    ),
+  );
+  assert.equal(latest.status, "match");
+  assert.deepEqual(latest.candidates[0].value, {
+    type: "money",
+    amount: "16.5",
+    currency: "USD",
+  });
+});
