@@ -471,6 +471,23 @@ function admissionRevisionConflict(
   );
 }
 
+/**
+ * P2-104e. The journaled discovery lease, while the server will still honour
+ * it. A step that walks a document back through its earlier steps must carry
+ * a live lease with it: `discovery.reserveArchived` under a fresh request id
+ * is refused by that very lease until it expires, and each lease it does hand
+ * out spends one of the row's discovery attempts.
+ */
+function liveDiscoveryLease(
+  checkpoint: ArchivedCheckpoint,
+  now = Date.now(),
+): ArchivedCheckpoint["discoveryLease"] {
+  const lease = checkpoint.discoveryLease;
+  return lease && lease.leaseExpiresAt > now + LEASE_SAFETY_MARGIN_MS
+    ? lease
+    : undefined;
+}
+
 function archivedBase(
   checkpoint: ArchivedCheckpoint,
   updates: Partial<ArchivedCheckpoint> = {},
@@ -2129,16 +2146,22 @@ export class PipelineRunner {
           throw new PipelineWorkerError("journal_phase_conflict");
         }
         const mapped = await this.mappedProcessing(checkpoint);
-        const providerOriginal = mapped.original.providerOriginal
-          ? this.providerDeclaration(mapped.original, false)
-          : undefined;
+        const provider = this.admissionProvider(
+          checkpoint,
+          mapped.original,
+          false,
+        );
         expected = request(this.config, operation, {
           requestId,
           workId: lease.workId,
           leaseEpoch: lease.leaseEpoch,
           leaseToken: lease.leaseToken,
-          ...this.admissionSelections(checkpoint, mapped, providerOriginal),
-          ...(providerOriginal === undefined ? {} : { providerOriginal }),
+          ...this.admissionSelections(
+            checkpoint,
+            mapped,
+            provider.providerOriginal,
+          ),
+          ...provider,
           parsedText: mapped.declaration,
         });
         break;
@@ -3431,6 +3454,7 @@ export class PipelineRunner {
           throw new PipelineWorkerError("journal_phase_conflict");
         }
         const code = errorCode(response);
+        if (code === "lease_conflict") return await this.leaseHeld(current);
         if (code) {
           return scanTerminal(current, "failed", code, true);
         }
@@ -4112,7 +4136,7 @@ export class PipelineRunner {
     return archivedBase(checkpoint, {
       step: "capture",
       receiptChecked: true,
-      discoveryLease: undefined,
+      discoveryLease: liveDiscoveryLease(checkpoint),
       expectedOriginalRevision: nextOriginal.rowRevision,
       expectedProcessingRevision: nextProcessing.rowRevision,
     });
@@ -4287,11 +4311,36 @@ export class PipelineRunner {
           // them are immutable, bound to the admission that created them. A
           // second processing generation cannot declare them again -- a fresh
           // admission carries a fresh request digest and the stored receipt
-          // refuses it -- so it selects them. A provider original has no
-          // backup receipt to select and does not reach admission at all
-          // (P2-31b), so it is left alone.
+          // refuses it -- so it selects them.
+          //
+          // P2-104e. A provider original is the same case and was left out:
+          // its reference is bound to the admission that declared it, so the
+          // second generation selects the bound reference the server names
+          // here. Left out, every document of a provider source walked to
+          // `admit`, was sent back to `lookup_original` by the P2-31b guard
+          // with its live lease dropped, and failed the pass at the second
+          // `reserve` with `lease_conflict` against its own lease.
           ...(provider
-            ? {}
+            ? {
+                originalReuse: {
+                  primaryReceiptId: text(
+                    value.originalPrimaryReceiptId,
+                    "original_primary_receipt_id",
+                  ),
+                  primaryBindingEpoch: integer(
+                    value.originalPrimaryBindingEpoch,
+                    "original_primary_binding_epoch",
+                  ),
+                  providerReferenceId: text(
+                    value.originalProviderReferenceId,
+                    "original_provider_reference_id",
+                  ),
+                  providerBindingEpoch: integer(
+                    value.originalProviderBindingEpoch,
+                    "original_provider_binding_epoch",
+                  ),
+                },
+              }
             : {
                 originalReuse: {
                   primaryReceiptId: text(
@@ -4842,10 +4891,36 @@ export class PipelineRunner {
     }
   }
 
+  /**
+   * P2-104e. Someone holds a live lease on this one work row: most often an
+   * earlier pass of this same worker that died after reserving. That is a fact
+   * about one document and it clears itself when the lease expires, so the
+   * document waits for a later pass and the others do not. Nothing was
+   * reserved, so no discovery attempt was spent.
+   */
+  private async leaseHeld(
+    checkpoint: ArchivedCheckpoint,
+  ): Promise<RunnerCheckpoint> {
+    process.stderr.write(
+      `${JSON.stringify({ event: "archived_lease_held", action: "deferred_to_next_pass" })}\n`,
+    );
+    return await this.afterArchivedItem(checkpoint, 0);
+  }
+
   private async driveArchivedReserve(): Promise<void> {
     const checkpoint = this.journal.checkpoint;
     if (checkpoint.phase !== "archived" || checkpoint.step !== "reserve") {
       throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    // P2-104e. A lease this journal already holds and the server will still
+    // honour is the reservation. Asking again under a new request id would be
+    // refused by it, and used to fail the whole pass.
+    if (!this.journal.pending && liveDiscoveryLease(checkpoint)) {
+      await this.journal.transitionCheckpoint({
+        checkpoint: archivedBase(checkpoint, { step: "admit" }),
+        credentialSessionActive: true,
+      });
+      return;
     }
     const identity = archivedIdentity(
       checkpoint,
@@ -4858,11 +4933,12 @@ export class PipelineRunner {
           requestId: randomUUID(),
           identity,
         }),
-      (current, response) => {
+      async (current, response) => {
         if (current.phase !== "archived" || current.step !== "reserve") {
           throw new PipelineWorkerError("journal_phase_conflict");
         }
         const code = errorCode(response);
+        if (code === "lease_conflict") return await this.leaseHeld(current);
         if (code) {
           return scanTerminal(current, "failed", code, true);
         }
@@ -4995,6 +5071,31 @@ export class PipelineRunner {
     };
   }
 
+  /**
+   * P2-104e. How an admission accounts for a provider original: a selection
+   * of the reference the server already holds, a fresh declaration, or
+   * nothing for an original with its own backup receipt. Shared by the admit
+   * and its replay validator so the two cannot disagree.
+   */
+  private admissionProvider(
+    checkpoint: ArchivedCheckpoint,
+    original: OriginalCatalogRow,
+    requireFresh: boolean,
+  ) {
+    const reuse = checkpoint.originalReuse;
+    if (reuse?.providerReferenceId !== undefined) {
+      return {
+        existingProviderOriginal: {
+          referenceId: reuse.providerReferenceId,
+          bindingEpoch: reuse.providerBindingEpoch!,
+        },
+      };
+    }
+    return original.providerOriginal
+      ? { providerOriginal: this.providerDeclaration(original, requireFresh) }
+      : {};
+  }
+
   private async driveArchivedAdmit(): Promise<void> {
     const checkpoint = this.journal.checkpoint;
     if (checkpoint.phase !== "archived" || checkpoint.step !== "admit") {
@@ -5041,8 +5142,12 @@ export class PipelineRunner {
     // A pending call is exempt: a replay sends the persisted request under its
     // original `requestId`, which is the one shape the server does accept
     // against a recorded reference.
+    // P2-104e. None of that applies to an admission that selects the bound
+    // reference instead of declaring it, which is the shape P2-31b said did
+    // not exist yet.
     if (
       !this.journal.pending &&
+      checkpoint.originalReuse?.providerReferenceId === undefined &&
       admitting.providerOriginal &&
       admitting.cloud &&
       "providerReferenceId" in admitting.cloud
@@ -5061,7 +5166,7 @@ export class PipelineRunner {
           checkpoint: archivedBase(checkpoint, {
             step: "lookup_original",
             receiptChecked: true,
-            discoveryLease: undefined,
+            discoveryLease: liveDiscoveryLease(checkpoint),
           }),
           credentialSessionActive: true,
         });
@@ -5107,12 +5212,12 @@ export class PipelineRunner {
       return;
     }
     const mapped = await this.mappedProcessing(checkpoint);
-    const providerOriginal = mapped.original.providerOriginal
-      ? this.providerDeclaration(
-          mapped.original,
-          this.journal.pending === undefined,
-        )
-      : undefined;
+    const provider = this.admissionProvider(
+      checkpoint,
+      mapped.original,
+      this.journal.pending === undefined,
+    );
+    const providerOriginal = provider.providerOriginal;
     const result = await this.mutation(
       "discovery.admitArchived",
       () =>
@@ -5122,7 +5227,7 @@ export class PipelineRunner {
           leaseEpoch: lease.leaseEpoch,
           leaseToken: lease.leaseToken,
           ...this.admissionSelections(checkpoint, mapped, providerOriginal),
-          ...(providerOriginal === undefined ? {} : { providerOriginal }),
+          ...provider,
           parsedText: mapped.declaration,
         }),
       async (current, response, pending) => {
@@ -5150,7 +5255,8 @@ export class PipelineRunner {
         }
         let { original, processing } = this.archivedRows(current);
         const responseProvider = "originalProviderReferenceId" in value;
-        if ((providerOriginal !== undefined) !== responseProvider)
+        const viaProvider = Object.keys(provider).length > 0;
+        if (viaProvider !== responseProvider)
           throw new PipelineWorkerError("archived_recovery_branch_conflict");
         // P2-31f: two admissions disagree about which revision was accepted
         // for this one file. Nothing about any other file is in doubt, so the
@@ -5164,7 +5270,7 @@ export class PipelineRunner {
           );
         for (const [subject, role, receiptField] of [
           ["original_bytes", "primary", "originalPrimaryReceiptId"],
-          ...(providerOriginal === undefined
+          ...(!viaProvider
             ? [
                 [
                   "original_bytes",
@@ -5214,7 +5320,7 @@ export class PipelineRunner {
                 "source_revision_id",
               ),
               primaryReceiptId: original.copies.primary.cloudReceipt!.receiptId,
-              ...(providerOriginal === undefined
+              ...(!viaProvider
                 ? {
                     backupReceiptId:
                       original.copies.independent_backup.cloudReceipt!

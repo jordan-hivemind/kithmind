@@ -105,6 +105,13 @@ export type ArchiveReceiptReuse = {
   primaryBindingEpoch: number;
   backupReceiptId?: string;
   backupBindingEpoch?: number;
+  /**
+   * P2-104e. The provider original reference the server reports bound to
+   * these bytes, which stands where the backup receipt would. Admission
+   * selects it rather than declaring the reference a second time.
+   */
+  providerReferenceId?: string;
+  providerBindingEpoch?: number;
 };
 
 /**
@@ -646,11 +653,19 @@ function archiveReceiptReuse(value: unknown): ArchiveReceiptReuse {
   exact(
     row,
     ["primaryReceiptId", "primaryBindingEpoch"],
-    ["backupReceiptId", "backupBindingEpoch"],
+    [
+      "backupReceiptId",
+      "backupBindingEpoch",
+      "providerReferenceId",
+      "providerBindingEpoch",
+    ],
   );
   if (
     (row.backupReceiptId === undefined) !==
-    (row.backupBindingEpoch === undefined)
+      (row.backupBindingEpoch === undefined) ||
+    (row.providerReferenceId === undefined) !==
+      (row.providerBindingEpoch === undefined) ||
+    (row.backupReceiptId !== undefined && row.providerReferenceId !== undefined)
   )
     fail();
   return {
@@ -661,6 +676,12 @@ function archiveReceiptReuse(value: unknown): ArchiveReceiptReuse {
       : {
           backupReceiptId: id(row.backupReceiptId),
           backupBindingEpoch: integer(row.backupBindingEpoch),
+        }),
+    ...(row.providerReferenceId === undefined
+      ? {}
+      : {
+          providerReferenceId: id(row.providerReferenceId),
+          providerBindingEpoch: integer(row.providerBindingEpoch),
         }),
   };
 }
