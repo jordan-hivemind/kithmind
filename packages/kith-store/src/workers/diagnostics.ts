@@ -4,7 +4,10 @@ import type {
   WorkerDiagnosticsStatusResult,
   WorkerRequest,
 } from "@repo/worker-protocol/request";
-import type { PrincipalRef } from "../identity/authorization.js";
+import {
+  requireSpaceAccess,
+  type PrincipalRef,
+} from "../identity/authorization.js";
 
 import { newKithId } from "../ids.js";
 import { sha256Utf8 } from "../provenance/sql.js";
@@ -222,6 +225,47 @@ export async function getWorkerDiagnosticsStatus(
   };
 }
 
+/**
+ * ADM-10. Whether this heartbeat is the registered watcher under its new id.
+ *
+ * What the identity check is for. The worker credential is what authorizes a
+ * heartbeat at all (`requireWorkerSourceAccount`), so this check is not an
+ * authentication control and never was: a holder of the key can already open
+ * scans and publish documents. What it protects is the *operational* truth the
+ * health screen reads off this row -- that exactly one host is the registered
+ * watcher for a source account, so a host that goes silent shows up as missing
+ * instead of being masked by a second host's pings. Two hosts on one credential
+ * and a stale process left running are the same failure seen twice, and the
+ * refusal is what makes either of them visible rather than a race to write
+ * last.
+ *
+ * That is preserved here. A heartbeat presenting neither the registered id nor
+ * the id it was registered under is still refused, and re-registration stays an
+ * owner action (`resetWorkerWatcher`). What is allowed is exactly one thing: a
+ * watcher that presents, as `legacyWatcherId`, the id the row already holds may
+ * carry that row to its ADM-10 id. It is the same installation saying the same
+ * thing in the new spelling, and a *live* watcher can do it without a gap --
+ * gating it on the row being overdue would mean every upgraded worker went
+ * missing for the overdue window and opened an incident for it.
+ *
+ * The trade, stated plainly: a second host on the same credential that reads
+ * the registered id from `diagnostics.status` can present it here and take the
+ * row over, where before ADM-10 it was refused. It gains the heartbeat row and
+ * nothing else, it must already hold a key that can write documents into the
+ * space, and the host it displaced is refused from its next ping onward and
+ * says so. Set against a derivation that killed the heartbeat on every parser
+ * upgrade, that is the better failure.
+ */
+function adoptsLegacyWatcherId(
+  current: Watcher,
+  request: Extract<WorkerRequest, { operation: "diagnostics.heartbeat" }>,
+): boolean {
+  return (
+    request.legacyWatcherId !== undefined &&
+    current.watcherId === request.legacyWatcherId
+  );
+}
+
 export async function recordWorkerHeartbeat(
   ctx: WorkerCtx,
   principal: PrincipalRef,
@@ -239,11 +283,18 @@ export async function recordWorkerHeartbeat(
   const current = await watcherForSource(ctx, source.account.id, true);
   if (current) {
     validateWatcher(current, source);
-    if (current.watcherId !== request.watcherId)
+    if (
+      current.watcherId !== request.watcherId &&
+      !adoptsLegacyWatcherId(current, request)
+    )
       workerProtocolError("identity_review_required");
   }
   const incident = await openIncident(ctx, source.account.id, true);
-  if (incident) validateIncident(incident, source, request.watcherId);
+  // The incident belongs to the *registered* watcher, which on an ADM-10
+  // adoption is still the legacy id. It is resolved below in this same
+  // transaction, so it is never left pointing at an id no row carries.
+  if (incident)
+    validateIncident(incident, source, current?.watcherId ?? request.watcherId);
   if (
     incident &&
     current?.state === "active" &&
@@ -254,6 +305,10 @@ export async function recordWorkerHeartbeat(
   if (
     current?.state === "active" &&
     !incident &&
+    // An adoption is a write even inside the damping window: skipping it here
+    // would answer the ping and leave the row on the legacy id, so the next
+    // ping outside the window would have to adopt all over again.
+    current.watcherId === request.watcherId &&
     ctx.now >= current.lastSeenAt!.getTime() &&
     ctx.now - current.lastSeenAt!.getTime() < WORKER_HEARTBEAT_MIN_WRITE_MS
   ) {
@@ -270,7 +325,8 @@ export async function recordWorkerHeartbeat(
   if (current) {
     await exec(
       ctx,
-      `UPDATE kith.worker_watcher_states SET state = 'active', connector_version = $1,
+      `UPDATE kith.worker_watcher_states SET state = 'active', watcher_id = $7,
+      connector_version = $1,
       actor_user_id = $2, actor_credential_id = $3, last_seen_at = $4, next_expected_at = $5,
       sweep_after = $5, updated_at = $4 WHERE id = $6`,
       [
@@ -280,6 +336,7 @@ export async function recordWorkerHeartbeat(
         at(receivedAt),
         at(nextExpectedAt),
         current.id,
+        request.watcherId,
       ],
     );
   } else {
@@ -794,5 +851,106 @@ export async function resetWorkerWatcher(
     watcherId: args.nextWatcherId,
     reused: false,
     changedAt: ctx.now,
+  };
+}
+
+export type ReregisterWatcherResult = {
+  sourceAccountId: string;
+  /** The id that was cleared, or null when nothing was registered. */
+  clearedWatcherId: string | null;
+  changedAt: number;
+};
+
+/**
+ * ADM-10. The owner's re-registration: clear the binding so the next heartbeat
+ * claims it.
+ *
+ * This is the supported way out of `identity_review_required`, and it is the
+ * only one. Section "Worker heartbeat diagnostics" of the worker protocol plan
+ * settles who may do it: "A worker cannot approve an ambiguous identity mapping
+ * itself", and "Only a current-session owner operation may replace or clear the
+ * binding". A worker-credential subcommand that re-registered its own host --
+ * even gated on the registered watcher being overdue -- is exactly the
+ * self-approval that sentence forbids, so there is no `reregister-watcher` CLI
+ * on the worker and this is the whole surface. It costs nothing to do without
+ * one: the owner is already on the health screen looking at the pill that told
+ * him, and the watcher recovers on its next ping, within thirty seconds.
+ *
+ * `nextWatcherId: null` rather than a replacement id, because the server cannot
+ * derive the worker's id and must not be told one over this route: the
+ * heartbeat is the only thing that knows it, and `recordWorkerHeartbeat`'s
+ * first-heartbeat path claims an unbound source. So the window this opens is
+ * one heartbeat interval wide and closes on the first ping that arrives -- and
+ * the first ping to arrive is the host that is up.
+ *
+ * Authorization, in order: the account is loaded by id and its *own* space is
+ * what `requireSpaceAccess` is asked about, so no space id crosses the wire;
+ * `write` is required before the role is looked at, so a reader is refused by
+ * the same path an outsider is; and then the membership must be `owner`, which
+ * denies an editor. Every refusal is the same `Source account not found` the
+ * rest of this surface gives, so a caller cannot map another space's accounts
+ * by reading the denial.
+ */
+export async function reregisterWorkerWatcher(
+  ctx: WorkerCtx,
+  principal: PrincipalRef,
+  args: { sourceAccountId: string; requestId: string },
+): Promise<ReregisterWatcherResult> {
+  validateNow(ctx.now);
+  const account = await row<{
+    id: string;
+    space_id: string;
+    enabled: boolean | null;
+  }>(ctx, "SELECT id, space_id, enabled FROM kith.source_accounts WHERE id = $1", [
+    args.sourceAccountId,
+  ]);
+  if (!account) throw new Error("Source account not found");
+  let membership;
+  try {
+    membership = await requireSpaceAccess(
+      ctx,
+      principal,
+      account.space_id,
+      "write",
+    );
+  } catch {
+    throw new Error("Source account not found");
+  }
+  if (membership.role !== "owner") throw new Error("Source account not found");
+
+  // `resetWorkerWatcher` is a compare-and-set, and the id to compare against
+  // is whatever is registered right now. A retry of the same request would
+  // therefore compute a *different* expectation -- the row this call already
+  // deleted -- and be answered `request_conflict` by its own receipt. So a
+  // replay reuses the expectation the receipt recorded, which is what makes a
+  // lost response safe to retry instead of merely safe to repeat.
+  const prior = await row<{ expected_watcher_id: string | null }>(
+    ctx,
+    `SELECT expected_watcher_id FROM kith.worker_watcher_reset_receipts
+       WHERE source_account_id = $1 AND request_id = $2 LIMIT 1`,
+    [args.sourceAccountId, args.requestId],
+  );
+  const current = await watcherForSource(ctx, account.id, true);
+  const expectedWatcherId = prior
+    ? prior.expected_watcher_id
+    : (current?.watcherId ?? null);
+  const reset = await resetWorkerWatcher(
+    ctx,
+    {
+      id: account.id,
+      spaceId: account.space_id,
+      enabled: account.enabled === true,
+    },
+    membership.userId,
+    {
+      requestId: args.requestId,
+      expectedWatcherId,
+      nextWatcherId: null,
+    },
+  );
+  return {
+    sourceAccountId: account.id,
+    clearedWatcherId: expectedWatcherId,
+    changedAt: reset.changedAt,
   };
 }

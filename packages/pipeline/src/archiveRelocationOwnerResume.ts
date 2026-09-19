@@ -528,7 +528,14 @@ async function verify(
     journal.credentialStatus !== "current" ||
     journal.pending !== undefined ||
     !archiveCheckpointIsQuiescent(checkpoint) ||
-    journal.watcherId === recipe.body.localBindings.previousWatcherId ||
+    // ADM-10 removed a clause here that required `journal.watcherId` to differ
+    // from the recipe's `previousWatcherId`. It asserted that the rebind had
+    // minted a new heartbeat identity, which is what the old derivation did on
+    // any configuration change and what `mintWatcherId` deliberately no longer
+    // does: a relocation moves the archive root, not the watcher. Restating it
+    // as an equality would only duplicate the compare-and-set the owner reset
+    // below already performs against the server's own stored id, which is the
+    // copy that matters.
     !UUID.test(journal.watcherId)
   )
     fail("session_not_ready");

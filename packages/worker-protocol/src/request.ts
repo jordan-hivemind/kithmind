@@ -301,6 +301,17 @@ export type WorkerRequest =
   | (WorkerSourceRequest & {
       operation: "diagnostics.heartbeat";
       watcherId: string;
+      /**
+       * ADM-10. The id this watcher would have computed under the `v1`
+       * derivation, which bound the identity to the worker's configuration.
+       *
+       * Optional in both directions: a worker older than ADM-10 sends only
+       * `watcherId`, and a server older than ADM-10 refuses the unknown key
+       * with `invalid_request`. That costs such a deployment its heartbeat
+       * until the server is updated, and costs its passes nothing -- the
+       * heartbeat runs on its own timer. Deploy the server first.
+       */
+      legacyWatcherId?: string;
       connectorVersion: string;
     })
   | (WorkerSourceRequest & {
@@ -1921,11 +1932,23 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
       exactKeys(input, baseKeys);
       return { ...base, operation: "diagnostics.status" };
     case "diagnostics.heartbeat":
-      exactKeys(input, [...baseKeys, "watcherId", "connectorVersion"]);
+      exactKeys(
+        input,
+        [...baseKeys, "watcherId", "connectorVersion"],
+        ["legacyWatcherId"],
+      );
       return {
         ...base,
         operation: "diagnostics.heartbeat",
         watcherId: string(input.watcherId, { maxUtf16: 36, pattern: UUID }),
+        ...(input.legacyWatcherId === undefined
+          ? {}
+          : {
+              legacyWatcherId: string(input.legacyWatcherId, {
+                maxUtf16: 36,
+                pattern: UUID,
+              }),
+            }),
         connectorVersion: string(input.connectorVersion, { maxUtf8: 100 }),
       };
     // ADM-9. The terminal outcome of one pass, sent after the pass is over.

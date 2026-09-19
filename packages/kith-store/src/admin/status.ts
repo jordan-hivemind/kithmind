@@ -54,6 +54,14 @@ export type HealthCheck = {
     code: string | null;
     problem: boolean;
   };
+  /**
+   * ADM-10. Only the watcher check sets it. `stuck` is the source accounts
+   * whose heartbeat has stopped arriving, which is what "Re-register watcher"
+   * acts on; `identity` says those heartbeats are being refused rather than
+   * not sent (`identityRefused`), which is a different pill and a different
+   * fix.
+   */
+  watcher?: { stuck: readonly string[]; identity: boolean };
 };
 
 const MINUTE = 60_000;
@@ -154,6 +162,43 @@ export function passProblem(watcher: WatcherFact, now: number): boolean {
 }
 
 /**
+ * ADM-10. Whether this watcher's heartbeat is being refused rather than absent.
+ *
+ * `recordWorkerHeartbeat` refuses a heartbeat whose `watcherId` is not the
+ * registered one with `identity_review_required`, before any write. The row it
+ * refuses to touch is this one, so from here an unregistered host and a host
+ * that is switched off look identical: `last_seen_at` simply stops. That is
+ * what let the owner's watcher run for seventeen hours reading as missing.
+ *
+ * The two are told apart by work the refused host still does. A heartbeat
+ * carries a `watcherId` and is refused; a processing assessment carries none
+ * (`workers/assessment.ts`) and lands, as do its scans and its published
+ * documents. So a watcher whose heartbeat stopped while its assessments kept
+ * arriving is a host that is up, reachable, authorized, and talking to this
+ * server under an identity the server does not recognise -- which is
+ * `identity_review_required` and nothing else.
+ *
+ * Derived rather than recorded because the refusal writes nothing: the
+ * heartbeat's transaction is rolled back by the very error that refuses it
+ * (`withKithTransaction` is `SERIALIZABLE` and a throw aborts it), so a column
+ * set on the way out would not survive to be read here.
+ *
+ * The assessment must be newer than the deadline the heartbeat missed, not
+ * merely newer than the last heartbeat: an assessment written in the same pass
+ * as the last accepted ping proves nothing about the window since.
+ */
+export function identityRefused(watcher: WatcherFact, now: number): boolean {
+  return (
+    watcher.enabled &&
+    watcher.watcherState === "active" &&
+    watcher.nextExpectedAt !== null &&
+    watcher.nextExpectedAt < now &&
+    watcher.assessmentAt !== null &&
+    watcher.assessmentAt > watcher.nextExpectedAt
+  );
+}
+
+/**
  * One source account's watcher status.
  *
  * A disabled source is `not_configured` rather than a failure: nothing is
@@ -198,12 +243,13 @@ function watcherCheck(
   // Two different failures, counted separately because they need different
   // things done about them: a host that stopped reporting, and a host that
   // reports and gets nowhere. Before ADM-9 only the first was visible.
-  const overdue = watching.filter(
+  const silent = watching.filter(
     (watcher) =>
       watcher.watcherState === "active" &&
       watcher.nextExpectedAt !== null &&
       watcher.nextExpectedAt < now,
-  ).length;
+  );
+  const overdue = silent.length;
   const stuck = watching.filter((watcher) => passProblem(watcher, now)).length;
   const detail = [
     `last pass ${ago(lastCheckedAt, now)}`,
@@ -254,6 +300,14 @@ function watcherCheck(
             state: shown.lastPassState,
             code: shown.lastPassCode,
             problem: passProblem(shown, now),
+          },
+        }),
+    ...(silent.length === 0
+      ? {}
+      : {
+          watcher: {
+            stuck: silent.map((watcher) => watcher.sourceAccountId),
+            identity: silent.some((watcher) => identityRefused(watcher, now)),
           },
         }),
   };

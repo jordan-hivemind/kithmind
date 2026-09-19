@@ -152,3 +152,33 @@ test("an unknown field is refused rather than ignored, on every operation", () =
     { ...source, operation: "source.roots" },
   );
 });
+
+// ADM-10. `legacyWatcherId` on the heartbeat, and the skew it creates.
+test("diagnostics.heartbeat takes an optional legacy watcher id", () => {
+  const heartbeat = {
+    ...source,
+    operation: "diagnostics.heartbeat",
+    watcherId: outcome.watcherId,
+    connectorVersion: "1.2.3",
+  };
+  // Old worker to new server: the field is absent and nothing changes.
+  assert.deepEqual(parseWorkerRequest(heartbeat), heartbeat);
+
+  const withLegacy = {
+    ...heartbeat,
+    legacyWatcherId: "10000000-0000-4000-8000-000000000002",
+  };
+  assert.deepEqual(parseWorkerRequest(withLegacy), withLegacy);
+
+  // Same shape rule as `watcherId`: a canonical UUID and nothing else, so it
+  // can never smuggle a path or a host name into the column the health screen
+  // renders.
+  for (const bad of [
+    { ...heartbeat, legacyWatcherId: "not-a-uuid" },
+    { ...heartbeat, legacyWatcherId: "" },
+    { ...heartbeat, legacyWatcherId: "/Users/someone/journal" },
+    { ...heartbeat, legacyWatcherId: null },
+  ]) {
+    assert.throws(() => parseWorkerRequest(bad), WorkerProtocolParseError);
+  }
+});

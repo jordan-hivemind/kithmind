@@ -212,6 +212,12 @@ export class WatchHeartbeat {
     private readonly config: PipelineConfig,
     private transport: WorkerTransport,
     readonly watcherId: string,
+    /**
+     * ADM-10. `journal.legacyWatcherId`. Left out only by a caller that has
+     * none, in which case a server holding the legacy id refuses this watcher
+     * until the owner re-registers it.
+     */
+    readonly legacyWatcherId?: string,
   ) {}
 
   start(): void {
@@ -247,6 +253,10 @@ export class WatchHeartbeat {
           spaceId: this.config.spaceId,
           sourceAccountId: this.config.sourceAccountId,
           watcherId: this.watcherId,
+          ...(this.legacyWatcherId === undefined ||
+          this.legacyWatcherId === this.watcherId
+            ? {}
+            : { legacyWatcherId: this.legacyWatcherId }),
           connectorVersion: "kithmind-filesystem-worker-v1",
         },
         controller.signal,
