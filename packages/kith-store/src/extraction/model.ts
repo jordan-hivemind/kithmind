@@ -51,6 +51,13 @@ import {
 import { ProofError } from "../errors.js";
 import { KITH_ID, newKithId } from "../ids.js";
 import { locateCardQuote } from "../provenance/model.js";
+import {
+  citationRange,
+  numberedPage,
+  pageLines,
+  MAX_PAGE_LINES,
+  type PageLine,
+} from "./lines.js";
 import { sha256Utf8 } from "../provenance/sql.js";
 import { occurrenceColumns, occurrenceSortKey } from "../records/model.js";
 import type { ObservationValue, Occurrence } from "../records/values.js";
@@ -58,11 +65,13 @@ import { withKithTransaction } from "../schema.js";
 import {
   openCorrection,
   reapplyCorrections,
+  supersedeOpenCorrections,
   resolvedCorrections,
 } from "./corrections.js";
 import { seedDocumentTypes } from "./seed.js";
 import {
   checkValue,
+  type DateOrder,
   isObservationFieldName,
   itemsSumToTotal,
   normalizeForMatch,
@@ -247,10 +256,78 @@ type LoadedType = {
   version: number;
   guidance: string | null;
   description: string | null;
+  /** The model this kind asks for, when it asks for one. See
+   * {@link extractionModelSetting}. */
+  model: string | null;
+  /** How this kind writes a numeric date, when it says. See
+   * {@link documentTypeSetting}. */
+  dateOrder: DateOrder | null;
   fields: TypeField[];
 };
 
-type LoadedPage = { id: string; ordinal: number; text: string };
+/**
+ * A per-kind model override, read out of `document_types.examples`.
+ *
+ * A receipt full of money is worth a stronger model than a letter, and which
+ * is which is the owner's call, not this code's. So it is data: an element of
+ * the type's `examples` array shaped
+ * `{"setting": "extraction_model", "value": "gpt-4.1"}`. Plain-string elements
+ * stay what they always were, examples.
+ *
+ * `examples` rather than a column of its own because `document_types` has no
+ * spare one and the next free migration number is already claimed by an open
+ * PR, which would leave this branch's own tests unable to apply the schema.
+ * ponytail: a real `extraction_model text` column is the upgrade path the
+ * moment a migration is free.
+ *
+ * Nothing here picks a model. With no such element the configured default is
+ * used, which is what every kind does until the owner says otherwise.
+ */
+export function documentTypeSetting(
+  examples: unknown,
+  name: string,
+): string | null {
+  if (!Array.isArray(examples)) return null;
+  for (const entry of examples) {
+    if (!entry || typeof entry !== "object") continue;
+    const setting = entry as { setting?: unknown; value?: unknown };
+    if (
+      setting.setting === name &&
+      typeof setting.value === "string" &&
+      /^[a-zA-Z0-9._:/-]{1,200}$/.test(setting.value)
+    ) {
+      return setting.value;
+    }
+  }
+  return null;
+}
+
+/** The kind's model override, or null for the configured default. */
+export function extractionModelSetting(examples: unknown): string | null {
+  return documentTypeSetting(examples, "extraction_model");
+}
+
+/**
+ * How this kind writes a numeric date, or null.
+ *
+ * `01/02/26` is two different days and the string cannot settle which. Unset,
+ * an ambiguous date opens a correction rather than being guessed; set, it is
+ * read that way and stored. The owner's documents are overwhelmingly US, but
+ * that is the owner's statement to make per kind, not this code's to assume.
+ */
+export function dateOrderSetting(examples: unknown): DateOrder | null {
+  const value = documentTypeSetting(examples, "date_order");
+  return value === "MDY" || value === "DMY" ? value : null;
+}
+
+type LoadedPage = {
+  id: string;
+  ordinal: number;
+  text: string;
+  /** The page's lines and their offsets, computed once: the prompt numbers
+   * them and a citation resolves against them. */
+  lines: PageLine[];
+};
 
 type Loaded = {
   spaceId: string;
@@ -263,6 +340,9 @@ type Loaded = {
   pages: LoadedPage[];
   pagesTotal: number;
   types: LoadedType[];
+  /** The kind the last extraction of this document settled on, when there was
+   * one. Only used to pick the model before the reply names a kind. */
+  priorKind: string | null;
 };
 
 async function loadDocument(
@@ -313,11 +393,15 @@ async function loadDocument(
       [generation.source_text_version_id, spaceId],
     )
   ).rows;
-  const pages = pageRows.map((row) => ({
-    id: String(row.id),
-    ordinal: Number(row.ordinal),
-    text: String(row.text ?? ""),
-  }));
+  const pages = pageRows.map((row) => {
+    const text = String(row.text ?? "");
+    return {
+      id: String(row.id),
+      ordinal: Number(row.ordinal),
+      text,
+      lines: pageLines(text),
+    };
+  });
   if (pages.length === 0) return null;
   return {
     spaceId,
@@ -330,6 +414,14 @@ async function loadDocument(
     pages: boundPages(pages),
     pagesTotal: pages.length,
     types: await loadTypes(client, spaceId, now),
+    priorKind:
+      (
+        await client.query<{ kind: string }>(
+          `SELECT kind FROM kith.document_extractions
+            WHERE space_id = $1 AND source_item_id = $2 LIMIT 1`,
+          [spaceId, sourceItemId],
+        )
+      ).rows[0]?.kind ?? null,
   };
 }
 
@@ -372,7 +464,8 @@ async function loadTypes(
   // and an extraction runs against the current one.
   const typeRows = (
     await client.query<Record<string, unknown>>(
-      `SELECT DISTINCT ON (kind) id, kind, version, guidance, description
+      `SELECT DISTINCT ON (kind) id, kind, version, guidance, description,
+              examples
          FROM kith.document_types
         WHERE space_id = $1 AND active
         ORDER BY kind, version DESC LIMIT 200`,
@@ -402,6 +495,8 @@ async function loadTypes(
       version: Number(row.version),
       guidance: (row.guidance ?? null) as string | null,
       description: (row.description ?? null) as string | null,
+      model: extractionModelSetting(row.examples),
+      dateOrder: dateOrderSetting(row.examples),
       fields,
     });
   }
@@ -432,18 +527,30 @@ export function buildRequest(loaded: Loaded): ExtractionRequest {
     })
     .join("\n");
   const body = loaded.pages
-    .map((page) => `=== page ${page.ordinal} ===\n${page.text}`)
+    .map(
+      (page) => `=== page ${page.ordinal} ===\n${numberedPage(page.lines)}`,
+    )
     .join("\n\n");
-  const truncated =
+  const longest = Math.max(0, ...loaded.pages.map((p) => p.lines.length));
+  const truncated = [
     loaded.pages.length < loaded.pagesTotal
-      ? `\nOnly the first ${loaded.pages.length} of ${loaded.pagesTotal} pages are shown.\n`
-      : "";
+      ? `Only the first ${loaded.pages.length} of ${loaded.pagesTotal} pages are shown.`
+      : "",
+    longest > MAX_PAGE_LINES
+      ? `Only the first ${MAX_PAGE_LINES} lines of a page are shown.`
+      : "",
+  ]
+    .filter(Boolean)
+    .map((note) => `\n${note}\n`)
+    .join("");
   // Every field name of every active kind, deduplicated. The schema's enum and
   // the prompt's catalog are two statements of one contract.
   const fields = [
     ...new Set(loaded.types.flatMap((type) => type.fields.map((f) => f.name))),
   ];
   const prompt = `Read this document and report what it says. Do not infer, calculate, or convert anything.
+
+Each page is shown as numbered lines, like "7| Subtotal    10.00". Cite the lines a value comes from by their numbers. Do not copy text back.
 
 Reply with JSON only, in exactly this shape:
 {"kind": "<one kind below, or other>",
@@ -453,25 +560,34 @@ Reply with JSON only, in exactly this shape:
     "value": "<the value, as a string>",
     "line_items": null,
     "page": <page number>,
-    "quote": "<text copied from that page>"}]}
+    "lines": [<line number>]}]}
 
 Rules:
 - Every statement names a field in "field". Never leave it out, never rename it, and never use the field name as a key of its own.
-- Every statement needs a quote copied exactly from the page it cites. If you cannot copy a quote, omit the statement.
+- "lines" holds one to three line numbers from the page named in "page". Cite the line the value is printed on. If a label and its amount are on different lines, cite both.
 - Only use fields listed under the kind you chose. Omit a field the document does not state.
-- Dates are YYYY-MM-DD. Money keeps the document's own digits, including the currency symbol if there is one.
+- Copy a value exactly as the line prints it, including the currency symbol. Dates may be copied as printed.
 - A line_item_list field puts its lines in "line_items" and sets "value" to null. Every other field puts its value in "value" and sets "line_items" to null.
 - Names, diagnoses and descriptions are copied as written. Do not normalize them.
 
-Worked example, for a receipt that reads "Bracken Tools / 2 Apr 2026 / Chisel 12.00 / Mallet 8.00 / Total $20.00":
+Worked example. Given this page:
+1| Bracken Tools
+2| 2 Apr 2026
+3| Chisel            12.00
+4| Mallet             8.00
+5| Subtotal   Tax   Total
+6| 20.00      1.60  21.60
+the reply is:
 {"kind": "receipt",
- "summary": "Hardware receipt from Bracken Tools for $20.00.",
+ "summary": "Hardware receipt from Bracken Tools for 21.60.",
  "statements": [
-   {"field": "vendor", "value": "Bracken Tools", "line_items": null, "page": 0, "quote": "Bracken Tools"},
-   {"field": "purchase_date", "value": "2026-04-02", "line_items": null, "page": 0, "quote": "2 Apr 2026"},
-   {"field": "line_items", "value": null, "page": 0, "quote": "Chisel 12.00 / Mallet 8.00",
+   {"field": "vendor", "value": "Bracken Tools", "line_items": null, "page": 0, "lines": [1]},
+   {"field": "purchase_date", "value": "2 Apr 2026", "line_items": null, "page": 0, "lines": [2]},
+   {"field": "line_items", "value": null, "page": 0, "lines": [3, 4],
     "line_items": [{"description": "Chisel", "amount": "12.00"}, {"description": "Mallet", "amount": "8.00"}]},
-   {"field": "total", "value": "$20.00", "line_items": null, "page": 0, "quote": "Total $20.00"}]}
+   {"field": "subtotal", "value": "20.00", "line_items": null, "page": 0, "lines": [5, 6]},
+   {"field": "tax", "value": "1.60", "line_items": null, "page": 0, "lines": [5, 6]},
+   {"field": "total", "value": "21.60", "line_items": null, "page": 0, "lines": [5, 6]}]}
 
 Kinds:
 ${catalog}
@@ -531,15 +647,60 @@ type Prepared = {
   occurrence: Occurrence;
 };
 
+/**
+ * Where one statement's citation points, and the text the server reads there.
+ *
+ * Line ids first: they resolve arithmetically against the page's own line
+ * offsets, so a citation in range always produces a quote and the model is
+ * never asked to reproduce anything. A reply that carried the older `quote`
+ * shape instead still locates, which is what the non-schema fallback path has.
+ */
+function resolveCitation(
+  page: LoadedPage,
+  statement: { lines?: readonly number[]; quote?: string },
+): { start: number; end: number; quote: string; reason?: CorrectionReason } {
+  const cited = Array.isArray(statement.lines) ? statement.lines : [];
+  const quoted = typeof statement.quote === "string" ? statement.quote : "";
+  if (cited.length > 0) {
+    const range = citationRange(page.lines, cited);
+    if (!range) {
+      return { start: 0, end: 0, quote: "", reason: "citation_out_of_range" };
+    }
+    return { ...range, quote: page.text.slice(range.start, range.end) };
+  }
+  if (!quoted.trim()) {
+    return { start: 0, end: 0, quote: "", reason: "quote_not_found" };
+  }
+  const located = locateCardQuote(page.text, quoted);
+  if (
+    !located ||
+    located.start < 0 ||
+    located.end <= located.start ||
+    located.end > page.text.length
+  ) {
+    return {
+      start: 0,
+      end: 0,
+      quote: "",
+      reason: normalizeForMatch(page.text).includes(normalizeForMatch(quoted))
+        ? "span_unresolved"
+        : "quote_not_found",
+    };
+  }
+  return {
+    start: located.start,
+    end: located.end,
+    quote: page.text.slice(located.start, located.end),
+  };
+}
+
 async function findOrCreateSpan(
   client: ClientBase,
   loaded: Loaded,
   page: LoadedPage,
-  quote: string,
+  located: { start: number; end: number },
 ): Promise<string | null> {
-  const located = locateCardQuote(page.text, quote);
   if (
-    !located ||
     located.start < 0 ||
     located.end <= located.start ||
     located.end > page.text.length
@@ -623,6 +784,7 @@ async function prepare(
     field: TypeField;
     page: number;
     quote: string;
+    lines: number[];
     spanId: string;
     values: ObservationValue[];
     itemsTotal?: string;
@@ -647,38 +809,42 @@ async function prepare(
     }
     prepared.named += 1;
     const page = pages.get(statement.page);
-    if (!page || !statement.quote.trim()) {
+    if (!page) {
       prepared.failures.push({
         field: field.name,
-        reason: "quote_not_found",
+        reason: "citation_out_of_range",
         reading: statement.value,
       });
       continue;
     }
-    const spanId = await findOrCreateSpan(
-      client,
-      loaded,
-      page,
-      statement.quote,
-    );
+    const located = resolveCitation(page, statement);
+    if (located.reason) {
+      prepared.failures.push({
+        field: field.name,
+        reason: located.reason,
+        reading: statement.value,
+      });
+      continue;
+    }
+    const spanId = await findOrCreateSpan(client, loaded, page, located);
     if (!spanId) {
       prepared.failures.push({
         field: field.name,
-        reason: normalizeForMatch(page.text).includes(
-          normalizeForMatch(statement.quote),
-        )
-          ? "span_unresolved"
-          : "quote_not_found",
+        reason: "span_unresolved",
         reading: statement.value,
       });
       continue;
     }
+    // The quote is the server's own text at the cited offsets, so the gates
+    // below check the value against what the page says rather than against
+    // what the model typed.
     const gated = checkValue({
       valueType: field.valueType,
       value: statement.value,
-      quote: statement.quote,
+      quote: located.quote,
       pageText: page.text,
       defaultCurrency: "USD",
+      ...(type?.dateOrder ? { dateOrder: type.dateOrder } : {}),
     });
     if (!gated.ok) {
       prepared.failures.push({
@@ -691,7 +857,8 @@ async function prepare(
     accepted.push({
       field,
       page: statement.page,
-      quote: statement.quote,
+      quote: located.quote,
+      lines: [...(statement.lines ?? [])],
       spanId,
       values: gated.values,
       ...(gated.itemsTotal === undefined
@@ -909,6 +1076,7 @@ async function store(
   modelName: string,
   now: number,
   retryUnreadable: boolean,
+  refusedModel: string | null = null,
 ): Promise<ExtractionOutcome> {
   const type = loaded.types.find(
     (candidate) => candidate.kind === reading.kind,
@@ -1026,7 +1194,14 @@ async function store(
     }
   }
 
-  const truncated = loaded.pages.length < loaded.pagesTotal;
+  // Partially read either way: fewer pages shown than the document has, or a
+  // page longer than the model was shown. A limitation the owner cannot see is
+  // the same as no limitation at all.
+  const droppedPages = loaded.pages.length < loaded.pagesTotal;
+  const droppedLines = loaded.pages.some(
+    (page) => page.lines.length > MAX_PAGE_LINES,
+  );
+  const truncated = droppedPages || droppedLines;
   await client.query(
     `INSERT INTO kith.document_extractions
        (id,space_id,source_item_id,processing_generation_id,event_id,kind,
@@ -1072,6 +1247,15 @@ async function store(
     sourceItemId: loaded.sourceItemId,
   });
 
+  // The previous run's open items go before this run's are written, so the
+  // queue shows what is wrong now rather than everything that has ever been
+  // wrong. A failure that recurs is re-opened a line below; one that no longer
+  // applies simply is not.
+  await supersedeOpenCorrections(client, {
+    spaceId: loaded.spaceId,
+    sourceItemId: loaded.sourceItemId,
+  });
+
   // Corrections. A field a human already fixed does not get a new open item:
   // the fix stands, the new reading is kept alongside it, and re-raising it
   // every run would make the screen unusable.
@@ -1097,6 +1281,17 @@ async function store(
       reading: failure.reading,
     });
   }
+  if (refusedModel !== null) {
+    // One row, named, saying which string the provider would not take. The
+    // reading beside it is the default model's, so the document is read.
+    await openCorrection(client, {
+      spaceId: loaded.spaceId,
+      sourceItemId: loaded.sourceItemId,
+      fieldName: null,
+      reason: "extraction_model_refused",
+      reading: { requestedModel: refusedModel, usedModel: modelName },
+    });
+  }
   if (truncated) {
     await openCorrection(client, {
       spaceId: loaded.spaceId,
@@ -1106,6 +1301,11 @@ async function store(
       reading: {
         pagesRead: loaded.pages.length,
         pagesTotal: loaded.pagesTotal,
+        linesShownPerPage: MAX_PAGE_LINES,
+        longestPageLines: Math.max(
+          0,
+          ...loaded.pages.map((page) => page.lines.length),
+        ),
       },
     });
   }
@@ -1159,7 +1359,56 @@ export async function runDocumentExtractionJob(
   // its own job.
   if (!loaded || loaded.types.length === 0) return null;
 
-  const reading = await model.read(buildRequest(loaded));
+  // Which model reads this document.
+  //
+  // A kind's override can only apply once the kind is known, and the model is
+  // what decides the kind. Two ways out of that, both used here: a document
+  // extracted before reads with the model its recorded kind asks for, and a
+  // document read for the first time is read again -- once, at most -- when
+  // the kind it turned out to be asks for a different one. A kind with no
+  // override, which is every kind until the owner adds one, costs exactly one
+  // call as it always did.
+  const request = buildRequest(loaded);
+  const knownOverride = loaded.priorKind
+    ? (loaded.types.find((type) => type.kind === loaded.priorKind)?.model ??
+      null)
+    : null;
+  // A refused override falls back to the default, once.
+  //
+  // The override is a string an owner typed. A typo in it would otherwise
+  // wedge every document of that kind: the provider refuses the model, the
+  // job fails, the queue retries and fails again until the attempts run out,
+  // and the only sign is a provider error that names nothing. So a refusal
+  // costs one fallback call and one correction that says which string was
+  // refused, and the document is read with the default model meanwhile.
+  let used = knownOverride ?? model.name;
+  let refusedModel: string | null = null;
+  let reading: ModelReading;
+  try {
+    reading = await model.read(
+      knownOverride ? { ...request, model: knownOverride } : request,
+    );
+  } catch (error) {
+    // Only an override can be fallen back from. A default that fails is the
+    // provider being down, which is the queue's business, not this branch's.
+    if (!knownOverride) throw error;
+    refusedModel = knownOverride;
+    used = model.name;
+    reading = await model.read(request);
+  }
+  const wanted =
+    loaded.types.find((type) => type.kind === reading.kind)?.model ?? null;
+  if (wanted && wanted !== used && refusedModel === null) {
+    try {
+      reading = await model.read({ ...request, model: wanted });
+      used = wanted;
+    } catch {
+      // Keep the reading the default already produced rather than losing the
+      // document to a string the provider will refuse again. No second try:
+      // that is the loop this guard exists to prevent.
+      refusedModel = wanted;
+    }
+  }
 
   return await withKithTransaction(pool, async (client) => {
     // The generation may have been replaced while the model was reading. Write
@@ -1179,9 +1428,10 @@ export async function runDocumentExtractionJob(
       client,
       current,
       reading,
-      model.name,
+      used,
       now,
       job.attempts === 0,
+      refusedModel,
     );
   });
 }

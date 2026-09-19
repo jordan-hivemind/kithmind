@@ -50,14 +50,28 @@ export const CORRECTION_REASONS = [
   "money_unparsable",
   /** A date value was not a real ISO calendar date. */
   "date_unparsable",
+  /** A numeric date could be read two ways and the kind does not say which.
+   * `01/02/26` is the first of February or the second of January, and a
+   * coin flip stored with a citation is worse than an item in the queue. Set
+   * the kind's `date_order` to settle it. */
+  "date_ambiguous",
   /** A number value did not parse to an exact decimal. */
   "number_unparsable",
   /** Line items did not sum to the total stated alongside them. */
   "line_items_mismatch",
   /** The document was longer than the extraction bound, so part was not read. */
   "input_truncated",
+  /** The kind named a model the provider would not take. The document was
+   * read with the default instead, so this is a configuration item rather
+   * than a reading to fix. */
+  "extraction_model_refused",
   /** The model's output was not the shape the prompt asks for. */
   "malformed_statement",
+  /** The statement cited a page or line ids the page does not have, or a
+   * range too wide to be a citation. A citation, unlike a quote, is either in
+   * range or it is not: the server builds the text, so there is nothing left
+   * for the model to get wrong except the numbers. */
+  "citation_out_of_range",
   /** Two statements gave the same field two different values. Neither is
    * stored: a coin flip between two readings is the silent wrongness this
    * whole gate exists to prevent. */
@@ -104,6 +118,12 @@ function fail(reason: CorrectionReason): GateFailure {
 export function normalizeForMatch(value: string): string {
   return value.normalize("NFKC").replace(/\s+/g, " ").trim().toLowerCase();
 }
+
+/** What marks the digits after it as money: a symbol, or three capitals
+ * standing as their own word. Used only to decide whether a space inside a
+ * number is a rendering artifact. */
+const CURRENCY_MARK =
+  "[$\u20ac\u00a3\u00a5\u20b9\u20a9]|(?<![A-Za-z])[A-Z]{3}(?![A-Za-z])";
 
 const CURRENCY_SYMBOLS: ReadonlyArray<readonly [string, string]> = [
   ["$", "USD"],
@@ -255,7 +275,34 @@ function realIsoDate(value: string): boolean {
  * a separator.
  */
 export function amountsInText(text: string): string[] {
-  const normalized = text.normalize("NFKC");
+  // A parsed receipt prints "$ 165 .00" as readily as "$165.00": the space is
+  // a rendering artifact of the column the amount sat in, not a separator.
+  // Closing it up before tokenizing is what lets such an amount be found.
+  //
+  // Only ever next to a currency symbol or an ISO code, and only around a
+  // decimal point. A bare gap between two numbers is two numbers, and joining
+  // them invents an amount the page does not state: "APPLES 12 .99" is a
+  // quantity beside a price, "3. 12 Pack Soda 5.99" is a list position beside
+  // an item, "Milk 2. 5L" is a size, and "refs 1, 234, 567" is three
+  // references. Every one of those was read as a single amount by the first
+  // version of this repair, which is a fabricated value with a citation --
+  // the one outcome this gate exists to prevent. A comma is never closed at
+  // all, because a comma between numbers is a list far more often than it is
+  // a decimal point.
+  //
+  // The cost of the narrow rule is a column-rendered amount with no symbol
+  // beside it, which becomes a correction. An extra correction is cheap; a
+  // wrong stored number is not.
+  const normalized = text
+    .normalize("NFKC")
+    .replace(
+      new RegExp(`(${CURRENCY_MARK})([ \u00a0]*)(\\d+)[ \u00a0]+\\.(?=\\d)`, "g"),
+      "$1$2$3.",
+    )
+    .replace(
+      new RegExp(`(${CURRENCY_MARK})([ \u00a0]*)(\\d+\\.)[ \u00a0]+(?=\\d)`, "g"),
+      "$1$2$3",
+    );
   const symbols = new Set(["$", "\u20ac", "\u00a3", "\u00a5", "\u20b9", "\u20a9"]);
   const found: string[] = [];
   const runs = /\d[\d.,]*/g;
@@ -333,10 +380,10 @@ function namesMonth(month: number, word: string): boolean {
 const NUMERIC_DATE = /\d+[^\w]{1,2}\d+[^\w]{1,2}\d+/g;
 /** `September 1, 2026`, `Sep 1 2026`, `Sept. 1st, 2026`. */
 const MONTH_FIRST_DATE =
-  /([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})/g;
+  /([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4}|\d{2})\b/g;
 /** `1 September 2026`, `1st Sep. 2026`. */
 const DAY_FIRST_DATE =
-  /(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})/g;
+  /(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{4}|\d{2})\b/g;
 
 /**
  * Whether the quote prints this ISO date.
@@ -362,37 +409,189 @@ const DAY_FIRST_DATE =
  * resolves in a moment; a date it wrongly accepts is a stored fact nobody
  * looks at again.
  */
-function dateInQuote(iso: string, quote: string): boolean {
+/**
+ * Two-digit years. 00-69 is this century, 70-99 the last one.
+ *
+ * The POSIX rule, and the one a receipt printed `09/18/26` means. It is stated
+ * rather than inferred because the alternative -- refusing every two-digit
+ * year -- loses the date on most till receipts, and guessing differently per
+ * document would make two identical receipts disagree.
+ */
+export function expandTwoDigitYear(year: number): number {
+  return year <= 69 ? 2000 + year : 1900 + year;
+}
+
+function isoFrom(year: number, month: number, day: number): string | undefined {
+  const iso = `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  return realIsoDate(iso) ? iso : undefined;
+}
+
+export type DateOrder = "MDY" | "DMY";
+
+/** What `readPrintedDate` made of the text. `ambiguous` is a numeric date
+ * that could be read two ways, which is a different answer from "not a date"
+ * and gets its own correction reason. */
+export type PrintedDate =
+  | { kind: "date"; iso: string }
+  | { kind: "ambiguous" }
+  | { kind: "none" };
+
+/**
+ * A printed date, read.
+ *
+ * The backstop for a model that copies a date as the document prints it,
+ * which is what the prompt now asks it to do: a receipt says `09/18/26 14:32`
+ * and re-typing that as `2026-09-18` is a conversion, which the prompt
+ * forbids for good reason. So the conversion happens here, where it can be
+ * checked, rather than in the model, where it cannot.
+ *
+ * Nothing is invented, and nothing is guessed. `01/02/26` is the first of
+ * February to most of the world and the second of January to the United
+ * States, and no amount of reading the string settles it -- so unless the
+ * document's kind says which order it uses, this returns `ambiguous` and the
+ * value becomes a correction. An earlier version of this function assumed
+ * month-first silently, which stored one of the two readings under a citation
+ * that supported either.
+ *
+ * A form that settles itself needs no knob: `13/02/2026` has no thirteenth
+ * month, `9 Apr 26` names it, and an ISO date is an ISO date.
+ */
+export function readPrintedDate(raw: string, order?: DateOrder): PrintedDate {
+  const text = raw.normalize("NFKC").trim();
+  if (!text) return { kind: "none" };
+
+  const isoLike = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b/.exec(text);
+  if (isoLike) {
+    const iso = isoFrom(
+      Number(isoLike[1]),
+      Number(isoLike[2]),
+      Number(isoLike[3]),
+    );
+    return iso ? { kind: "date", iso } : { kind: "none" };
+  }
+
+  const numeric = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4}|\d{2})\b/.exec(text);
+  if (numeric) {
+    const resolved = resolveNumericParts(
+      Number(numeric[1]),
+      Number(numeric[2]),
+      order,
+    );
+    if (resolved === "ambiguous") return { kind: "ambiguous" };
+    if (!resolved) return { kind: "none" };
+    const iso = isoFrom(namedYear(numeric[3]!), resolved.month, resolved.day);
+    return iso ? { kind: "date", iso } : { kind: "none" };
+  }
+
+  const monthFirst =
+    /^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4}|\d{2})\b/.exec(
+      text,
+    );
+  if (monthFirst) {
+    const month = monthNumber(monthFirst[1]!);
+    if (month) {
+      const iso = isoFrom(
+        namedYear(monthFirst[3]!),
+        month,
+        Number(monthFirst[2]),
+      );
+      return iso ? { kind: "date", iso } : { kind: "none" };
+    }
+  }
+
+  const dayFirst =
+    /^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{4}|\d{2})\b/.exec(
+      text,
+    );
+  if (dayFirst) {
+    const month = monthNumber(dayFirst[2]!);
+    if (month) {
+      const iso = isoFrom(namedYear(dayFirst[3]!), month, Number(dayFirst[1]));
+      return iso ? { kind: "date", iso } : { kind: "none" };
+    }
+  }
+  return { kind: "none" };
+}
+
+function namedYear(digits: string): number {
+  return digits.length === 2
+    ? expandTwoDigitYear(Number(digits))
+    : Number(digits);
+}
+
+/**
+ * Which of two numbers is the month.
+ *
+ * One of them being impossible as a month settles it. Both being possible and
+ * different is the ambiguity, and only the kind's declared order settles that.
+ * Both being the same number settles itself: `03/03/26` is the third of March
+ * either way.
+ */
+function resolveNumericParts(
+  first: number,
+  second: number,
+  order?: DateOrder,
+): { month: number; day: number } | "ambiguous" | null {
+  const firstCanBeMonth = first >= 1 && first <= 12;
+  const secondCanBeMonth = second >= 1 && second <= 12;
+  if (!firstCanBeMonth && !secondCanBeMonth) return null;
+  if (firstCanBeMonth && !secondCanBeMonth) return { month: first, day: second };
+  if (!firstCanBeMonth && secondCanBeMonth) return { month: second, day: first };
+  if (first === second) return { month: first, day: second };
+  if (order === "MDY") return { month: first, day: second };
+  if (order === "DMY") return { month: second, day: first };
+  return "ambiguous";
+}
+
+/** The ISO form, or undefined. A thin wrapper over {@link readPrintedDate}
+ * for callers that do not distinguish "ambiguous" from "not a date". */
+export function printedDateToIso(
+  raw: string,
+  order?: DateOrder,
+): string | undefined {
+  const read = readPrintedDate(raw, order);
+  return read.kind === "date" ? read.iso : undefined;
+}
+
+function monthNumber(word: string): number | undefined {
+  const cleaned = word.toLowerCase();
+  if (cleaned.length < 3) return undefined;
+  const at = MONTH_NAMES.findIndex((name) => name.startsWith(cleaned));
+  return at < 0 ? undefined : at + 1;
+}
+
+function dateInQuote(
+  iso: string,
+  quote: string,
+  order?: DateOrder,
+): boolean {
   const [year, month, day] = iso.split("-") as [string, string, string];
   const text = quote.normalize("NFKC");
   if (text.includes(iso)) return true;
   const days = [day, String(Number(day))];
-  const months = [month, String(Number(month))];
 
+  // A numeric window is read positionally, by the same rules the value is
+  // read by. Matching its three runs in any order was what let a quote of
+  // "Date 01/02/26" support both the first of February and the second of
+  // January: whichever the model said, the citation agreed.
   for (const window of text.match(NUMERIC_DATE) ?? []) {
-    const runs = window.match(/\d+/g) ?? [];
-    const take = (candidates: readonly string[]): boolean => {
-      const at = runs.findIndex((run) => candidates.includes(run));
-      if (at < 0) return false;
-      runs.splice(at, 1);
-      return true;
-    };
-    if (take([year]) && take(days) && take(months)) return true;
+    const printed = readPrintedDate(window, order);
+    if (printed.kind === "date" && printed.iso === iso) return true;
   }
 
-  for (const [pattern, order] of [
+  for (const [pattern, position] of [
     [MONTH_FIRST_DATE, "month"],
     [DAY_FIRST_DATE, "day"],
   ] as const) {
     pattern.lastIndex = 0;
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(text)) !== null) {
-      const word = order === "month" ? match[1]! : match[2]!;
-      const dayPart = order === "month" ? match[2]! : match[1]!;
+      const word = position === "month" ? match[1]! : match[2]!;
+      const dayPart = position === "month" ? match[2]! : match[1]!;
       if (
         namesMonth(Number(month), word) &&
         days.includes(dayPart) &&
-        match[3] === year
+        String(namedYear(match[3]!)) === year
       ) {
         return true;
       }
@@ -430,6 +629,9 @@ export type GateInput = {
   /** The document type's declared currency, or USD. Used only when the page
    * states none, and flagged when it is. */
   defaultCurrency: string;
+  /** How this kind writes a numeric date, when it says. Unset, an ambiguous
+   * one is a correction rather than a guess. */
+  dateOrder?: DateOrder;
 };
 
 /**
@@ -492,9 +694,23 @@ export function checkValue(input: GateInput): GateResult {
       };
     }
     case "date": {
-      if (!realIsoDate(literal)) return fail("date_unparsable");
-      if (!dateInQuote(literal, quote)) return fail("value_not_in_quote");
-      return { ok: true, values: [{ type: "date", value: literal }] };
+      // ISO first, then the printed forms a document actually uses. The value
+      // is normalized here and checked against the cited lines afterwards, so
+      // a date can only be stored when the page prints it, in the order the
+      // page prints it.
+      if (realIsoDate(literal)) {
+        if (!dateInQuote(literal, quote, input.dateOrder)) {
+          return fail("value_not_in_quote");
+        }
+        return { ok: true, values: [{ type: "date", value: literal }] };
+      }
+      const printed = readPrintedDate(literal, input.dateOrder);
+      if (printed.kind === "ambiguous") return fail("date_ambiguous");
+      if (printed.kind === "none") return fail("date_unparsable");
+      if (!dateInQuote(printed.iso, quote, input.dateOrder)) {
+        return fail("value_not_in_quote");
+      }
+      return { ok: true, values: [{ type: "date", value: printed.iso }] };
     }
     case "number": {
       // Through `parseAmount`, not a bare canonicalize: a percentage prints as

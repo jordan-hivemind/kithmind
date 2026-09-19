@@ -54,6 +54,16 @@ export type ModelStatement = {
   value_type?: string;
   value: unknown;
   page: number;
+  /**
+   * The line ids on that page this statement reads from, one to three.
+   *
+   * The citation the schema asks for. The server builds the quote from these,
+   * so a citation is either in range or it is not and `quote_not_found` cannot
+   * happen for a valid one. Empty when the reply used the older `quote` shape.
+   */
+  lines: number[];
+  /** The older shape: text the model copied. Still read, because the
+   * non-schema fallback path cannot require line ids. */
   quote: string;
 };
 
@@ -86,6 +96,9 @@ export type ModelReading = {
  */
 export type ExtractionRequest = {
   prompt: string;
+  /** The model to use for this document, when the kind asks for one other
+   * than the configured default. Omitted, the configured model is used. */
+  model?: string;
   /** The kinds the reply may choose between. `other` is added here. */
   kinds: readonly string[];
   /** Every field name any active kind declares, as one enum. Cross-kind
@@ -211,11 +224,16 @@ export function extractionSchema(request: ExtractionRequest): unknown {
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["field", "page", "quote", "value", "line_items"],
+          required: ["field", "page", "lines", "value", "line_items"],
           properties: {
             field: { type: "string", enum: [...request.fields] },
             page: { type: "integer" },
-            quote: { type: "string" },
+            /**
+             * One to three line ids from the numbered page. Not a quote: the
+             * server builds the quote from these, which is what makes a
+             * citation checkable rather than reproducible.
+             */
+            lines: { type: "array", items: { type: "integer" } },
             /** The value of every field except a `line_item_list` one, which
              * passes null here and fills `line_items` instead. */
             value: { type: ["string", "null"] },
@@ -299,6 +317,12 @@ export function parseModelReading(content: string): ModelReading {
     const items = statement.line_items;
     const value =
       Array.isArray(items) && items.length > 0 ? items : statement.value;
+    const lines = Array.isArray(statement.lines)
+      ? statement.lines
+          .map((id) => Number(id))
+          .filter((id) => Number.isInteger(id))
+          .slice(0, 3)
+      : [];
     statements.push({
       field,
       ...(typeof statement.value_type === "string"
@@ -306,6 +330,7 @@ export function parseModelReading(content: string): ModelReading {
         : {}),
       value,
       page: Number(statement.page),
+      lines,
       quote: typeof statement.quote === "string" ? statement.quote : "",
     });
   }
@@ -363,7 +388,7 @@ export function providerExtractionModel(
                 : {}),
             },
             body: JSON.stringify({
-              model: settings.model,
+              model: request.model ?? settings.model,
               response_format: useSchema
                 ? {
                     type: "json_schema",
