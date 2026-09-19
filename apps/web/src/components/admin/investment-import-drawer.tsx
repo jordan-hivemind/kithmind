@@ -177,9 +177,13 @@ export function ImportDrawer({
                         </td>
                         <td className="h-row text-right tabular-nums text-gray-500">
                           rows sum to {check.summarySum}
+                          {check.difference === null ? "" : ` (${check.difference})`}
                           {check.ledgerSum === null
                             ? ""
-                            : `, Ledger sums to ${check.ledgerSum}`}
+                            : `, Ledger sums to ${check.ledgerSum}` +
+                              (check.ledgerDifference === null
+                                ? ""
+                                : ` (${check.ledgerDifference})`)}
                         </td>
                       </tr>
                     );

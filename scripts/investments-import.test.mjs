@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 
-import { argumentsFor } from "./investments-import.mjs";
+import { argumentsFor, SpaceAccessDenied, storeWriter } from "./investments-import.mjs";
 
 const execFileAsync = promisify(execFile);
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -105,4 +105,112 @@ test("a dry run against the real sheet's fixture reuses investment-import.ts end
   // Angel Startup's commitment is the one row genuinely left for the owner.
   assert.equal(report.invalid.length, 1);
   assert.match(report.invalid[0].reason, /no Ledger rows to estimate/);
+});
+
+// ---------------------------------------------------------------------------
+// Independent review of #309 found `storeWriter` reading `--space` with no
+// access check (review #3) and creating investments in a way that fails a
+// whole investment's entries on a whitespace-only name collision (review #4).
+// `storeWriter` takes the store's own functions as arguments, so both are
+// testable here with fakes and no live Postgres.
+// ---------------------------------------------------------------------------
+
+function fakeAdmin({ investments = [], findOrCreateResult } = {}) {
+  const calls = { listInvestments: [], findOrCreateInvestment: [] };
+  return {
+    calls,
+    listInvestments: async (ctx, spaceIds, opts) => {
+      calls.listInvestments.push({ ctx, spaceIds, opts });
+      return investments;
+    },
+    findOrCreateInvestment: async (ctx, args) => {
+      calls.findOrCreateInvestment.push({ ctx, args });
+      return findOrCreateResult ?? { id: "investment-1", created: true };
+    },
+  };
+}
+
+// A fake `withKithTransaction` that just runs the work against a marker
+// "client": `storeWriter`'s own logic, not a real transaction, is what these
+// tests check.
+const fakeTransaction = (pool, work) => work({ fakeClient: true });
+const fakeIdentityCtx = (client) => ({ ctx: true, client });
+
+test("storeWriter checks --user against --space before listing investments, and refuses named and clean when denied (review #3)", async () => {
+  const admin = fakeAdmin();
+  const accessChecks = [];
+  const requireSpaceAccess = async (ctx, principal, spaceId, operation) => {
+    accessChecks.push({ principal, spaceId, operation });
+    throw new Error("Space not found");
+  };
+  await assert.rejects(
+    () =>
+      storeWriter({
+        pool: {},
+        spaceId: "wrong-space",
+        principal: { userId: "user-1" },
+        admin,
+        identityCtx: fakeIdentityCtx,
+        withKithTransaction: fakeTransaction,
+        requireSpaceAccess,
+      }),
+    (error) => {
+      assert.ok(error instanceof SpaceAccessDenied);
+      assert.match(error.message, /user-1/);
+      assert.match(error.message, /wrong-space/);
+      return true;
+    },
+  );
+  // The access check ran with the write capability the import needs, and
+  // named the right space and user -- and `listInvestments` never ran at
+  // all, so a mistyped --space never gets its investment names read out.
+  assert.deepEqual(accessChecks, [
+    { principal: { userId: "user-1" }, spaceId: "wrong-space", operation: "write" },
+  ]);
+  assert.equal(admin.calls.listInvestments.length, 0);
+});
+
+test("storeWriter lists investments only after access is granted", async () => {
+  const admin = fakeAdmin({ investments: [{ id: "inv-1", name: "Alpha" }] });
+  const requireSpaceAccess = async () => ({ role: "owner" });
+  const writer = await storeWriter({
+    pool: {},
+    spaceId: "space-1",
+    principal: { userId: "user-1" },
+    admin,
+    identityCtx: fakeIdentityCtx,
+    withKithTransaction: fakeTransaction,
+    requireSpaceAccess,
+  });
+  assert.equal(admin.calls.listInvestments.length, 1);
+  assert.deepEqual(admin.calls.listInvestments[0].spaceIds, ["space-1"]);
+  assert.deepEqual(admin.calls.listInvestments[0].opts, { includeArchived: true });
+  assert.equal(writer.existing.get("alpha"), "inv-1");
+});
+
+test("storeWriter's createInvestment uses findOrCreateInvestment and carries its created flag through (review #4)", async () => {
+  // `created: false`: the store found this by its own normalized-name match
+  // rather than inserting a duplicate -- exactly the case the plain
+  // `createInvestment` would have thrown a duplicate error for, failing this
+  // investment and, since `runImport`'s `ensure` never gets an id back,
+  // every entry that names it too.
+  const admin = fakeAdmin({
+    findOrCreateResult: { id: "investment-9", created: false },
+  });
+  const requireSpaceAccess = async () => ({ role: "owner" });
+  const writer = await storeWriter({
+    pool: {},
+    spaceId: "space-1",
+    principal: { userId: "user-1" },
+    admin,
+    identityCtx: fakeIdentityCtx,
+    withKithTransaction: fakeTransaction,
+    requireSpaceAccess,
+  });
+  const result = await writer.createInvestment({ name: "Bramble Fund I " });
+  assert.deepEqual(result, { id: "investment-9", created: false });
+  assert.equal(admin.calls.findOrCreateInvestment.length, 1);
+  assert.equal(admin.calls.findOrCreateInvestment[0].args.name, "Bramble Fund I ");
+  assert.equal(admin.calls.findOrCreateInvestment[0].args.spaceId, "space-1");
+  assert.equal(admin.calls.findOrCreateInvestment[0].args.principal.userId, "user-1");
 });

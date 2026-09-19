@@ -126,15 +126,48 @@ function reportOf(preview, plan) {
   };
 }
 
+/** Thrown when `--user` may not write `--space`, so `main` can print one
+ * clear line instead of a stack trace through three transactions. Exported
+ * for the test, which checks the access check runs -- and refuses -- before
+ * any read of the space's investments. */
+export class SpaceAccessDenied extends Error {
+  constructor(spaceId, userId) {
+    super(`--user ${userId} may not write --space ${spaceId}`);
+    this.name = "SpaceAccessDenied";
+  }
+}
+
 /** The three operations `runImport` needs, backed by the store directly
  * instead of by `fetch`: one `withKithTransaction` per write, the same "one
- * operation is one transaction" rule every other CLI in this package follows. */
-async function storeWriter({ pool, spaceId, principal, admin, identityCtx, withKithTransaction }) {
-  const existingInvestments = await withKithTransaction(pool, (client) =>
-    admin.listInvestments(identityCtx(client), [spaceId], {
-      includeArchived: true,
-    }),
-  );
+ * operation is one transaction" rule every other CLI in this package follows.
+ * Exported for the test, which passes fakes for everything but the shape of
+ * the calls. */
+export async function storeWriter({
+  pool,
+  spaceId,
+  principal,
+  admin,
+  identityCtx,
+  withKithTransaction,
+  requireSpaceAccess,
+}) {
+  const existingInvestments = await withKithTransaction(pool, async (client) => {
+    const ctx = identityCtx(client);
+    // In the same transaction as the read that follows, and before it: a
+    // mistyped --space otherwise lets `listInvestments` read (and this script
+    // print) another space's investment names, with nothing wrong noticed
+    // until the first write hits its own access check deep inside `runImport`
+    // and is merely recorded as one failed row among many.
+    try {
+      await requireSpaceAccess(ctx, principal, spaceId, "write");
+    } catch (error) {
+      if (error instanceof Error && error.message === "Space not found") {
+        throw new SpaceAccessDenied(spaceId, principal.userId);
+      }
+      throw error;
+    }
+    return admin.listInvestments(ctx, [spaceId], { includeArchived: true });
+  });
   return {
     existing: new Map(
       existingInvestments.map((investment) => [
@@ -142,15 +175,22 @@ async function storeWriter({ pool, spaceId, principal, admin, identityCtx, withK
         investment.id,
       ]),
     ),
+    // `findOrCreateInvestment`, not the plain `createInvestment`: the
+    // `existing` map above is built from one `listInvestments` read and does
+    // not re-check on every row, so a name differing from a row already in
+    // the database only by whitespace or case (which `existing`'s own
+    // `.toLowerCase()` key does not normalize the same way the database's
+    // `lower(btrim(name))` uniqueness does) would otherwise throw a duplicate
+    // error here -- failing not just this investment but, since `ensure`
+    // never gets an id to reuse, every entry that names it too.
     createInvestment: (fields) =>
-      withKithTransaction(pool, async (client) => ({
-        id: await admin.createInvestment(identityCtx(client), {
+      withKithTransaction(pool, (client) =>
+        admin.findOrCreateInvestment(identityCtx(client), {
           principal,
           spaceId,
           ...fields,
         }),
-        created: true,
-      })),
+      ),
     createEntry: (investmentId, body) =>
       withKithTransaction(pool, (client) =>
         admin.createInvestmentEntry(identityCtx(client), {
@@ -184,7 +224,9 @@ export async function main(argv) {
   const { admin, createKithPool, withKithTransaction } = await import(
     KITH_STORE_INDEX_URL
   );
-  const { identityCtx, webPrincipal } = await import(KITH_STORE_IDENTITY_URL);
+  const { identityCtx, requireSpaceAccess, webPrincipal } = await import(
+    KITH_STORE_IDENTITY_URL
+  );
   const pool = createKithPool(requireDatabaseUrl());
   try {
     const writer = await storeWriter({
@@ -194,12 +236,19 @@ export async function main(argv) {
       admin,
       identityCtx,
       withKithTransaction,
+      requireSpaceAccess,
     });
     const outcome = await runImport(plan, writer);
     process.stdout.write(
       `${JSON.stringify({ dryRun: false, ...report, outcome }, null, 2)}\n`,
     );
     return outcome.failed.length > 0 ? 1 : 0;
+  } catch (error) {
+    if (error instanceof SpaceAccessDenied) {
+      process.stderr.write(`${error.message}\n`);
+      return 2;
+    }
+    throw error;
   } finally {
     await pool.end();
   }

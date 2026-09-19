@@ -824,3 +824,110 @@ describe("the real sheet's format, reproduced end to end", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Independent review of #309 (ADM-3b) found five more issues. 1-3 below get a
+// test each, as asked; 4 (the store's `findOrCreateInvestment`) is addressed
+// in scripts/investments-import.mjs (see its own test), and 5
+// (topLineCheck's own ledgerDifference) gets a test here too.
+// ---------------------------------------------------------------------------
+
+describe("a zero USD cell states no direction (review #1)", () => {
+  it("reads a capital call from GBP when Amount is the zero placeholder, not a distribution", () => {
+    // Amount blank entirely (no USD column at all) already worked; the bug
+    // was the accounting zero placeholder `$ -`, which is *present* and
+    // parses to a real (zero) value, so it used to win as the sign source
+    // and every such row came out positive -- a distribution -- regardless
+    // of the GBP call's own sign.
+    const ledger = [
+      "Date,Investment,Amount,GBP,Exchange Rate,Comment",
+      '2024-02-01,Alpha,"$ -   ","(10,000)",1.3,Sterling call',
+    ].join("\n");
+    const { drafts } = mapLedger(keyed(parseCsv(ledger)));
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0]).toMatchObject({
+      entryType: "capital_call_paid",
+      currency: "GBP",
+      amount: "10000.00",
+      why: "negative GBP → capital_call_paid",
+    });
+  });
+
+  it("still reads the sign from a genuinely stated, non-zero USD cell", () => {
+    const ledger = [
+      "Date,Investment,Amount,GBP,Exchange Rate,Comment",
+      '2024-02-01,Alpha,150,"(10,000)",1.3,Disagreeing signs',
+    ].join("\n");
+    const { drafts } = mapLedger(keyed(parseCsv(ledger)));
+    expect(drafts[0]).toMatchObject({ entryType: "distribution" });
+  });
+
+  it("does not check a GBP row's rate against the zero placeholder", () => {
+    // "0.00" is not a stated USD figure to check the conversion against; it
+    // used to flag as suspect every single time, no matter how close the
+    // rate actually was.
+    const ledger = [
+      "Date,Investment,Amount,GBP,Exchange Rate,Comment",
+      '2024-02-01,Alpha,"$ -   ","(10,000)",1.3,Sterling call',
+    ].join("\n");
+    const { drafts } = mapLedger(keyed(parseCsv(ledger)));
+    expect(drafts[0]!.rateCheck).toBeNull();
+  });
+});
+
+describe("parseMoney refuses an ambiguous number rather than guessing (review #2)", () => {
+  it("refuses a European-style decimal comma instead of dropping it", () => {
+    // Stripped blindly, `1.234,56` became `1.23456`: a different number.
+    expect(parseMoney("1.234,56")).toBeNull();
+  });
+
+  it("refuses a space used as a thousands separator", () => {
+    expect(parseMoney("1 000,50")).toBeNull();
+  });
+
+  it("refuses a malformed comma grouping", () => {
+    expect(parseMoney("1,2,3")).toBeNull();
+  });
+
+  it("still accepts a plain decimal and a properly grouped one", () => {
+    expect(parseMoney("1234.56")).toMatchObject({ amount: "1234.56" });
+    expect(parseMoney("1,234,567.89")).toMatchObject({ amount: "1234567.89" });
+  });
+
+  it("reports an unreadable Committed cell rather than silently treating it as not stated", () => {
+    const summary = [
+      "Investment,Docs Signed,Category,Committed,Sent,Outstanding Commitment,Received,Status",
+      'Alpha,2024-01-01,Direct,"1.234,56",0,1000,0,Active',
+    ].join("\n");
+    const { drafts, skipped } = mapSummary(keyed(parseCsv(summary)));
+    expect(drafts[0]!.committed).toBeNull();
+    expect(skipped).toContainEqual(
+      expect.objectContaining({ reason: "Committed value is unreadable" }),
+    );
+  });
+});
+
+describe("topLineCheck also differences the Ledger's own totals (review #5)", () => {
+  it("does not report 0.00 when the Ledger is thousands off the Total row", () => {
+    const summary = [
+      "Investment,Docs Signed,Category,Committed,Sent,Outstanding Commitment,Received,Status",
+      "Alpha,2024-01-01,Direct,1000,1000,0,0,Active",
+      "Total,,,1000,1000,0,0,",
+    ].join("\n");
+    const ledger = [
+      "Date,Investment,Amount,GBP,Exchange Rate,Comment",
+      // The Ledger's own capital calls add to only 1: nowhere near the
+      // Total row's stated 1000, even though the Summary's own rows agree
+      // with it exactly.
+      "2024-02-01,Alpha,-1,,,",
+    ].join("\n");
+    const { topLineCheck } = buildPreview(summary, ledger);
+    expect(topLineCheck!.sent).toMatchObject({
+      totalRow: "1000.00",
+      summarySum: "1000.00",
+      difference: "0.00",
+      ledgerSum: "1.00",
+      ledgerDifference: "999.00",
+    });
+  });
+});
