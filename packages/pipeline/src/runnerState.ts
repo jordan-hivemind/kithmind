@@ -387,8 +387,8 @@ function bindings(value: unknown): IdentityBinding[] {
   if (!Array.isArray(value) || value.length > MAX_FILES) fail();
   const paths = new Set<string>();
   const externalIds = new Set<string>();
-  const providerFileIds = new Set<string>();
-  return value.map((raw) => {
+  const owners = new Map<string, number>();
+  const parsed = value.map((raw) => {
     const row = object(raw);
     // ADM-4a: `providerFileId` is optional, so a journal written before it
     // existed parses unchanged and is upgraded in place on the next pass.
@@ -402,12 +402,11 @@ function bindings(value: unknown): IdentityBinding[] {
         : string(row.providerFileId, 256, PROVIDER_FILE_ID);
     const key = `${rootAlias}\0${relativePath}`;
     if (paths.has(key) || externalIds.has(externalId)) fail();
-    if (providerFileId !== undefined) {
-      if (providerFileIds.has(providerFileId)) fail();
-      providerFileIds.add(providerFileId);
-    }
     paths.add(key);
     externalIds.add(externalId);
+    if (providerFileId !== undefined) {
+      owners.set(providerFileId, (owners.get(providerFileId) ?? 0) + 1);
+    }
     return {
       rootAlias,
       relativePath,
@@ -415,6 +414,23 @@ function bindings(value: unknown): IdentityBinding[] {
       ...(providerFileId === undefined ? {} : { providerFileId }),
     };
   });
+  // ADM-4a: two bindings naming one provider file is a contradiction, but it is
+  // not a reason to refuse the journal. A refusal here would wedge the worker
+  // on every pass with nothing but a hand edit to clear it, which is exactly
+  // what a durable journal must never require. Dropping the id from both
+  // leaves two ordinary path-keyed bindings, and the next pass re-resolves
+  // them. Path and external id uniqueness still fail closed: those are the
+  // identity itself.
+  return parsed.map((binding) =>
+    binding.providerFileId !== undefined &&
+    owners.get(binding.providerFileId)! > 1
+      ? {
+          rootAlias: binding.rootAlias,
+          relativePath: binding.relativePath,
+          externalId: binding.externalId,
+        }
+      : binding,
+  );
 }
 
 function files(value: unknown): FilePlan[] {

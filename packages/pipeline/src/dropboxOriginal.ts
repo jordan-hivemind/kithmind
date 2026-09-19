@@ -352,11 +352,23 @@ export async function verifyDropboxOriginal(
  * file under this root, is simply absent from the result. The caller keeps
  * path identity for it. A failure to reach the provider at all throws, and the
  * caller falls back for the whole pass.
+ *
+ * The whole lookup is bounded by `budgetMs` and returns what it has when that
+ * runs out, because this runs in front of a pass that has not yet touched a
+ * document. A path not reached is not lost: it has no id this pass and is
+ * asked about on the next one. The caller asks about rename candidates first,
+ * so a budget that runs out drops only the paths that have not moved.
  */
 export async function lookupDropboxFileIds(
   input: DropboxRootBinding,
   relativePaths: readonly string[],
+  options: { budgetMs?: number } = {},
 ): Promise<Map<string, string>> {
+  const deadline = Date.now() + (options.budgetMs ?? 30_000);
+  const remaining = () =>
+    AbortSignal.timeout(
+      Math.min(30_000, Math.max(1_000, deadline - Date.now())),
+    );
   if (
     ![input.providerAccountIdHash, input.providerRootDirectoryIdHash].every(
       (x) => HEX.test(x),
@@ -373,7 +385,7 @@ export async function lookupDropboxFileIds(
         token,
         "users/get_current_account",
         null,
-        AbortSignal.timeout(30_000),
+        remaining(),
       );
       const accountId = requiredString(
         account,
@@ -389,7 +401,7 @@ export async function lookupDropboxFileIds(
         token,
         "files/get_metadata",
         { path: input.providerRootDirectoryId },
-        AbortSignal.timeout(30_000),
+        remaining(),
       );
       const rootPath = requiredString(
         root,
@@ -403,6 +415,7 @@ export async function lookupDropboxFileIds(
         fail("provider root mismatch");
       const ids = new Map<string, string>();
       for (const relativePath of relativePaths) {
+        if (Date.now() >= deadline) break;
         if (!validRelativePath(relativePath)) continue;
         let file: Record<string, unknown>;
         try {
@@ -413,7 +426,7 @@ export async function lookupDropboxFileIds(
               path: `${rootPath}/${relativePath}`,
               include_deleted: false,
             },
-            AbortSignal.timeout(30_000),
+            remaining(),
           );
         } catch {
           // Not synced yet, or gone. Path identity still answers for it.

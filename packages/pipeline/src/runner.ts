@@ -195,6 +195,26 @@ const MAX_RESERVATION_ROUNDS = 64;
 const MAX_ASSESSMENT_PAGES = 4_096;
 const LEASE_SAFETY_MARGIN_MS = 30_000;
 const MAX_ARCHIVED_RESERVATION_ROUNDS = 64;
+/**
+ * ADM-4a. Provider file ids resolved before one pass does anything else.
+ *
+ * Every lookup is a round trip, so the work in front of a pass that has not yet
+ * touched a document has to be bounded. It is bounded twice: a pass plans at
+ * most 256 files, and `lookupDropboxFileIds` stops on its own wall-clock
+ * budget. This constant is the first of those, held equal to the plan bound on
+ * purpose.
+ *
+ * A smaller count cap was tried and rejected. Splitting one folder rename
+ * across passes leaves the leftover files both missing and unmatched, which is
+ * what puts a pass into identity recovery -- and recovery discards the very
+ * external ids the provider ids just recovered, so it ends in
+ * `identity_review_required` and the next pass is forced into recovery again by
+ * that same code. Renaming 60 files would work and renaming 70 would wedge.
+ * The wall-clock budget is the right bound because rename candidates are asked
+ * about first: a budget that runs out can only ever drop a lazy-upgrade
+ * lookup, whose path has not moved and which therefore still matches by path.
+ */
+const MAX_PROVIDER_LOOKUPS_PER_PASS = 256;
 
 /**
  * Mirrors `WORKER_MUTATION_RATE_WINDOW_MS` in
@@ -2443,13 +2463,16 @@ export class PipelineRunner {
    * ADM-4a. Attaches the provider's stable file id to each plan under the
    * provider's root, so a renamed or moved file keeps its identity.
    *
-   * Only paths with no remembered id are asked about. A steady pass therefore
-   * makes no provider call at all, a journal written before ids existed is
-   * upgraded one file at a time as each is next seen where it already was, and
-   * a rename costs one lookup per moved file.
+   * Only paths with no remembered id are asked about, at most
+   * `MAX_PROVIDER_LOOKUPS_PER_PASS` of them and inside the lookup's own
+   * deadline. A steady pass therefore makes no provider call at all, a journal
+   * written before ids existed is upgraded a batch at a time as each file is
+   * next seen where it already was, and a rename costs one lookup per moved
+   * file. Anything left over is asked about on a later pass.
    *
-   * Nothing here may fail the pass. An unreachable provider leaves every plan
-   * on the identity it already had, which is exactly today's behaviour.
+   * Nothing here may fail the pass. An unreachable provider, a deadline, or a
+   * budget leaves every plan on the identity it already had, which is exactly
+   * today's behaviour.
    */
   private async attachProviderFileIds(
     plans: FilePlan[],
@@ -2462,11 +2485,22 @@ export class PipelineRunner {
       const remembered = byPath.get(fileKey(plan))?.providerFileId;
       if (remembered !== undefined) plan.providerFileId = remembered;
     }
-    const ask = under.filter((plan) => plan.providerFileId === undefined);
-    if (ask.length === 0) return;
+    // A path we have never seen is a rename candidate and answers this pass's
+    // question; a known path with no id yet is only the lazy upgrade, which any
+    // later pass can finish. Asking in that order means a rename inside the
+    // budget still resolves in one pass while a large journal is upgrading.
+    const wanted = under
+      .filter((plan) => plan.providerFileId === undefined)
+      .sort(
+        (left, right) =>
+          Number(byPath.has(fileKey(left))) -
+          Number(byPath.has(fileKey(right))),
+      );
+    const ask = new Set(wanted.slice(0, MAX_PROVIDER_LOOKUPS_PER_PASS));
+    if (ask.size === 0) return;
     let ids: Map<string, string>;
     try {
-      ids = await source.lookup(ask.map((plan) => plan.relativePath));
+      ids = await source.lookup([...ask].map((plan) => plan.relativePath));
     } catch (error) {
       console.warn(
         `[pipeline] provider file ids unavailable this pass; identity falls back to paths (${
@@ -2487,8 +2521,29 @@ export class PipelineRunner {
     // plan that only remembered it falls back to path identity, and the next
     // pass asks the provider for its real id.
     for (const plan of under) {
-      if (plan.providerFileId !== undefined && !ask.includes(plan)) {
-        if (fresh.has(plan.providerFileId)) delete plan.providerFileId;
+      if (ask.has(plan) || plan.providerFileId === undefined) continue;
+      if (fresh.has(plan.providerFileId)) delete plan.providerFileId;
+    }
+    // Two watched paths can still resolve to one provider file: the same name
+    // in NFC and in NFD, or two spellings a case-insensitive provider does not
+    // distinguish. Neither plan may keep an id it does not solely own, because
+    // an id on two plans puts one external id on two items, which the journal
+    // refuses to write. Both fall back to path identity, which separates them.
+    const owners = new Map<string, number>();
+    for (const plan of under) {
+      if (plan.providerFileId === undefined) continue;
+      owners.set(
+        plan.providerFileId,
+        (owners.get(plan.providerFileId) ?? 0) + 1,
+      );
+    }
+    for (const plan of under) {
+      if (plan.providerFileId === undefined) continue;
+      if (owners.get(plan.providerFileId)! > 1) {
+        console.warn(
+          `[pipeline] two watched paths resolve to one provider file; both keep path identity this pass`,
+        );
+        delete plan.providerFileId;
       }
     }
   }

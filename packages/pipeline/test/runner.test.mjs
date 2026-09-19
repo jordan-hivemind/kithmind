@@ -5897,6 +5897,10 @@ async function identityPass({
   }
 }
 
+function journalTerminal(bindings) {
+  return { ...terminalCheckpoint(bindings), scanned: bindings.length };
+}
+
 /** The binding for one path, by path, for an assertion that names the path. */
 function bindingAt(bindings, relativePath) {
   return bindings.find((row) => row.relativePath === relativePath);
@@ -6174,6 +6178,214 @@ test("a file that took a renamed file's place does not inherit its identity", as
       replacement.providerFileId,
       undefined,
       "and the id the old path remembered went with the file, not the path",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("two watched paths that resolve to one provider file both keep path identity", async () => {
+  const setup = await fixture(0);
+  // A provider that normalizes or folds case answers for two watched paths
+  // with one file id: the same name in NFC and NFD, or a case-only twin. This
+  // filesystem collapses both of those into one file, so the collision is
+  // staged with two plainly distinct paths instead. What is under test is the
+  // runner's response to one id arriving on two plans, not how it arose.
+  await mkdir(join(setup.root, "a"), { mode: 0o700 });
+  await mkdir(join(setup.root, "b"), { mode: 0o700 });
+  await writeFile(join(setup.root, "a", "statement.txt"), "synthetic-a");
+  await writeFile(join(setup.root, "b", "statement.txt"), "synthetic-b");
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: [],
+      ids: {
+        "a/statement.txt": "id:one_file",
+        "b/statement.txt": "id:one_file",
+      },
+    });
+    assert.equal(
+      pass.entries.length,
+      2,
+      "both files are still their own entry",
+    );
+    assert.notEqual(
+      pass.entries[0].externalId,
+      pass.entries[1].externalId,
+      "and each one has its own identity",
+    );
+    for (const binding of pass.bindings) {
+      assert.equal(
+        binding.providerFileId,
+        undefined,
+        "an id neither path solely owns is kept by neither",
+      );
+    }
+    // The journal has to accept what the pass wrote.
+    assert.equal(
+      parseRunnerCheckpoint(journalTerminal(pass.bindings)).bindings.length,
+      2,
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a journal naming one provider file twice loads without its ids rather than refusing", async () => {
+  const left = randomUUID();
+  const right = randomUUID();
+  const checkpoint = parseRunnerCheckpoint({
+    version: 1,
+    phase: "terminal",
+    outcome: "complete",
+    credentialSessionActive: false,
+    scanned: 2,
+    published: 2,
+    bindings: [
+      {
+        rootAlias: "fixture",
+        relativePath: "one.txt",
+        externalId: left,
+        providerFileId: "id:same",
+      },
+      {
+        rootAlias: "fixture",
+        relativePath: "two.txt",
+        externalId: right,
+        providerFileId: "id:same",
+      },
+    ],
+  });
+  assert.deepEqual(checkpoint.bindings, [
+    { rootAlias: "fixture", relativePath: "one.txt", externalId: left },
+    { rootAlias: "fixture", relativePath: "two.txt", externalId: right },
+  ]);
+  // The identity itself still fails closed.
+  assert.throws(() =>
+    parseRunnerCheckpoint({
+      version: 1,
+      phase: "terminal",
+      outcome: "complete",
+      credentialSessionActive: false,
+      scanned: 2,
+      published: 2,
+      bindings: [
+        { rootAlias: "fixture", relativePath: "one.txt", externalId: left },
+        { rootAlias: "fixture", relativePath: "one.txt", externalId: right },
+      ],
+    }),
+  );
+});
+
+test("a different file at a vacated path inherits it, exactly as path identity does", async () => {
+  const setup = await fixture(0);
+  const externalId = randomUUID();
+  // The remembered file has moved out of every watched root, or has not synced
+  // yet, so no lookup can see it. Something else now sits at its path.
+  await writeFile(join(setup.root, "statement.txt"), "a different document");
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "statement.txt",
+          externalId,
+          providerFileId: "id:moved_away",
+        },
+      ],
+      // Even if the provider would answer for this path, it is not asked: the
+      // path is remembered and already carries an id.
+      ids: { "statement.txt": "id:the_newcomer" },
+    });
+    assert.deepEqual(pass.asked, []);
+    assert.equal(pass.mode, "normal");
+    assert.equal(
+      pass.entries[0].externalId,
+      externalId,
+      // This is the documented limit of the fallback and it is unchanged from
+      // path identity: the new bytes become a new revision of the same item
+      // rather than a new item. Provider ids narrow this rather than widen it
+      // -- see the test above, where the moved file is still inside the root
+      // and the newcomer is therefore refused the identity.
+      "the newcomer inherits the path's identity, as it does on the old build",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a folder rename larger than any batch resolves in one pass, upgrades last", async () => {
+  const setup = await fixture(0);
+  const count = 70;
+  const moved = [];
+  const settled = [];
+  await mkdir(join(setup.root, "moved"), { mode: 0o700 });
+  for (let index = 0; index < count; index += 1) {
+    moved.push(randomUUID());
+    await writeFile(
+      join(setup.root, "moved", `page-${index}.txt`),
+      `synthetic-${index}`,
+      { mode: 0o600 },
+    );
+  }
+  // Two files that did not move and have no id yet: the lazy upgrade, which
+  // any later pass can finish and which must not be asked about first.
+  for (let index = 0; index < 2; index += 1) {
+    settled.push(randomUUID());
+    await writeFile(join(setup.root, `settled-${index}.txt`), "synthetic", {
+      mode: 0o600,
+    });
+  }
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: [
+        ...moved.map((externalId, index) => ({
+          rootAlias: "fixture",
+          relativePath: `page-${index}.txt`,
+          externalId,
+          providerFileId: `id:file_${index}`,
+        })),
+        ...settled.map((externalId, index) => ({
+          rootAlias: "fixture",
+          relativePath: `settled-${index}.txt`,
+          externalId,
+        })),
+      ],
+      ids: {
+        ...Object.fromEntries(
+          moved.map((_, index) => [
+            `moved/page-${index}.txt`,
+            `id:file_${index}`,
+          ]),
+        ),
+        ...Object.fromEntries(
+          settled.map((_, index) => [
+            `settled-${index}.txt`,
+            `id:settled_${index}`,
+          ]),
+        ),
+      },
+    });
+    assert.equal(
+      pass.mode,
+      "normal",
+      "a rename bigger than one batch must not fall into identity recovery",
+    );
+    assert.deepEqual(
+      pass.asked.slice(0, count).sort(),
+      moved.map((_, index) => `moved/page-${index}.txt`).sort(),
+      "every rename candidate is asked about before any lazy upgrade",
+    );
+    const after = pass.bindings.filter((row) =>
+      row.relativePath.startsWith("moved/"),
+    );
+    assert.equal(after.length, count);
+    assert.deepEqual(
+      after.map((row) => row.externalId).sort(),
+      [...moved].sort(),
+      "and every one of them followed its identity in this one pass",
     );
   } finally {
     await rm(setup.base, { recursive: true, force: true });
