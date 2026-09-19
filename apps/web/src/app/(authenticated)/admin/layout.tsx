@@ -33,7 +33,11 @@ const SCREENS = [
   { href: "/admin/coverage", label: "Coverage", ready: true },
   { href: "/admin/investments", label: "Investments", ready: true },
   { href: "/admin/types", label: "Types and fields", ready: false },
-  { href: "/admin/corrections", label: "Corrections", ready: false },
+  // ADM-8a: the corrections table widened into the single attention queue
+  // (section 5 of docs/plans/2026-09-19-investment-document-matching.md),
+  // so this screen replaces the earlier "Corrections" placeholder rather
+  // than sitting beside it.
+  { href: "/admin/attention", label: "Attention", ready: true },
 ] as const;
 
 export default async function AdminLayout({
