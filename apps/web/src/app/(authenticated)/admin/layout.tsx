@@ -3,16 +3,28 @@
 //
 // The session check is the `(authenticated)` layout's above this one, and each
 // page below reloads it for itself inside its own read transaction. This
-// segment adds two things: the query cache the live hook invalidates, and the
-// navigation.
+// segment adds three things: the role gate, the query cache the live hook
+// invalidates, and the navigation.
+//
+// The gate is owner-or-editor, not merely signed in. These screens show how
+// the household's records are collected -- the watcher host's filesystem
+// paths, the problems it reported, the source account ids -- which is
+// operational detail a `reader` member is not entitled to. `getAdminSpaceIds`
+// draws that line off the same `"write"` check every mutation uses, and a
+// reader gets `notFound()` rather than a denial, so the panel's existence is
+// not confirmed to someone who may not use it. The pages below do not lean on
+// this: each one's data function applies the same narrowing for itself.
 //
 // A screen that has not been built yet is listed and disabled rather than
 // hidden. The owner's decision was that "the UI must show a complete inventory
 // so gaps are visible", and the navigation is the first place that is true.
 
+import { headers } from "next/headers";
 import Link from "next/link";
+import { notFound, redirect } from "next/navigation";
 
 import { QueryProvider } from "@/components/query-provider";
+import { loadAdminAccess } from "@/lib/kith/sources-data";
 
 const SCREENS = [
   { href: "/admin/health", label: "Health", ready: false },
@@ -24,11 +36,15 @@ const SCREENS = [
   { href: "/admin/corrections", label: "Corrections", ready: false },
 ] as const;
 
-export default function AdminLayout({
+export default async function AdminLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
+  const allowed = await loadAdminAccess((await headers()).get("cookie"));
+  if (allowed === null) redirect("/sign-in");
+  if (!allowed) notFound();
+
   return (
     <QueryProvider>
       <div className="flex min-h-[70vh] gap-6">

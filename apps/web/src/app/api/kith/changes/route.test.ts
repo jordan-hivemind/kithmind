@@ -135,11 +135,29 @@ describeWithDatabase("GET /api/kith/changes", () => {
     expect((await route(noContentType)).status).toBe(415);
   });
 
-  test("a cursor that is not a cursor is refused", async () => {
+  test("a cursor that is not a cursor is refused with 400, never 500", async () => {
     const user = await signedInUser();
-    const response = await route(request("?since=not-a-number", user.cookie));
-    expect(response.status).toBe(400);
-    expect(((await response.json()) as { code: string }).code).toBe("invalid_cursor");
+    for (const cursor of [
+      "not-a-number",
+      "-1",
+      "1e3",
+      // Past `bigint`'s ceiling. Binding this would make the server raise
+      // 22003 on the cast, which used to surface as an opaque 500.
+      "9223372036854775808",
+      "9999999999999999999",
+    ]) {
+      const response = await route(
+        request(`?since=${encodeURIComponent(cursor)}`, user.cookie),
+      );
+      expect(response.status, cursor).toBe(400);
+      expect(((await response.json()) as { code: string }).code).toBe(
+        "invalid_cursor",
+      );
+    }
+    // The ceiling itself is a cursor, and answers normally.
+    expect(
+      (await route(request("?since=9223372036854775807", user.cookie))).status,
+    ).toBe(200);
   });
 
   test("no cursor starts from now rather than replaying the retained feed", async () => {

@@ -68,10 +68,15 @@ export type ChangesPayload = {
   changes: admin.ChangeRow[];
 };
 
-/** A cursor is a decimal `bigint`, or absent. Anything else is refused. */
+/**
+ * A cursor is a decimal id this feed could have issued, or absent. Anything
+ * else -- a word, a negative, a value past `bigint`'s ceiling -- is refused
+ * here with a 400 rather than reaching the statement, where an out-of-range
+ * cast would come back as a database error and fall through to an opaque 500.
+ */
 function parseCursor(value: string | null): string | null | undefined {
   if (value === null || value === "") return null;
-  return /^\d{1,19}$/.test(value) ? value : undefined;
+  return admin.isChangeCursor(value) ? value : undefined;
 }
 
 /**
