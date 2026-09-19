@@ -221,3 +221,24 @@ entry is deleted by hand.
 A `Summary` row with a committed amount but no `Docs Signed` date is reported
 as unimportable rather than given today's date: a fabricated date in a
 financial record is worse than a missing entry.
+
+## 12. Extraction knobs (ADM-5d)
+
+The model reads a page as numbered lines and cites line ids rather than
+copying text. The server builds the quote from the cited lines, so a citation
+is checkable arithmetic and the value gates run against the page's own words.
+
+| Knob | Where | Effect |
+| --- | --- | --- |
+| `KITH_EXTRACT_MODEL` | daemon environment | The default model. Unchanged. |
+| `KITH_EXTRACT_ENDPOINT` | daemon environment | OpenAI-compatible chat completions. A 4xx on the JSON-schema request falls back to plain JSON for the rest of the run. |
+| `KITH_EXTRACT_API_KEY` | daemon environment | Falls back to `OPENAI_API_KEY` on the default endpoint. |
+| per-kind model | `document_types.examples`, an element `{"setting": "extraction_model", "value": "<model>"}` | That kind is read with that model. A kind without one uses the default. |
+
+A per-kind override costs one extra call the first time a document is read,
+because the kind is not known until the reply names it; a re-extraction knows
+the kind already and costs one call. Nothing here picks a model.
+
+Two-digit years in a printed date expand 00-69 to the 2000s and 70-99 to the
+1900s. Numeric dates are read month-first, and the two numbers are swapped
+only when the first cannot be a month.

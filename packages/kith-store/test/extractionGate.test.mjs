@@ -291,7 +291,17 @@ test("dates must be real ISO calendar dates", () => {
     ok: true,
     values: [{ type: "date", value: "2026-09-01" }],
   });
-  for (const bad of ["09/01/2026", "2026-02-30", "September 1, 2026", "2026-9-1"]) {
+  // ADM-5d: a printed form the cited text also carries is normalized rather
+  // than refused. The prompt now asks the model to copy a date as printed,
+  // so converting it is the server's job.
+  for (const printed of ["09/01/2026", "September 1, 2026", "2026-9-1"]) {
+    assert.deepEqual(gate({ valueType: "date", value: printed, quote }), {
+      ok: true,
+      values: [{ type: "date", value: "2026-09-01" }],
+    });
+  }
+  // What is not a date is still not a date.
+  for (const bad of ["2026-02-30", "sometime in September", "the 1st"]) {
     assert.deepEqual(gate({ valueType: "date", value: bad, quote }), {
       ok: false,
       reason: "date_unparsable",

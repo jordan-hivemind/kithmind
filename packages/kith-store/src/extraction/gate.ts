@@ -58,6 +58,11 @@ export const CORRECTION_REASONS = [
   "input_truncated",
   /** The model's output was not the shape the prompt asks for. */
   "malformed_statement",
+  /** The statement cited a page or line ids the page does not have, or a
+   * range too wide to be a citation. A citation, unlike a quote, is either in
+   * range or it is not: the server builds the text, so there is nothing left
+   * for the model to get wrong except the numbers. */
+  "citation_out_of_range",
   /** Two statements gave the same field two different values. Neither is
    * stored: a coin flip between two readings is the silent wrongness this
    * whole gate exists to prevent. */
@@ -255,7 +260,15 @@ function realIsoDate(value: string): boolean {
  * a separator.
  */
 export function amountsInText(text: string): string[] {
-  const normalized = text.normalize("NFKC");
+  // A parsed receipt prints "$ 10 .80" and "10. 80" as readily as "10.80":
+  // the space is a rendering artifact of the column the amount sat in, not a
+  // separator between two numbers. Closing it up before tokenizing is what
+  // lets such an amount be found at all; every other space is left alone, so
+  // "10.00 0.80" is still two amounts rather than one.
+  const normalized = text
+    .normalize("NFKC")
+    .replace(/(\d)[ \u00a0]+([.,]\d)/g, "$1$2")
+    .replace(/(\d[.,])[ \u00a0]+(\d)/g, "$1$2");
   const symbols = new Set(["$", "\u20ac", "\u00a3", "\u00a5", "\u20b9", "\u20a9"]);
   const found: string[] = [];
   const runs = /\d[\d.,]*/g;
@@ -368,6 +381,12 @@ function dateInQuote(iso: string, quote: string): boolean {
   if (text.includes(iso)) return true;
   const days = [day, String(Number(day))];
   const months = [month, String(Number(month))];
+  // A till receipt prints `09/18/26`, so a two-digit year counts -- but only
+  // when it expands back to this same year under the stated rule, which keeps
+  // `75` from supporting 2075.
+  const years = [year];
+  const short = year.slice(2);
+  if (String(expandTwoDigitYear(Number(short))) === year) years.push(short);
 
   for (const window of text.match(NUMERIC_DATE) ?? []) {
     const runs = window.match(/\d+/g) ?? [];
@@ -377,7 +396,7 @@ function dateInQuote(iso: string, quote: string): boolean {
       runs.splice(at, 1);
       return true;
     };
-    if (take([year]) && take(days) && take(months)) return true;
+    if (take(years) && take(days) && take(months)) return true;
   }
 
   for (const [pattern, order] of [
@@ -399,6 +418,90 @@ function dateInQuote(iso: string, quote: string): boolean {
     }
   }
   return false;
+}
+
+/**
+ * Two-digit years. 00-69 is this century, 70-99 the last one.
+ *
+ * The POSIX rule, and the one a receipt printed `09/18/26` means. It is stated
+ * rather than inferred because the alternative -- refusing every two-digit
+ * year -- loses the date on most till receipts, and guessing differently per
+ * document would make two identical receipts disagree.
+ */
+export function expandTwoDigitYear(year: number): number {
+  return year <= 69 ? 2000 + year : 1900 + year;
+}
+
+function isoFrom(year: number, month: number, day: number): string | undefined {
+  const iso = `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  return realIsoDate(iso) ? iso : undefined;
+}
+
+/**
+ * A printed date to ISO, or undefined when the text is not a date.
+ *
+ * The backstop for a model that copies a date as the document prints it,
+ * which is what the prompt now asks it to do: a receipt says `09/18/26 14:32`
+ * and re-typing that as `2026-09-18` is a conversion, which the prompt
+ * forbids for good reason. So the conversion happens here, where it can be
+ * checked, rather than in the model, where it cannot.
+ *
+ * Nothing is invented. Every part comes from the text, an unreadable text
+ * returns undefined, and the caller still requires the cited lines to print
+ * the same date before the value is stored.
+ *
+ * A numeric form is read month-first (`03/04/26` is the fourth of March),
+ * which is the convention of the documents this system reads. When the first
+ * number cannot be a month and the second can, the two are swapped rather
+ * than refused.
+ */
+export function printedDateToIso(raw: string): string | undefined {
+  const text = raw.normalize("NFKC").trim();
+  if (!text) return undefined;
+
+  const isoLike = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b/.exec(text);
+  if (isoLike) {
+    return isoFrom(Number(isoLike[1]), Number(isoLike[2]), Number(isoLike[3]));
+  }
+
+  const numeric = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2}|\d{4})\b/.exec(text);
+  if (numeric) {
+    let month = Number(numeric[1]);
+    let day = Number(numeric[2]);
+    if (month > 12 && day <= 12) [month, day] = [day, month];
+    const yearDigits = numeric[3]!;
+    const year =
+      yearDigits.length === 2
+        ? expandTwoDigitYear(Number(yearDigits))
+        : Number(yearDigits);
+    return isoFrom(year, month, day);
+  }
+
+  const monthFirst =
+    /^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b/.exec(text);
+  if (monthFirst) {
+    const month = monthNumber(monthFirst[1]!);
+    if (month) {
+      return isoFrom(Number(monthFirst[3]), month, Number(monthFirst[2]));
+    }
+  }
+
+  const dayFirst =
+    /^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})\b/.exec(text);
+  if (dayFirst) {
+    const month = monthNumber(dayFirst[2]!);
+    if (month) {
+      return isoFrom(Number(dayFirst[3]), month, Number(dayFirst[1]));
+    }
+  }
+  return undefined;
+}
+
+function monthNumber(word: string): number | undefined {
+  const cleaned = word.toLowerCase();
+  if (cleaned.length < 3) return undefined;
+  const at = MONTH_NAMES.findIndex((name) => name.startsWith(cleaned));
+  return at < 0 ? undefined : at + 1;
 }
 
 function asLineItems(value: unknown): LineItem[] | undefined {
@@ -492,9 +595,15 @@ export function checkValue(input: GateInput): GateResult {
       };
     }
     case "date": {
-      if (!realIsoDate(literal)) return fail("date_unparsable");
-      if (!dateInQuote(literal, quote)) return fail("value_not_in_quote");
-      return { ok: true, values: [{ type: "date", value: literal }] };
+      // ISO first, then the printed forms a document actually uses. The value
+      // is normalized here and checked against the cited lines afterwards, so
+      // a date can only be stored when the page prints it.
+      const iso = realIsoDate(literal)
+        ? literal
+        : printedDateToIso(literal);
+      if (!iso) return fail("date_unparsable");
+      if (!dateInQuote(iso, quote)) return fail("value_not_in_quote");
+      return { ok: true, values: [{ type: "date", value: iso }] };
     }
     case "number": {
       // Through `parseAmount`, not a bare canonicalize: a percentage prints as

@@ -367,6 +367,38 @@ async function insertCorrected(
 }
 
 /**
+ * Clears the previous run's open items before the current run writes its own.
+ *
+ * Without this the queue is cumulative rather than current: a field that
+ * failed in March and is read correctly in June keeps its March row forever,
+ * and a failure that recurs every run keeps exactly one row only because
+ * `openCorrection` deduplicates on the reason. The owner reads this queue, and
+ * a queue that never shrinks is one nobody opens.
+ *
+ * Only `open` rows the owner has not touched. A `resolved` row is the owner's
+ * own answer and outlives every extraction; an `open` row that already carries
+ * a `corrected_value` is one they are partway through and is left alone too.
+ *
+ * ponytail: deleted rather than marked superseded, which loses "how long has
+ * this been wrong". The alternative is a third `state`, which `corrections`
+ * constrains in the schema and so would cost a migration for a column no
+ * screen reads yet. Upgrade path if that history is ever wanted: add
+ * `superseded` to the CHECK and update these rows instead of deleting them.
+ */
+export async function supersedeOpenCorrections(
+  client: ClientBase,
+  input: { spaceId: string; sourceItemId: string },
+): Promise<number> {
+  const cleared = await client.query(
+    `DELETE FROM kith.corrections
+      WHERE space_id = $1 AND target_kind = 'document' AND target_id = $2
+        AND state = 'open' AND corrected_value IS NULL`,
+    [input.spaceId, input.sourceItemId],
+  );
+  return cleared.rowCount ?? 0;
+}
+
+/**
  * Re-applies every resolved correction for one document to the observations
  * that were just written.
  *

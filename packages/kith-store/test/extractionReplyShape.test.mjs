@@ -335,13 +335,19 @@ test("the schema makes the field name unrepresentable when absent", { skip }, as
   assert.ok(request.fields.includes("line_items"));
   const schema = extractionSchema(request);
   const statement = schema.properties.statements.items;
+  // ADM-5d: the citation is line ids, not a quote. The server builds the
+  // quote from them, so there is nothing left for the model to copy wrong.
   assert.deepEqual(statement.required, [
     "field",
     "page",
-    "quote",
+    "lines",
     "value",
     "line_items",
   ]);
+  assert.deepEqual(statement.properties.lines, {
+    type: "array",
+    items: { type: "integer" },
+  });
   assert.equal(statement.additionalProperties, false);
   assert.ok(statement.properties.field.enum.includes("vendor"));
   assert.deepEqual(statement.properties.line_items.type, ["array", "null"]);
