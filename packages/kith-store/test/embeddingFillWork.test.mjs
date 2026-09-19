@@ -267,24 +267,57 @@ test(
     // `SERIALIZABLE` transaction, and every capture into one space also locks
     // that space's embedding-state row, so captures racing into one space
     // contend on both. `withKithTransaction`'s bounded retry is what makes
-    // that converge rather than fail; this pins that it does, because a
-    // capture that threw under concurrency would be a regression the
-    // single-writer tests above could not see.
+    // that converge for most writers; it is not a proof that every one of
+    // `KITH_SERIALIZATION_ATTEMPTS` racing writers always succeeds.
     //
-    // Exactly `KITH_SERIALIZATION_ATTEMPTS` writers, not more. A writer fails
-    // an attempt only because another writer committed after its snapshot,
-    // and each writer commits once, so N racing writers cost the unluckiest
-    // one at most N - 1 failures and N attempts. That is the convergence the
-    // budget guarantees; one writer past it can lose every round and
-    // legitimately exhaust the budget, which is what CI saw with six.
+    // The comment this replaced argued that N racing writers cost the
+    // unluckiest one at most N - 1 failures, because a writer fails an
+    // attempt only when another writer commits after its snapshot and each
+    // writer commits once. That bound holds for two writers blocked on one
+    // row, but this capture contends on several: the space's embedding-state
+    // row, its active generation row, and the fill job's dedupe key. Once more
+    // than one shared object is in play, PostgreSQL's SSI can abort a
+    // transaction on a *read* that forms a three-transaction "dangerous
+    // structure" with two other writers, not only on a direct write-write
+    // conflict -- so one writer can legitimately lose more than N - 1 rounds
+    // even with no bug anywhere. CI has hit both shapes of this at exactly
+    // N = `KITH_SERIALIZATION_ATTEMPTS`: a plain "could not serialize access
+    // due to concurrent update" (`40001`), and a read inside
+    // `ensureSpaceEmbeddingState` cancelled with "Reason code: Canceled on
+    // conflict out to pivot ..., during read" (also `40001`), both from the
+    // last of five attempts.
+    //
+    // So this no longer requires every writer to land. It requires the two
+    // things the test's name actually promises: every writer that does land
+    // gets its own thought, and the space converges on exactly one fill job
+    // regardless of how many writers that took. A writer that exhausts the
+    // bounded retry budget is only acceptable when the error is the same kind
+    // of retryable serialization failure `withKithTransaction` itself retries
+    // -- anything else is a real bug this test still has to catch.
     const writers = Array.from(
       { length: KITH_SERIALIZATION_ATTEMPTS },
       (_, n) => n,
     );
-    const ids = await Promise.all(
+    const settled = await Promise.allSettled(
       writers.map((n) => capture(f, space, `memory ${n}`, NOW + n)),
     );
-    assert.equal(new Set(ids).size, writers.length);
+    const ids = [];
+    for (const outcome of settled) {
+      if (outcome.status === "fulfilled") {
+        ids.push(outcome.value);
+        continue;
+      }
+      const code = outcome.reason?.code;
+      assert.ok(
+        code === "40001" || code === "40P01",
+        `a writer failed with something other than a retryable serialization ` +
+          `failure: ${outcome.reason?.stack ?? outcome.reason}`,
+      );
+    }
+    // At least one writer has to land, or "exactly one job" below would pass
+    // vacuously on an empty burst.
+    assert.ok(ids.length >= 1, "every writer exhausted its retry budget");
+    assert.equal(new Set(ids).size, ids.length);
     const jobs = await fillJobs(f, space.spaceId);
     assert.equal(jobs.length, 1);
   },
