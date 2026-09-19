@@ -9,7 +9,11 @@
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { readAuthorizeRequest, submitConsent } from "./authorize-request";
+import {
+  readAuthorizeRequest,
+  submitConsent,
+  submitDenial,
+} from "./authorize-request";
 
 const REDIRECT_URI = "https://client.example.test/callback";
 
@@ -113,5 +117,45 @@ describe("submitConsent", () => {
     await expect(
       submitConsent(request, { spaceIds: ["space-a"], capabilities: ["read"] }),
     ).rejects.toThrow("Selected access is no longer available");
+  });
+});
+
+describe("submitDenial", () => {
+  const request = readAuthorizeRequest(params({ state: "abc" }))!;
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  function respondWith(body: unknown) {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => body,
+      text: async () => JSON.stringify(body),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  test("posts a denial with no grant and returns the error redirect", async () => {
+    const denied = `${REDIRECT_URI}?error=access_denied&state=abc`;
+    const fetchMock = respondWith({ redirect_url: denied });
+
+    expect(await submitDenial(request)).toBe(denied);
+    const [, init] = fetchMock.mock.calls[0]! as unknown as [
+      string,
+      { body: string },
+    ];
+    const body = JSON.parse(init.body);
+    expect(body).toMatchObject({ decision: "deny", state: "abc" });
+    expect(body).not.toHaveProperty("spaceIds");
+    expect(body).not.toHaveProperty("capabilities");
+  });
+
+  test("refuses a denial redirect to another origin", async () => {
+    respondWith({
+      redirect_url: "https://attacker.example.test/callback?error=access_denied",
+    });
+    await expect(submitDenial(request)).rejects.toThrow(
+      "Authorization returned an invalid redirect",
+    );
   });
 });

@@ -74,9 +74,28 @@ export function readAuthorizeRequest(
  * is in the query string of that URL, which is why the check is on origin and
  * path rather than on the whole string.
  */
-export async function submitConsent(
+export function submitConsent(
   request: AuthorizeRequest,
   grant: { spaceIds: readonly string[]; capabilities: readonly string[] },
+): Promise<string> {
+  return submitDecision(request, {
+    spaceIds: grant.spaceIds,
+    capabilities: grant.capabilities,
+  });
+}
+
+/**
+ * Posts a denial and returns the client's redirect carrying `access_denied`.
+ * The server builds it, because only the server can check the redirect URI
+ * against the client's registration.
+ */
+export function submitDenial(request: AuthorizeRequest): Promise<string> {
+  return submitDecision(request, { decision: "deny" });
+}
+
+async function submitDecision(
+  request: AuthorizeRequest,
+  decision: Record<string, unknown>,
 ): Promise<string> {
   const response = await fetch("/api/mcp/authorize/complete", {
     method: "POST",
@@ -90,8 +109,7 @@ export async function submitConsent(
       resource: request.resource,
       scope: request.scope,
       state: request.state || undefined,
-      spaceIds: grant.spaceIds,
-      capabilities: grant.capabilities,
+      ...decision,
     }),
   });
   if (!response.ok) {

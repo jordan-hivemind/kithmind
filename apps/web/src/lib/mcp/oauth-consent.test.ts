@@ -53,7 +53,10 @@ function issuedGrant() {
   };
 }
 
-function request(grants: Record<string, unknown>) {
+function request(
+  grants: Record<string, unknown>,
+  redirectUri = "https://client.example.test/callback",
+) {
   const clientId = encryptClientRegistration({
     clientName: "Synthetic client",
     redirectUris: ["https://client.example.test/callback"],
@@ -67,7 +70,7 @@ function request(grants: Record<string, unknown>) {
     },
     body: JSON.stringify({
       clientId,
-      redirectUri: "https://client.example.test/callback",
+      redirectUri,
       codeChallenge: "a".repeat(43),
       codeChallengeMethod: "S256",
       responseType: "code",
@@ -199,5 +202,42 @@ describe("OAuth space consent", () => {
     const body = await response.json();
     expect(body).toEqual({ error: "Selected space is not available" });
     expect(JSON.stringify(body)).not.toContain("space-the-session-cannot-read");
+  });
+
+  test("denial redirects to the registered URI with access_denied and state", async () => {
+    const response = await POST(
+      request({ decision: "deny", state: "opaque-state" }),
+    );
+    expect(response.status).toBe(200);
+    const location = new URL((await response.json()).redirect_url);
+    expect(location.origin + location.pathname).toBe(
+      "https://client.example.test/callback",
+    );
+    expect(location.searchParams.get("error")).toBe("access_denied");
+    expect(location.searchParams.get("state")).toBe("opaque-state");
+    expect(location.searchParams.has("code")).toBe(false);
+    // Nothing is granted: no session lookup, no key, no code.
+    expect(mocks.principal).not.toHaveBeenCalled();
+    expect(mocks.begin).not.toHaveBeenCalled();
+    expect(mocks.finalize).not.toHaveBeenCalled();
+  });
+
+  test("denial wins over a grant in the same body", async () => {
+    const response = await POST(
+      request({ decision: "deny", spaceIds: ["space"], capabilities: ["read"] }),
+    );
+    const location = new URL((await response.json()).redirect_url);
+    expect(location.searchParams.get("error")).toBe("access_denied");
+    expect(location.searchParams.has("state")).toBe(false);
+    expect(mocks.begin).not.toHaveBeenCalled();
+  });
+
+  test("denial never redirects to an unregistered URI", async () => {
+    const response = await POST(
+      request({ decision: "deny" }, "https://attacker.example.test/callback"),
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).not.toHaveProperty("redirect_url");
+    expect(mocks.begin).not.toHaveBeenCalled();
   });
 });

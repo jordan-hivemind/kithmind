@@ -47,7 +47,7 @@ import {
   OAUTH_NO_STORE_HEADERS,
   readLimitedOAuthBody,
 } from "@/lib/mcp/oauth";
-import { authorizationConsentSchema } from "@/lib/mcp/oauth-validation";
+import { authorizationDecisionSchema } from "@/lib/mcp/oauth-validation";
 
 export const runtime = "nodejs";
 
@@ -225,7 +225,7 @@ export async function POST(req: Request) {
     return errorResponse("Invalid authorization request", 400);
   }
 
-  const parsed = authorizationConsentSchema.safeParse(input);
+  const parsed = authorizationDecisionSchema.safeParse(input);
   if (!parsed.success) {
     return errorResponse("Invalid authorization request", 400);
   }
@@ -245,6 +245,25 @@ export async function POST(req: Request) {
     !registration.redirectUris.includes(request.redirectUri)
   ) {
     return errorResponse("Client or redirect URI is not registered", 400);
+  }
+
+  // Only a registered redirect URI is ever followed, for a code or an error.
+  const redirectWith = (params: Record<string, string>) => {
+    const redirect = new URL(request.redirectUri);
+    for (const [key, value] of Object.entries(params)) {
+      redirect.searchParams.set(key, value);
+    }
+    if (request.state) redirect.searchParams.set("state", request.state);
+    return Response.json(
+      { redirect_url: redirect.toString() },
+      { headers: OAUTH_NO_STORE_HEADERS },
+    );
+  };
+
+  // RFC 6749 section 4.1.2.1. A denial writes nothing and needs no session:
+  // it grants nothing, and the redirect is one the client registered.
+  if ("decision" in request) {
+    return redirectWith({ error: "access_denied" });
   }
 
   let backend: GrantBackend;
@@ -294,15 +313,7 @@ export async function POST(req: Request) {
     );
   }
 
-  const redirectWithCode = (code: string) => {
-    const redirect = new URL(request.redirectUri);
-    redirect.searchParams.set("code", code);
-    if (request.state) redirect.searchParams.set("state", request.state);
-    return Response.json(
-      { redirect_url: redirect.toString() },
-      { headers: OAUTH_NO_STORE_HEADERS },
-    );
-  };
+  const redirectWithCode = (code: string) => redirectWith({ code });
   if (grant.status === "pending") {
     return redirectWithCode(grant.encryptedCode);
   }

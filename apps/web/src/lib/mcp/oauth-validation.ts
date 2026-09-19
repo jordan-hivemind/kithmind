@@ -75,6 +75,16 @@ export const authorizationConsentSchema = authorizationRequestSchema.extend({
     ),
 });
 
+/**
+ * Either decision on the consent screen. A denial carries the request and no
+ * grant, and is listed first so a body that says "deny" is never read as
+ * consent.
+ */
+export const authorizationDecisionSchema = z.union([
+  authorizationRequestSchema.extend({ decision: z.literal("deny") }),
+  authorizationConsentSchema,
+]);
+
 export const tokenRequestSchema = z.object({
   grant_type: z.literal("authorization_code"),
   code: z.string().min(1).max(8192),
