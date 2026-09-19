@@ -38,3 +38,15 @@ export async function loadAttention(
     return { items, nextCursor, counts, spaceIds };
   });
 }
+
+/** The nav badge's first paint (`components/admin/attention-badge.tsx`),
+ * read from the admin layout for every admin page, not only the attention
+ * screen. `null` (not signed in, or administers no space) reads as zero. */
+export async function loadAttentionCounts(
+  cookieHeader: string | null,
+): Promise<{ attention: number; alert: number }> {
+  const counts = await loadAuthenticatedPage(cookieHeader, ({ ctx, principal }) =>
+    admin.attentionSeverityCounts(ctx, { principal }),
+  );
+  return counts ?? { attention: 0, alert: 0 };
+}

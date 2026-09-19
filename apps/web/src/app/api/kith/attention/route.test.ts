@@ -49,6 +49,8 @@ describeWithDatabase("/api/kith/attention", () => {
     request: Request,
     context: { params: Promise<{ id: string }> },
   ) => Promise<Response>;
+  let count: (request: Request) => Promise<Response>;
+  let counts: (request: Request) => Promise<Response>;
 
   async function onAdmin<T>(work: (admin: pg.Client) => Promise<T>): Promise<T> {
     const admin = new pg.Client({ connectionString: adminUrl });
@@ -110,9 +112,10 @@ describeWithDatabase("/api/kith/attention", () => {
       const id = newKithId();
       const sourceItemId = newKithId();
       await ctx.client.query(
-        `INSERT INTO kith.source_items (id, space_id, created_at, title)
-           VALUES ($1, $2, transaction_timestamp(), 'Synthetic receipt')`,
-        [sourceItemId, spaceId],
+        `INSERT INTO kith.source_items
+           (id, space_id, created_at, title, worker_source_modified_at)
+           VALUES ($1, $2, transaction_timestamp(), 'Synthetic receipt', $3)`,
+        [sourceItemId, spaceId, overrides.workerSourceModifiedAt ?? null],
       );
       await ctx.client.query(
         `INSERT INTO kith.corrections
@@ -164,6 +167,8 @@ describeWithDatabase("/api/kith/attention", () => {
     listMutes = mutes.GET;
     addMute = mutes.POST;
     removeMute = (await import("./mutes/[id]/route")).DELETE;
+    count = (await import("./count/route")).POST;
+    counts = (await import("./counts/route")).GET;
   }, 60_000);
 
   afterAll(async () => {
@@ -318,5 +323,41 @@ describeWithDatabase("/api/kith/attention", () => {
 
     // Nothing was touched by any of it.
     expect((await itemsOf(owner)).items.map((item) => item.id)).toEqual([id]);
+  });
+
+  test("the before-date preview count matches the document's own date, not when the row opened", async () => {
+    const owner = await signedInUser();
+    await seedItem(owner.spaceId, { workerSourceModifiedAt: "2020-01-01T00:00:00Z" });
+    await seedItem(owner.spaceId, { workerSourceModifiedAt: "2026-09-01T00:00:00Z" });
+    // No date at all (neither an extraction nor a provider-reported modified
+    // time): never matched, whatever the cutoff.
+    await seedItem(owner.spaceId);
+
+    const response = await count(
+      request(
+        "",
+        owner.cookie,
+        "POST",
+        { spaceId: owner.spaceId, filter: { kind: "beforeDate", beforeDate: "2025-01-01" } },
+        "/api/kith/attention/count",
+      ),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ count: 1 });
+
+    // The preview never touches anything: all three are still open.
+    const items = (await itemsOf(owner)).items;
+    expect(items.length).toBe(3);
+    expect(items.every((item) => item.state === "open")).toBe(true);
+  });
+
+  test("the nav badge's counts route matches attentionSeverityCounts and excludes info", async () => {
+    const owner = await signedInUser();
+    await seedItem(owner.spaceId, { severity: "attention" });
+    await seedItem(owner.spaceId, { severity: "info" });
+
+    const response = await counts(request("", owner.cookie, "GET", undefined, "/api/kith/attention/counts"));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ attention: 1, alert: 0 });
   });
 });

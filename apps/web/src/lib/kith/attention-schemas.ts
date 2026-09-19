@@ -28,12 +28,14 @@ export const dismissReasonSchema = z.enum([
   "other",
 ]);
 
+// `investment` and `before_date` are refused here even though the database
+// allows both on `kith.attention_mutes.scope_kind` -- see
+// `MUTE_SCOPE_KINDS` in `packages/kith-store/src/admin/attention.ts` for
+// why accepting them would be a mute that silently never fires.
 export const muteScopeKindSchema = z.enum([
   "detector",
-  "investment",
   "source_root",
   "document_kind",
-  "before_date",
 ]);
 
 const isoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
@@ -92,6 +94,11 @@ export const patchAttentionSchema = z.discriminatedUnion("action", [
   snoozeAttentionSchema,
   bulkSnoozeAttentionSchema,
 ]);
+
+export const countAttentionFilterSchema = z.object({
+  spaceId: kithIdSchema,
+  filter: attentionFilterSchema,
+});
 
 export const addMuteSchema = z.object({
   spaceId: kithIdSchema,
