@@ -47,6 +47,12 @@ const RATE_SCALE = 10;
  * much before the rate is called into question. */
 const RATE_TOLERANCE_FRACTION = 100n; // 1%
 const RATE_TOLERANCE_FLOOR_CENTS = 100n; // $1.00
+/** How far the Summary's Sent/Received may sit from the Ledger's own sum
+ * before it is reported as a difference. The Summary's figures are whole
+ * dollars, typed by hand; the Ledger's are to the cent. A sheet the owner
+ * calls balanced can be off by the fraction that rounding to a dollar drops,
+ * and reporting that every time would be a warning nobody reads. */
+const RECONCILE_TOLERANCE_CENTS = 100n; // $1.00
 
 export type LedgerDraft = {
   /**
@@ -138,6 +144,47 @@ export type ImportPreview = {
    * per-investment difference because the cause is different: usually an
    * inverted rate. */
   suspectRates: LedgerDraft[];
+  /** The sheet's own "Total" row, checked against the sums of the other
+   * Summary rows and against the Ledger's totals. `null` when the sheet has
+   * no such row. */
+  topLineCheck: TopLineCheck | null;
+  /** Investment names the Ledger mentions that the Summary never names. Each
+   * is still created -- with no commitment, since the Summary is what states
+   * one -- but is called out here rather than blending into the ordinary
+   * investment list. */
+  ledgerOnlyInvestments: string[];
+  /** A Summary row that states a Sent amount but has no Ledger rows at all:
+   * the commitment is still handled by the Docs Signed / estimated-date rule,
+   * but there is nothing here to reconcile Sent against, which is worth the
+   * operator's own look rather than silence. */
+  sentWithNoLedgerRows: { investmentName: string; line: number; amount: string }[];
+};
+
+export type TopLineCheckField = {
+  /** The Total row's own figure for this column, in USD. `null` when the
+   * sheet left the cell blank. */
+  totalRow: string | null;
+  /** The sum of every other Summary row's figure for this column. */
+  summarySum: string;
+  /** The sum of the Ledger's own rows for this column, converted to USD.
+   * `null` for Committed, which the Ledger has no entries for. */
+  ledgerSum: string | null;
+  /** `totalRow - summarySum`. `null` when the sheet left the cell blank. */
+  difference: string | null;
+  /** `totalRow - ledgerSum`. `null` whenever `ledgerSum` is (Committed), or
+   * the sheet left the Total cell blank. Shown separately from `difference`
+   * because the two can disagree: a Ledger-only investment or a Summary row
+   * with no Ledger rows moves this figure but not the Summary-only one, and
+   * a large gap here has to be visible on its own rather than folded into a
+   * `ledgerSum` the operator has to subtract by hand to notice it. */
+  ledgerDifference: string | null;
+};
+
+export type TopLineCheck = {
+  line: number;
+  committed: TopLineCheckField;
+  sent: TopLineCheckField;
+  received: TopLineCheckField;
 };
 
 // ---------------------------------------------------------------------------
@@ -295,6 +342,15 @@ function absolute(value: string): string {
   return value.startsWith("-") ? value.slice(1) : value;
 }
 
+/** Whether a cell held text that did not read as a stated value: not blank,
+ * but its parse (`parseMoney`, `parseRate`, ...) came back null. Distinct
+ * from "not stated", so a malformed cell -- `1.234,56`, a comma-decimal a US
+ * export never writes -- is reported for what it is rather than silently
+ * treated the same as one the sheet simply left empty. */
+function isUnreadable(raw: string | undefined, parsed: unknown): boolean {
+  return (raw ?? "").trim() !== "" && parsed === null;
+}
+
 // ---------------------------------------------------------------------------
 // Cells
 // ---------------------------------------------------------------------------
@@ -314,17 +370,46 @@ function absolute(value: string): string {
  * different number before anything had looked at it. Anything beyond the
  * column's scale is rounded and `rounded` says so, so the preview can show it.
  */
+/** A plain decimal (`1234.56`), or one grouped in threes with commas
+ * (`1,234,567.89`). Checked against the cell -- with its symbol, parens and
+ * whitespace stripped but its commas still in place -- before those commas
+ * are ever removed: stripping them first accepted any placement, so
+ * `1.234,56` (a comma decimal mark) silently became `1.23456`, `1 000,50`
+ * became `100050.00`, and `1,2,3` became `123.00`, three different numbers
+ * nobody chose. */
+const GROUPED_OR_PLAIN_DECIMAL = /^\d{1,3}(,\d{3})*(\.\d+)?$|^\d+(\.\d+)?$/;
+
 export function parseMoney(
   value: string | undefined,
 ): { amount: string; negative: boolean; rounded: boolean } | null {
   if (value === undefined) return null;
   const trimmed = value.trim();
   if (trimmed === "" || trimmed === "-") return null;
-  const parenthesised = /^\(.*\)$/.test(trimmed);
-  const digits = trimmed.replace(/[()$£€,\s]/g, "");
-  if (!/^-?\d+(\.\d+)?$/.test(digits)) return null;
-  const negative = parenthesised || digits.startsWith("-");
-  const scaled = roundToScale(digits.replace(/^-/, ""), MONEY_SCALE);
+  // Accounting style puts the symbol outside the parenthesis (`$ (72,182)`),
+  // so the parenthesis is looked for anywhere in the cell rather than anchored
+  // to its very start -- anchored, this cell's `(` never matched and every
+  // capital call was read as a positive number.
+  const parenthesised = trimmed.includes("(") && trimmed.endsWith(")");
+  const hasSymbol = /[$£€]/.test(trimmed);
+  // The symbol, the parens and every space gone -- an accounting cell puts a
+  // space between the symbol and the number (`$ (72,182)`) -- but the sign
+  // and the commas are still there: the sign, because the zero check below
+  // needs to tell "$ -" from "-15,200.00"; the commas, because whether they
+  // are really thousands separators is what `GROUPED_OR_PLAIN_DECIMAL` below
+  // decides.
+  const withoutSymbols = trimmed.replace(/[$£€\s()]/g, "");
+  // The accounting zero placeholder (`$ -`, `$ -   `): a currency symbol with
+  // nothing but a dash for its number. A bare dash with no symbol is the
+  // "not stated" cell handled above and stays absent, not zero.
+  if (withoutSymbols === "-" && hasSymbol) {
+    return { amount: "0.00", negative: false, rounded: false };
+  }
+  const negativeSign = withoutSymbols.startsWith("-");
+  const numeric = negativeSign ? withoutSymbols.slice(1) : withoutSymbols;
+  if (!GROUPED_OR_PLAIN_DECIMAL.test(numeric)) return null;
+  const digits = numeric.replace(/,/g, "");
+  const negative = parenthesised || negativeSign;
+  const scaled = roundToScale(digits, MONEY_SCALE);
   return { amount: scaled.value, negative, rounded: scaled.rounded };
 }
 
@@ -346,27 +431,59 @@ export function parseRate(
   return { rate: scaled.value, rounded: scaled.rounded };
 }
 
+/** The year a real date may plausibly hold. A typo like `2/6/0206` matches the
+ * `M/D/YYYY` shape and would otherwise become a stored date nobody chose. */
+const MIN_PLAUSIBLE_YEAR = 1990;
+const MAX_PLAUSIBLE_YEAR = 2100;
+
+function plausibleYear(year: string): boolean {
+  const numeric = Number(year);
+  return numeric >= MIN_PLAUSIBLE_YEAR && numeric <= MAX_PLAUSIBLE_YEAR;
+}
+
 /**
  * A spreadsheet date cell as `YYYY-MM-DD`.
  *
  * ISO first, then the `M/D/YYYY` a US-locale export produces. Anything else is
  * a skipped row with a reason rather than a guess: `3/4/2024` is ambiguous
  * across locales and the only safe reading of an unrecognised date is to say
- * so.
+ * so. A year outside `MIN_PLAUSIBLE_YEAR`..`MAX_PLAUSIBLE_YEAR` is refused the
+ * same way: `2/6/0206` matches the `M/D/YYYY` shape exactly and would
+ * otherwise become `0206-02-06`, imported silently rather than reported.
  */
 export function parseSheetDate(value: string | undefined): string | null {
   if (value === undefined) return null;
   const trimmed = value.trim();
   if (trimmed === "") return null;
   const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(trimmed);
-  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  if (iso) return plausibleYear(iso[1]!) ? `${iso[1]}-${iso[2]}-${iso[3]}` : null;
   const slashed = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(trimmed);
   if (slashed) {
+    if (!plausibleYear(slashed[3]!)) return null;
     const month = slashed[1]!.padStart(2, "0");
     const day = slashed[2]!.padStart(2, "0");
     return `${slashed[3]}-${month}-${day}`;
   }
   return null;
+}
+
+/**
+ * Why a non-blank date cell produced no date, for a row's skip reason.
+ *
+ * Distinguished from "blank or unrecognised" only when the cell otherwise fit
+ * a recognised shape and failed on its year: that is the one case a person
+ * fixing the sheet needs a different sentence for, because "unrecognised"
+ * reads as a formatting problem and this is a typo in the year itself.
+ */
+function unusableDateReason(raw: string): string {
+  if (raw === "") return "Date is blank or unrecognised";
+  const year =
+    /^(\d{4})-\d{2}-\d{2}/.exec(raw)?.[1] ??
+    /^\d{1,2}\/\d{1,2}\/(\d{4})$/.exec(raw)?.[1];
+  if (year !== undefined && !plausibleYear(year)) {
+    return `Date year ${year} is outside a plausible range (${MIN_PLAUSIBLE_YEAR}-${MAX_PLAUSIBLE_YEAR})`;
+  }
+  return "Date is blank or unrecognised";
 }
 
 // ---------------------------------------------------------------------------
@@ -382,12 +499,27 @@ const STATUS_BY_LABEL: Record<string, SummaryDraft["status"]> = {
   "write-off": "written_off",
 };
 
-/** `Summary` rows to investments. A row with no Investment name is skipped. */
+/** The sheet's own totals row (Investment cell exactly "Total"), kept to check
+ * against the sums of the other rows rather than imported as an investment. */
+export type SummaryTotalsRow = {
+  line: number;
+  committed: string | null;
+  sent: string | null;
+  received: string | null;
+};
+
+/** `Summary` rows to investments. A row with no Investment name is skipped,
+ * and the sheet's own "Total" row is pulled out rather than imported. */
 export function mapSummary(
   rows: readonly Record<string, string>[],
-): { drafts: SummaryDraft[]; skipped: SkippedRow[] } {
+): {
+  drafts: SummaryDraft[];
+  skipped: SkippedRow[];
+  totalsRow: SummaryTotalsRow | null;
+} {
   const drafts: SummaryDraft[] = [];
   const skipped: SkippedRow[] = [];
+  let totalsRow: SummaryTotalsRow | null = null;
   rows.forEach((record, index) => {
     const line = index + 2;
     const name = (record.investment ?? "").trim();
@@ -397,6 +529,19 @@ export function mapSummary(
         raw: Object.values(record).join(","),
         reason: "No investment name",
       });
+      return;
+    }
+    if (name.toLowerCase() === "total") {
+      // Not an investment: the sheet's own check figure. `mapSummary` cannot
+      // compute the check itself -- it needs the Ledger's totals too -- so it
+      // only carries the row's own numbers out; `buildPreview` does the
+      // comparison once it has both tabs.
+      totalsRow = {
+        line,
+        committed: parseMoney(record.committed)?.amount ?? null,
+        sent: parseMoney(record.sent)?.amount ?? null,
+        received: parseMoney(record.received)?.amount ?? null,
+      };
       return;
     }
     const committed = parseMoney(record.committed);
@@ -410,12 +555,42 @@ export function mapSummary(
       .map(([, value]) => value.trim())
       .filter(Boolean)
       .join(" — ");
+    const docsSignedRaw = (record["docs signed"] ?? "").trim();
+    const signedOn = parseSheetDate(record["docs signed"]);
+    if (docsSignedRaw !== "" && signedOn === null) {
+      // Reported, not silently folded into "blank": a typo'd Docs Signed date
+      // (an implausible year, an unrecognised format) is not the same fact as
+      // an empty cell, and rule 3's ledger-date fallback below must not be
+      // allowed to quietly absorb it.
+      skipped.push({
+        line,
+        raw: docsSignedRaw,
+        reason: `Docs Signed "${docsSignedRaw}" is not a usable date`,
+      });
+    }
+    const unreadableMoney = (
+      [
+        ["Committed", record.committed, committed],
+        ["Sent", record.sent, sent],
+        ["Received", record.received, received],
+      ] as const
+    ).filter(([, raw, parsed]) => isUnreadable(raw, parsed));
+    if (unreadableMoney.length > 0) {
+      // Reported rather than silently read as "not stated": a malformed
+      // amount is a data problem, not an empty cell, and folding the two
+      // together lost a stated Committed figure with nothing said.
+      skipped.push({
+        line,
+        raw: unreadableMoney.map(([field, raw]) => `${field}="${raw}"`).join(", "),
+        reason: `${unreadableMoney.map(([field]) => field).join(", ")} value is unreadable`,
+      });
+    }
     drafts.push({
       importKey: `summary:${name.toLowerCase()}`,
       line,
       name,
       category: (record.category ?? "").trim() || null,
-      signedOn: parseSheetDate(record["docs signed"]),
+      signedOn,
       status: STATUS_BY_LABEL[statusLabel] ?? "active",
       notes: notes || null,
       committed: committed === null ? null : committed.amount,
@@ -423,7 +598,7 @@ export function mapSummary(
       statedReceived: received === null ? null : received.amount,
     });
   });
-  return { drafts, skipped };
+  return { drafts, skipped, totalsRow };
 }
 
 /** `Ledger` rows to entries, applying IMPORT_RULE. */
@@ -449,12 +624,35 @@ export function mapLedger(
       return;
     }
     if (entryDate === null) {
-      skipped.push({ line, raw, reason: "Date is blank or unrecognised" });
+      skipped.push({
+        line,
+        raw,
+        reason: unusableDateReason((record.date ?? "").trim()),
+      });
       return;
     }
+    const unreadableAmount = isUnreadable(record.amount, usd);
+    const unreadableGbp = isUnreadable(record.gbp, gbp);
     if (usd === null && gbp === null) {
-      skipped.push({ line, raw, reason: "No amount" });
+      skipped.push({
+        line,
+        raw,
+        reason:
+          unreadableAmount || unreadableGbp
+            ? `${[unreadableAmount && "Amount", unreadableGbp && "GBP"].filter(Boolean).join(" and ")} value is unreadable`
+            : "No amount",
+      });
       return;
+    }
+    if (unreadableAmount || unreadableGbp) {
+      // One column read fine and the row still imports from it, but the
+      // other was not blank -- it held text `parseMoney` could not read --
+      // which is worth the operator's own look rather than silent loss.
+      skipped.push({
+        line,
+        raw,
+        reason: `${[unreadableAmount && "Amount", unreadableGbp && "GBP"].filter(Boolean).join(" and ")} value is unreadable`,
+      });
     }
     if (gbp !== null && rate === null) {
       skipped.push({ line, raw, reason: "GBP amount with no exchange rate" });
@@ -466,8 +664,15 @@ export function mapLedger(
     // was wrong: a sheet that writes the GBP figure unsigned and puts the sign
     // only on the USD column would have had every GBP row imported as a
     // distribution.
+    //
+    // "Has one" excludes the accounting zero placeholder (`$ -`): a zero USD
+    // cell states no direction, and reading it as positive turned a GBP
+    // capital call with a blank Amount column (represented as `$ -`, not
+    // truly absent) into a distribution. The USD cell is a real sign source
+    // only when it is present and not that placeholder.
+    const usdStatesValue = usd !== null && usd.amount !== "0.00";
     const currency = gbp === null ? "USD" : "GBP";
-    const signSource = usd ?? gbp!;
+    const signSource = usdStatesValue ? usd! : (gbp ?? usd!);
     const amountSource = currency === "GBP" ? gbp! : usd!;
     const entryType = signSource.negative ? "capital_call_paid" : "distribution";
     const notes: string[] = [];
@@ -487,11 +692,14 @@ export function mapLedger(
     // Both columns stated: the sheet is checkable against itself, and an
     // inverted rate shows up here rather than in a total months later. The
     // comparison itself is at cents, because that is the precision the sheet's
-    // own USD column carries.
+    // own USD column carries. Gated on `usdStatesValue`, not merely `usd !==
+    // null`, for the same reason the sign is: the zero placeholder is not a
+    // stated USD figure to check the rate against, and comparing it produced
+    // a "rate looks wrong" warning on every GBP row that used it.
     const rateCheck =
-      currency === "GBP" && usd !== null
+      currency === "GBP" && usdStatesValue
         ? checkRate(
-            usd.amount,
+            usd!.amount,
             multiplyDecimals(amountSource.amount, rate!.rate),
           )
         : null;
@@ -515,7 +723,7 @@ export function mapLedger(
       note: (record.comment ?? "").trim() || null,
       why:
         `${signSource.negative ? "negative" : "positive"} ` +
-        `${usd === null ? "GBP" : "Amount"} → ${entryType}`,
+        `${usdStatesValue ? "Amount" : "GBP"} → ${entryType}`,
       usdAmount: convertedUsd,
       rateCheck,
       notes,
@@ -595,7 +803,7 @@ export function reconcile(
       const claim = stated[field];
       if (claim === null) continue;
       const difference = subtractDecimals(claim, totals[field]);
-      if (units(difference, 2) !== 0n) {
+      if (units(absolute(difference), 2) > RECONCILE_TOLERANCE_CENTS) {
         differences.push({
           investmentName: investment.name,
           field,
@@ -610,6 +818,93 @@ export function reconcile(
     }
   }
   return differences;
+}
+
+/** The sheet's own Total row against the sums this import computes. */
+function checkTopLine(
+  totalsRow: SummaryTotalsRow,
+  summary: readonly SummaryDraft[],
+  ledger: readonly LedgerDraft[],
+): TopLineCheck {
+  const sumOf = (values: readonly (string | null)[]) =>
+    addDecimals(values.filter((value): value is string => value !== null));
+  const ledgerSumAs = (entryType: LedgerDraft["entryType"]) =>
+    roundToScale(
+      addDecimals(
+        ledger
+          .filter((entry) => entry.entryType === entryType)
+          .map((entry) => entry.usdAmount),
+      ),
+      2,
+    ).value;
+  const field = (
+    totalRow: string | null,
+    summarySum: string,
+    ledgerSum: string | null,
+  ): TopLineCheckField => ({
+    totalRow,
+    summarySum,
+    ledgerSum,
+    difference: totalRow === null ? null : subtractDecimals(totalRow, summarySum),
+    ledgerDifference:
+      totalRow === null || ledgerSum === null
+        ? null
+        : subtractDecimals(totalRow, ledgerSum),
+  });
+  return {
+    line: totalsRow.line,
+    committed: field(
+      totalsRow.committed,
+      sumOf(summary.map((row) => row.committed)),
+      null, // The Ledger has no commitment entries to sum against.
+    ),
+    sent: field(
+      totalsRow.sent,
+      sumOf(summary.map((row) => row.statedSent)),
+      ledgerSumAs("capital_call_paid"),
+    ),
+    received: field(
+      totalsRow.received,
+      sumOf(summary.map((row) => row.statedReceived)),
+      ledgerSumAs("distribution"),
+    ),
+  };
+}
+
+/** Ledger investment names the Summary never mentions, in first-seen order. */
+function findLedgerOnlyInvestments(
+  summary: readonly SummaryDraft[],
+  ledger: readonly LedgerDraft[],
+): string[] {
+  const summaryNames = new Set(summary.map((row) => row.name.toLowerCase()));
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const entry of ledger) {
+    const key = entry.investmentName.toLowerCase();
+    if (summaryNames.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    names.push(entry.investmentName);
+  }
+  return names;
+}
+
+/** Summary rows that state a Sent amount but have no Ledger rows at all. */
+function findSentWithNoLedgerRows(
+  summary: readonly SummaryDraft[],
+  ledger: readonly LedgerDraft[],
+): { investmentName: string; line: number; amount: string }[] {
+  const ledgerNames = new Set(
+    ledger.map((entry) => entry.investmentName.toLowerCase()),
+  );
+  return summary
+    .filter(
+      (row) => row.statedSent !== null && !ledgerNames.has(row.name.toLowerCase()),
+    )
+    .map((row) => ({
+      investmentName: row.name,
+      line: row.line,
+      amount: row.statedSent!,
+    }));
 }
 
 /** The whole preview from the two files' text. */
@@ -627,6 +922,15 @@ export function buildPreview(
     suspectRates: ledger.drafts.filter(
       (draft) => draft.rateCheck?.suspect === true,
     ),
+    topLineCheck:
+      summary.totalsRow === null
+        ? null
+        : checkTopLine(summary.totalsRow, summary.drafts, ledger.drafts),
+    ledgerOnlyInvestments: findLedgerOnlyInvestments(
+      summary.drafts,
+      ledger.drafts,
+    ),
+    sentWithNoLedgerRows: findSentWithNoLedgerRows(summary.drafts, ledger.drafts),
   };
 }
 
@@ -711,6 +1015,18 @@ export function planImport(preview: ImportPreview): ImportPlan {
   const operations: ImportOperation[] = [];
   const invalid: ImportRowResult[] = [];
 
+  // Rule 3's fallback: the earliest Ledger entry per investment, for a
+  // commitment whose Docs Signed cell is blank. Built once, from every Ledger
+  // row, rather than re-scanning the Ledger per investment.
+  const earliestLedgerDate = new Map<string, string>();
+  for (const entry of preview.ledger) {
+    const key = entry.investmentName.toLowerCase();
+    const current = earliestLedgerDate.get(key);
+    if (current === undefined || entry.entryDate < current) {
+      earliestLedgerDate.set(key, entry.entryDate);
+    }
+  }
+
   for (const investment of preview.summary) {
     const fields = present({
       name: investment.name,
@@ -742,28 +1058,45 @@ export function planImport(preview: ImportPreview): ImportPlan {
     });
 
     if (investment.committed === null) continue;
-    if (investment.signedOn === null) {
-      // No date, and a commitment entry must have one. Today's date would be a
-      // fabricated fact in a financial record, so the row is reported instead.
-      invalid.push({
-        key: `${investment.importKey}:commitment`,
-        label: `${investment.line}: ${investment.name} commitment`,
-        status: "failed",
-        reason:
-          "Committed amount with no Docs Signed date; set the date in the sheet, or add the commitment by hand",
-      });
-      continue;
+    let commitmentDate = investment.signedOn;
+    let estimated = false;
+    if (commitmentDate === null) {
+      // No Docs Signed date. Rather than block the commitment, date it at the
+      // investment's own earliest Ledger entry and say so: the sheet's first
+      // capital call is real evidence of when the commitment began, and it
+      // beats leaving 34 of 40 commitments unimported. Today's date would
+      // still be a fabricated fact, so that is never the fallback.
+      const fallback = earliestLedgerDate.get(investment.name.toLowerCase());
+      if (fallback === undefined) {
+        // No ledger rows either: nothing to estimate from, so this is left
+        // for the owner rather than guessed.
+        invalid.push({
+          key: `${investment.importKey}:commitment`,
+          label: `${investment.line}: ${investment.name} commitment`,
+          status: "failed",
+          reason:
+            "Committed amount with no Docs Signed date and no Ledger rows to estimate one from; set the date in the sheet, or add the commitment by hand",
+        });
+        continue;
+      }
+      commitmentDate = fallback;
+      estimated = true;
     }
     const body: EntryBody = {
       entryType: "commitment",
-      entryDate: investment.signedOn,
+      entryDate: commitmentDate,
       amount: investment.committed,
       currency: "USD",
       importKey: investment.importKey,
+      // The schema has no boolean for this; the note is where "estimated"
+      // fits without a migration.
+      ...(estimated ? { note: "date estimated from first payment" } : {}),
     };
     pushEntry(operations, invalid, {
       key: body.importKey,
-      label: `${investment.name} commitment ${body.amount} USD`,
+      label:
+        `${investment.name} commitment ${body.amount} USD` +
+        (estimated ? " (date estimated from first payment)" : ""),
       investmentName: investment.name,
       body,
     });

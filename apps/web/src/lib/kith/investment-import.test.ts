@@ -4,6 +4,10 @@
 //
 // Synthetic fixtures only. Every name, amount and date below is invented.
 
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -14,6 +18,7 @@ import {
   type InvestmentFields,
   keyed,
   mapLedger,
+  mapSummary,
   multiplyDecimals,
   parseCsv,
   parseMoney,
@@ -23,6 +28,19 @@ import {
   runImport,
 } from "./investment-import";
 import { amountSchemaFor } from "./investment-schemas";
+
+const FIXTURES_DIR = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "investment-import-fixtures",
+);
+const REAL_SUMMARY_CSV = readFileSync(
+  path.join(FIXTURES_DIR, "summary.csv"),
+  "utf8",
+);
+const REAL_LEDGER_CSV = readFileSync(
+  path.join(FIXTURES_DIR, "ledger.csv"),
+  "utf8",
+);
 
 describe("the amount rule the drawer and the routes share", () => {
   it("accepts a negative amount for a commitment change and no other type", () => {
@@ -518,5 +536,398 @@ describe("running", () => {
     expect(outcome.failed).toHaveLength(1);
     expect(outcome.failed[0]!.reason).toContain("no Docs Signed date");
     expect(outcome.investmentsCreated).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The real sheet's accounting format, and the six failures a dry run against
+// it found. Each is tested in isolation here; `REAL_SUMMARY_CSV` and
+// `REAL_LEDGER_CSV` (below) reproduce all of them together, the way the real
+// export does.
+// ---------------------------------------------------------------------------
+
+describe("the accounting-style money format", () => {
+  it("reads a parenthesised negative even when a symbol sits outside the parens", () => {
+    // The bug: `(...)` was only recognised anchored to the cell's own start,
+    // so `$ (72,182)` -- the real sheet's own shape -- never matched, and
+    // every capital call was read as a positive number.
+    expect(parseMoney(" $ (72,182)")).toMatchObject({
+      amount: "72182.00",
+      negative: true,
+    });
+    expect(parseMoney("$ (1,234.56)")).toMatchObject({
+      amount: "1234.56",
+      negative: true,
+    });
+  });
+
+  it("reads the accounting zero placeholder as zero, not as absent", () => {
+    expect(parseMoney(" $ -   ")).toEqual({
+      amount: "0.00",
+      negative: false,
+      rounded: false,
+    });
+    // A bare dash with no currency symbol is still "not stated": that is the
+    // existing rule for a column the sheet left out of the row entirely.
+    expect(parseMoney("-")).toBeNull();
+  });
+
+  it("reads a positive accounting amount with the symbol and digits spaced apart", () => {
+    expect(parseMoney(" $ 100,000 ")).toEqual({
+      amount: "100000.00",
+      negative: false,
+      rounded: false,
+    });
+  });
+});
+
+describe("date year plausibility", () => {
+  it("refuses a date whose year is outside 1990-2100 rather than importing it", () => {
+    // `2/6/0206` matches the `M/D/YYYY` shape exactly (day 2, month 6, year
+    // "0206") and used to become the stored date `0206-02-06`.
+    expect(parseSheetDate("2/6/0206")).toBeNull();
+    expect(parseSheetDate("2024-02-06")).toBe("2024-02-06");
+  });
+
+  it("reports the bad year with its own reason, not the generic one", () => {
+    const ledger = [
+      "Date,Investment,Amount,GBP,Exchange Rate,Comment",
+      "2/6/0206,Alpha,-1000,,,Typo year",
+    ].join("\n");
+    const { skipped } = mapLedger(keyed(parseCsv(ledger)));
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]!.reason).toBe(
+      "Date year 0206 is outside a plausible range (1990-2100)",
+    );
+  });
+});
+
+describe("the sheet's own Total row", () => {
+  it("is not imported as an investment", () => {
+    const summary = [
+      "Investment,Docs Signed,Category,Committed,Sent,Outstanding Commitment,Received,Status",
+      "Alpha,2024-01-01,Direct,1000,0,1000,0,Active",
+      "Total,,,1000,0,1000,0,",
+    ].join("\n");
+    const { drafts, totalsRow } = mapSummary(keyed(parseCsv(summary)));
+    expect(drafts.map((row) => row.name)).toEqual(["Alpha"]);
+    expect(totalsRow).toMatchObject({ committed: "1000.00" });
+  });
+
+  it("matches the Investment cell case-insensitively and trimmed", () => {
+    const summary = [
+      "Investment,Docs Signed,Category,Committed,Sent,Outstanding Commitment,Received,Status",
+      " TOTAL ,,,1000,0,1000,0,",
+    ].join("\n");
+    const { drafts, totalsRow } = mapSummary(keyed(parseCsv(summary)));
+    expect(drafts).toEqual([]);
+    expect(totalsRow).not.toBeNull();
+  });
+});
+
+describe("reconciliation tolerance", () => {
+  it("stays silent within a dollar, the gap whole-dollar Summary figures vs cents in the Ledger leaves", () => {
+    const summary = [
+      "Investment,Docs Signed,Category,Committed,Sent,Outstanding Commitment,Received,Status",
+      "Alpha,2024-01-01,Direct,1000,1000,0,0,Active",
+    ].join("\n");
+    const ledger = [
+      "Date,Investment,Amount,GBP,Exchange Rate,Comment",
+      "2024-02-01,Alpha,-999.50,,,",
+    ].join("\n");
+    expect(buildPreview(summary, ledger).reconciliation).toEqual([]);
+  });
+
+  it("still reports a gap of more than a dollar", () => {
+    const summary = [
+      "Investment,Docs Signed,Category,Committed,Sent,Outstanding Commitment,Received,Status",
+      "Alpha,2024-01-01,Direct,1000,1000,0,0,Active",
+    ].join("\n");
+    const ledger = [
+      "Date,Investment,Amount,GBP,Exchange Rate,Comment",
+      "2024-02-01,Alpha,-998,,,",
+    ].join("\n");
+    expect(buildPreview(summary, ledger).reconciliation).toMatchObject([
+      { investmentName: "Alpha", field: "sent", difference: "2.00" },
+    ]);
+  });
+});
+
+describe("dating a commitment from the Ledger when Docs Signed is blank", () => {
+  it("dates the commitment at the earliest Ledger entry and marks it estimated", () => {
+    const summary = [
+      "Investment,Docs Signed,Category,Committed,Sent,Outstanding Commitment,Received,Status",
+      "Alpha,,Direct,1000,900,100,0,Active",
+    ].join("\n");
+    const ledger = [
+      "Date,Investment,Amount,GBP,Exchange Rate,Comment",
+      "2024-05-01,Alpha,-400,,,",
+      "2024-02-15,Alpha,-500,,,",
+    ].join("\n");
+    const plan = planImport(buildPreview(summary, ledger));
+    expect(plan.invalid).toEqual([]);
+    const commitment = plan.operations.find(
+      (op) => op.kind === "entry" && op.body.entryType === "commitment",
+    );
+    expect(commitment).toMatchObject({
+      kind: "entry",
+      body: {
+        entryDate: "2024-02-15",
+        amount: "1000.00",
+        note: "date estimated from first payment",
+      },
+    });
+  });
+
+  it("leaves the commitment for the owner when there is no Docs Signed date and no Ledger rows either", () => {
+    const summary = [
+      "Investment,Docs Signed,Category,Committed,Sent,Outstanding Commitment,Received,Status",
+      "Alpha,,Direct,1000,0,1000,0,Active",
+    ].join("\n");
+    const plan = planImport(buildPreview(summary, ""));
+    expect(plan.operations).toHaveLength(1); // the investment, not the commitment
+    expect(plan.invalid).toHaveLength(1);
+    expect(plan.invalid[0]!.reason).toContain("no Ledger rows to estimate");
+    // Never today's date, whatever today is.
+    expect(
+      plan.operations.some(
+        (op) => op.kind === "entry" && op.body.entryType === "commitment",
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("investments named in only one tab", () => {
+  it("lists a Ledger investment the Summary never names under its own heading", () => {
+    const summary = [
+      "Investment,Docs Signed,Category,Committed,Sent,Outstanding Commitment,Received,Status",
+      "Alpha,2024-01-01,Direct,1000,1000,0,0,Active",
+    ].join("\n");
+    const ledger = [
+      "Date,Investment,Amount,GBP,Exchange Rate,Comment",
+      "2024-02-01,Alpha,-1000,,,",
+      "2024-03-01,Beta,-500,,,",
+    ].join("\n");
+    const preview = buildPreview(summary, ledger);
+    expect(preview.ledgerOnlyInvestments).toEqual(["Beta"]);
+    // Still gets created: `runImport` makes an investment for any Ledger row
+    // whose name resolves to nothing, with no commitment since the Summary is
+    // what states one.
+    const outcome = planImport(preview);
+    expect(
+      outcome.operations.some(
+        (op) => op.kind === "entry" && op.investmentName === "Beta",
+      ),
+    ).toBe(true);
+  });
+
+  it("lists a Summary row with a Sent amount and no Ledger rows under its own heading", () => {
+    const summary = [
+      "Investment,Docs Signed,Category,Committed,Sent,Outstanding Commitment,Received,Status",
+      "Alpha,2024-01-01,Direct,1000,1000,0,0,Active",
+    ].join("\n");
+    const preview = buildPreview(summary, "");
+    expect(preview.sentWithNoLedgerRows).toEqual([
+      { investmentName: "Alpha", line: 2, amount: "1000.00" },
+    ]);
+  });
+});
+
+describe("the real sheet's format, reproduced end to end", () => {
+  it("reconciles the whole sheet the way the operator will see it", () => {
+    const preview = buildPreview(REAL_SUMMARY_CSV, REAL_LEDGER_CSV);
+
+    // Four investments, not five: the sheet's own Total row is used, not
+    // imported.
+    expect(preview.summary.map((row) => row.name)).toEqual([
+      "Bramble Fund I",
+      "Tanager Direct",
+      "Angel Startup",
+      "Volo Earth",
+    ]);
+
+    // Bramble's Docs Signed is blank; its commitment is dated at its earliest
+    // capital call and marked estimated.
+    expect(preview.summary[0]).toMatchObject({
+      committed: "100000.00",
+      statedSent: "72182.00",
+      statedReceived: "12345.67",
+      signedOn: null,
+    });
+
+    // "Direct " (trailing space) and the accounting zero placeholder both
+    // read cleanly.
+    expect(preview.summary[1]).toMatchObject({
+      category: "Direct",
+      statedReceived: "0.00",
+    });
+
+    // The typo'd year is reported, not imported as a fourth VoLo Earth call.
+    expect(preview.skipped).toContainEqual(
+      expect.objectContaining({
+        reason: "Date year 0206 is outside a plausible range (1990-2100)",
+      }),
+    );
+
+    // Case differs between the tabs ("Volo Earth" / "VoLo Earth") and two
+    // identical calls land on the same day; both still reconcile exactly.
+    // Tanager (off by $1.50) is the one investment that does not.
+    expect(preview.reconciliation).toMatchObject([
+      { investmentName: "Tanager Direct", field: "sent", difference: "1.50" },
+      { investmentName: "Angel Startup", field: "sent", difference: "10000.00" },
+    ]);
+
+    // Meridian Notes is only in the Ledger; Angel Startup's Sent has no
+    // Ledger rows at all.
+    expect(preview.ledgerOnlyInvestments).toEqual(["Meridian Notes"]);
+    expect(preview.sentWithNoLedgerRows).toEqual([
+      { investmentName: "Angel Startup", line: 4, amount: "10000.00" },
+    ]);
+
+    // The sheet's own Total row checks out against both the Summary's own
+    // rows and the Ledger's totals.
+    expect(preview.topLineCheck).toMatchObject({
+      committed: { totalRow: "185000.00", summarySum: "185000.00" },
+      sent: { totalRow: "157182.00", summarySum: "157182.00" },
+      received: { totalRow: "12345.67", summarySum: "12345.67" },
+    });
+
+    // A GBP row with no USD column reads by its own sign and converts at its
+    // own rate: -£15,200.00 at 1.3 is a $19,760.00 capital call.
+    const sterling = preview.ledger.find(
+      (row) => row.investmentName === "Meridian Notes" && row.currency === "GBP",
+    );
+    expect(sterling).toMatchObject({
+      entryType: "capital_call_paid",
+      usdAmount: "19760.00",
+    });
+
+    const plan = planImport(preview);
+    // Angel Startup's commitment is the one row genuinely left for the owner:
+    // no Docs Signed date and no Ledger rows to estimate one from.
+    expect(plan.invalid).toHaveLength(1);
+    expect(plan.invalid[0]!.label).toContain("Angel Startup");
+    expect(plan.invalid[0]!.reason).toContain("no Ledger rows to estimate");
+
+    const commitments = plan.operations.filter(
+      (op) => op.kind === "entry" && op.body.entryType === "commitment",
+    );
+    expect(commitments).toHaveLength(3); // not Angel Startup
+    const bramble = commitments.find(
+      (op) => op.kind === "entry" && op.investmentName === "Bramble Fund I",
+    );
+    expect(bramble).toMatchObject({
+      body: {
+        entryDate: "2021-03-01", // Bramble's earliest capital call
+        note: "date estimated from first payment",
+      },
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Independent review of #309 (ADM-3b) found five more issues. 1-3 below get a
+// test each, as asked; 4 (the store's `findOrCreateInvestment`) is addressed
+// in scripts/investments-import.mjs (see its own test), and 5
+// (topLineCheck's own ledgerDifference) gets a test here too.
+// ---------------------------------------------------------------------------
+
+describe("a zero USD cell states no direction (review #1)", () => {
+  it("reads a capital call from GBP when Amount is the zero placeholder, not a distribution", () => {
+    // Amount blank entirely (no USD column at all) already worked; the bug
+    // was the accounting zero placeholder `$ -`, which is *present* and
+    // parses to a real (zero) value, so it used to win as the sign source
+    // and every such row came out positive -- a distribution -- regardless
+    // of the GBP call's own sign.
+    const ledger = [
+      "Date,Investment,Amount,GBP,Exchange Rate,Comment",
+      '2024-02-01,Alpha,"$ -   ","(10,000)",1.3,Sterling call',
+    ].join("\n");
+    const { drafts } = mapLedger(keyed(parseCsv(ledger)));
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0]).toMatchObject({
+      entryType: "capital_call_paid",
+      currency: "GBP",
+      amount: "10000.00",
+      why: "negative GBP → capital_call_paid",
+    });
+  });
+
+  it("still reads the sign from a genuinely stated, non-zero USD cell", () => {
+    const ledger = [
+      "Date,Investment,Amount,GBP,Exchange Rate,Comment",
+      '2024-02-01,Alpha,150,"(10,000)",1.3,Disagreeing signs',
+    ].join("\n");
+    const { drafts } = mapLedger(keyed(parseCsv(ledger)));
+    expect(drafts[0]).toMatchObject({ entryType: "distribution" });
+  });
+
+  it("does not check a GBP row's rate against the zero placeholder", () => {
+    // "0.00" is not a stated USD figure to check the conversion against; it
+    // used to flag as suspect every single time, no matter how close the
+    // rate actually was.
+    const ledger = [
+      "Date,Investment,Amount,GBP,Exchange Rate,Comment",
+      '2024-02-01,Alpha,"$ -   ","(10,000)",1.3,Sterling call',
+    ].join("\n");
+    const { drafts } = mapLedger(keyed(parseCsv(ledger)));
+    expect(drafts[0]!.rateCheck).toBeNull();
+  });
+});
+
+describe("parseMoney refuses an ambiguous number rather than guessing (review #2)", () => {
+  it("refuses a European-style decimal comma instead of dropping it", () => {
+    // Stripped blindly, `1.234,56` became `1.23456`: a different number.
+    expect(parseMoney("1.234,56")).toBeNull();
+  });
+
+  it("refuses a space used as a thousands separator", () => {
+    expect(parseMoney("1 000,50")).toBeNull();
+  });
+
+  it("refuses a malformed comma grouping", () => {
+    expect(parseMoney("1,2,3")).toBeNull();
+  });
+
+  it("still accepts a plain decimal and a properly grouped one", () => {
+    expect(parseMoney("1234.56")).toMatchObject({ amount: "1234.56" });
+    expect(parseMoney("1,234,567.89")).toMatchObject({ amount: "1234567.89" });
+  });
+
+  it("reports an unreadable Committed cell rather than silently treating it as not stated", () => {
+    const summary = [
+      "Investment,Docs Signed,Category,Committed,Sent,Outstanding Commitment,Received,Status",
+      'Alpha,2024-01-01,Direct,"1.234,56",0,1000,0,Active',
+    ].join("\n");
+    const { drafts, skipped } = mapSummary(keyed(parseCsv(summary)));
+    expect(drafts[0]!.committed).toBeNull();
+    expect(skipped).toContainEqual(
+      expect.objectContaining({ reason: "Committed value is unreadable" }),
+    );
+  });
+});
+
+describe("topLineCheck also differences the Ledger's own totals (review #5)", () => {
+  it("does not report 0.00 when the Ledger is thousands off the Total row", () => {
+    const summary = [
+      "Investment,Docs Signed,Category,Committed,Sent,Outstanding Commitment,Received,Status",
+      "Alpha,2024-01-01,Direct,1000,1000,0,0,Active",
+      "Total,,,1000,1000,0,0,",
+    ].join("\n");
+    const ledger = [
+      "Date,Investment,Amount,GBP,Exchange Rate,Comment",
+      // The Ledger's own capital calls add to only 1: nowhere near the
+      // Total row's stated 1000, even though the Summary's own rows agree
+      // with it exactly.
+      "2024-02-01,Alpha,-1,,,",
+    ].join("\n");
+    const { topLineCheck } = buildPreview(summary, ledger);
+    expect(topLineCheck!.sent).toMatchObject({
+      totalRow: "1000.00",
+      summarySum: "1000.00",
+      difference: "0.00",
+      ledgerSum: "1.00",
+      ledgerDifference: "999.00",
+    });
   });
 });
