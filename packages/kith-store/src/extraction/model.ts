@@ -122,9 +122,15 @@ export async function scheduleDocumentExtraction(
 }
 
 /**
- * Re-extraction on demand: every document of one kind, or every document that
- * has never been extracted when `kind` is omitted. Bounded per call so an
- * accidental click cannot enqueue an unbounded sweep.
+ * Re-extraction on demand: every already-extracted document of one kind, or
+ * every already-extracted document when `kind` is omitted. Bounded per call
+ * so an accidental click cannot enqueue an unbounded sweep.
+ *
+ * This selects from `kith.document_extractions`, so a document that has
+ * never been extracted -- one activated before the typed extraction backend
+ * landed, or whose first job was lost -- has no row here to find and is
+ * silently skipped. `scheduleExtractionBackfill` below is the route for that
+ * case.
  */
 export async function scheduleReextraction(
   ctx: DeferredCtx,
@@ -146,6 +152,57 @@ export async function scheduleReextraction(
       ? [input.spaceId, limit]
       : [input.spaceId, limit, input.kind],
   );
+  const scheduled: string[] = [];
+  for (const row of result.rows) {
+    await scheduleDocumentExtraction(ctx, {
+      spaceId: input.spaceId,
+      sourceItemId: row.source_item_id,
+      processingGenerationId: row.processing_generation_id,
+    });
+    scheduled.push(row.source_item_id);
+  }
+  return scheduled;
+}
+
+/**
+ * Backfill for documents that activated before typed extraction existed, or
+ * whose activation job was lost: every active document in the space with a
+ * ready processing generation and no `kith.document_extractions` row at all.
+ * Bounded per call for the same reason `scheduleReextraction` is.
+ *
+ * `apply` defaults to true (schedule); the operator CLI (`cli.ts`) passes
+ * `false` for a dry-run count.
+ */
+export async function scheduleExtractionBackfill(
+  ctx: DeferredCtx,
+  input: { spaceId: string; limit?: number; apply?: boolean },
+): Promise<string[]> {
+  const limit = Math.min(Math.max(input.limit ?? 200, 1), 1_000);
+  const apply = input.apply ?? true;
+  // The same "current ready generation" join `loadDocument` above uses:
+  // `source_items.active_generation_id` -> `processing_generations`, gated on
+  // `state = 'ready'`. A document with no extraction row and no ready
+  // generation is still processing or failed, not a backfill candidate.
+  const result = await ctx.client.query<{
+    source_item_id: string;
+    processing_generation_id: string;
+  }>(
+    `SELECT i.id AS source_item_id,
+            i.active_generation_id AS processing_generation_id
+       FROM kith.source_items i
+       JOIN kith.processing_generations g
+         ON g.id = i.active_generation_id AND g.space_id = i.space_id
+      WHERE i.space_id = $1
+        AND i.lifecycle = 'available'
+        AND g.state = 'ready'
+        AND NOT EXISTS (
+          SELECT 1 FROM kith.document_extractions e
+           WHERE e.source_item_id = i.id
+        )
+      ORDER BY i.id LIMIT $2`,
+    [input.spaceId, limit],
+  );
+  if (!apply) return result.rows.map((row) => row.source_item_id);
   const scheduled: string[] = [];
   for (const row of result.rows) {
     await scheduleDocumentExtraction(ctx, {
