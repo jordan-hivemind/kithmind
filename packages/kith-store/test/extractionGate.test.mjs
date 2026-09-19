@@ -7,6 +7,8 @@ import test from "node:test";
 
 import {
   amountsInText,
+  checkLineItem,
+  readLineItems,
   checkValue,
   currencyOnPage,
   itemsSumToTotal,
@@ -389,36 +391,96 @@ test("a name must appear inside the quote that supports it", () => {
   );
 });
 
-test("line items become one money value each and carry their own sum", () => {
-  const result = gate({
-    valueType: "line_item_list",
-    value: [
-      { description: "Hammer", amount: "$10.00" },
-      { description: "Nails", amount: "$5.50" },
-    ],
-    quote: "Hammer $10.00 Nails $5.50",
-  });
-  assert.equal(result.ok, true);
-  assert.equal(result.values.length, 2);
-  assert.equal(result.itemsTotal, "15.5");
-  assert.equal(itemsSumToTotal(result.itemsTotal, "15.50"), true);
-  // The canonical form drops a trailing zero; the comparison is by value.
-  assert.equal(itemsSumToTotal(result.itemsTotal, "15.5"), true);
-  // Tolerance zero, by design.
-  assert.equal(itemsSumToTotal(result.itemsTotal, "15.51"), false);
+/** One cited line, as the per-item gate takes them. */
+function citedLine(id, text) {
+  return { id, text, start: 0, end: text.length };
+}
 
-  assert.deepEqual(
-    gate({ valueType: "line_item_list", value: "Hammer, Nails" }),
-    { ok: false, reason: "malformed_statement" },
+test("a line item is gated on its own citation", () => {
+  const page = "Hammer\n  $10.00\nNails\n  $5.50";
+  const item = (description, amount, lines) => ({
+    item: { description, amount, lines: [] },
+    cited: lines,
+    pageText: page,
+    defaultCurrency: "USD",
+  });
+  // The amount on one cited line, the description on another: both are
+  // checked, and the span is the line that prints the amount.
+  const hammer = checkLineItem(
+    item("Hammer", "$10.00", [citedLine(1, "Hammer"), citedLine(2, "  $10.00")]),
   );
+  assert.equal(hammer.ok, true);
+  assert.equal(hammer.amount, "10");
+  assert.equal(hammer.span.text, "  $10.00");
+
+  // ADM-5g: a trailing tax or status letter is a flag, not a digit.
+  for (const printed of ["12.99T", "12.99 A", "1,234.56F"]) {
+    const flagged = checkLineItem(
+      item("Widget", printed, [citedLine(1, `Widget ${printed}`)]),
+    );
+    assert.equal(flagged.ok, true, printed);
+  }
+  assert.equal(
+    checkLineItem(item("Widget", "12.99T", [citedLine(1, "Widget 12.99T")]))
+      .amount,
+    "12.99",
+  );
+  // But an amount with its decimal point dropped is that number, not cents.
   assert.deepEqual(
-    gate({
-      valueType: "line_item_list",
-      value: [{ description: "Hammer", amount: "ten" }],
-      quote: "Hammer ten",
-    }),
+    checkLineItem(item("Widget", "1299", [citedLine(1, "Widget 12.99")])),
+    { ok: false, reason: "value_not_in_quote" },
+  );
+  assert.equal(
+    checkLineItem(item("Widget", "1299", [citedLine(1, "Widget 1299")])).amount,
+    "1299",
+  );
+
+  // A description the cited lines do not print is refused, like any name.
+  assert.deepEqual(
+    checkLineItem(item("Chisel", "$10.00", [citedLine(2, "  $10.00")])),
+    { ok: false, reason: "value_not_in_quote" },
+  );
+  // An unparsable amount is its own reason.
+  assert.deepEqual(
+    checkLineItem(item("Hammer", "ten", [citedLine(1, "Hammer ten")])),
     { ok: false, reason: "money_unparsable" },
   );
+  // And an entry that cites nothing says so.
+  assert.deepEqual(checkLineItem(item("Hammer", "$10.00", [])), {
+    ok: false,
+    reason: "citation_missing",
+  });
+});
+
+test("one bad entry does not take the list down", () => {
+  // `readLineItems` reads per entry, so a garbled line is one refused line.
+  const read = readLineItems([
+    { description: "Hammer", amount: "10.00", lines: [1] },
+    "Nails 5.50",
+    { description: "", amount: "5.50", lines: [2] },
+    { description: "Screws", amount: 7.25, lines: [3] },
+  ]);
+  assert.equal(read.length, 4);
+  assert.deepEqual(
+    read.map((entry) => entry.ok),
+    [true, false, false, true],
+  );
+  assert.deepEqual(read[0].item, {
+    description: "Hammer",
+    amount: "10.00",
+    lines: [1],
+  });
+  // A number amount is read as its decimal string, not rounded.
+  assert.equal(read[3].item.amount, "7.25");
+  // The whole value being the wrong shape is still the whole list failing.
+  assert.equal(readLineItems("Hammer, Nails"), undefined);
+  assert.equal(readLineItems([]), undefined);
+});
+
+test("the sum of the entries still has zero tolerance", () => {
+  assert.equal(itemsSumToTotal("15.5", "15.50"), true);
+  assert.equal(itemsSumToTotal("15.5", "15.5"), true);
+  assert.equal(itemsSumToTotal("15.5", "15.51"), false);
 });
 
 test("the starter set is well formed and every field name is usable", () => {

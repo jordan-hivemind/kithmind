@@ -272,6 +272,16 @@ line; only a text field may span two adjacent cited ones, and only a text
 field is matched case- and punctuation-folded. Money, numbers and dates keep
 their exact reading.
 
+Each entry of a `line_item_list` carries its own citation and is gated on its
+own: its amount must occur within one cited line, its description folds like
+any name and may span two adjacent cited lines, and its evidence span is the
+line that prints the amount. An entry that fails is one entry, not the list:
+the rest store and a single `line_items_partial` correction says how many are
+missing. An amount is the decimal string the line prints, with its decimal
+point; a trailing tax or status letter is dropped as a flag; `1299` is one
+thousand two hundred and ninety-nine, never twelve ninety-nine. A partial list
+is never compared against a stated total.
+
 Every stored statement and every gate correction records what it cited: shown
 page, page ordinal, line ids, the page's line count and whether the ids are
 contiguous. `kith-extraction-diagnose [--kind k] [--limit N]` reads those back

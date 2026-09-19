@@ -67,6 +67,13 @@ export const CORRECTION_REASONS = [
   "extraction_model_refused",
   /** The model's output was not the shape the prompt asks for. */
   "malformed_statement",
+  /** The statement cited no lines at all, and carried no quote either. Its
+   * own reason, because "the model forgot to cite" and "the quote is not on
+   * the page" are different faults and the counts have to separate them. */
+  "citation_missing",
+  /** Some lines of a list failed while others stored. One row for the list,
+   * carrying how many. */
+  "line_items_partial",
   /** The statement cited a page number that is not in the document as shown.
    * Distinct from a bad line id on purpose: this one means the model and the
    * server disagree about how pages are numbered, which is a fault in the
@@ -85,8 +92,15 @@ export const CORRECTION_REASONS = [
 
 export type CorrectionReason = (typeof CORRECTION_REASONS)[number];
 
-/** One line of a `line_item_list`, as the model returns it. */
-export type LineItem = { description: string; amount: string };
+/** One line of a `line_item_list`, as the model returns it. Each item may
+ * cite its own lines: on a receipt the items are on different lines, and a
+ * citation shared by the whole list cannot be right for more than one of
+ * them. */
+export type LineItem = {
+  description: string;
+  amount: string;
+  lines: number[];
+};
 
 /** A model statement, after JSON parsing and before any check. */
 export type RawStatement = {
@@ -213,6 +227,12 @@ export function parseAmount(raw: string): string | undefined {
     if (/[-+]/.test(text)) return undefined;
   }
   text = text.replace(/[A-Z]{3}/g, "");
+  // A single letter right after the digits is a tax or status flag, which
+  // receipts and invoices print constantly: "12.99T", "1,234.56F", "12.99 A".
+  // The flag is not part of the number and is dropped. Two letters are not
+  // touched here -- "CR" is a sign, and it is read around the token rather
+  // than inside it.
+  text = text.replace(/(\d)[ \u00a0]*[A-Za-z]$/, "$1");
   for (const [symbol] of CURRENCY_SYMBOLS) text = text.split(symbol).join("");
   text = text.replace(/[\s ]/g, "");
   if (text.startsWith("-")) {
@@ -625,25 +645,56 @@ function dateInQuote(
   return false;
 }
 
-function asLineItems(value: unknown): LineItem[] | undefined {
+/** One entry of a list, read or refused on its own. */
+export type ReadLineItem =
+  | { ok: true; item: LineItem }
+  | { ok: false; reason: CorrectionReason };
+
+/**
+ * The entries of a `line_item_list`, each read on its own.
+ *
+ * Per entry, not per list. One malformed line used to refuse the whole
+ * statement, so a receipt with six good items and one the model garbled
+ * stored nothing -- which is how a strong model still lost every line item on
+ * both trial documents. A bad entry is now one refused entry and the rest
+ * store.
+ */
+export function readLineItems(value: unknown): ReadLineItem[] | undefined {
   if (!Array.isArray(value) || value.length === 0 || value.length > 64) {
     return undefined;
   }
-  const items: LineItem[] = [];
-  for (const entry of value) {
-    if (!entry || typeof entry !== "object") return undefined;
-    const item = entry as { description?: unknown; amount?: unknown };
+  return value.map((entry): ReadLineItem => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return { ok: false, reason: "malformed_statement" };
+    }
+    const item = entry as {
+      description?: unknown;
+      amount?: unknown;
+      lines?: unknown;
+    };
     if (
       typeof item.description !== "string" ||
       !item.description.trim() ||
       item.description.length > 500 ||
       (typeof item.amount !== "string" && typeof item.amount !== "number")
     ) {
-      return undefined;
+      return { ok: false, reason: "malformed_statement" };
     }
-    items.push({ description: item.description, amount: String(item.amount) });
-  }
-  return items;
+    const lines = Array.isArray(item.lines)
+      ? item.lines
+          .map((id) => Number(id))
+          .filter((id) => Number.isInteger(id) && id >= 1)
+          .slice(0, 3)
+      : [];
+    return {
+      ok: true,
+      item: {
+        description: item.description,
+        amount: String(item.amount),
+        lines,
+      },
+    };
+  });
 }
 
 export type GateInput = {
@@ -786,31 +837,9 @@ export function checkValue(input: GateInput): GateResult {
     candidates.findIndex((candidate) => predicate(candidate.text));
 
   if (valueType === "line_item_list") {
-    const items = asLineItems(value);
-    if (!items) return fail("malformed_statement");
-    const values: ObservationValue[] = [];
-    const support: number[] = [];
-    let total = "0";
-    const pageCurrency = currencyOnPage(pageText);
-    const currency = pageCurrency ?? defaultCurrency;
-    for (const item of items) {
-      const amount = parseAmount(item.amount);
-      if (amount === undefined) return fail("money_unparsable");
-      // Same rule as a single money value, per item: one cited line has to
-      // print it. Different items may be on different cited lines.
-      const at = firstMatch((text) => amountInQuote(amount, text));
-      if (at < 0) return fail("value_not_in_quote");
-      total = addDecimals(total, amount);
-      values.push({ type: "money", amount, currency });
-      support.push(at);
-    }
-    return {
-      ok: true,
-      values,
-      support,
-      itemsTotal: total,
-      ...(pageCurrency === undefined ? { currencyAssumed: true as const } : {}),
-    };
+    // Handled by `checkLineItems`, which gates each entry on its own cited
+    // lines. Reaching here means a caller has not been updated.
+    return fail("malformed_statement");
   }
 
   if (typeof value !== "string" && typeof value !== "number") {
@@ -928,6 +957,114 @@ function printedFormOf(text: string, folded: string): string | undefined {
   const to = mapped.ends[at + folded.length - 1];
   if (from === undefined || to === undefined || to <= from) return undefined;
   return text.normalize("NFKC").slice(from, to);
+}
+
+/** One entry's outcome: the money value it becomes, and which candidate line
+ * printed the amount. */
+export type LineItemOutcome =
+  | {
+      ok: true;
+      value: ObservationValue;
+      amount: string;
+      span: Candidate;
+      currencyAssumed?: true;
+    }
+  | { ok: false; reason: CorrectionReason };
+
+export type LineItemCheck = {
+  item: LineItem;
+  /** The lines this entry cites, already resolved. */
+  cited: ReadonlyArray<{ id: number; text: string; start: number; end: number }>;
+  pageText: string;
+  defaultCurrency: string;
+};
+
+/**
+ * One line item, gated on its own citation.
+ *
+ * The amount must occur within a single cited line, exactly as a money value
+ * anywhere else must. The description is a text field, so it folds and may
+ * span two adjacent cited lines, exactly as a vendor may. The span stored is
+ * the line that prints the *amount*: that is the number someone will later
+ * check against a statement.
+ */
+export function checkLineItem(input: LineItemCheck): LineItemOutcome {
+  const { item, cited, pageText, defaultCurrency } = input;
+  if (cited.length === 0) return { ok: false, reason: "citation_missing" };
+  const amount = parseAmount(item.amount);
+  if (amount === undefined) return { ok: false, reason: "money_unparsable" };
+
+  const amountCandidates = candidatesFor(cited, "money");
+  const at = amountCandidates.findIndex((candidate) =>
+    amountInQuote(amount, candidate.text),
+  );
+  if (at < 0) return { ok: false, reason: "value_not_in_quote" };
+
+  // The description is checked the way a name is, against the same lines.
+  const folded = foldTextForMatch(item.description);
+  const described =
+    folded.length > 0 &&
+    candidatesFor(cited, "text").some((candidate) =>
+      foldTextForMatch(candidate.text).includes(folded),
+    );
+  if (!described) return { ok: false, reason: "value_not_in_quote" };
+
+  const pageCurrency = currencyOnPage(pageText);
+  return {
+    ok: true,
+    amount,
+    value: {
+      type: "money",
+      amount,
+      currency: pageCurrency ?? defaultCurrency,
+    },
+    span: amountCandidates[at]!,
+    ...(pageCurrency === undefined ? { currencyAssumed: true as const } : {}),
+  };
+}
+
+/** The widest a signature gets. Long enough to see a shape, short enough that
+ * it cannot carry a sentence. */
+const MAX_SIGNATURE_CHARS = 24;
+
+/** Punctuation a signature keeps, because the shape of an amount or a date is
+ * the point. Everything else becomes `.`-free: letters fold to `a`, digits to
+ * `9`, and anything else is dropped. */
+const KEPT_IN_SIGNATURE = new Set([
+  "$",
+  ".",
+  ",",
+  "/",
+  "-",
+  ":",
+  " ",
+]);
+
+/**
+ * The character-class shape of a value.
+ *
+ * `"$1,234.56"` becomes `"$9,999.99"` and `"Bracken Tools"` becomes
+ * `"aaaaaaa aaaaa"`. Enough to see that a money field came back as words, or
+ * that a date came back with a time on it; not enough to learn anything about
+ * the household.
+ */
+export function valueSignature(value: unknown): string {
+  const text =
+    typeof value === "string"
+      ? value
+      : typeof value === "number" || typeof value === "boolean"
+        ? String(value)
+        : value === null || value === undefined
+          ? ""
+          : JSON.stringify(value).slice(0, 200);
+  let signature = "";
+  for (const unit of text.normalize("NFKC")) {
+    if (signature.length >= MAX_SIGNATURE_CHARS) break;
+    if (/[0-9]/.test(unit)) signature += "9";
+    else if (/[A-Za-z]/.test(unit)) signature += "a";
+    else if (KEPT_IN_SIGNATURE.has(unit)) signature += unit;
+  }
+  return signature;
 }
 
 /** Zero tolerance, by design. A receipt whose items do not sum to its total is
