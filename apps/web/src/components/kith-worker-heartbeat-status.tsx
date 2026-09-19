@@ -1,18 +1,17 @@
 "use client";
 
-// The PostgreSQL worker heartbeat status: a poll of `GET /api/status/worker`
-// through `useStatusPoll` instead of the Convex subscription
-// `convex-worker-heartbeat-status.tsx` uses. Presentation matches that file
-// so the two surfaces read the same to someone watching the settings page,
-// modulo the "possibly stale" marker a failed poll adds here and a Convex
-// subscription never needed.
+// A filesystem source account's worker heartbeat, as one tag in the settings
+// table: a poll of `GET /api/status/worker` through `useStatusPoll`, fetched
+// on mount and every ten seconds after.
 //
-// No initial value comes from the settings page's own loader (`settings-data.ts`
-// is unchanged by i6), so this starts in the same "Loading worker
-// heartbeat..." state the Convex version's `status === undefined` case
-// rendered, and fetches immediately on mount rather than waiting for the
-// first ten-second tick.
+// Polled rather than driven by the change feed on purpose: "overdue" is a
+// function of the clock, and nothing writes a row when a heartbeat fails to
+// arrive.
+//
+// A heartbeat confirms worker contact with Kith Mind. It does not confirm file
+// access or record completeness; the tooltip says as much in one line.
 
+import { Detail, Tag } from "@/components/ui/data-table";
 import { useStatusPoll } from "@/lib/kith/use-status-poll";
 
 type WorkerStatusResponse = {
@@ -44,30 +43,33 @@ export function WorkerHeartbeatStatus({
     { immediate: true },
   );
 
-  if (status === null) return <p>Loading worker heartbeat...</p>;
-  if (status.watcher.state === "not_configured") {
-    return <p>No worker watcher is configured yet.</p>;
-  }
-  if (status.watcher.state === "awaiting_heartbeat") {
-    return <p>Worker watcher is awaiting its first heartbeat.</p>;
-  }
+  if (status === null) return <Tag>loading</Tag>;
+  if (status.watcher.state === "not_configured") return <Tag>no watcher</Tag>;
+  if (status.watcher.state === "awaiting_heartbeat") return <Tag>awaiting</Tag>;
+
+  const detail = [
+    `Last heartbeat ${localTime(status.watcher.lastHeartbeatAt)}`,
+    possiblyStale ? "Could not refresh; last known value" : "",
+    "Confirms worker contact only, not file access",
+  ]
+    .filter(Boolean)
+    .join(". ");
 
   return (
-    <div>
-      <p>
-        Worker heartbeat: {status.stale ? "overdue" : "current"}. Last
-        successful heartbeat: {localTime(status.watcher.lastHeartbeatAt)}.
-        {possiblyStale && (
-          <> (Could not refresh just now; showing the last known value.)</>
-        )}
-      </p>
+    <span className="inline-flex items-center gap-1">
+      <Detail
+        label={
+          <Tag tone={status.stale ? "warn" : "accent"}>
+            {status.stale ? "overdue" : "current"}
+          </Tag>
+        }
+        detail={detail}
+      />
       {status.incident.state === "open" && (
-        <p role="alert">Missing-worker incident is open.</p>
+        <span role="alert">
+          <Tag tone="warn">incident open</Tag>
+        </span>
       )}
-      <p style={{ color: "#666", fontSize: 13 }}>
-        A heartbeat confirms worker contact with Kith Mind. It does not confirm
-        file access or record completeness.
-      </p>
-    </div>
+    </span>
   );
 }

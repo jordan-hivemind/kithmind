@@ -1,10 +1,10 @@
 "use client";
 
-// The TanStack Query cache for the admin panel.
+// The TanStack Query cache.
 //
-// One client per browser tab, created in state so a re-render never swaps it,
-// and mounted at the admin layout rather than the root layout: the pages that
-// predate the admin panel fetch nothing through it.
+// One client per browser tab, created in state so a re-render never swaps it.
+// Mounted by the `(authenticated)` layout for the app pages; the admin layout
+// mounts its own inside that one, which is harmless.
 //
 // `staleTime` is deliberately long. The live feed is what makes data fresh
 // here (`useLiveChanges` invalidates by table name), so a timer refetching on

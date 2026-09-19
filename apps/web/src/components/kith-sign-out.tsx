@@ -18,13 +18,14 @@ import { useState } from "react";
 
 import { AuthenticatedNav } from "./authenticated-nav";
 
-export function KithSignOutNav() {
+export function KithSignOutNav({ canAdmin = false }: { canAdmin?: boolean }) {
   const router = useRouter();
   const [pending, setPending] = useState(false);
 
   return (
     <AuthenticatedNav
       pending={pending}
+      canAdmin={canAdmin}
       onSignOut={() => {
         setPending(true);
         void (async () => {

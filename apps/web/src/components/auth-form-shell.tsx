@@ -16,6 +16,13 @@
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
 
+import {
+  authButtonClass,
+  AuthCard,
+  authInputClass,
+  linkClass,
+} from "@/components/ui/controls";
+
 export type AuthMode = "signIn" | "signUp";
 
 export type AuthSubmit = (
@@ -51,21 +58,16 @@ export function AuthFormShell({
     : `/${alternateMode}`;
 
   return (
-    <div
-      style={{
-        maxWidth: 400,
-        margin: "100px auto",
-        padding: 24,
-        fontFamily: "system-ui, sans-serif",
-      }}
+    <AuthCard
+      title={mode === "signIn" ? "Sign in to Kith Mind" : "Create your Kith Mind"}
     >
-      <h1>
-        {mode === "signIn" ? "Sign in to Kith Mind" : "Create your Kith Mind"}
-      </h1>
       {returnPath && (
-        <p>You will return to your invitation after you sign in.</p>
+        <p className="mb-3 text-xs text-gray-600">
+          You will return to your invitation after you sign in.
+        </p>
       )}
       <form
+        className="flex flex-col gap-3"
         onSubmit={async (event) => {
           event.preventDefault();
           setError("");
@@ -89,8 +91,8 @@ export function AuthFormShell({
           }
         }}
       >
-        <div style={{ marginBottom: 12 }}>
-          <label htmlFor="email" style={{ display: "block", marginBottom: 4 }}>
+        <div className="flex flex-col gap-1">
+          <label htmlFor="email" className="text-xs font-medium text-gray-700">
             Email
           </label>
           <input
@@ -99,14 +101,11 @@ export function AuthFormShell({
             type="email"
             required
             autoComplete="email"
-            style={{ width: "100%", padding: 8, boxSizing: "border-box" }}
+            className={authInputClass}
           />
         </div>
-        <div style={{ marginBottom: 12 }}>
-          <label
-            htmlFor="password"
-            style={{ display: "block", marginBottom: 4 }}
-          >
+        <div className="flex flex-col gap-1">
+          <label htmlFor="password" className="text-xs font-medium text-gray-700">
             Password
           </label>
           <input
@@ -118,19 +117,19 @@ export function AuthFormShell({
             autoComplete={
               mode === "signIn" ? "current-password" : "new-password"
             }
-            style={{ width: "100%", padding: 8, boxSizing: "border-box" }}
+            className={authInputClass}
           />
         </div>
         <input type="hidden" name="flow" value={mode} />
         {error && (
-          <p role="alert" style={{ color: "#b42318" }}>
+          <p role="alert" className="text-xs text-red-700">
             {error}
           </p>
         )}
         <button
           type="submit"
           disabled={loading}
-          style={{ width: "100%", padding: 10, cursor: "pointer" }}
+          className={authButtonClass}
         >
           {loading
             ? mode === "signIn"
@@ -141,14 +140,14 @@ export function AuthFormShell({
               : "Create account"}
         </button>
       </form>
-      <p style={{ marginTop: 16, textAlign: "center" }}>
+      <p className="mt-4 text-center text-xs text-gray-600">
         {mode === "signIn"
           ? "Don't have an account?"
           : "Already have an account?"}{" "}
-        <a href={alternateHref} style={{ color: "#0070f3" }}>
+        <a href={alternateHref} className={linkClass}>
           {mode === "signIn" ? "Sign up" : "Sign in"}
         </a>
       </p>
-    </div>
+    </AuthCard>
   );
 }

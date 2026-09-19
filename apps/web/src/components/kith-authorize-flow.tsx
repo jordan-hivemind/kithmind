@@ -24,15 +24,16 @@ import {
   submitConsent,
 } from "@/components/authorize-request";
 import {
-  buttonStyle,
-  containerStyle,
-  inputStyle,
-} from "@/components/authorize-styles";
-import {
   type GrantableSpace,
   type KeyCapability,
   SpaceGrantChoices,
 } from "@/components/space-grant-choices";
+import {
+  authButtonClass,
+  AuthCard,
+  authInputClass,
+  linkClass,
+} from "@/components/ui/controls";
 
 const allowedCapabilities: readonly KeyCapability[] = ["read", "write"];
 
@@ -53,13 +54,12 @@ export function KithAuthorizeFlow({
   const request = readAuthorizeRequest(searchParams);
   if (!request) {
     return (
-      <div style={containerStyle}>
-        <h1>Open Brain</h1>
-        <p style={{ color: "#dc2626" }}>
+      <AuthCard title="Open Brain">
+        <p role="alert" className="text-xs text-red-700">
           Missing OAuth parameters. Please start the authorization flow from
           your MCP client.
         </p>
-      </div>
+      </AuthCard>
     );
   }
 
@@ -79,14 +79,14 @@ export function KithAuthorizeFlow({
 
   if (spaces === null) {
     return (
-      <div style={containerStyle}>
-        <h1>Open Brain</h1>
-        <p style={{ color: "#666", marginTop: 0 }}>
+      <AuthCard title="Open Brain">
+        <p className="mb-3 text-xs text-gray-600">
           {mode === "signIn"
             ? "Sign in to authorize this MCP client."
             : "Create an account to authorize this MCP client."}
         </p>
         <form
+          className="flex flex-col gap-3"
           onSubmit={async (event) => {
             event.preventDefault();
             setError("");
@@ -120,11 +120,8 @@ export function KithAuthorizeFlow({
             }
           }}
         >
-          <div style={{ marginBottom: 12 }}>
-            <label
-              htmlFor="email"
-              style={{ display: "block", marginBottom: 4, fontWeight: 500 }}
-            >
+          <div className="flex flex-col gap-1">
+            <label htmlFor="email" className="text-xs font-medium text-gray-700">
               Email
             </label>
             <input
@@ -133,14 +130,11 @@ export function KithAuthorizeFlow({
               type="email"
               required
               autoComplete="email"
-              style={inputStyle}
+              className={authInputClass}
             />
           </div>
-          <div style={{ marginBottom: 12 }}>
-            <label
-              htmlFor="password"
-              style={{ display: "block", marginBottom: 4, fontWeight: 500 }}
-            >
+          <div className="flex flex-col gap-1">
+            <label htmlFor="password" className="text-xs font-medium text-gray-700">
               Password
             </label>
             <input
@@ -152,11 +146,15 @@ export function KithAuthorizeFlow({
                 mode === "signIn" ? "current-password" : "new-password"
               }
               {...(mode === "signUp" ? { minLength: 8 } : {})}
-              style={inputStyle}
+              className={authInputClass}
             />
           </div>
-          {error && <p style={{ color: "#dc2626" }}>{error}</p>}
-          <button type="submit" disabled={loading} style={buttonStyle}>
+          {error && (
+            <p role="alert" className="text-xs text-red-700">
+              {error}
+            </p>
+          )}
+          <button type="submit" disabled={loading} className={authButtonClass}>
             {loading
               ? mode === "signIn"
                 ? "Signing in..."
@@ -166,7 +164,7 @@ export function KithAuthorizeFlow({
                 : "Sign Up"}
           </button>
         </form>
-        <p style={{ marginTop: 16, textAlign: "center", color: "#666" }}>
+        <p className="mt-4 text-center text-xs text-gray-600">
           {mode === "signIn"
             ? "Don't have an account? "
             : "Already have an account? "}
@@ -178,19 +176,18 @@ export function KithAuthorizeFlow({
               setMode(mode === "signIn" ? "signUp" : "signIn");
               setError("");
             }}
-            style={{ color: "#0070f3" }}
+            className={linkClass}
           >
             {mode === "signIn" ? "Sign up" : "Sign in"}
           </a>
         </p>
-      </div>
+      </AuthCard>
     );
   }
 
   return (
-    <div style={containerStyle}>
-      <h1>Open Brain</h1>
-      <p style={{ color: "#666", marginTop: 0 }}>
+    <AuthCard title="Open Brain">
+      <p className="text-xs text-gray-700">
         Choose what this MCP client can access. After approval, you will return
         to <strong>{request.redirectDestination}</strong>.
       </p>
@@ -203,14 +200,18 @@ export function KithAuthorizeFlow({
         onCapabilitiesChange={setCapabilities}
         allowedCapabilities={allowedCapabilities}
       />
-      {error && <p style={{ color: "#dc2626" }}>{error}</p>}
+      {error && (
+        <p role="alert" className="mb-2 text-xs text-red-700">
+          {error}
+        </p>
+      )}
       <button
         onClick={handleAuthorize}
         disabled={loading || !spaceIds.length || !capabilities.length}
-        style={buttonStyle}
+        className={authButtonClass}
       >
         {loading ? "Authorizing..." : "Authorize"}
       </button>
-    </div>
+    </AuthCard>
   );
 }

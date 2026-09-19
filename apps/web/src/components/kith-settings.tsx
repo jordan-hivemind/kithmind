@@ -1,16 +1,21 @@
 "use client";
 
-// The PostgreSQL settings page.
+// The settings page: default write destination, API keys, source accounts,
+// and the Connect list that replaced the getting-started page.
 //
-// The server component (`app/(authenticated)/settings/page.tsx`) loads the
-// first paint -- destination settings, spaces, source accounts, and the first
-// API key page -- from one read-only transaction and passes it in as
-// `initial`. Every mutation below is a `fetch` to `/api/kith/*`, and every one
-// of those routes reloads the session and opens its own transaction, the same
-// shape `app/api/auth/*` already uses. This component holds no query of its
-// own and imports nothing from Convex.
+// `app/(authenticated)/settings/page.tsx` loads the first paint in one
+// read-only transaction. Every mutation is a `fetch` to the same
+// `/api/kith/*` route as before, each of which reloads the session and
+// authorizes for itself; what changed is only that the table shows the result
+// at once and rolls back with a toast if the route refuses
+// (`useOptimisticMutation`), then resyncs from the server render.
+//
+// API keys are not in the change feed (migration 024 says why), so a key made
+// on another device shows up on the next visit rather than live.
 
-import { useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import type { ColumnDef } from "@tanstack/react-table";
+import { useEffect, useMemo, useState } from "react";
 
 import { WorkerHeartbeatStatus } from "@/components/kith-worker-heartbeat-status";
 import {
@@ -18,8 +23,27 @@ import {
   type KeyCapability,
   SpaceGrantChoices,
 } from "@/components/space-grant-choices";
+import {
+  Button,
+  ErrorText,
+  Field,
+  inputClass,
+  PageHeader,
+  Panel,
+  Section,
+} from "@/components/ui/controls";
+import { CopyButton } from "@/components/ui/copy-button";
+import { DataTable, Detail, type RowAction, Tag } from "@/components/ui/data-table";
+import { useToast } from "@/components/ui/toast";
 import { sourceAccountGrantsForCapabilities } from "@/lib/api-key-scopes";
+import { PLUGIN_COMMANDS, PROMPTS } from "@/lib/kith/connect-guide";
+import { shortDate } from "@/lib/kith/format";
+import { isPendingId, mutateJson, pendingId, requestJson } from "@/lib/kith/optimistic";
 import type { SettingsData } from "@/lib/kith/settings-data";
+import { useOptimisticMutation, useServerData } from "@/lib/kith/use-server-data";
+
+const KEY = ["settings"] as const;
+const LIVE_TABLES = ["source_accounts"] as const;
 
 const settingsCapabilities: readonly KeyCapability[] = ["read", "write", "ingest"];
 
@@ -29,743 +53,795 @@ function sourceKindLabel(connector: string) {
   return sourceKinds[connector as keyof typeof sourceKinds] ?? connector;
 }
 
-async function requestJson(
-  input: string,
-  init: RequestInit,
-): Promise<{ ok: true; body: unknown } | { ok: false; message: string }> {
-  const response = await fetch(input, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...init.headers },
-  });
-  if (response.status === 204) return { ok: true, body: undefined };
-  let body: unknown;
-  try {
-    body = await response.json();
-  } catch {
-    body = undefined;
-  }
-  if (!response.ok) {
-    const message =
-      typeof body === "object" && body !== null && "error" in body &&
-      typeof (body as { error?: unknown }).error === "string"
-        ? (body as { error: string }).error
-        : "Request failed.";
-    return { ok: false, message };
-  }
-  return { ok: true, body };
+const MAX_FRESHNESS_MINUTES = 525_600;
+
+function validFreshness(minutes: number): boolean {
+  return Number.isSafeInteger(minutes) && minutes >= 1 && minutes <= MAX_FRESHNESS_MINUTES;
 }
 
 type ApiKeyRow = SettingsData["apiKeys"]["page"][number];
 type SourceAccountRow = SettingsData["sourceAccounts"][number];
+/** A source account with the derived columns chips and search read by name. */
+type SourceView = SourceAccountRow & { kind: string; status: "enabled" | "disabled" };
 
 export function KithSettings({ initial }: { initial: SettingsData }) {
-  const [spaces] = useState(initial.spaces);
-  const [defaultWriteSpaceId, setDefaultWriteSpaceId] = useState(
-    initial.settings.defaultWriteSpaceId,
-  );
-  const [defaultError, setDefaultError] = useState("");
-  const [savingDefault, setSavingDefault] = useState(false);
-
-  const [sourceAccounts, setSourceAccounts] = useState(initial.sourceAccounts);
-  const [apiKeys, setApiKeys] = useState(initial.apiKeys.page);
-  const [cursor, setCursor] = useState(initial.apiKeys.continueCursor);
-  const [isDone, setIsDone] = useState(initial.apiKeys.isDone);
-  const [loadingMore, setLoadingMore] = useState(false);
+  const data = useServerData<SettingsData>(KEY, initial, LIVE_TABLES);
 
   const writableSpaces = useMemo(
-    () => spaces.filter((space) => space.role !== "reader"),
-    [spaces],
+    () => data.spaces.filter((space) => space.role !== "reader"),
+    [data.spaces],
   );
+
+  return (
+    <div>
+      <PageHeader title="Settings" />
+      <DestinationSection data={data} writableSpaces={writableSpaces} />
+      <ApiKeysSection data={data} />
+      <SourceAccountsSection
+        sourceAccounts={data.sourceAccounts}
+        spaces={writableSpaces}
+      />
+      <ConnectSection />
+    </div>
+  );
+}
+
+function DestinationSection({
+  data,
+  writableSpaces,
+}: {
+  data: SettingsData;
+  writableSpaces: SettingsData["spaces"];
+}) {
+  const defaultWriteSpaceId = data.settings.defaultWriteSpaceId;
+  const unavailable =
+    defaultWriteSpaceId !== null &&
+    !writableSpaces.some((space) => space.spaceId === defaultWriteSpaceId);
+
+  const change = useOptimisticMutation<SettingsData, string | null>({
+    queryKey: KEY,
+    mutationFn: (spaceId) =>
+      mutateJson("/api/kith/settings/default-write-space", {
+        method: "POST",
+        body: JSON.stringify({ spaceId }),
+      }),
+    apply: (current, spaceId) => ({
+      ...current,
+      settings: { ...current.settings, defaultWriteSpaceId: spaceId },
+    }),
+  });
+
+  return (
+    <Section id="destination" title="Default write destination">
+      <div className="flex flex-wrap items-end gap-3">
+        <Field label="Destination" htmlFor="default-write-space">
+          <select
+            id="default-write-space"
+            value={unavailable ? "unavailable" : (defaultWriteSpaceId ?? "")}
+            onChange={(event) => change.mutate(event.target.value || null)}
+            className={`${inputClass} min-w-64`}
+          >
+            {unavailable && (
+              <option value="unavailable" disabled>
+                Previous destination unavailable
+              </option>
+            )}
+            <option value="">No explicit default (Personal)</option>
+            {writableSpaces.map((space) => (
+              <option key={space.spaceId} value={space.spaceId}>
+                {space.name} {space.kind === "personal" ? "(Personal)" : ""}
+              </option>
+            ))}
+          </select>
+        </Field>
+        {unavailable && (
+          <div role="alert" className="flex items-center gap-2">
+            <Tag tone="warn">no longer writable</Tag>
+            <Button onClick={() => change.mutate(null)}>Reset to Personal</Button>
+          </div>
+        )}
+      </div>
+    </Section>
+  );
+}
+
+type NewKey = {
+  row: ApiKeyRow;
+  body: {
+    name: string;
+    spaceIds: string[];
+    capabilities: KeyCapability[];
+    sourceAccountIds: string[];
+  };
+};
+
+function ApiKeysSection({ data }: { data: SettingsData }) {
+  const queryClient = useQueryClient();
+  const toast = useToast();
+  const [creating, setCreating] = useState(false);
+  const [newRawKey, setNewRawKey] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  const spaceNames = useMemo(
+    () => new Map(data.spaces.map((space) => [space.spaceId, space.name])),
+    [data.spaces],
+  );
+
+  const create = useOptimisticMutation<SettingsData, NewKey>({
+    queryKey: KEY,
+    mutationFn: ({ body }) =>
+      mutateJson("/api/kith/api-keys", { method: "POST", body: JSON.stringify(body) }),
+    apply: (current, { row }) => ({
+      ...current,
+      apiKeys: { ...current.apiKeys, page: [row, ...current.apiKeys.page] },
+    }),
+    onSuccess: (result) => setNewRawKey((result as { rawKey: string }).rawKey),
+  });
+
+  const revoke = useOptimisticMutation<SettingsData, string>({
+    queryKey: KEY,
+    mutationFn: (id) => mutateJson(`/api/kith/api-keys/${id}`, { method: "DELETE" }),
+    apply: (current, id) => ({
+      ...current,
+      apiKeys: {
+        ...current.apiKeys,
+        page: current.apiKeys.page.filter((key) => key.id !== id),
+      },
+    }),
+  });
+
+  // ponytail: a resync from the server render collapses loaded pages back to
+  // the first 25 keys. Keep extra pages across resyncs if anyone has more.
+  async function loadMore() {
+    setLoadingMore(true);
+    const url = new URL("/api/kith/api-keys", window.location.origin);
+    url.searchParams.set("numItems", "25");
+    if (data.apiKeys.continueCursor) {
+      url.searchParams.set("cursor", data.apiKeys.continueCursor);
+    }
+    const result = await requestJson(url.toString(), { method: "GET" });
+    if (result.ok) {
+      const next = result.body as SettingsData["apiKeys"];
+      queryClient.setQueryData<SettingsData>(KEY, (current) =>
+        current === undefined
+          ? current
+          : {
+              ...current,
+              apiKeys: {
+                page: [...current.apiKeys.page, ...next.page],
+                isDone: next.isDone,
+                continueCursor: next.continueCursor,
+              },
+            },
+      );
+    } else {
+      toast(result.message);
+    }
+    setLoadingMore(false);
+  }
+
+  const columns = useMemo<ColumnDef<ApiKeyRow, unknown>[]>(
+    () => [
+      { id: "name", accessorKey: "name", header: "Name" },
+      {
+        id: "keyPrefix",
+        accessorKey: "keyPrefix",
+        header: "Key",
+        cell: ({ row }) => (
+          <code className="font-mono text-[11px] text-gray-700">
+            {isPendingId(row.original.id) ? "creating" : `${row.original.keyPrefix}...`}
+          </code>
+        ),
+      },
+      {
+        id: "capabilities",
+        accessorFn: (row) => row.capabilities.join(" "),
+        header: "Access",
+        cell: ({ row }) => (
+          <span className="flex gap-1">
+            {row.original.capabilities.map((capability) => (
+              <Tag key={capability}>{capability}</Tag>
+            ))}
+          </span>
+        ),
+      },
+      {
+        id: "spaces",
+        accessorFn: (row) => row.spaceIds.length,
+        header: "Spaces",
+        cell: ({ row }) => (
+          <Detail
+            label={<span className="tabular-nums">{row.original.spaceIds.length}</span>}
+            detail={row.original.spaceIds
+              .map((id) => spaceNames.get(id) ?? id)
+              .join(", ")}
+          />
+        ),
+      },
+      {
+        id: "lastUsedAt",
+        accessorKey: "lastUsedAt",
+        header: "Last used",
+        cell: ({ row }) => (
+          <span className="text-gray-600 tabular-nums">
+            {row.original.lastUsedAt ? shortDate(row.original.lastUsedAt) : "never"}
+          </span>
+        ),
+      },
+      {
+        id: "createdAt",
+        accessorKey: "createdAt",
+        header: "Created",
+        cell: ({ row }) => (
+          <span className="text-gray-600 tabular-nums">{shortDate(row.original.createdAt)}</span>
+        ),
+      },
+    ],
+    [spaceNames],
+  );
+
+  const actions = useMemo<RowAction<ApiKeyRow>[]>(
+    () => [
+      {
+        label: "Revoke",
+        onSelect: (key) => revoke.mutate(key.id),
+        disabled: (key) => isPendingId(key.id),
+      },
+    ],
+    [revoke],
+  );
+
+  return (
+    <Section
+      id="api-keys"
+      title="API keys"
+      actions={
+        <Button variant="primary" onClick={() => setCreating((open) => !open)}>
+          {creating ? "Close" : "New key"}
+        </Button>
+      }
+    >
+      {creating && (
+        <NewKeyForm
+          spaces={data.spaces}
+          sourceAccounts={data.sourceAccounts}
+          onSubmit={(key) => {
+            setNewRawKey(null);
+            create.mutate(key);
+            setCreating(false);
+          }}
+        />
+      )}
+      {newRawKey && (
+        <Panel tone="accent">
+          <div className="mb-2 text-xs font-medium text-gray-900">
+            Save this key now. It won&apos;t be shown again.
+          </div>
+          <div className="flex items-center gap-2">
+            <code className="flex-1 rounded-tag border border-accent-200 bg-white px-2 py-1 font-mono text-[11px] break-all">
+              {newRawKey}
+            </code>
+            <CopyButton text={newRawKey} />
+            <Button onClick={() => setNewRawKey(null)}>Dismiss</Button>
+          </div>
+        </Panel>
+      )}
+      <DataTable
+        data={data.apiKeys.page}
+        columns={columns}
+        actions={actions}
+        filterColumns={[]}
+        initialSorting={[{ id: "createdAt", desc: true }]}
+        searchPlaceholder="Search keys"
+        empty="No API keys"
+      />
+      {!data.apiKeys.isDone && (
+        <Button className="mt-2" onClick={() => void loadMore()} disabled={loadingMore}>
+          {loadingMore ? "Loading..." : "Load more"}
+        </Button>
+      )}
+    </Section>
+  );
+}
+
+function NewKeyForm({
+  spaces,
+  sourceAccounts,
+  onSubmit,
+}: {
+  spaces: SettingsData["spaces"];
+  sourceAccounts: SourceAccountRow[];
+  onSubmit: (key: NewKey) => void;
+}) {
+  const [name, setName] = useState("");
+  const [spaceIds, setSpaceIds] = useState<string[]>([]);
+  const [capabilities, setCapabilities] = useState<KeyCapability[]>(["read"]);
+  const [sourceAccountIds, setSourceAccountIds] = useState<string[]>([]);
+  const [error, setError] = useState("");
+
   const grantableSpaces: GrantableSpace[] = spaces.map((space) => ({
     spaceId: space.spaceId,
     name: space.name,
     kind: space.kind,
     role: space.role,
   }));
-  const configuredDefaultIsUnavailable =
-    defaultWriteSpaceId !== null &&
-    !writableSpaces.some((space) => space.spaceId === defaultWriteSpaceId);
-
-  async function handleDefaultChange(value: string) {
-    setDefaultError("");
-    setSavingDefault(true);
-    const result = await requestJson("/api/kith/settings/default-write-space", {
-      method: "POST",
-      body: JSON.stringify({ spaceId: value || null }),
-    });
-    if (result.ok) setDefaultWriteSpaceId(value || null);
-    else setDefaultError(result.message);
-    setSavingDefault(false);
-  }
-
-  async function loadMoreKeys() {
-    setLoadingMore(true);
-    const url = new URL("/api/kith/api-keys", window.location.origin);
-    url.searchParams.set("numItems", "25");
-    if (cursor) url.searchParams.set("cursor", cursor);
-    const result = await requestJson(url.toString(), { method: "GET" });
-    if (result.ok) {
-      const page = result.body as {
-        page: ApiKeyRow[];
-        isDone: boolean;
-        continueCursor: string | null;
-      };
-      setApiKeys((existing) => [...existing, ...page.page]);
-      setCursor(page.continueCursor);
-      setIsDone(page.isDone);
-    }
-    setLoadingMore(false);
-  }
-
-  return (
-    <div>
-      <h1>Settings</h1>
-
-      <section aria-labelledby="destination-heading">
-        <h2 id="destination-heading">Default write destination</h2>
-        <p style={{ color: "#666" }}>
-          Destination-less writes use this space. No explicit default always
-          falls back to your Personal space.
-        </p>
-        {configuredDefaultIsUnavailable && (
-          <div role="alert" style={{ color: "#b45309" }}>
-            <p>
-              Your configured destination is no longer writable. Reset it
-              before creating destination-less content.
-            </p>
-            <button
-              type="button"
-              onClick={() => void handleDefaultChange("")}
-              disabled={savingDefault}
-            >
-              Reset to Personal
-            </button>
-          </div>
-        )}
-        <label htmlFor="default-write-space">Default destination</label>
-        <select
-          id="default-write-space"
-          value={configuredDefaultIsUnavailable ? "unavailable" : (defaultWriteSpaceId ?? "")}
-          onChange={(event) => void handleDefaultChange(event.target.value)}
-          disabled={savingDefault}
-          style={{ display: "block", marginTop: 6, padding: 8 }}
-        >
-          {configuredDefaultIsUnavailable && (
-            <option value="unavailable" disabled>
-              Previous destination unavailable
-            </option>
-          )}
-          <option value="">No explicit default (Personal)</option>
-          {writableSpaces.map((space) => (
-            <option key={space.spaceId} value={space.spaceId}>
-              {space.name} {space.kind === "personal" ? "(Personal)" : ""}
-            </option>
-          ))}
-        </select>
-        {defaultError && <p role="alert">{defaultError}</p>}
-      </section>
-
-      <SourceAccountsSection
-        spaces={writableSpaces}
-        sourceAccounts={sourceAccounts}
-        onCreated={(account) =>
-          setSourceAccounts((existing) => [...existing, account])
-        }
-        onUpdated={(id, patch) =>
-          setSourceAccounts((existing) =>
-            existing.map((account) =>
-              account.id === id ? { ...account, ...patch } : account,
-            ),
-          )
-        }
-      />
-
-      <ApiKeysSection
-        grantableSpaces={grantableSpaces}
-        sourceAccounts={sourceAccounts}
-        apiKeys={apiKeys}
-        isDone={isDone}
-        loadingMore={loadingMore}
-        onLoadMore={() => void loadMoreKeys()}
-        onCreated={(key) => setApiKeys((existing) => [key, ...existing])}
-        onRevoked={(id) =>
-          setApiKeys((existing) => existing.filter((key) => key.id !== id))
-        }
-      />
-    </div>
-  );
-}
-
-function SourceAccountsSection({
-  spaces,
-  sourceAccounts,
-  onCreated,
-  onUpdated,
-}: {
-  spaces: SettingsData["spaces"];
-  sourceAccounts: SourceAccountRow[];
-  onCreated: (account: SourceAccountRow) => void;
-  onUpdated: (id: string, patch: Partial<SourceAccountRow>) => void;
-}) {
-  const [sourceName, setSourceName] = useState("");
-  const [sourceConnector, setSourceConnector] =
-    useState<keyof typeof sourceKinds>("mcp-client");
-  const [sourceAccountId, setSourceAccountId] = useState("");
-  const [sourceFreshnessMinutes, setSourceFreshnessMinutes] = useState("1440");
-  const [sourceSpaceId, setSourceSpaceId] = useState("");
-  const [sourceError, setSourceError] = useState("");
-  const [savingSource, setSavingSource] = useState(false);
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editedName, setEditedName] = useState("");
-  const [editedFreshness, setEditedFreshness] = useState("");
-  const [updatingId, setUpdatingId] = useState<string | null>(null);
-
-  async function handleCreateSource(event: React.FormEvent) {
-    event.preventDefault();
-    if (!sourceSpaceId || !sourceName.trim() || !sourceAccountId.trim()) return;
-    const freshnessMinutes = Number(sourceFreshnessMinutes);
-    if (
-      !Number.isSafeInteger(freshnessMinutes) ||
-      freshnessMinutes < 1 ||
-      freshnessMinutes > 525_600
-    ) {
-      setSourceError("Freshness must be between one minute and one year.");
-      return;
-    }
-    setSourceError("");
-    setSavingSource(true);
-    const result = await requestJson("/api/kith/source-accounts", {
-      method: "POST",
-      body: JSON.stringify({
-        spaceId: sourceSpaceId,
-        connector: sourceConnector,
-        accountId: sourceAccountId.trim(),
-        name: sourceName.trim(),
-        freshnessMs: freshnessMinutes * 60_000,
-      }),
-    });
-    if (result.ok) {
-      const { id } = result.body as { id: string };
-      onCreated({
-        id,
-        spaceId: sourceSpaceId,
-        name: sourceName.trim(),
-        connector: sourceConnector,
-        accountId: sourceAccountId.trim(),
-        freshnessMs: freshnessMinutes * 60_000,
-        enabled: true,
-      });
-      setSourceName("");
-      setSourceAccountId("");
-    } else {
-      setSourceError(result.message);
-    }
-    setSavingSource(false);
-  }
-
-  async function toggleEnabled(account: SourceAccountRow) {
-    setUpdatingId(account.id);
-    const result = await requestJson(`/api/kith/source-accounts/${account.id}`, {
-      method: "PATCH",
-      body: JSON.stringify({ enabled: !account.enabled }),
-    });
-    if (result.ok) onUpdated(account.id, { enabled: !account.enabled });
-    else setSourceError(result.message);
-    setUpdatingId(null);
-  }
-
-  async function saveEdit(id: string) {
-    const freshnessMinutes = Number(editedFreshness);
-    if (
-      !editedName.trim() ||
-      !Number.isSafeInteger(freshnessMinutes) ||
-      freshnessMinutes < 1 ||
-      freshnessMinutes > 525_600
-    ) {
-      setSourceError(
-        "Enter a source name and freshness between one minute and one year.",
-      );
-      return;
-    }
-    setUpdatingId(id);
-    const result = await requestJson(`/api/kith/source-accounts/${id}`, {
-      method: "PATCH",
-      body: JSON.stringify({
-        name: editedName.trim(),
-        freshnessMs: freshnessMinutes * 60_000,
-      }),
-    });
-    if (result.ok) {
-      onUpdated(id, {
-        name: editedName.trim(),
-        freshnessMs: freshnessMinutes * 60_000,
-      });
-      setEditingId(null);
-    } else {
-      setSourceError(result.message);
-    }
-    setUpdatingId(null);
-  }
-
-  return (
-    <section aria-labelledby="sources-heading" style={{ marginTop: 32 }}>
-      <h2 id="sources-heading">Source accounts</h2>
-      <p style={{ color: "#666" }}>
-        Add each source account a client may ingest from. This only
-        configures its identity and access scope; it does not fetch, poll, or
-        scan a source.
-      </p>
-      <form onSubmit={(event) => void handleCreateSource(event)}>
-        <label htmlFor="source-kind">Source kind</label>
-        <select
-          id="source-kind"
-          value={sourceConnector}
-          onChange={(event) =>
-            setSourceConnector(event.target.value as keyof typeof sourceKinds)
-          }
-          disabled={savingSource}
-          style={{ display: "block", margin: "6px 0 12px", padding: 8 }}
-        >
-          {Object.entries(sourceKinds).map(([connector, label]) => (
-            <option key={connector} value={connector}>
-              {label}
-            </option>
-          ))}
-        </select>
-        <label htmlFor="source-space">Space</label>
-        <select
-          id="source-space"
-          value={sourceSpaceId}
-          onChange={(event) => setSourceSpaceId(event.target.value)}
-          disabled={spaces.length === 0 || savingSource}
-          style={{ display: "block", margin: "6px 0 12px", padding: 8 }}
-        >
-          <option value="">Choose a writable space</option>
-          {spaces.map((space) => (
-            <option key={space.spaceId} value={space.spaceId}>
-              {space.name}
-            </option>
-          ))}
-        </select>
-        <label htmlFor="source-name">Source name</label>
-        <input
-          id="source-name"
-          value={sourceName}
-          onChange={(event) => setSourceName(event.target.value)}
-          placeholder="Cursor desktop"
-          required
-          maxLength={200}
-          style={{ display: "block", margin: "6px 0 12px", padding: 8 }}
-        />
-        <label htmlFor="source-account-id">Source account ID</label>
-        <input
-          id="source-account-id"
-          value={sourceAccountId}
-          onChange={(event) => setSourceAccountId(event.target.value)}
-          placeholder="desktop-capture"
-          required
-          maxLength={512}
-          style={{ display: "block", margin: "6px 0", padding: 8 }}
-        />
-        <label htmlFor="source-freshness">Freshness (minutes)</label>
-        <input
-          id="source-freshness"
-          type="number"
-          min={1}
-          max={525_600}
-          step={1}
-          value={sourceFreshnessMinutes}
-          onChange={(event) => setSourceFreshnessMinutes(event.target.value)}
-          required
-          style={{ display: "block", margin: "6px 0 12px", padding: 8 }}
-        />
-        {sourceError && <p role="alert">{sourceError}</p>}
-        <button
-          type="submit"
-          disabled={
-            savingSource ||
-            !sourceSpaceId ||
-            !sourceName.trim() ||
-            !sourceAccountId.trim()
-          }
-        >
-          {savingSource ? "Adding..." : "Add source account"}
-        </button>
-      </form>
-      {sourceAccounts.length === 0 ? (
-        <p style={{ color: "#666" }}>No source accounts configured.</p>
-      ) : (
-        <ul>
-          {sourceAccounts.map((account) => (
-            <li key={account.id} style={{ marginBottom: 8 }}>
-              {editingId === account.id ? (
-                <div>
-                  <label htmlFor={`source-name-${account.id}`}>Source name</label>
-                  <input
-                    id={`source-name-${account.id}`}
-                    value={editedName}
-                    onChange={(event) => setEditedName(event.target.value)}
-                  />
-                  <label htmlFor={`source-freshness-${account.id}`}>
-                    Freshness (minutes)
-                  </label>
-                  <input
-                    id={`source-freshness-${account.id}`}
-                    type="number"
-                    min={1}
-                    max={525_600}
-                    step={1}
-                    value={editedFreshness}
-                    onChange={(event) => setEditedFreshness(event.target.value)}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => void saveEdit(account.id)}
-                    disabled={updatingId === account.id}
-                    style={{ marginLeft: 8 }}
-                  >
-                    Save
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setEditingId(null)}
-                    disabled={updatingId === account.id}
-                    style={{ marginLeft: 8 }}
-                  >
-                    Cancel
-                  </button>
-                </div>
-              ) : (
-                <>
-                  <strong>{account.name}</strong> (
-                  {sourceKindLabel(account.connector)}){" · account ID: "}
-                  <code>{account.accountId}</code>
-                  {" · refreshes at most every "}
-                  {account.freshnessMs / 60_000} minute(s)
-                  {" · "}
-                  {account.enabled ? "enabled" : "disabled"}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setEditingId(account.id);
-                      setEditedName(account.name);
-                      setEditedFreshness(String(account.freshnessMs / 60_000));
-                    }}
-                    disabled={updatingId === account.id}
-                    style={{ marginLeft: 8 }}
-                  >
-                    Edit
-                  </button>
-                  {account.connector === "fs" && (
-                    <WorkerHeartbeatStatus sourceAccountId={account.id} />
-                  )}
-                </>
-              )}
-              <button
-                type="button"
-                onClick={() => void toggleEnabled(account)}
-                disabled={updatingId === account.id}
-                style={{ marginLeft: 8 }}
-              >
-                {updatingId === account.id
-                  ? "Saving..."
-                  : account.enabled
-                    ? "Disable"
-                    : "Enable"}
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-    </section>
-  );
-}
-
-function ApiKeysSection({
-  grantableSpaces,
-  sourceAccounts,
-  apiKeys,
-  isDone,
-  loadingMore,
-  onLoadMore,
-  onCreated,
-  onRevoked,
-}: {
-  grantableSpaces: GrantableSpace[];
-  sourceAccounts: SourceAccountRow[];
-  apiKeys: ApiKeyRow[];
-  isDone: boolean;
-  loadingMore: boolean;
-  onLoadMore: () => void;
-  onCreated: (key: ApiKeyRow) => void;
-  onRevoked: (id: string) => void;
-}) {
-  const [spaceIds, setSpaceIds] = useState<string[]>([]);
-  const [capabilities, setCapabilities] = useState<KeyCapability[]>(["read"]);
-  const [sourceAccountIds, setSourceAccountIds] = useState<string[]>([]);
-  const [newKeyName, setNewKeyName] = useState("");
-  const [newRawKey, setNewRawKey] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const [error, setError] = useState("");
-  const [showCreateForm, setShowCreateForm] = useState(false);
-  const [revokingId, setRevokingId] = useState<string | null>(null);
-
   const scopedSourceAccounts = sourceAccounts.filter(
-    (account) => spaceIds.includes(account.spaceId) && account.enabled,
+    (account) =>
+      spaceIds.includes(account.spaceId) && account.enabled && !isPendingId(account.id),
   );
+  const needsSource = capabilities.includes("ingest");
 
-  async function handleCreate(event: React.FormEvent) {
+  function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (!newKeyName.trim() || !spaceIds.length || !capabilities.length) return;
-    if (capabilities.includes("ingest") && !sourceAccountIds.length) {
+    const trimmed = name.trim();
+    if (!trimmed || !spaceIds.length || !capabilities.length) return;
+    if (needsSource && !sourceAccountIds.length) {
       setError("Choose at least one source account for an ingest key.");
       return;
     }
-    setError("");
-    setCreating(true);
-    const result = await requestJson("/api/kith/api-keys", {
-      method: "POST",
-      body: JSON.stringify({
-        name: newKeyName.trim(),
-        spaceIds,
-        capabilities,
-        sourceAccountIds: sourceAccountGrantsForCapabilities(
-          capabilities,
-          sourceAccountIds,
-        ),
-      }),
-    });
-    if (result.ok) {
-      const created = result.body as { id: string; rawKey: string };
-      setNewRawKey(created.rawKey);
-      setNewKeyName("");
-      setSourceAccountIds([]);
-      onCreated({
-        id: created.id,
+    const grantedSources = sourceAccountGrantsForCapabilities(capabilities, sourceAccountIds);
+    onSubmit({
+      row: {
+        id: pendingId(),
         createdAt: Date.now(),
-        keyPrefix: created.rawKey.slice(0, 11),
-        name: newKeyName.trim(),
+        keyPrefix: "",
+        name: trimmed,
         lastUsedAt: null,
         capabilities,
         spaceIds,
-        sourceAccountIds,
-      });
-    } else {
-      setError(result.message);
-    }
-    setCreating(false);
-  }
-
-  async function handleRevoke(id: string) {
-    setRevokingId(id);
-    const result = await requestJson(`/api/kith/api-keys/${id}`, {
-      method: "DELETE",
+        sourceAccountIds: grantedSources,
+      },
+      body: { name: trimmed, spaceIds, capabilities, sourceAccountIds: grantedSources },
     });
-    if (result.ok) onRevoked(id);
-    else setError(result.message);
-    setRevokingId(null);
   }
-
-  async function handleCopy() {
-    if (newRawKey) {
-      await navigator.clipboard.writeText(newRawKey);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    }
-  }
-
-  const showKeyForm = apiKeys.length > 0 || showCreateForm;
 
   return (
-    <section aria-labelledby="keys-heading" style={{ marginTop: 32 }}>
-      <h2 id="keys-heading">API Keys</h2>
-      <p style={{ color: "#666" }}>
-        Clients connect with an API key. Choose spaces and permissions when you
-        create one.
-      </p>
+    <Panel>
+      <form onSubmit={submit}>
+        <Field label="Key name" htmlFor="api-key-name">
+          <input
+            id="api-key-name"
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="Cursor"
+            className={`${inputClass} w-64`}
+          />
+        </Field>
+        <SpaceGrantChoices
+          spaces={grantableSpaces}
+          error=""
+          spaceIds={spaceIds}
+          onSpaceIdsChange={setSpaceIds}
+          capabilities={capabilities}
+          onCapabilitiesChange={setCapabilities}
+          allowedCapabilities={settingsCapabilities}
+        />
+        {needsSource && (
+          <fieldset className="my-3 rounded-tag border border-gray-200 p-3 text-xs">
+            <legend className="px-1 text-[11px] font-medium text-gray-600">
+              Ingest source accounts
+            </legend>
+            {scopedSourceAccounts.length === 0 ? (
+              <p role="alert" className="text-red-700">
+                No enabled source account in the selected spaces.
+              </p>
+            ) : (
+              <div className="flex flex-col gap-1.5">
+                {scopedSourceAccounts.map((account) => (
+                  <label key={account.id} className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      className="size-3.5 accent-accent-600"
+                      checked={sourceAccountIds.includes(account.id)}
+                      onChange={(event) =>
+                        setSourceAccountIds((selected) =>
+                          event.target.checked
+                            ? [...selected, account.id]
+                            : selected.filter((id) => id !== account.id),
+                        )
+                      }
+                    />
+                    {account.name} ({sourceKindLabel(account.connector)})
+                  </label>
+                ))}
+              </div>
+            )}
+          </fieldset>
+        )}
+        <ErrorText>{error}</ErrorText>
+        <Button
+          type="submit"
+          variant="primary"
+          className="mt-2"
+          disabled={
+            !name.trim() ||
+            !spaceIds.length ||
+            !capabilities.length ||
+            (needsSource && !sourceAccountIds.length)
+          }
+        >
+          Generate key
+        </Button>
+      </form>
+    </Panel>
+  );
+}
 
-      {!showKeyForm && (
-        <button
-          onClick={() => setShowCreateForm(true)}
-          style={{
-            padding: "8px 16px",
-            cursor: "pointer",
-            borderRadius: 4,
-            border: "1px solid #ddd",
-            background: "white",
-            marginBottom: 24,
+type SourceDraft = {
+  id: string | null;
+  name: string;
+  connector: keyof typeof sourceKinds;
+  accountId: string;
+  spaceId: string;
+  freshnessMinutes: string;
+};
+
+const EMPTY_DRAFT: SourceDraft = {
+  id: null,
+  name: "",
+  connector: "mcp-client",
+  accountId: "",
+  spaceId: "",
+  freshnessMinutes: "1440",
+};
+
+function SourceAccountsSection({
+  sourceAccounts,
+  spaces,
+}: {
+  sourceAccounts: SourceAccountRow[];
+  spaces: SettingsData["spaces"];
+}) {
+  const [draft, setDraft] = useState<SourceDraft | null>(null);
+  const [error, setError] = useState("");
+
+  const patchRow = (current: SettingsData, id: string, patch: Partial<SourceAccountRow>) => ({
+    ...current,
+    sourceAccounts: current.sourceAccounts.map((account) =>
+      account.id === id ? { ...account, ...patch } : account,
+    ),
+  });
+
+  const create = useOptimisticMutation<SettingsData, SourceAccountRow>({
+    queryKey: KEY,
+    mutationFn: (row) =>
+      mutateJson("/api/kith/source-accounts", {
+        method: "POST",
+        body: JSON.stringify({
+          spaceId: row.spaceId,
+          connector: row.connector,
+          accountId: row.accountId,
+          name: row.name,
+          freshnessMs: row.freshnessMs,
+        }),
+      }),
+    apply: (current, row) => ({
+      ...current,
+      sourceAccounts: [...current.sourceAccounts, row],
+    }),
+  });
+
+  const update = useOptimisticMutation<
+    SettingsData,
+    { id: string; patch: Partial<SourceAccountRow> }
+  >({
+    queryKey: KEY,
+    mutationFn: ({ id, patch }) =>
+      mutateJson(`/api/kith/source-accounts/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+      }),
+    apply: (current, { id, patch }) => patchRow(current, id, patch),
+  });
+
+  function submit(event: React.FormEvent) {
+    event.preventDefault();
+    if (draft === null) return;
+    const minutes = Number(draft.freshnessMinutes);
+    const name = draft.name.trim();
+    if (!name || !validFreshness(minutes)) {
+      setError("Enter a source name and freshness between one minute and one year.");
+      return;
+    }
+    setError("");
+    if (draft.id === null) {
+      const accountId = draft.accountId.trim();
+      if (!draft.spaceId || !accountId) return;
+      create.mutate({
+        id: pendingId(),
+        spaceId: draft.spaceId,
+        name,
+        connector: draft.connector,
+        accountId,
+        freshnessMs: minutes * 60_000,
+        enabled: true,
+      });
+    } else {
+      update.mutate({ id: draft.id, patch: { name, freshnessMs: minutes * 60_000 } });
+    }
+    setDraft(null);
+  }
+
+  const columns = useMemo<ColumnDef<SourceView, unknown>[]>(
+    () => [
+      { id: "name", accessorKey: "name", header: "Name" },
+      {
+        id: "kind",
+        accessorKey: "kind",
+        header: "Kind",
+        cell: ({ row }) => <Tag>{row.original.kind}</Tag>,
+      },
+      {
+        id: "accountId",
+        accessorKey: "accountId",
+        header: "Account ID",
+        cell: ({ row }) => (
+          <code className="font-mono text-[11px] text-gray-700">{row.original.accountId}</code>
+        ),
+      },
+      {
+        id: "freshness",
+        accessorFn: (row) => row.freshnessMs / 60_000,
+        header: "Freshness (min)",
+        cell: ({ getValue }) => <span className="tabular-nums">{getValue() as number}</span>,
+      },
+      {
+        id: "status",
+        accessorKey: "status",
+        header: "Status",
+        cell: ({ row }) => (
+          <Tag tone={row.original.enabled ? "accent" : "neutral"}>{row.original.status}</Tag>
+        ),
+      },
+      {
+        id: "heartbeat",
+        header: "Worker",
+        enableSorting: false,
+        cell: ({ row }) =>
+          row.original.connector === "fs" && !isPendingId(row.original.id) ? (
+            <WorkerHeartbeatStatus sourceAccountId={row.original.id} />
+          ) : null,
+      },
+    ],
+    [],
+  );
+
+  const rows = useMemo<SourceView[]>(
+    () =>
+      sourceAccounts.map((account) => ({
+        ...account,
+        kind: sourceKindLabel(account.connector),
+        status: account.enabled ? "enabled" : "disabled",
+      })),
+    [sourceAccounts],
+  );
+
+  const actions = useMemo<RowAction<SourceView>[]>(
+    () => [
+      {
+        label: "Edit",
+        disabled: (account) => isPendingId(account.id),
+        onSelect: (account) => {
+          setError("");
+          setDraft({
+            id: account.id,
+            name: account.name,
+            connector: account.connector as keyof typeof sourceKinds,
+            accountId: account.accountId,
+            spaceId: account.spaceId,
+            freshnessMinutes: String(account.freshnessMs / 60_000),
+          });
+        },
+      },
+      {
+        label: "Enable or disable",
+        disabled: (account) => isPendingId(account.id),
+        onSelect: (account) =>
+          update.mutate({ id: account.id, patch: { enabled: !account.enabled } }),
+      },
+    ],
+    [update],
+  );
+
+  return (
+    <Section
+      id="source-accounts"
+      title="Source accounts"
+      actions={
+        <Button
+          variant="primary"
+          onClick={() => {
+            setError("");
+            setDraft(draft === null ? EMPTY_DRAFT : null);
           }}
         >
-          Generate API Key
-        </button>
-      )}
-
-      {showKeyForm && (
-        <>
-          <form onSubmit={(event) => void handleCreate(event)} style={{ marginBottom: 24 }}>
-            <input
-              type="text"
-              value={newKeyName}
-              onChange={(event) => setNewKeyName(event.target.value)}
-              placeholder='Key name (e.g., "Cursor")'
-              style={{ flex: 1, padding: 8, borderRadius: 4, border: "1px solid #ddd" }}
-            />
-            <SpaceGrantChoices
-              spaces={grantableSpaces}
-              error=""
-              spaceIds={spaceIds}
-              onSpaceIdsChange={setSpaceIds}
-              capabilities={capabilities}
-              onCapabilitiesChange={setCapabilities}
-              allowedCapabilities={settingsCapabilities}
-            />
-            {capabilities.includes("ingest") && (
-              <fieldset
-                style={{
-                  border: "1px solid #ddd",
-                  borderRadius: 6,
-                  padding: 12,
-                  margin: "12px 0",
-                }}
-              >
-                <legend>Ingest source accounts</legend>
-                {scopedSourceAccounts.length === 0 ? (
-                  <p role="alert">
-                    Add and enable a source account in a selected space before
-                    issuing this key.
-                  </p>
-                ) : (
-                  scopedSourceAccounts.map((account) => (
-                    <label key={account.id} style={{ display: "block", marginBottom: 8 }}>
-                      <input
-                        type="checkbox"
-                        checked={sourceAccountIds.includes(account.id)}
-                        onChange={(event) =>
-                          setSourceAccountIds((selected) =>
-                            event.target.checked
-                              ? [...selected, account.id]
-                              : selected.filter((id) => id !== account.id),
-                          )
-                        }
-                      />{" "}
-                      {account.name} ({sourceKindLabel(account.connector)})
-                    </label>
-                  ))
-                )}
-              </fieldset>
-            )}
-            {error && <p role="alert">{error}</p>}
-            <button
-              type="submit"
-              disabled={
-                creating ||
-                !newKeyName.trim() ||
-                !spaceIds.length ||
-                !capabilities.length ||
-                (capabilities.includes("ingest") && !sourceAccountIds.length)
-              }
-              style={{ padding: "8px 16px", cursor: "pointer", borderRadius: 4 }}
-            >
-              {creating ? "Creating..." : "Generate Key"}
-            </button>
-          </form>
-
-          {newRawKey && (
-            <div
-              style={{
-                padding: 16,
-                marginBottom: 24,
-                backgroundColor: "#fff3cd",
-                border: "1px solid #ffc107",
-                borderRadius: 8,
-              }}
-            >
-              <strong>Save this key now — it won&apos;t be shown again!</strong>
-              <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8 }}>
-                <code
-                  style={{
-                    flex: 1,
-                    padding: 8,
-                    backgroundColor: "#f5f5f5",
-                    borderRadius: 4,
-                    fontSize: 13,
-                    wordBreak: "break-all",
-                  }}
-                >
-                  {newRawKey}
-                </code>
-                <button onClick={() => void handleCopy()} style={{ padding: "8px 16px", cursor: "pointer", borderRadius: 4 }}>
-                  {copied ? "Copied!" : "Copy"}
-                </button>
-              </div>
-              <button
-                onClick={() => setNewRawKey(null)}
-                style={{ marginTop: 8, padding: "4px 12px", cursor: "pointer", borderRadius: 4 }}
-              >
-                Dismiss
-              </button>
-            </div>
-          )}
-        </>
-      )}
-
-      <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: 16 }}>
-        <thead>
-          <tr style={{ borderBottom: "2px solid #eee", textAlign: "left" }}>
-            <th style={{ padding: 8 }}>Name</th>
-            <th style={{ padding: 8 }}>Key</th>
-            <th style={{ padding: 8 }}>Last Used</th>
-            <th style={{ padding: 8 }}>Created</th>
-            <th style={{ padding: 8 }}></th>
-          </tr>
-        </thead>
-        <tbody>
-          {apiKeys.length === 0 ? (
-            <tr>
-              <td colSpan={5} style={{ padding: 8, color: "#666" }}>
-                No API keys yet.
-              </td>
-            </tr>
-          ) : (
-            apiKeys.map((key) => (
-              <tr key={key.id} style={{ borderBottom: "1px solid #eee" }}>
-                <td style={{ padding: 8 }}>
-                  {key.name}
-                  <br />
-                  <small>
-                    {key.capabilities.join(", ")} · {key.spaceIds.length} space(s)
-                  </small>
-                </td>
-                <td style={{ padding: 8 }}>
-                  <code>{key.keyPrefix}...</code>
-                </td>
-                <td style={{ padding: 8, color: "#666" }}>
-                  {key.lastUsedAt ? new Date(key.lastUsedAt).toLocaleDateString() : "Never"}
-                </td>
-                <td style={{ padding: 8, color: "#666" }}>
-                  {new Date(key.createdAt).toLocaleDateString()}
-                </td>
-                <td style={{ padding: 8 }}>
-                  <button
-                    type="button"
-                    onClick={() => void handleRevoke(key.id)}
-                    disabled={revokingId === key.id}
-                    style={{ color: "red", cursor: "pointer", background: "none", border: "none" }}
+          {draft === null ? "New source" : "Close"}
+        </Button>
+      }
+    >
+      {draft !== null && (
+        <Panel>
+          <form onSubmit={submit} className="flex flex-wrap items-end gap-3">
+            {draft.id === null && (
+              <>
+                <Field label="Source kind" htmlFor="source-kind">
+                  <select
+                    id="source-kind"
+                    value={draft.connector}
+                    onChange={(event) =>
+                      setDraft({
+                        ...draft,
+                        connector: event.target.value as keyof typeof sourceKinds,
+                      })
+                    }
+                    className={inputClass}
                   >
-                    {revokingId === key.id ? "Revoking..." : "Revoke"}
-                  </button>
-                </td>
-              </tr>
-            ))
-          )}
-        </tbody>
-      </table>
-      {!isDone && (
-        <button type="button" onClick={onLoadMore} disabled={loadingMore}>
-          {loadingMore ? "Loading..." : "Load more"}
-        </button>
+                    {Object.entries(sourceKinds).map(([connector, name]) => (
+                      <option key={connector} value={connector}>
+                        {name}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="Space" htmlFor="source-space">
+                  <select
+                    id="source-space"
+                    value={draft.spaceId}
+                    onChange={(event) => setDraft({ ...draft, spaceId: event.target.value })}
+                    disabled={spaces.length === 0}
+                    className={inputClass}
+                  >
+                    <option value="">Choose a writable space</option>
+                    {spaces.map((space) => (
+                      <option key={space.spaceId} value={space.spaceId}>
+                        {space.name}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              </>
+            )}
+            <Field label="Source name" htmlFor="source-name">
+              <input
+                id="source-name"
+                value={draft.name}
+                onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+                placeholder="Cursor desktop"
+                required
+                maxLength={200}
+                className={inputClass}
+              />
+            </Field>
+            {draft.id === null && (
+              <Field label="Source account ID" htmlFor="source-account-id">
+                <input
+                  id="source-account-id"
+                  value={draft.accountId}
+                  onChange={(event) => setDraft({ ...draft, accountId: event.target.value })}
+                  placeholder="desktop-capture"
+                  required
+                  maxLength={512}
+                  className={inputClass}
+                />
+              </Field>
+            )}
+            <Field label="Freshness (minutes)" htmlFor="source-freshness">
+              <input
+                id="source-freshness"
+                type="number"
+                min={1}
+                max={MAX_FRESHNESS_MINUTES}
+                step={1}
+                value={draft.freshnessMinutes}
+                onChange={(event) =>
+                  setDraft({ ...draft, freshnessMinutes: event.target.value })
+                }
+                required
+                className={`${inputClass} w-28`}
+              />
+            </Field>
+            <Button
+              type="submit"
+              variant="primary"
+              disabled={
+                !draft.name.trim() ||
+                (draft.id === null && (!draft.spaceId || !draft.accountId.trim()))
+              }
+            >
+              {draft.id === null ? "Add source account" : "Save"}
+            </Button>
+          </form>
+          <ErrorText>{error}</ErrorText>
+        </Panel>
       )}
-    </section>
+      <DataTable
+        data={rows}
+        columns={columns}
+        actions={actions}
+        filterColumns={["kind", "status"]}
+        initialSorting={[{ id: "name", desc: false }]}
+        searchPlaceholder="Search sources"
+        empty="No source accounts"
+      />
+    </Section>
+  );
+}
+
+type ConnectRow = { id: string; name: string; value: string; detail: string };
+
+function ConnectSection() {
+  // The page's own origin, read after mount so the server render and the
+  // first client render agree. No host is written down anywhere.
+  const [origin, setOrigin] = useState("");
+  useEffect(() => setOrigin(window.location.origin), []);
+
+  const rows = useMemo<ConnectRow[]>(
+    () => [
+      {
+        id: "mcp-url",
+        name: "MCP URL",
+        value: origin ? `${origin}/api/mcp` : "",
+        detail: "Claude Desktop, Cowork and Cursor: add a custom MCP server with this URL",
+      },
+      ...PLUGIN_COMMANDS.map((command) => ({
+        id: command.name,
+        name: command.name,
+        value: command.value,
+        detail: "",
+      })),
+      ...PROMPTS.map((prompt) => ({
+        id: prompt.title,
+        name: `Prompt: ${prompt.title}`,
+        value: prompt.prompt,
+        detail: prompt.description,
+      })),
+    ],
+    [origin],
+  );
+
+  const columns = useMemo<ColumnDef<ConnectRow, unknown>[]>(
+    () => [
+      {
+        id: "name",
+        accessorKey: "name",
+        header: "Item",
+        cell: ({ row }) => <Detail label={row.original.name} detail={row.original.detail} />,
+      },
+      {
+        id: "value",
+        accessorKey: "value",
+        header: "Value",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <code className="line-clamp-1 max-w-xl font-mono text-[11px] text-gray-700">
+            {row.original.value}
+          </code>
+        ),
+      },
+    ],
+    [],
+  );
+
+  const actions = useMemo<RowAction<ConnectRow>[]>(
+    () => [
+      {
+        label: "Copy",
+        disabled: (row) => row.value === "",
+        onSelect: (row) => void navigator.clipboard.writeText(row.value),
+      },
+    ],
+    [],
+  );
+
+  return (
+    <Section id="connect" title="Connect">
+      <DataTable
+        data={rows}
+        columns={columns}
+        actions={actions}
+        searchPlaceholder="Search"
+        empty="Nothing to connect"
+      />
+    </Section>
   );
 }

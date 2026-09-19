@@ -12,18 +12,17 @@
 import { headers } from "next/headers";
 import { Suspense } from "react";
 
-import { containerStyle } from "@/components/authorize-styles";
 import { KithAuthorizeFlow } from "@/components/kith-authorize-flow";
+import { AuthCard } from "@/components/ui/controls";
 import { consentSpaces } from "@/lib/mcp/consent-spaces";
 
 export const dynamic = "force-dynamic";
 
 function Loading() {
   return (
-    <div style={containerStyle}>
-      <h1>Open Brain</h1>
-      <p style={{ color: "#666" }}>Loading...</p>
-    </div>
+    <AuthCard title="Open Brain">
+      <p className="text-xs text-gray-600">Loading...</p>
+    </AuthCard>
   );
 }
 

@@ -1,19 +1,23 @@
 "use client";
 
-// The browse page's thought search, on PostgreSQL.
+// The browse page's thoughts table, with search as you type.
 //
-// The search text is never put in the URL (`lib/kith/browse.ts` says why):
-// this component posts it to `/api/kith/thoughts/search` and swaps the
-// rendered list for the response, entirely client-side. The type filter and
-// history toggle stay a plain `GET` form on the page around this component
-// (bounded, enumerated values, not the free-text search), so changing either
-// still reloads the page and remounts this component with fresh initial
-// props; only the search box itself avoids a navigation.
+// The listing is the page's own server read (the latest thoughts, filtered by
+// type and history on the server). Typing searches on the server instead of
+// filtering those rows: `POST /api/kith/thoughts/search` covers every thought
+// in the caller's spaces, not only the ones on screen. The search text is
+// never put in the URL (`lib/kith/browse.ts` says why).
+//
+// Requests are debounced, and a response that arrives after a newer one was
+// sent is dropped, so typing fast cannot leave an older result on screen.
 
 import type { memory } from "@repo/kith-store";
-import { useState } from "react";
+import { type ColumnDef } from "@tanstack/react-table";
+import { useEffect, useRef, useState } from "react";
 
-import { ThoughtRow } from "@/components/kith-browse";
+import { DataTable, Detail, Tag } from "@/components/ui/data-table";
+import { useToast } from "@/components/ui/toast";
+import { label, shortDate } from "@/lib/kith/format";
 
 type ThoughtWithScore = memory.Thought & { score?: number };
 
@@ -22,121 +26,115 @@ type SearchResponse = {
   vectorStatus: "ready" | "unavailable";
 };
 
+type ThoughtRow = {
+  id: string;
+  content: string;
+  type: string;
+  topics: string;
+  createdAt: number;
+};
+
+const DEBOUNCE_MS = 250;
+
+function thoughtRows(thoughts: readonly memory.Thought[]): ThoughtRow[] {
+  return thoughts.map((thought) => ({
+    id: thought.id,
+    content: thought.content,
+    type: label(thought.metadata.type),
+    topics: thought.metadata.topics.join(", "),
+    createdAt: thought.createdAt,
+  }));
+}
+
+const columns: ColumnDef<ThoughtRow, unknown>[] = [
+  {
+    id: "content",
+    accessorKey: "content",
+    header: "Thought",
+    cell: ({ row }) => (
+      <span className="line-clamp-1 max-w-2xl">
+        <Detail label={row.original.content} detail={row.original.content} />
+      </span>
+    ),
+  },
+  {
+    id: "type",
+    accessorKey: "type",
+    header: "Type",
+    cell: ({ row }) => <Tag>{row.original.type}</Tag>,
+  },
+  { id: "topics", accessorKey: "topics", header: "Topics" },
+  {
+    id: "createdAt",
+    accessorKey: "createdAt",
+    header: "Created",
+    cell: ({ row }) => (
+      <span className="text-gray-600 tabular-nums">{shortDate(row.original.createdAt)}</span>
+    ),
+  },
+];
+
 export function KithThoughtSearch({
   initialThoughts,
   type,
   includeHistorical,
+  toolbar,
 }: {
   initialThoughts: readonly ThoughtWithScore[];
   type: string;
   includeHistorical: boolean;
+  toolbar?: React.ReactNode;
 }) {
+  const toast = useToast();
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<ThoughtWithScore[] | null>(null);
-  const [searching, setSearching] = useState(false);
-  const [error, setError] = useState("");
+  const latest = useRef(0);
 
-  async function runSearch(event: React.FormEvent) {
-    event.preventDefault();
+  useEffect(() => {
     const trimmed = query.trim();
+    const request = ++latest.current;
     if (!trimmed) {
       setResults(null);
       return;
     }
-    setSearching(true);
-    setError("");
-    try {
-      const response = await fetch("/api/kith/thoughts/search", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          query: trimmed,
-          includeHistorical,
-          ...(type ? { type } : {}),
-        }),
-      });
-      if (!response.ok) throw new Error("search failed");
-      const body = (await response.json()) as SearchResponse;
-      setResults(body.thoughts);
-    } catch {
-      setError("Search failed. Try again.");
-      setResults([]);
-    } finally {
-      setSearching(false);
-    }
-  }
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const response = await fetch("/api/kith/thoughts/search", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              query: trimmed,
+              includeHistorical,
+              ...(type ? { type } : {}),
+            }),
+          });
+          if (!response.ok) throw new Error("search failed");
+          const body = (await response.json()) as SearchResponse;
+          if (request === latest.current) setResults(body.thoughts);
+        } catch {
+          if (request === latest.current) {
+            setResults([]);
+            toast("Search failed. Try again.");
+          }
+        }
+      })();
+    }, DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [query, type, includeHistorical, toast]);
 
-  function clearSearch() {
-    setQuery("");
-    setResults(null);
-    setError("");
-  }
-
-  const showingSearch = results !== null;
-  const thoughts = showingSearch ? results : initialThoughts;
+  const rows = thoughtRows(results ?? initialThoughts);
 
   return (
-    <div>
-      <form
-        onSubmit={(event) => void runSearch(event)}
-        style={{ display: "flex", gap: 8, marginBottom: 8 }}
-      >
-        <input
-          type="text"
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          placeholder="Search your thoughts..."
-          style={{
-            flex: 1,
-            minWidth: 200,
-            padding: 10,
-            borderRadius: 4,
-            border: "1px solid #ddd",
-          }}
-        />
-        <button
-          type="submit"
-          disabled={searching || !query.trim()}
-          style={{ padding: "10px 20px", borderRadius: 4 }}
-        >
-          {searching ? "Searching..." : "Search"}
-        </button>
-        {showingSearch && (
-          <button
-            type="button"
-            onClick={clearSearch}
-            style={{
-              padding: "10px 16px",
-              borderRadius: 4,
-              background: "none",
-              border: "1px solid #ddd",
-              color: "#666",
-            }}
-          >
-            Clear
-          </button>
-        )}
-      </form>
-      <p style={{ color: "#666", fontSize: 13, marginTop: 0 }}>
-        Search matches by keyword only on this surface. Full semantic search
-        is available through an MCP client.
-      </p>
-      {error && (
-        <p role="alert" style={{ color: "#b42318" }}>
-          {error}
-        </p>
-      )}
-      {thoughts.length === 0 ? (
-        <p style={{ color: "#666" }}>
-          {showingSearch ? "No matching thoughts found." : "No thoughts found."}
-        </p>
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          {thoughts.map((thought) => (
-            <ThoughtRow key={thought.id} thought={thought} />
-          ))}
-        </div>
-      )}
-    </div>
+    <DataTable
+      data={rows}
+      columns={columns}
+      filterColumns={["type"]}
+      initialSorting={[{ id: "createdAt", desc: true }]}
+      searchPlaceholder="Keyword search"
+      onSearchChange={setQuery}
+      empty={results === null ? "No thoughts" : "No matches"}
+      toolbar={toolbar}
+    />
   );
 }

@@ -69,54 +69,61 @@ export function SpaceGrantChoices({
   }, [allowedCapabilities, capabilities, onCapabilitiesChange]);
 
   return (
-    <fieldset
-      style={{
-        border: "1px solid #ddd",
-        borderRadius: 6,
-        padding: 12,
-        margin: "12px 0",
-      }}
-    >
-      <legend>Client access</legend>
-      <p style={{ marginTop: 0 }}>
+    <fieldset className="my-3 rounded-tag border border-gray-200 p-3 text-xs">
+      <legend className="px-1 text-[11px] font-medium text-gray-600">
+        Client access
+      </legend>
+      <p className="mb-2 text-gray-700">
         Choose the spaces and operations this client may use.
       </p>
-      {error && <p role="alert">{error}</p>}
-      {!spaces && !error && <p>Loading spaces...</p>}
-      {spaces?.map((space) => (
-        <label key={space.spaceId} style={{ display: "block", marginBottom: 8 }}>
-          <input
-            type="checkbox"
-            checked={spaceIds.includes(space.spaceId)}
-            onChange={(event) =>
-              onSpaceIdsChange(
-                event.target.checked
-                  ? [...spaceIds, space.spaceId]
-                  : spaceIds.filter((id) => id !== space.spaceId),
-              )
-            }
-          />{" "}
-          {space.name} ({space.kind === "personal" ? "Personal" : space.role})
-          {space.role === "reader" && " · read only"}
-        </label>
-      ))}
-      {allowedCapabilities.map((capability) => (
-        <label key={capability} style={{ display: "block", marginTop: 8 }}>
-          <input
-            type="checkbox"
-            checked={capabilities.includes(capability)}
-            onChange={(event) =>
-              onCapabilitiesChange(
-                event.target.checked
-                  ? [...capabilities, capability]
-                  : capabilities.filter((value) => value !== capability),
-              )
-            }
-          />{" "}
-          {capabilityCopy[capability]}
-        </label>
-      ))}
-      <p style={{ color: "#666", fontSize: 13, marginBottom: 0 }}>
+      {error && (
+        <p role="alert" className="mb-2 text-red-700">
+          {error}
+        </p>
+      )}
+      {!spaces && !error && <p className="text-gray-600">Loading spaces...</p>}
+      <div className="flex flex-col gap-1.5">
+        {spaces?.map((space) => (
+          <label key={space.spaceId} className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              className="size-3.5 accent-accent-600"
+              checked={spaceIds.includes(space.spaceId)}
+              onChange={(event) =>
+                onSpaceIdsChange(
+                  event.target.checked
+                    ? [...spaceIds, space.spaceId]
+                    : spaceIds.filter((id) => id !== space.spaceId),
+                )
+              }
+            />
+            <span>
+              {space.name} ({space.kind === "personal" ? "Personal" : space.role})
+              {space.role === "reader" && " · read only"}
+            </span>
+          </label>
+        ))}
+      </div>
+      <div className="mt-3 flex flex-col gap-1.5 border-t border-gray-100 pt-3">
+        {allowedCapabilities.map((capability) => (
+          <label key={capability} className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              className="size-3.5 accent-accent-600"
+              checked={capabilities.includes(capability)}
+              onChange={(event) =>
+                onCapabilitiesChange(
+                  event.target.checked
+                    ? [...capabilities, capability]
+                    : capabilities.filter((value) => value !== capability),
+                )
+              }
+            />
+            <span>{capabilityCopy[capability]}</span>
+          </label>
+        ))}
+      </div>
+      <p className="mt-3 text-[11px] text-gray-600">
         Access follows your current membership. Removing access to a space also
         removes this client’s access. Narrative memory capture needs both read
         and write access to check existing memories.

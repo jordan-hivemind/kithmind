@@ -1,14 +1,18 @@
 "use client";
 
-// Quick Capture on the PostgreSQL surface, posting to
-// `POST /api/kith/thoughts/capture` (`lib/kith/capture.ts`'s
-// `captureThoughtFromWeb`). Renders every disposition that route can return,
-// the way `features/thoughts/components/QuickCapture.tsx` (the Convex
-// version) renders its own: a stored capture clears the textarea and shows
-// its classification, and every other disposition keeps the typed text and
-// shows `operationSummary` so the person can edit and resend.
+// Quick Capture, posting to `POST /api/kith/thoughts/capture`
+// (`lib/kith/capture.ts`'s `captureThoughtFromWeb`).
+//
+// Not optimistic, deliberately: the route runs a classifier and an admission
+// gate, and may store, merge, supersede or refuse the text. Guessing the
+// outcome would show a thought that then vanishes. A stored capture clears the
+// box and shows its classification; the recent list picks it up from the change
+// feed. Every other disposition keeps the text and shows `operationSummary` so
+// it can be edited and resent.
 
 import { useState } from "react";
+
+import { Button, inputClass } from "@/components/ui/controls";
 
 type CaptureResponse = {
   thoughtId?: string;
@@ -26,7 +30,7 @@ type CaptureResponse = {
 export function KithQuickCapture() {
   const [content, setContent] = useState("");
   const [loading, setLoading] = useState(false);
-  const [status, setStatus] = useState("");
+  const [status, setStatus] = useState<{ text: string; failed: boolean } | null>(null);
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -34,7 +38,7 @@ export function KithQuickCapture() {
     if (!trimmed) return;
 
     setLoading(true);
-    setStatus("");
+    setStatus(null);
     try {
       const response = await fetch("/api/kith/thoughts/capture", {
         method: "POST",
@@ -42,80 +46,61 @@ export function KithQuickCapture() {
         body: JSON.stringify({ content: trimmed }),
       });
       if (response.status === 401) {
-        setStatus("Sign in again to capture a thought.");
+        setStatus({ text: "Sign in again to capture a thought.", failed: true });
         return;
       }
       if (!response.ok) {
-        setStatus("Failed to capture thought. Please try again.");
+        setStatus({ text: "Failed to capture thought. Please try again.", failed: true });
         return;
       }
       const result = (await response.json()) as CaptureResponse;
       if (result.disposition === "stored") {
-        setStatus(
-          `Saved as ${result.metadata.type.replace("_", " ")}: ${result.metadata.summary}`,
-        );
+        setStatus({
+          text: `Saved as ${result.metadata.type.replaceAll("_", " ")}: ${result.metadata.summary}`,
+          failed: false,
+        });
         setContent("");
       } else {
-        setStatus(
-          result.operationSummary ??
+        setStatus({
+          text:
+            result.operationSummary ??
             "This was not stored. Try one coherent durable narrative, or use a structured fact.",
-        );
+          failed: true,
+        });
       }
     } catch {
-      setStatus("Failed to capture thought. Please try again.");
+      setStatus({ text: "Failed to capture thought. Please try again.", failed: true });
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div
-      style={{
-        border: "1px solid #e0e0e0",
-        borderRadius: 8,
-        padding: 16,
-        backgroundColor: "#fafafa",
-      }}
-    >
-      <h3 style={{ marginTop: 0 }}>Quick Capture</h3>
-      <form onSubmit={handleSubmit}>
+    <form onSubmit={(event) => void handleSubmit(event)} className="flex flex-col gap-1.5">
+      <label htmlFor="quick-capture" className="text-[11px] font-medium text-gray-600">
+        Capture
+      </label>
+      <div className="flex items-start gap-2">
         <textarea
+          id="quick-capture"
           value={content}
           onChange={(event) => setContent(event.target.value)}
-          placeholder="Type a thought, decision, note, or idea..."
-          rows={3}
-          style={{
-            width: "100%",
-            padding: 8,
-            boxSizing: "border-box",
-            borderRadius: 4,
-            border: "1px solid #ddd",
-            resize: "vertical",
-            fontFamily: "inherit",
-          }}
+          placeholder="Thought, decision, note or idea"
+          rows={2}
+          className={`${inputClass} h-auto min-h-14 flex-1 resize-y py-1.5`}
         />
-        <div
-          style={{
-            display: "flex",
-            gap: 12,
-            alignItems: "center",
-            marginTop: 8,
-          }}
+        <Button type="submit" variant="primary" disabled={loading || !content.trim()}>
+          {loading ? "Saving..." : "Capture"}
+        </Button>
+      </div>
+      {status && (
+        <p
+          role={status.failed ? "alert" : "status"}
+          className={`text-xs ${status.failed ? "text-red-700" : "text-gray-600"}`}
         >
-          <button
-            type="submit"
-            disabled={loading || !content.trim()}
-            style={{
-              padding: "8px 16px",
-              cursor: loading ? "wait" : "pointer",
-              borderRadius: 4,
-            }}
-          >
-            {loading ? "Saving..." : "Capture"}
-          </button>
-          {status && <span style={{ fontSize: 14, color: "#666" }}>{status}</span>}
-        </div>
-      </form>
-    </div>
+          {status.text}
+        </p>
+      )}
+    </form>
   );
 }
