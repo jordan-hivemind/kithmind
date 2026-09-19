@@ -55,6 +55,15 @@ const GRANTED = Object.freeze({
     "record_query_space_state",
   ],
   coverage: ["coverage_windows", "coverage_gaps"],
+  admin: [
+    "document_types",
+    "document_type_fields",
+    "source_roots",
+    "source_root_reports",
+    "investments",
+    "investment_entries",
+    "corrections",
+  ],
 });
 
 /** Tables no application write may reach. The control for the list above. */
@@ -257,6 +266,73 @@ test(
         null,
       );
 
+      // The admin panel (ADM-1), and with it the change trigger every one of
+      // its writes fires. The app role has no INSERT on `kith.changes` and
+      // never will: `kith.record_change()` is `SECURITY DEFINER`, so the row
+      // below lands through the migration role's rights, not this one's.
+      const investmentId = newKithId();
+      assert.equal(
+        await attempt(
+          app,
+          `INSERT INTO kith.investments (id, space_id, name)
+             VALUES ($1, $2, 'Synthetic Fund I')`,
+          [investmentId, spaceId],
+        ),
+        null,
+      );
+      assert.equal(
+        (
+          await app.query(
+            `SELECT count(*)::int AS n FROM kith.changes
+              WHERE table_name = 'investments' AND row_id = $1`,
+            [investmentId],
+          )
+        ).rows[0].n,
+        1,
+      );
+
+      // `kith.changes` is its own case, because its privilege set is not the
+      // group's: SELECT so the feed route can read it, DELETE so the prune
+      // sweep can drain it, and nothing else. An INSERT or UPDATE through the
+      // application credential would be a forged or rewritten change row.
+      for (const [privilege, expected] of [
+        ["SELECT", true],
+        ["DELETE", true],
+        ["INSERT", false],
+        ["UPDATE", false],
+      ]) {
+        assert.equal(
+          (
+            await app.query("SELECT has_table_privilege($1, $2) AS granted", [
+              "kith.changes",
+              privilege,
+            ])
+          ).rows[0].granted,
+          expected,
+          `kith.changes: ${privilege}`,
+        );
+      }
+      assert.equal(
+        (
+          await attempt(
+            app,
+            `INSERT INTO kith.changes (space_id, table_name, row_id, op)
+               VALUES ($1, 'investments', 'forged', 'insert')`,
+            [spaceId],
+          )
+        )?.code,
+        INSUFFICIENT_PRIVILEGE,
+      );
+      assert.equal(
+        (await attempt(app, "UPDATE kith.changes SET op = 'delete'"))?.code,
+        INSUFFICIENT_PRIVILEGE,
+      );
+      // But the sweep's own delete still works.
+      assert.equal(
+        await attempt(app, "DELETE FROM kith.changes WHERE row_id = 'nothing'"),
+        null,
+      );
+
       // Every table in every group, including the ones no write above reaches.
       for (const [group, tables] of Object.entries(GRANTED)) {
         for (const table of tables) {
@@ -302,6 +378,98 @@ test(
       // Drop the role's privileges in this database before the role itself,
       // because a role a grant still names cannot be dropped, and this database
       // outlives the statement by one test hook.
+      await owner.query(`DROP OWNED BY "${role.role}"`).catch(() => {});
+      await owner.query(`DROP ROLE IF EXISTS "${role.role}"`).catch(() => {});
+    }
+  },
+);
+
+test(
+  "the change trigger needs no grant on kith.changes at all",
+  { skip },
+  async (t) => {
+    // The operational property migration 023's `SECURITY DEFINER` exists for:
+    // applying the schema to a live database must not break a single
+    // application write, with no grant step required in between. So this
+    // grants the role exactly what a triggered table needs and *nothing* on
+    // `kith.changes` beyond the reads and the sweep's delete -- not the grant
+    // script, which would hide the point by granting more.
+    const database = await throwawayDatabase(t);
+    const owner = await connect(database);
+    await applyKithSchema(owner);
+    const role = await createAppRole(owner);
+    const name = new URL(database.url).pathname.slice(1);
+    await owner.query(`GRANT CONNECT ON DATABASE "${name}" TO "${role.role}"`);
+    await owner.query(`GRANT USAGE ON SCHEMA kith TO "${role.role}"`);
+    await owner.query(`GRANT USAGE ON DOMAIN kith.kith_id TO "${role.role}"`);
+    await owner.query(
+      `GRANT SELECT, INSERT ON kith.users, kith.spaces, kith.investments TO "${role.role}"`,
+    );
+    await owner.query(`GRANT SELECT, DELETE ON kith.changes TO "${role.role}"`);
+
+    const url = new URL(database.url);
+    url.username = role.role;
+    url.password = role.password;
+    const app = database.adopt(new pg.Client({ connectionString: url.toString() }));
+    await app.connect();
+    try {
+      const userId = newKithId();
+      const spaceId = newKithId();
+      const investmentId = newKithId();
+      await app.query("INSERT INTO kith.users (id, email) VALUES ($1, $2)", [
+        userId,
+        "definer@example.test",
+      ]);
+      await app.query(
+        `INSERT INTO kith.spaces (id, kind, name, created_by)
+           VALUES ($1, 'personal', 'Personal', $2)`,
+        [spaceId, userId],
+      );
+      // The write the whole property is about: it succeeds, and it succeeds
+      // *through* the trigger rather than around it.
+      assert.equal(
+        await attempt(
+          app,
+          `INSERT INTO kith.investments (id, space_id, name)
+             VALUES ($1, $2, 'Synthetic Fund I')`,
+          [investmentId, spaceId],
+        ),
+        null,
+      );
+      assert.equal(
+        (
+          await app.query(
+            `SELECT count(*)::int AS n FROM kith.changes
+              WHERE table_name = 'investments' AND row_id = $1 AND op = 'insert'`,
+            [investmentId],
+          )
+        ).rows[0].n,
+        1,
+      );
+
+      // And the role still cannot put a row there itself, or rewrite one.
+      assert.equal(
+        (
+          await attempt(
+            app,
+            `INSERT INTO kith.changes (space_id, table_name, row_id, op)
+               VALUES ($1, 'investments', 'forged', 'insert')`,
+            [spaceId],
+          )
+        )?.code,
+        INSUFFICIENT_PRIVILEGE,
+      );
+      assert.equal(
+        (await attempt(app, "UPDATE kith.changes SET op = 'delete'"))?.code,
+        INSUFFICIENT_PRIVILEGE,
+      );
+
+      // Nor call the definer function directly to reach its rights: it takes
+      // no arguments and returns `trigger`, so the server refuses outright.
+      const direct = await attempt(app, "SELECT kith.record_change()");
+      assert.match(String(direct?.message), /trigger/i);
+    } finally {
+      await app.end().catch(() => {});
       await owner.query(`DROP OWNED BY "${role.role}"`).catch(() => {});
       await owner.query(`DROP ROLE IF EXISTS "${role.role}"`).catch(() => {});
     }

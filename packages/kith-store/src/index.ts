@@ -58,6 +58,7 @@ export * as workers from "./workers/index.js";
 export * as records from "./records/index.js";
 export * as sources from "./sources/index.js";
 export * as deferred from "./deferred/index.js";
+export * as admin from "./admin/index.js";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const UUID =
@@ -307,6 +308,31 @@ export async function grantProofAppRole(
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.ingest_requests, kith.inline_work, kith.ingest_rate_limits,
     kith.source_fetch_requests TO "${appRole}"`);
+  // The admin panel (ADM-1, migration 022): the seven configuration and
+  // investment tables the admin screens own.
+  await owner.query(`GRANT INSERT, UPDATE, DELETE ON
+    kith.document_types, kith.document_type_fields,
+    kith.source_roots, kith.source_root_reports,
+    kith.investments, kith.investment_entries, kith.corrections
+    TO "${appRole}"`);
+  // The change feed (migration 023) is deliberately not in the list above.
+  //
+  // Nothing in the application writes `kith.changes`: rows arrive only through
+  // `kith.record_change()`, which is `SECURITY DEFINER` and therefore inserts
+  // as the migration role that owns it. So the application credential gets no
+  // INSERT -- a write through it would be a forged change row, and now it is
+  // not merely unwritten but unwritable -- and no UPDATE, because a change
+  // already recorded is a fact about the past.
+  //
+  // DELETE is the one write it does need: `removeExpiredChanges`
+  // (src/deferred/sweeps.ts) runs on the daemon under this credential. SELECT
+  // comes from the schema-wide grant above, which is what the feed route
+  // reads through.
+  //
+  // The definer's rights are also what decouples the schema from the grants:
+  // applying 022 and 023 to a live database cannot break an app-role write on
+  // any triggered table, whether or not this function has run yet.
+  await owner.query(`GRANT DELETE ON kith.changes TO "${appRole}"`);
   // Deliberately still absent, and each one is a table an application write
   // would be a bug on: `kith.schema_version`, which only a migration runner
   // writes; the `proof_*` prototype pair, which only the owner role seeds; and

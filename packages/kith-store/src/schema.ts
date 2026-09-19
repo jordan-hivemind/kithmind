@@ -169,6 +169,16 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
       import.meta.url,
     ),
   },
+  {
+    version: 22,
+    name: "admin panel: document types and fields, source roots and reports, investments and entries, corrections (ADM-1)",
+    url: new URL("../migrations/022_admin_panel.sql", import.meta.url),
+  },
+  {
+    version: 23,
+    name: "change feed: kith.changes, the generic record_change trigger, and triggers on the tables the first admin screens read (ADM-1)",
+    url: new URL("../migrations/023_change_feed.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

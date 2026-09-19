@@ -476,6 +476,13 @@ test(
         .join(", ");
       await restoredOwner.query(`DROP TABLE ${names} CASCADE`);
     }
+    // Undo migration 23's function. Dropping the tables above took their
+    // triggers with them, but a trigger function outlives its triggers, and a
+    // rewind that leaves one behind is not at version 1: the replay would
+    // reach 23 with an object it is supposed to be creating. Migration 23 uses
+    // `CREATE OR REPLACE` so the replay survives either way; this is the other
+    // half, so the rewind means what it says.
+    await restoredOwner.query("DROP FUNCTION IF EXISTS kith.record_change()");
     // Undo migration 6's renames as well. It gave the plain `spaces` and
     // `api_keys` names to the kith_id-keyed tables (just dropped above) and moved
     // the prototype's uuid-keyed pair to `proof_*`. A database genuinely at

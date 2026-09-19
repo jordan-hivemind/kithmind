@@ -1,0 +1,37 @@
+/* The owner's style decision, as tokens: white, gray and blue, Inter, compact
+ * tables, square tags. Section 1 of docs/plans/2026-09-18-admin-panel-and-
+ * ingestion.md. Nothing here is a component library; the admin screens compose
+ * Tailwind utilities over these tokens.
+ *
+ * The pages that predate the admin panel style themselves with inline `style`
+ * props and are untouched by this file beyond the preflight reset. */
+@import "tailwindcss";
+
+@theme {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+
+  /* One blue, one gray ramp, white. No second accent: a status that needs to
+   * shout does it with weight and a border, not with a new hue. */
+  --color-accent-50: #eff6ff;
+  --color-accent-100: #dbeafe;
+  --color-accent-200: #bfdbfe;
+  --color-accent-500: #3b82f6;
+  --color-accent-600: #2563eb;
+  --color-accent-700: #1d4ed8;
+
+  /* Compact tables: about 34px rows. Declared once so a cell, a header and a
+   * skeleton row cannot drift apart. */
+  --spacing-row: 34px;
+
+  /* Square tags (2px radius). */
+  --radius-tag: 2px;
+}
+
+html {
+  font-family: var(--font-sans);
+}
+
+body {
+  background: #ffffff;
+  color: #111827;
+}

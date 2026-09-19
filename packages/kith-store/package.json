@@ -52,6 +52,11 @@
       "node": "./dist/sources/index.js",
       "default": "./src/sources/index.ts"
     },
+    "./admin": {
+      "types": "./src/admin/index.ts",
+      "node": "./dist/admin/index.js",
+      "default": "./src/admin/index.ts"
+    },
     "./deferred": {
       "types": "./src/deferred/index.ts",
       "node": "./dist/deferred/index.js",
