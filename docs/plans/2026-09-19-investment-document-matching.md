@@ -69,9 +69,15 @@ Windows: `capital_call_notice`, `wire_confirmation` and `distribution_notice`,
 `investments.signed_on`; `schedule_k1`, the tax year;
 `capital_account_statement`, the quarter containing the entry.
 
-A GBP entry is compared with GBP document money only. It carries an
-`exchange_rate` (migration 025), but converting to compare would invent
-precision, so a cross-currency pair is never scored on amount.
+Decision, owner, 2026-09-19: a GBP document now scores amount against a USD
+entry, and the reverse. The entry's own `exchange_rate` (migration 025)
+converts the document money into the entry's currency, and the compare reuses
+the importer's own rate-check tolerance rather than inventing a new one:
+`apps/web/src/lib/kith/investment-import.ts` accepts a converted amount within
+the larger of 1% (`RATE_TOLERANCE_FRACTION = 100n`) or $1.00
+(`RATE_TOLERANCE_FLOOR_CENTS = 100n`) of the target. A converted amount inside
+that tolerance scores the full 4 amount points, so a cross-currency match can
+reach `auto_linked` the same way a same-currency one does.
 
 ### Decision
 
@@ -176,6 +182,32 @@ document by more than 3 days, the detector below opens an item instead and the
 panel offers Use the document's date or Keep mine. Two documents offering
 different dates for one estimated entry also open an item.
 
+### Commitments
+
+Owner requirement, 2026-09-19: a fund investment should record a total
+commitment that capital calls count against. The model already does this;
+this design references it rather than building a second one.
+
+`kith.investment_entries` already carries a `commitment` entry per investment
+and a signed `commitment_change` for every increase or reduction (the one
+entry type allowed to be negative, `SIGNED_ENTRY_TYPE` in
+`packages/kith-store/src/admin/investments.ts`). The totals query in the same
+file computes `committed = commitment + commitment_change`,
+`outstanding = committed - sent` (signed, not floored at zero), and
+`overCalled = greatest(sent - committed, 0)`. The `over_called` detector and
+"calls exceed commitment" below read this same `overCalled` figure; it is not
+a new computation. The Investment row panel in section 6 shows the same
+totals the drawer already renders.
+
+A commitment is edited the way any entry is: open the investment's drawer
+(`apps/web/src/components/admin/investment-drawers.tsx`) and edit or add a
+`commitment` or `commitment_change` row. A fund that commits in a currency
+other than USD (a GBP commitment, say) is entered in that currency with its
+own `exchange_rate`, the same field a capital call or distribution uses. The
+drawer's USD figure is `amount * exchange_rate` at the owner's entered rate,
+not a market conversion, so it reads as estimated, the same caveat
+`exchange_rate` already carries for every non-USD entry, not a new one.
+
 ### Migrations
 
 One migration, `028_investment_links_and_attention.sql`:
@@ -186,10 +218,17 @@ One migration, `028_investment_links_and_attention.sql`:
 3. `kith.deferred_work` kind check extended with `investment_link` and
    `investment_sweep`, as migration 027 extended it.
 4. `kith.corrections`: `target_kind` extended with `entry`, `investment` and
-   `link`; columns `severity`, `detector`, `dedupe_key`, `snooze_until`,
-   `last_seen_at`, `last_alerted_at`, `alert_count`; a unique index on
-   `(space_id, dedupe_key)` where `state = 'open'`.
-5. `investment_entries.date_is_estimated`, defaulting false, so every existing
+   `link`; columns `class` (`money_at_risk`, `system_breakage`, null for a
+   quiet queue item), `detector`, `dedupe_key`, `snooze_until`, `last_seen_at`,
+   `last_alerted_at`, `alert_count`; a unique index on `(space_id,
+   dedupe_key)` where `state = 'open'`.
+5. `kith.attention_suppressions`: `id, space_id, created_at, actor_user_id,
+   reason, scope, detector, investment_id, before_date`. `scope` is
+   `detector`, `investment`, or `before_date`, backing bulk dismiss and the
+   per-investment and per-detector "do not track documents" switches
+   (section 4). The sweep checks it before opening a row, the same place it
+   already checks for an open dismiss.
+6. `investment_entries.date_is_estimated`, defaulting false, so every existing
    row reads as owner-entered and none can be rewritten by this feature.
 
 No second migration. Every query in `extraction/corrections.ts` filters
@@ -197,21 +236,76 @@ No second migration. Every query in `extraction/corrections.ts` filters
 
 ## 4. Discrepancy detection
 
-Detectors run in the nightly sweep. Each is a query over current rows, so all
-auto-close.
+Owner principle, 2026-09-19, quoted because it drives every rule below: "this
+is a best-effort personal store; records will be incomplete; do not chase the
+owner for information he does not have; warnings about holes must not become
+so noisy that he misses what he cares about."
 
-| Detector | Rule | Severity | Auto-closes |
+Detectors run in the nightly sweep. Each is a query over current rows, so all
+auto-close. Only two classes ever alert; everything else is a quiet queue item
+that sits in Needs attention until it is resolved, dismissed, or auto-closes.
+The old low/medium/high ladder is gone: a detector either belongs to an
+alerting class or it does not.
+
+| Class | Detectors | Why it alerts |
+| --- | --- | --- |
+| Money at risk | `call_due_unpaid`, `over_called` | A capital call notice with no matching payment near or past its due date, or cumulative calls exceeding the commitment (section 3, "Commitments"), are the two shapes of losing track of the owner's own money |
+| System breakage | Pipeline stalled, alerter silent (the heartbeat check below) | If the system itself has stopped working, that is the one thing worth interrupting him for |
+| Quiet queue, never alerts | `entry_without_document`, `notice_without_entry`, `amount_or_date_mismatch`, `entry_date_disagrees` | Missing paperwork and disagreements he can look at whenever he opens the screen, never a reason to interrupt him |
+
+| Detector | Rule | Class | Auto-closes |
 | --- | --- | --- | --- |
-| `entry_without_document` | A `capital_call_paid` or `distribution` entry older than 14 days with no `auto_linked` or `confirmed` link | low | when a link lands |
-| `notice_without_entry` | A call or distribution notice with no link to any entry 7 days after extraction | medium | when a link lands |
-| `call_due_unpaid` | A notice whose `due_date` is within 7 days or past, with no matching `capital_call_paid` entry | high | when a matching entry exists |
-| `amount_or_date_mismatch` | A candidate matching on party and date whose money differs from the entry, or whose date is outside the window | high | when the entry is corrected or the link is rejected |
-| `entry_date_disagrees` | A confirmed or auto-linked document's date differs by more than 3 days from an entry date that is not marked estimated, or two documents offer different dates for an estimated one | medium | when the entry is edited or the link is rejected |
-| `over_called` | Cumulative `capital_call_paid` above committed (`overCalled` in the totals CTE of `admin/investments.ts`) | medium | when a commitment change or correction clears it |
-| `k1_missing` | An investment with an entry in tax year Y and no `schedule_k1` with `tax_year = Y` by March 15 of Y+1, high from April 1 | medium then high | when the K-1 is extracted |
+| `entry_without_document` | A `capital_call_paid` or `distribution` entry older than 14 days with no `auto_linked` or `confirmed` link | quiet queue | when a link lands, or is dismissed |
+| `notice_without_entry` | A call or distribution notice with no link to any entry 7 days after extraction | quiet queue | when a link lands, or is dismissed |
+| `call_due_unpaid` | A notice whose `due_date` is within 7 days or past, with no matching `capital_call_paid` entry | money at risk | when a matching entry exists |
+| `amount_or_date_mismatch` | A candidate matching on party and date whose money differs from the entry, or whose date is outside the window | quiet queue | when the entry is corrected or the link is rejected |
+| `entry_date_disagrees` | A confirmed or auto-linked document's date differs by more than 3 days from an entry date that is not marked estimated, or two documents offer different dates for an estimated one | quiet queue | when the entry is edited or the link is rejected |
+| `over_called` | Cumulative `capital_call_paid` above committed (`overCalled` in the totals CTE of `admin/investments.ts`, section 3) | money at risk | when a commitment change or correction clears it |
 
 Extraction gate failures already open `corrections` rows and need no detector.
-They appear in the queue because it is one table.
+They appear in the queue because it is one table, and they are quiet unless
+they happen to be one of the two alerting classes above.
+
+A quiet queue item never escalates and never repeats: it is written once, sits
+until resolved, dismissed, or no longer produced by the sweep, and no cadence
+in section 5 ever reads it.
+
+### Missing K-1s: a checklist, not a detector
+
+Owner requirement, 2026-09-19: a missing K-1 is never an alert and never a
+queue item. The owner typically receives K-1s in late August or September and
+cannot make them arrive sooner, so a March or April threshold (the earlier
+design's `k1_missing` detector, removed here) produces months of noise about
+something he cannot fix.
+
+In its place, a pull-only checklist: "which K-1s do I have for year Y", shown
+on request in the Needs attention screen (a tab, not a queue row) and through
+MCP (`list_missing_k1s`, section 7). For a chosen tax year it lists every
+investment with an entry that year and no linked `schedule_k1` for it. Nothing
+schedules it and nothing pushes it; it runs only when asked.
+
+### Dismissing and turning off tracking
+
+Because many entries will stay permanently undocumented, every quiet queue
+item gets a one-click permanent dismiss, labelled "not worth backfilling" in
+the UI. A dismissed key is resolved with that reason and no snooze end, and
+the detector that produced it never reopens that key (the `Dismiss` rule in
+section 5's Behaviour table).
+
+Bulk dismiss covers the common cases without repeating the click per row.
+`kith.attention_suppressions` (section 3): `scope` is `detector` (suppress a
+whole detector, space-wide), `investment` (suppress a whole investment's
+items, any detector), or `before_date` (suppress a detector's items whose
+target predates a cutoff: "all undocumented entries before 2019" in one
+action). The sweep checks this table before opening a row, exactly where it
+already checks `corrections` for an open dismiss, so a suppressed key is never
+written rather than written and then hidden.
+
+A per-investment and a per-detector "do not track documents" switch are the
+standing form of the same table: a `scope = 'investment'` or `scope =
+'detector'` row with no `before_date`, set from the investment's drawer or the
+Needs attention screen's kebab and shown there as a toggle rather than a log
+entry.
 
 ## 5. Attention queue and alerts
 
@@ -226,27 +320,36 @@ ingestion-class report keyed by source account.
 | Qualifies | Any open row: gate failure, detector finding, stale link evidence |
 | Deduplication | `dedupe_key` is `<detector>:<target>[:<period>]`, unique among open rows; a repeat run updates `last_seen_at` |
 | Snooze | `snooze_until` hides the row from the default filter and from every alert until it passes |
-| Dismiss | Resolve with a reason and no snooze end; a detector never re-opens a key whose newest row is resolved that way |
+| Dismiss | Resolve with a reason and no snooze end ("not worth backfilling" in the UI); a detector never re-opens a key whose newest row is resolved that way |
+| Bulk dismiss | A `kith.attention_suppressions` row (section 4) stops a whole detector, a whole investment, or everything before a date from ever being written, not just from being hidden |
+| Do not track | A standing `attention_suppressions` row with no `before_date`, set per investment or per detector, shown as a toggle rather than a log entry |
 | Auto-close | The sweep resolves open rows whose key the detector no longer produces, reason `cleared` |
-| Aging | `created_at` drives the age column and the cadence below |
+| Aging | `created_at` drives the age column |
 
 Alerts are sent from the owner's always-on machine, because the webhook secret
 is in that machine's Keychain and the hosted app must never hold it. The
 existing daily health check script is extended, not replaced.
 
+Owner requirement, 2026-09-19, on timing: every alert, whatever its class, is
+held to the next local 08:00 window; nothing sends at night. A detection at
+2am waits for that morning's run; a detection at 08:05 waits for the next
+day's. There is no separate always-on immediate channel.
+
 | Channel | Contents | Cadence |
 | --- | --- | --- |
-| Daily digest | Open items by severity, items opened and auto-closed since yesterday, every auto-link and every estimated date corrected that day, plus the health checks it already posts | Daily |
-| Immediate | `call_due_unpaid` within 7 days, and `amount_or_date_mismatch` | Every 30 minutes, 08:00 to 21:00 local |
-| Escalation | High repeats every 3 days while open, medium weekly, low never repeats | From `last_alerted_at` and `alert_count` |
-| Weekly summary | Always sends, including "0 open", so silence means the alerter is broken | Weekly |
+| 08:00 alert | Every open `money at risk` and `system breakage` item, new or still open | Once daily, 08:00 local, nothing outside that window |
+| Daily digest | Open quiet-queue items by detector, items opened and auto-closed since yesterday, every auto-link (first 30 days of the feature) and every estimated date corrected that day, plus the health checks it already posts | Daily, same 08:00 run |
+| Escalation | A money-at-risk or system-breakage item repeats at the next 08:00 run while it stays open; a quiet queue item never repeats | From `last_alerted_at` and `alert_count` |
+| Weekly summary | Always sends, including "0 open", so silence means the alerter is broken | Weekly, at the 08:00 run |
 
 Dead man check: each run updates a heartbeat row with
 `dedupe_key = 'alerter_heartbeat'`; the Health screen derives a check from its
 age, in the slot `BACKUP_CHECK` in `packages/kith-store/src/admin/status.ts`
 reserves for work this app cannot see; and a second launchd job posts if that
 heartbeat is over 36 hours old. If the machine is off nothing sends, and the
-always-sending weekly summary is the cue.
+always-sending weekly summary is the cue. A silent alerter is itself a
+`system breakage` item, so this check feeds the same alerting class it
+guards.
 
 ## 6. UI
 
@@ -257,9 +360,10 @@ House style, with the existing components
 | Place | Shows |
 | --- | --- |
 | Entry row | Pills: `linked`, `suggested` or `none`, and `estimated` on an estimated date; tooltip carries the cited quote; kebab: Confirm, Reject, Open document |
-| Entry drawer | The top suggestion with its cited field and quote, Confirm or Reject beside it |
-| Investment row, expanded | Documents list: kind, date, state, and the entry each is linked to |
-| Needs attention screen | Severity, detector, target, one-line detail, age; right-hand panel shows the evidence; kebab: Confirm, Reject with reason, Use the document's date, Snooze 7 or 30 days, Dismiss with reason |
+| Entry drawer | The top suggestion with its cited field and quote, Confirm or Reject beside it; the commitment total from section 3 alongside sent and outstanding |
+| Investment row, expanded | Documents list: kind, date, state, and the entry each is linked to; a "do not track documents" toggle |
+| Needs attention screen | Class (money at risk, system breakage, or unlabelled for quiet queue), detector, target, one-line detail, age; right-hand panel shows the evidence; kebab: Confirm, Reject with reason, Use the document's date, Snooze 7 or 30 days, Dismiss ("not worth backfilling"), Bulk dismiss (before a date, whole investment, whole detector) |
+| K-1 checklist tab | Pull-only, on request: pick a tax year, see every investment missing a `schedule_k1` for it. No badge and no count on the main screen |
 
 Live updates come from the change feed. The new table gets its trigger in
 migration 028; `corrections` and `investment_entries` already have one.
@@ -273,7 +377,8 @@ No new write tools. All of it through the existing authorization in
 | --- | --- |
 | `get_investment` | Each entry gains `documents: [{ documentId, sourceItemId, kind, state, citedFields: [{ field, value, quote, evidenceSpanId }] }]`, plus investment-level documents for K-1s and reports |
 | `list_investments` | `needsAttentionCount` per investment |
-| `list_attention` (new, read only) | Open items: detector, severity, target, one-line detail, age, citation ids, snooze state |
+| `list_attention` (new, read only) | Open items: detector, class (money at risk, system breakage, or none for quiet queue), target, one-line detail, age, citation ids, snooze state |
+| `list_missing_k1s` (new, read only) | Pull-only checklist for a tax year: every investment with an entry that year and no linked `schedule_k1` |
 
 Both questions are then one call each, with exact decimal amounts.
 
@@ -284,8 +389,8 @@ Both questions are then one call each, with exact decimal amounts.
 | 1 | Migration 028, link table, deterministic scorer | Synthetic fixtures produce the right auto, suggest and none decisions | Yes, it writes `investment_entries.document_id` |
 | 1b | Estimated-date marker, import change, date replacement rule | An estimated date moves and is recorded; a non-estimated one never does | Yes, it changes a financial date |
 | 2 | `investment_link` kind, three triggers, backfill command | Fixture documents link themselves through one drain | No |
-| 3 | Attention items and the seven detectors | Fixtures open items and clear them next sweep | No |
-| 4 | Investments pills and actions, Needs attention screen | Confirm and reject round trip, live with no refresh | No |
+| 3 | Attention items, the six detectors, bulk dismiss and do-not-track suppressions | Fixtures open items and clear them next sweep; a suppressed key never opens one | No |
+| 4 | Investments pills and actions, Needs attention screen, K-1 checklist tab | Confirm and reject round trip, live with no refresh; checklist matches fixtures on request | No |
 | 5 | Digest, immediate alerts, weekly summary, heartbeat | A dry run prints each payload without posting | No |
 | 6 | MCP additions | Read tools answer both questions with citations | Yes, MCP exposure |
 | 7 | Model-assisted leftovers behind the gate | A wrong model answer opens an attention item, never a link | Yes |
@@ -295,12 +400,13 @@ documents extracted), suggestion acceptance (confirmed over offered), false
 links found (rejected after auto-linking, target zero), documents with no
 candidate, and items opened against auto-closed.
 
-## 9. Open questions
+## 9. Decisions (owner, 2026-09-19)
 
-| Question | Recommended default |
-| --- | --- |
-| Auto-link silently from day one, or suggest everything for 30 days? | Auto-link on, with every auto-link listed in the daily digest for the first 30 days |
-| Days before an entry with no document is raised? | 14 |
-| When is a missing K-1 a problem? | Medium on March 15 of the following year, high on April 1 |
-| Immediate alerts at night? | No, queue them to the next 08:00 window |
-| Auto-link a GBP document to a USD entry with the recorded rate? | No, suggest only |
+| # | Question | Decision |
+| --- | --- | --- |
+| 1 | Auto-link silently from day one, or suggest everything for 30 days? | Auto-link from day one. Every auto-link still lists in the daily digest for the first 30 days (section 5) |
+| 2 | Auto-link a GBP document to a USD entry with the recorded rate? | Yes, within the importer's own tolerance: the larger of 1% or $1.00 (section 2) |
+| 3 | Days before an entry with no document is raised, and how noisy should that be? | 14 days, and it is never an alert. Missing-document items are informational, quiet queue items only. See the guiding principle and the two-class detector table (section 4) |
+| 4 | When is a missing K-1 a problem? | Never an alert or queue item. A pull-only checklist, shown on request (section 4, "Missing K-1s: a checklist, not a detector") |
+| 5 | Immediate alerts at night? | No alert of any class sends outside the next local 08:00 window (section 5) |
+| 6 | Fund commitments? | The existing model already tracks a total commitment that calls count against; this design references it rather than adding a second one (section 3, "Commitments") |

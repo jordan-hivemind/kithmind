@@ -95,24 +95,64 @@ instance with the same counterparty and a state jurisdiction.
 Preparer invoices and engagement letters reuse the existing `invoice` and
 `letter_or_notice` kinds in `packages/kith-store/src/extraction/seed.ts`.
 
-## 2. Storage
+Decision, owner, 2026-09-19: the owner has only ever filed in one state, and
+it levies no broad income tax, only a capital gains excise on high earners.
+That return is short, but it gets full catalog treatment like federal, not
+the identity-plus-six-totals fallback a state would otherwise get. The
+fallback stays the rule for any other state that appears later.
 
-Chosen: **(c), both, with the table as a projection.**
+## 2. Aggregatable projections: a general pattern
 
-The gated statements stay the source of truth. They carry the evidence span,
-survive re-extraction, and are what `corrections.ts` writes through. The
-projection is rebuilt from them inside the same transaction as `store()` in
-`extraction/model.ts`, so no reader sees the two disagree.
-
-Option (a) alone fails the owner's goal. `validateRecordQuery` in
-`packages/kith-store/src/records/query.ts` requires an `entityId` for
+Work item the owner approved, 2026-09-19, and not tax-only: every extraction
+observation hangs off `other:document`, `placeholderEntityId` in
+`packages/kith-store/src/extraction/model.ts`, because a document usually
+describes no single named entity. That is fine for storing an observation and
+citing its evidence, and it is what breaks aggregation. `validateRecordQuery`
+in `packages/kith-store/src/records/query.ts` requires an `entityId` for
 `latest_observation` and `list_events`, and exactly one `entityId` or
-`sourceAccountId` for `sum_money`. Every extraction observation hangs off the
-single `other:document` placeholder entity (`placeholderEntityId` in
-`model.ts`), so those filters carry no information here. `sum_money` has no
-group-by either: AGI by year for 15 years is 15 calls, and K-1 income by fund by
-year is not expressible. Option (b) alone would discard the evidence,
-correction and re-extraction machinery that already works.
+`sourceAccountId` for `sum_money`: filters that carry no information when
+every row points at the same placeholder. `sum_money` also has no group-by,
+so "AGI by year for 15 years" is 15 calls and "K-1 income by fund by year" is
+not expressible at all.
+
+The fix is not per-domain. Any domain that needs aggregation gets a flat,
+typed projection table, written inside the same transaction as `store()` in
+`extraction/model.ts` so no reader ever sees the gated statements and the
+projection disagree. The gated statements stay the source of truth: they
+carry the evidence span, survive re-extraction, and are what `corrections.ts`
+writes through. The projection is derived, never edited directly, and always
+rebuildable: a `rebuild-from-statements` command re-derives one domain's
+projection table from the current gated statements and evidence, so a schema
+fix or a new semantic key never requires re-running extraction to get history
+right.
+
+Order of adoption: `tax_facts` first (section 3), because it is the domain
+already on the table. Next, receipts and invoices line totals: the same
+placeholder-entity problem stops "total spent at each vendor this year" from
+being one query. Then investment-document facts, which
+`2026-09-19-investment-document-matching.md` scores and cites but never
+aggregates. Each projection is its own table with its own semantic keys; this
+section is the shape they share, not a shared table.
+
+A projection table earns four things a raw-statement query cannot give
+cheaply: a stable `semantic_key` per fact independent of a form's line
+numbering, one row per fact so `GROUP BY` works, a citation back to the
+statement and evidence span that produced it, and an `authoritative` flag
+where a domain has the idea of a superseding version (an amended tax return,
+a corrected invoice). A domain with none of that (a single flag, a one-off
+count) does not need a projection and should keep using `sum_money` and
+friends.
+
+## 3. Storage: tax_facts as the first projection
+
+Chosen: **(c), both, with the table as a projection**: the pattern section 2
+describes, applied here. Option (a) alone (gated statements only) fails the
+owner's goal for the reasons section 2 gives: the placeholder entity and the
+missing group-by. Option (b) alone (a bespoke table, no gated statements)
+would discard the evidence, correction and re-extraction machinery that
+already works. `tax_facts` is derived from the gated statements inside the
+same transaction as `store()`, and is rebuildable by the command section 2
+introduces.
 
 **Migration 028** adds `kith.tax_returns` (space, tax_year, jurisdiction,
 filing_kind, filing_version, authoritative, supersedes_return_id, filed_date),
@@ -159,7 +199,7 @@ SELECT tax_year, round(total_tax / nullif(agi, 0) * 100, 2) AS effective_rate_pc
  ORDER BY tax_year;
 ```
 
-## 3. Kinds as data
+## 4. Kinds as data
 
 One `document_types` row per form family, not per year: about 30 rows. Fields
 are semantic keys, which already satisfy `isObservationFieldName` in `gate.ts`.
@@ -177,7 +217,7 @@ kind), so an owner edit in the types screen is never walked back. Thirty kinds
 at about 15 fields is roughly 450 field rows, all generated, none hand-written,
 all editable afterwards from the existing screen.
 
-## 4. Long, multi-form documents
+## 5. Long, multi-form documents
 
 | Step | How | Tier |
 | --- | --- | --- |
@@ -217,7 +257,7 @@ escalates to tier 1. Parse time dominates: about 3 to 7 minutes per 200-page
 document plus about 5 minutes of extraction calls, and a few agent hours for the
 whole corpus.
 
-## 5. Tax-specific gates
+## 6. Tax-specific gates
 
 These sit on top of `checkValue` in `gate.ts`. Tolerance is zero everywhere: a
 US return prints whole dollars, so a near miss is a misread, not rounding.
@@ -235,7 +275,7 @@ every input it names is present and `verified`. A shortfall a missing document
 would explain becomes a missing-document item rather than a dispute. A form the
 catalog does not cover produces no identities at all.
 
-## 6. Draft, filed and amended
+## 7. Draft, filed and amended
 
 | Signal | Reads as |
 | --- | --- |
@@ -251,6 +291,15 @@ never reach the default queries. An amendment sets `supersedes_return_id` on
 itself and clears `authoritative` on the row it supersedes. Nothing is deleted
 and the year's history is one query away.
 
+Decision, owner, 2026-09-19: the owner believes no draft return exists in his
+records, but a draft is stored the same as any other filing rather than
+dropped: "I don't think one exists" is not "none exists." If one is found it
+is not just quietly stored: it opens a quiet queue item
+(`draft_return_found`), the same low-noise handling
+`2026-09-19-investment-document-matching.md` section 4 gives a missing
+document, so the owner learns about it without the alerting machinery
+treating it as urgent.
+
 Duplicates collapse on the fact set, not the file. A second document whose
 `(form, form_instance, semantic_key, amount)` tuples all match an existing
 filing adds a `tax_return_documents` row and no facts. A document that agrees on
@@ -258,49 +307,92 @@ identity but disagrees on an amount is not a duplicate: it becomes a new
 `filing_version` and an attention item, because two copies of one return with
 different numbers is the case the owner must see.
 
-## 7. Sensitivity
+## 8. Sensitivity
 
-There is no sensitivity tier system in the code today. Space isolation
+Work item the owner approved, 2026-09-19, and its own prerequisite slice: it
+ships before any tax PDF is ingested, not after. The earlier draft of this
+design argued that space isolation
 (`packages/kith-store/src/identity/spaces.ts`, `authorization.ts`) and a "last
-four only" convention are what exist, and this design uses them instead of
-inventing a tier scheme. `seed.ts` already models the convention with
-`account_last_four` and `partnership_ein_last_four`, and `maskedLabel` in
-`apps/web/src/lib/kith/institutions.ts` is the one place a web label is built.
+four only" convention were enough and that no tier system was needed. The
+owner's answer is that a document class this sensitive needs the level held
+as data, not left to a convention engineers have to remember.
 
-| Item | Rule |
-| --- | --- |
-| SSN, ITIN, any taxpayer identifying number | Never a fact, never a semantic key |
-| EIN | Last four only, as `*_ein_last_four` |
-| Bank routing and account numbers (1040 lines 35b to 35d) | Never captured |
-| Dependent names and SSNs | Never captured. A count of dependents is fine |
-| Street addresses | Never captured. Jurisdiction and state are fine |
-| Filer name | As written, as `recipient_as_written` already is |
+**Sensitivity as data.** A `sensitivity` column, `low | high`, on
+`kith.document_types` (per kind: a W-2 or a 1099 is `high`, a preparer
+invoice is `low`), and a second `sensitivity` column on
+`document_type_fields` (per field: `filer_name_as_written` on a 1040 is
+`low` even though the 1040 itself is `high`). A field's own value wins when
+set; the document kind's level otherwise. This reuses the shape `line_refs`
+already adds to `document_type_fields` (section 4), one more per-kind,
+per-field column on a table that already holds them.
 
-Page text and evidence spans are stored unredacted today and this design does
-not change that: the pages are the archive. The control is at the boundary. One
-new pure function beside the gate, `containsRestrictedIdentifier(text)`, refuses
-a statement whose value matches an SSN, EIN, routing or account pattern, and
-refuses a `tax_facts` row whose quote prints one. The new MCP tool returns
-amounts, semantic keys, form, line reference, year, jurisdiction, counterparty,
-state and an evidence span id, and no quote text. `get_document` keeps its
-existing behavior and authorization. Tax documents live in the owner's personal
-space: no new tier, permission or route.
+**Never extracted.** Unchanged from the earlier draft, and now the enforced
+consequence of `high` sensitivity rather than a convention alone: SSN, ITIN,
+any taxpayer identifying number; bank routing and account numbers (1040
+lines 35b to 35d); dependent names and SSNs (a count is fine); street
+addresses (jurisdiction and state are fine). `containsRestrictedIdentifier(text)`,
+beside the gate, refuses a statement whose value matches one of these
+patterns and refuses a `tax_facts` row whose quote prints one.
 
-## 8. MCP and UI
+**Masking.** EIN and any other identifier kept for matching rather than
+reading is last four only (`*_ein_last_four`, following `account_last_four`
+in `seed.ts` and `maskedLabel` in `apps/web/src/lib/kith/institutions.ts`).
+Filer name stays as written, as `recipient_as_written` already is. This is
+the existing convention, now the documented consequence of a field's
+sensitivity level rather than a habit.
+
+**Redaction at the boundary.** Page text and evidence spans stay unredacted in
+storage: the pages are the archive, and redacting them would make the
+evidence span lie about what the document says. The control is at read time:
+the same restricted-identifier patterns are stripped from any text an MCP
+tool returns and from any search snippet, whatever the caller's sensitivity
+ceiling. `get_document` keeps its existing authorization and behavior; this
+adds redaction on top, not a new permission model. `query_tax_facts` (section
+9) already returns amounts, semantic keys, form, line reference, year,
+jurisdiction, counterparty, state and an evidence span id, and no quote text,
+so it needs no separate redaction pass.
+
+**Per-key ceiling.** An API key or MCP client carries a `max_sensitivity`
+(`low | high`; default `high` for the owner's own clients). A read whose
+target exceeds the caller's ceiling is refused the way an unauthorized space
+already is, not silently filtered: a partial, unlabelled answer is its own
+failure mode. This is the one lever for "a connected assistant should not see
+W-2s," without a role or scope system built for cases that do not exist yet.
+
+**Audit line.** Every MCP read of a `high`-sensitivity document writes one row
+recording who, when, which document, and which tool. It is a log, not a queue
+item and not an alert; nothing reads it automatically. It exists so "did
+anything read my W-2s last month" has an answer.
+
+**Deliberately not built.** No per-field redaction inside a returned
+document's own text: a client is refused the whole document, not handed one
+with holes in it. No encryption at rest beyond what the database already
+provides. No approval workflow for a high-sensitivity read: the owner is the
+only principal with a `high` ceiling today, so there is no one to approve
+past. No retention or expiry policy for the audit log. These are proportionate
+omissions for a personal project with one owner and a small, named set of MCP
+clients, not oversights; each is a small addition later if a second
+owner-level principal or a third-party client needs one. Tax documents live
+in the owner's personal space: no new space, permission model, or route, only
+the sensitivity data and the boundary checks above.
+
+## 9. MCP and UI
 
 One new read tool, `query_tax_facts`, registered in
 `apps/web/src/lib/mcp/tools.ts` and annotated `readOnly` in `tool-policy.ts`.
 Arguments: `spaceIds`, `years`, `jurisdiction`, `forms`, `semanticKeys`, and
 `groupBy` in (`year`, `form`, `counterparty`). It answers "what was my AGI each
 year" and "how much state tax over five years" in one call each, with citations.
+Every result carries its `state` (`verified`, `unverified`, `disputed`); see
+the Decisions table below on why hiding that would be its own silent failure.
 
-"Which K-1s am I still missing for 2025" is an attention-queue question, not a
-tax-facts one. The queue is being designed in parallel
-(`docs/plans/2026-09-19-investment-document-matching.md`). This work writes to a
-generic interface: an item is `{kind, space_id, subject, detail, opened_at,
-state}` with kinds `missing_document`, `identity_mismatch` and
-`carryover_mismatch`. If that plan does not land first the items go to
-`kith.corrections`, which already has the shape and the screen. Either way no
+"Which K-1s am I still missing for 2025" is a pull-only checklist question,
+answered by `list_missing_k1s` in
+`docs/plans/2026-09-19-investment-document-matching.md` (section 4, "Missing
+K-1s: a checklist, not a detector"), never an alert, never a queue row, the
+same low-noise principle this design applies to its own missing checklist
+below. `identity_mismatch` and `carryover_mismatch` findings from this design
+still go to `kith.corrections`, which already has the shape and the screen; no
 second queue is added.
 
 Taxes screen, in the admin house style: white, gray and blue, Inter, compact
@@ -310,16 +402,21 @@ sortable tables, kebab menus, square tags, tooltips, no prose.
 | --- | --- |
 | Year by form matrix | Rows are years, columns are form families, a cell is the instance count with a state tag |
 | Return summary | One year's captured totals with printed line references, each linking to its citation |
-| Missing checklist | A form family present in at least two of the last three years and absent this year is expected. Each gap is an attention item, not a screen-local warning |
+| Missing checklist | Pull-only, on request, same principle as the K-1 checklist above: a form family present in at least two of the last three years and absent this year is listed. Never an alert, never a queue row |
 
-## 9. Build order
+## 10. Build order
+
+Slice 0 is a hard prerequisite: it ships and is verified before any tax PDF
+is ingested, real or synthetic-in-production. Slices 1 onward assume it is
+already live.
 
 | Slice | Hours | Second-model review |
 | --- | --- | --- |
+| 0. Sensitivity: schema columns, `containsRestrictedIdentifier`, MCP and search redaction, per-key ceiling, audit line | 5 | Yes: gates what every later slice can read |
 | 1. Catalog, seeder extension, migration 028 | 5 | Yes: schema and financial numbers |
 | 2. Page classification and segmentation, deterministic first | 5 | No |
 | 3. Raise the eight pipeline constants together, re-parse check | 4 | No |
-| 4. Per-form-instance extraction and the `tax_facts` projection | 6 | Yes |
+| 4. Per-form-instance extraction, the `tax_facts` projection and its rebuild command | 6 | Yes |
 | 5. Tax gates: line reference in quote, within-form identity, cross-form carries | 5 | Yes |
 | 6. Return identity: draft, filed, amended, duplicate collapse | 4 | Yes |
 | 7. Cross-document ties and carryovers, emitting attention items | 5 | Yes |
@@ -340,12 +437,15 @@ Measuring the first real run:
 | Corrections per return | Under 5. Over 10 means the queue is unusable and the cause is fixed before the next batch |
 | Cost and coverage | `document_extractions.pages_read` against `pages_total`, and spend per return |
 
-## 10. Open questions
+## 11. Decisions (owner, 2026-09-19)
 
-| # | Question | Recommended default |
+| # | Question | Decision |
 | --- | --- | --- |
-| 1 | Which state returns get a full catalog? | Federal in full. Per state, identity plus the six summary totals until that state earns its own catalog |
+| 1 | Which state returns get a full catalog? | Federal in full. The owner has filed in exactly one state, income-tax-free with a capital gains excise on high earners; that state gets full treatment too, not the identity-plus-six-totals fallback (section 1). Any other state that appears later still gets the fallback |
 | 2 | How far back does the first run go? | 2018 onward first, where catalog coverage is best, then backfill 2011 to 2017 at a lower capture rate |
-| 3 | Does MCP return `unverified` and `disputed` facts? | Yes, always with their state attached. Hiding them is its own silent failure |
-| 4 | After an amendment, is the year's authoritative answer the amended numbers or the original? | The amended filing. The original stays readable as superseded |
-| 5 | Is a draft return worth storing? | Yes, with `authoritative = false`. It is free and it answers what changed before filing |
+| 3 | Does MCP return `unverified` and `disputed` facts? | Yes, always with their state attached and labeled. Hiding them is its own silent failure |
+| 4 | After an amendment, is the year's authoritative answer the amended numbers or the original? | The amended filing is authoritative. The original stays readable as superseded |
+| 5 | Is a draft return worth storing? | Yes, with `authoritative = false`. The owner believes none exists, but if one is found it is surfaced as a quiet queue item, not just stored silently (section 7) |
+| 6 | Missing-document checklist noise? | Same low-noise principle as the investment-matching design: pull-only, never an alert or a queue item (section 9, "Missing checklist" and "Which K-1s") |
+| 7 | Aggregatable projections work item | Approved as a general pattern, not tax-only. `tax_facts` first, then receipts/invoices line totals, then investment-document facts, each a flat projection table rebuildable from the gated statements (section 2) |
+| 8 | Sensitivity work item | Approved as its own prerequisite slice, before any tax PDF is ingested: sensitivity levels as data, masking, MCP and search redaction, a per-key ceiling, and an audit line (section 8, build order slice 0) |
