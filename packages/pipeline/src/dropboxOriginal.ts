@@ -18,15 +18,32 @@ function fail(message: string): never {
   throw new DropboxVerificationError(message);
 }
 
-export type DropboxOriginalInput = {
+/** A relative path the provider can be asked about without escaping the root. */
+function validRelativePath(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.length <= 2048 &&
+    !/[\\\x00-\x1f\x7f]/.test(value) &&
+    value
+      .split("/")
+      .every(
+        (part) => part && part !== "." && part !== ".." && part.trim() === part,
+      )
+  );
+}
+
+export type DropboxRootBinding = {
   credentials: DropboxCredentialConfig;
   refreshPath: string;
-  capturePath: string;
-  sourceContentHash: string;
-  sourceByteLength: number;
   providerAccountIdHash: string;
   providerRootDirectoryIdHash: string;
   providerRootDirectoryId: string;
+};
+
+export type DropboxOriginalInput = DropboxRootBinding & {
+  capturePath: string;
+  sourceContentHash: string;
+  sourceByteLength: number;
   relativePath: string;
   bindingId: string;
   expectedProviderFileIdHash?: string;
@@ -204,12 +221,7 @@ export async function verifyDropboxOriginal(
       !UUID.test(input.bindingId) ||
       (input.expectedProviderFileIdHash !== undefined &&
         !HEX.test(input.expectedProviderFileIdHash)) ||
-      !input.relativePath ||
-      input.relativePath.length > 2048 ||
-      /[\\\x00-\x1f\x7f]/.test(input.relativePath) ||
-      input.relativePath
-        .split("/")
-        .some((x) => !x || x === "." || x === ".." || x.trim() !== x)
+      !validRelativePath(input.relativePath)
     )
       fail("provider source binding is invalid");
     const captured = await hashDropboxCapture(input.capturePath, {
@@ -328,4 +340,98 @@ export async function verifyDropboxOriginal(
     if (error instanceof DropboxVerificationError) throw error;
     fail("original verification failed");
   }
+}
+
+/**
+ * ADM-4a. The provider's stable file id for each relative path under the
+ * configured root, for the watcher's identity map.
+ *
+ * This is a lookup, not a verification: it proves the account and the root the
+ * same way, but it reads no bytes and asserts nothing about content. A path the
+ * provider does not answer for, or answers for with something that is not a
+ * file under this root, is simply absent from the result. The caller keeps
+ * path identity for it. A failure to reach the provider at all throws, and the
+ * caller falls back for the whole pass.
+ */
+export async function lookupDropboxFileIds(
+  input: DropboxRootBinding,
+  relativePaths: readonly string[],
+): Promise<Map<string, string>> {
+  if (
+    ![input.providerAccountIdHash, input.providerRootDirectoryIdHash].every(
+      (x) => HEX.test(x),
+    ) ||
+    !ID.test(input.providerRootDirectoryId) ||
+    digest(input.providerRootDirectoryId) !== input.providerRootDirectoryIdHash
+  )
+    fail("provider source binding is invalid");
+  return await withDropboxAccessToken(
+    input.credentials,
+    input.refreshPath,
+    async (token) => {
+      const account = await api(
+        token,
+        "users/get_current_account",
+        null,
+        AbortSignal.timeout(30_000),
+      );
+      const accountId = requiredString(
+        account,
+        "account_id",
+        /^dbid:[A-Za-z0-9_-]{1,256}$/,
+      );
+      if (
+        digest(accountId) !== input.providerAccountIdHash ||
+        account.disabled !== false
+      )
+        fail("provider account mismatch");
+      const root = await api(
+        token,
+        "files/get_metadata",
+        { path: input.providerRootDirectoryId },
+        AbortSignal.timeout(30_000),
+      );
+      const rootPath = requiredString(
+        root,
+        "path_lower",
+        /^\/[^\x00-\x1f\x7f]{1,2048}$/,
+      );
+      if (
+        root[".tag"] !== "folder" ||
+        root.id !== input.providerRootDirectoryId
+      )
+        fail("provider root mismatch");
+      const ids = new Map<string, string>();
+      for (const relativePath of relativePaths) {
+        if (!validRelativePath(relativePath)) continue;
+        let file: Record<string, unknown>;
+        try {
+          file = await api(
+            token,
+            "files/get_metadata",
+            {
+              path: `${rootPath}/${relativePath}`,
+              include_deleted: false,
+            },
+            AbortSignal.timeout(30_000),
+          );
+        } catch {
+          // Not synced yet, or gone. Path identity still answers for it.
+          continue;
+        }
+        const id = file.id;
+        const path = file.path_lower;
+        if (
+          file[".tag"] !== "file" ||
+          typeof id !== "string" ||
+          !ID.test(id) ||
+          typeof path !== "string" ||
+          !path.startsWith(`${rootPath}/`)
+        )
+          continue;
+        ids.set(relativePath, id);
+      }
+      return ids;
+    },
+  );
 }

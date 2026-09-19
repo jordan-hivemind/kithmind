@@ -73,7 +73,10 @@ import {
   removeCapturedPdfExact,
   type CapturedPdf,
 } from "./captureStore.js";
-import { verifyDropboxOriginal } from "./dropboxOriginal.js";
+import {
+  lookupDropboxFileIds,
+  verifyDropboxOriginal,
+} from "./dropboxOriginal.js";
 import {
   loadProviderBinding,
   persistProviderBinding,
@@ -977,6 +980,7 @@ function sameObservationPlan(
   const observedPlan = { ...plan } as Record<string, unknown>;
   for (const field of [
     "externalId",
+    "providerFileId",
     "sourceItemId",
     "observationEpoch",
     "processingEpoch",
@@ -1001,6 +1005,9 @@ function bindingsFromScan(checkpoint: {
       rootAlias: file.rootAlias,
       relativePath: file.relativePath,
       externalId: file.externalId,
+      ...(file.providerFileId === undefined
+        ? {}
+        : { providerFileId: file.providerFileId }),
     });
   }
   const result = [...byExternalId.values()].sort((left, right) =>
@@ -1198,6 +1205,15 @@ function resultFromTerminal(
   };
 }
 
+/**
+ * ADM-4a. Where the watcher gets a stable file id for a path, and which root
+ * those ids belong to. Everything outside that root keeps path identity.
+ */
+export type ProviderFileIdSource = {
+  rootAlias: string;
+  lookup(relativePaths: string[]): Promise<Map<string, string>>;
+};
+
 export class PipelineRunner {
   private preparedPdfProfile: PreparedPdfDocQaProfile | undefined;
   private archiveCatalog: ArchiveCatalog | undefined;
@@ -1215,6 +1231,13 @@ export class PipelineRunner {
       operatorClear?: boolean;
       maxClears?: number;
     } = {},
+    /**
+     * ADM-4a. The provider identity source, when the caller supplies its own.
+     * The runner builds the Dropbox one from its configuration otherwise, and
+     * a source with no provider configured has none at all.
+     */
+    private readonly providerFileIdSource:
+      ProviderFileIdSource | undefined = undefined,
   ) {}
 
   /**
@@ -1370,6 +1393,30 @@ export class PipelineRunner {
     });
   }
 
+  /**
+   * The local catalog rows that answer for this plan.
+   *
+   * ADM-4a: matched on the original, the processing epoch and the full
+   * fingerprint tuple, and deliberately *not* on the observation epoch.
+   *
+   * The observation epoch advances on any inventory metadata change: the path,
+   * the title, or the modification time. The processing epoch and the
+   * fingerprints are what say the parse is stale. Including the observation
+   * epoch here made a metadata-only change unmatchable, so the runner decided
+   * the document needed archived work -- while the server, seeing the same
+   * bytes, answered `unchanged` and opened no work row for it. The next
+   * `discovery.preflightArchived` then failed the whole pass with
+   * `stale_observation` (`resolveCurrentArchivedWork` in kith-store's
+   * `archivedDiscovery.ts`), every pass, until the bytes themselves changed.
+   *
+   * This is not specific to a rename: touching a file's modification time,
+   * which a sync client does on its own, reproduces it exactly. A rename is
+   * simply the first thing that reaches it now that identity survives one.
+   *
+   * Multiple matches across observation epochs are what `reusableProcessingRow`
+   * already exists to settle, and it still fails closed on a history it cannot
+   * judge.
+   */
   private matchingProcessingRows(plan: PdfFilePlan): ProcessingCatalogRow[] {
     const original = this.matchingOriginal(plan);
     if (!original) return [];
@@ -1379,7 +1426,6 @@ export class PipelineRunner {
       .filter(
         (row) =>
           row.originalCatalogId === original.originalCatalogId &&
-          row.currentObservation.observationEpoch === plan.observationEpoch &&
           row.currentObservation.processingEpoch === plan.processingEpoch &&
           equalJson(row.fingerprints, fingerprints),
       );
@@ -2364,6 +2410,135 @@ export class PipelineRunner {
     return asWorkerResponse(result);
   }
 
+  /** ADM-4a. The configured provider identity source, if there is one. */
+  private providerFileIds(): ProviderFileIdSource | undefined {
+    if (this.providerFileIdSource) return this.providerFileIdSource;
+    const pdf = this.config.pdfDocQa;
+    const provider = pdf?.providerOriginal;
+    const backup = pdf?.archive.independentBackup;
+    const repository = backup?.repository;
+    if (!provider || !repository) return undefined;
+    return {
+      rootAlias: provider.rootAlias,
+      lookup: async (relativePaths) =>
+        await lookupDropboxFileIds(
+          {
+            credentials: {
+              rcloneBinary: repository.rcloneBinary,
+              configPath: repository.configPath,
+              remoteName: repository.remoteName,
+              configIdentityFingerprint: repository.configIdentityFingerprint,
+            },
+            refreshPath: provider.refreshPath,
+            providerAccountIdHash: provider.providerAccountIdHash,
+            providerRootDirectoryId: provider.providerRootDirectoryId,
+            providerRootDirectoryIdHash: provider.providerRootDirectoryIdHash,
+          },
+          relativePaths,
+        ),
+    };
+  }
+
+  /**
+   * ADM-4a. Attaches the provider's stable file id to each plan under the
+   * provider's root, so a renamed or moved file keeps its identity.
+   *
+   * Only paths with no remembered id are asked about. A steady pass therefore
+   * makes no provider call at all, a journal written before ids existed is
+   * upgraded one file at a time as each is next seen where it already was, and
+   * a rename costs one lookup per moved file.
+   *
+   * Nothing here may fail the pass. An unreachable provider leaves every plan
+   * on the identity it already had, which is exactly today's behaviour.
+   */
+  private async attachProviderFileIds(
+    plans: FilePlan[],
+    byPath: Map<string, IdentityBinding>,
+  ): Promise<void> {
+    const source = this.providerFileIds();
+    if (!source) return;
+    const under = plans.filter((plan) => plan.rootAlias === source.rootAlias);
+    for (const plan of under) {
+      const remembered = byPath.get(fileKey(plan))?.providerFileId;
+      if (remembered !== undefined) plan.providerFileId = remembered;
+    }
+    const ask = under.filter((plan) => plan.providerFileId === undefined);
+    if (ask.length === 0) return;
+    let ids: Map<string, string>;
+    try {
+      ids = await source.lookup(ask.map((plan) => plan.relativePath));
+    } catch (error) {
+      console.warn(
+        `[pipeline] provider file ids unavailable this pass; identity falls back to paths (${
+          error instanceof Error ? error.message : "unknown error"
+        })`,
+      );
+      return;
+    }
+    const fresh = new Set<string>();
+    for (const plan of ask) {
+      const id = ids.get(plan.relativePath);
+      if (id === undefined) continue;
+      plan.providerFileId = id;
+      fresh.add(id);
+    }
+    // A remembered id the provider has just answered for another path belongs
+    // to that path now: the file moved and something else took its place. The
+    // plan that only remembered it falls back to path identity, and the next
+    // pass asks the provider for its real id.
+    for (const plan of under) {
+      if (plan.providerFileId !== undefined && !ask.includes(plan)) {
+        if (fresh.has(plan.providerFileId)) delete plan.providerFileId;
+      }
+    }
+  }
+
+  /**
+   * ADM-4a. The prior binding each plan continues, provider id first.
+   *
+   * Two rules make the fallback safe. A binding already continued by a provider
+   * id is never handed to a second plan, and a path match is refused when the
+   * two sides name different provider ids: that path holds a different file
+   * now. Either way the plan is unmatched and takes a new identity.
+   */
+  private matchBindings(
+    plans: FilePlan[],
+    prior: IdentityBinding[],
+    byPath: Map<string, IdentityBinding>,
+  ): Map<FilePlan, IdentityBinding> {
+    const byProviderId = new Map(
+      prior.flatMap((binding) =>
+        binding.providerFileId === undefined
+          ? []
+          : [[binding.providerFileId, binding] as const],
+      ),
+    );
+    const matched = new Map<FilePlan, IdentityBinding>();
+    const claimed = new Set<string>();
+    const claim = (plan: FilePlan, binding: IdentityBinding | undefined) => {
+      if (!binding || claimed.has(binding.externalId)) return;
+      matched.set(plan, binding);
+      claimed.add(binding.externalId);
+    };
+    for (const plan of plans) {
+      if (plan.providerFileId === undefined) continue;
+      claim(plan, byProviderId.get(plan.providerFileId));
+    }
+    for (const plan of plans) {
+      if (matched.has(plan)) continue;
+      const binding = byPath.get(fileKey(plan));
+      if (
+        binding?.providerFileId !== undefined &&
+        plan.providerFileId !== undefined &&
+        binding.providerFileId !== plan.providerFileId
+      ) {
+        continue;
+      }
+      claim(plan, binding);
+    }
+    return matched;
+  }
+
   private async startCycle(
     roots: SafeRoot[],
     status: Record<string, unknown>,
@@ -2374,11 +2549,13 @@ export class PipelineRunner {
         : [];
     const plans = await this.discoverPlans(roots);
     const byPath = new Map(prior.map((binding) => [fileKey(binding), binding]));
-    const currentPaths = new Set(plans.map(fileKey));
+    await this.attachProviderFileIds(plans, byPath);
+    const matched = this.matchBindings(plans, prior, byPath);
+    const claimed = new Set([...matched.values()].map((b) => b.externalId));
     const missingBindings = prior.filter(
-      (binding) => !currentPaths.has(fileKey(binding)),
+      (binding) => !claimed.has(binding.externalId),
     );
-    const unmatched = plans.filter((plan) => !byPath.has(fileKey(plan)));
+    const unmatched = plans.filter((plan) => !matched.has(plan));
     const enumeration = status.enumeration as { state?: unknown } | undefined;
     const newSource =
       this.journal.checkpoint.phase === "idle" &&
@@ -2390,7 +2567,7 @@ export class PipelineRunner {
           this.journal.checkpoint.code === "identity_review_required") ||
         (missingBindings.length > 0 && unmatched.length > 0));
     for (const plan of plans) {
-      const retained = byPath.get(fileKey(plan))?.externalId;
+      const retained = matched.get(plan)?.externalId;
       if (retained !== undefined || !recovery) {
         plan.externalId = retained ?? randomUUID();
       }

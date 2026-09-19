@@ -154,6 +154,14 @@ export type IdentityBinding = {
   rootAlias: string;
   relativePath: string;
   externalId: string;
+  /**
+   * ADM-4a. The provider's stable file id, when one is known. It is what the
+   * item is remembered by: a renamed or moved file keeps its external id
+   * because this does not change. The path stays the fallback, for a root with
+   * no provider, a file the provider does not know yet, and every journal
+   * written before this field existed.
+   */
+  providerFileId?: string;
 };
 
 export type PipelineRunResult = {

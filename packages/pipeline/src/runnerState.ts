@@ -13,12 +13,16 @@ const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HEX_64 = /^[a-f0-9]{64}$/;
 const ROOT_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+/** ADM-4a. A provider's opaque file id, e.g. Dropbox's `id:...`. */
+const PROVIDER_FILE_ID = /^[A-Za-z0-9:._-]{1,256}$/;
 
 type PlanLocation = {
   rootAlias: string;
   relativePath: string;
   sourceModifiedAt: number;
   externalId?: string;
+  /** ADM-4a. See `IdentityBinding.providerFileId`. Never sent to the server. */
+  providerFileId?: string;
 };
 
 /** Untagged UTF-8 plans are retained for every existing version-1 journal. */
@@ -383,17 +387,33 @@ function bindings(value: unknown): IdentityBinding[] {
   if (!Array.isArray(value) || value.length > MAX_FILES) fail();
   const paths = new Set<string>();
   const externalIds = new Set<string>();
+  const providerFileIds = new Set<string>();
   return value.map((raw) => {
     const row = object(raw);
-    exact(row, ["rootAlias", "relativePath", "externalId"]);
+    // ADM-4a: `providerFileId` is optional, so a journal written before it
+    // existed parses unchanged and is upgraded in place on the next pass.
+    exact(row, ["rootAlias", "relativePath", "externalId"], ["providerFileId"]);
     const rootAlias = string(row.rootAlias, 64, ROOT_ALIAS);
     const relativePath = string(row.relativePath, MAX_PATH_BYTES);
     const externalId = string(row.externalId, 36, UUID);
+    const providerFileId =
+      row.providerFileId === undefined
+        ? undefined
+        : string(row.providerFileId, 256, PROVIDER_FILE_ID);
     const key = `${rootAlias}\0${relativePath}`;
     if (paths.has(key) || externalIds.has(externalId)) fail();
+    if (providerFileId !== undefined) {
+      if (providerFileIds.has(providerFileId)) fail();
+      providerFileIds.add(providerFileId);
+    }
     paths.add(key);
     externalIds.add(externalId);
-    return { rootAlias, relativePath, externalId };
+    return {
+      rootAlias,
+      relativePath,
+      externalId,
+      ...(providerFileId === undefined ? {} : { providerFileId }),
+    };
   });
 }
 
@@ -406,7 +426,11 @@ function files(value: unknown): FilePlan[] {
     const kind = row.kind;
     const required = ["rootAlias", "relativePath", "sourceModifiedAt"];
     if (kind === undefined) {
-      exact(row, [...required, "sha256", "byteLength"], ["externalId"]);
+      exact(
+        row,
+        [...required, "sha256", "byteLength"],
+        ["externalId", "providerFileId"],
+      );
     } else if (kind === "pdf") {
       exact(
         row,
@@ -426,6 +450,7 @@ function files(value: unknown): FilePlan[] {
         ],
         [
           "externalId",
+          "providerFileId",
           "sourceItemId",
           "observationEpoch",
           "processingEpoch",
@@ -435,7 +460,11 @@ function files(value: unknown): FilePlan[] {
         ],
       );
     } else if (kind === "gap") {
-      exact(row, [...required, "kind", "code"], ["externalId"]);
+      exact(
+        row,
+        [...required, "kind", "code"],
+        ["externalId", "providerFileId"],
+      );
     } else fail();
     const rootAlias = string(row.rootAlias, 64, ROOT_ALIAS);
     const relativePath = string(row.relativePath, MAX_PATH_BYTES);
@@ -455,6 +484,11 @@ function files(value: unknown): FilePlan[] {
       relativePath,
       sourceModifiedAt: integer(row.sourceModifiedAt),
       ...(externalId === undefined ? {} : { externalId }),
+      ...(row.providerFileId === undefined
+        ? {}
+        : {
+            providerFileId: string(row.providerFileId, 256, PROVIDER_FILE_ID),
+          }),
     };
     if (kind === undefined) {
       return {
