@@ -92,9 +92,18 @@ export async function readDocumentExtraction(
     spaceId,
     sourceItemId,
   );
+  // `correctedValue !== null` excludes a row `supersedeOpenCorrections`
+  // auto-resolved (reason `cleared`) rather than the owner: that row is
+  // `resolved` with no correction to show, and without this it would read as
+  // "the owner fixed this field" with a null value (ADM-8a).
   const corrected = new Map(
     corrections
-      .filter((item) => item.state === "resolved" && item.fieldName !== null)
+      .filter(
+        (item) =>
+          item.state === "resolved" &&
+          item.fieldName !== null &&
+          item.correctedValue !== null,
+      )
       .map((item) => [item.fieldName!, item.correctedValue]),
   );
   // A correction targets one observation, so it is looked up by observation
