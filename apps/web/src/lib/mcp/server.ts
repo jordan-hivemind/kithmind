@@ -1527,6 +1527,47 @@ export function createMcpServer(
     },
   );
 
+  // ADM-3, section 11: outside investments, asked through the connector.
+  //
+  // Read-only and deliberately thin. Every figure is produced by the one SQL
+  // aggregation in `@repo/kith-store`'s admin surface and passed through as the
+  // exact decimal string it came back as, so there is no second arithmetic here
+  // to disagree with the screen. Space authorization is
+  // `getAuthorizedReadSpaceIds`, the same as every other read tool (see
+  // `reads.ts`), resolved inside the call's own transaction, so a credential
+  // revoked between two calls denies on the second.
+  const listInvestmentsTool = registerTool(
+    MCP_TOOL_NAMES.listInvestments,
+    "List outside investments (angel, fund and AngelList) with computed totals: committed, sent (capital calls paid), fees, outstanding and received (distributions). outstanding is committed minus sent and is SIGNED: a negative outstanding means the fund has called more than was committed, and overCalled reports that same excess as a positive number (0.00 when there is none). Totals are given per entry currency, unrounded, and separately in USD, converted with each entry's own recorded exchange rate and rounded to two places. Every amount is an exact decimal string, never a number: report them as given rather than reformatting or re-adding them. Archived investments are excluded unless includeArchived is set. linkedDocumentIds are the documents entries cite; unlinkedDocumentCount counts documents whose title names the investment and that no entry links to, which is a gap in filing rather than a total.",
+    {
+      spaceIds: readSpacesSchema,
+      category: z.string().trim().min(1).max(100).optional(),
+      status: z.enum(["active", "closed", "written_off"]).optional(),
+      nameContains: z.string().trim().min(1).max(200).optional(),
+      includeArchived: z.boolean().optional(),
+    },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listInvestments],
+    async ({ spaceIds, ...filters }) => {
+      const result = await reads.listInvestments({ ...filters, spaceIds });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result) }],
+      };
+    },
+  );
+
+  const getInvestmentTool = registerTool(
+    MCP_TOOL_NAMES.getInvestment,
+    "Read one investment with its entries and the documents they link to. Entry types are capital_call_paid, distribution, commitment, commitment_change, fee, write_off and other; the type carries the direction, so every amount is positive except a commitment_change, which is the one type that may be negative (a reduced commitment). exchangeRate is the rate to USD recorded with a non-USD entry. Totals follow list_investments, including the signed outstanding and overCalled. Amounts are exact decimal strings. An investment in a space this credential cannot read returns null, which is not evidence that it does not exist.",
+    { investmentId: spaceIdSchema, spaceIds: readSpacesSchema },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.getInvestment],
+    async ({ investmentId, spaceIds }) => {
+      const result = await reads.getInvestment({ investmentId, spaceIds });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result) }],
+      };
+    },
+  );
+
   const registeredTools = {
     [MCP_TOOL_NAMES.ingestUrl]: ingestUrlTool,
     [MCP_TOOL_NAMES.queryRecords]: queryRecordsTool,
@@ -1545,6 +1586,8 @@ export function createMcpServer(
     [MCP_TOOL_NAMES.timelineThoughts]: timelineThoughtsTool,
     [MCP_TOOL_NAMES.getStats]: getStatsTool,
     [MCP_TOOL_NAMES.captureThought]: captureThoughtTool,
+    [MCP_TOOL_NAMES.listInvestments]: listInvestmentsTool,
+    [MCP_TOOL_NAMES.getInvestment]: getInvestmentTool,
   } satisfies Record<McpToolName, { disable: () => void }>;
   const enabledToolNames = new Set(resolveEnabledMcpToolNames());
   for (const name of MCP_TOOL_NAME_LIST) {

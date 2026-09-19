@@ -74,6 +74,27 @@ export async function readJsonBody(
 }
 
 /**
+ * The JSON body parsed against a schema, or the 400 to send instead.
+ *
+ * Here rather than beside the schemas it is used with: those are loaded into
+ * the client bundle, because the spreadsheet import validates every row in the
+ * browser against the very schemas its routes will validate them with, and
+ * this module pulls in `@repo/kith-store`.
+ */
+export async function parsedBody<T>(
+  request: Request,
+  schema: { safeParse: (value: unknown) => { success: boolean; data?: T } },
+): Promise<{ value: T } | { response: Response }> {
+  const body = await readJsonBody(request);
+  if (body === null) return { response: problem(400, "Invalid request") };
+  const result = schema.safeParse(body);
+  if (!result.success || result.data === undefined) {
+    return { response: problem(400, "Invalid request", "invalid_input") };
+  }
+  return { value: result.data };
+}
+
+/**
  * Same-origin, the way a fetch from this app's own pages always is.
  *
  * `Sec-Fetch-Site` is sent by every browser that still matters and cannot be

@@ -187,6 +187,14 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
       import.meta.url,
     ),
   },
+  {
+    version: 25,
+    name: "investments: archived_at, the unique live name, the import row key, the exchange rate a non-USD amount needs and the amount sign rule (ADM-3)",
+    url: new URL(
+      "../migrations/025_investments_import_and_archive.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

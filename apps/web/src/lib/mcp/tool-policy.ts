@@ -61,6 +61,8 @@ export const MCP_TOOL_ANNOTATIONS = {
   [MCP_TOOL_NAMES.timelineThoughts]: readOnly,
   [MCP_TOOL_NAMES.getStats]: readOnly,
   [MCP_TOOL_NAMES.captureThought]: idempotentAdditive,
+  [MCP_TOOL_NAMES.listInvestments]: readOnly,
+  [MCP_TOOL_NAMES.getInvestment]: readOnly,
 } as const satisfies Record<McpToolName, McpToolAnnotations>;
 
 export const MCP_MEMORY_TOOL_NAMES = [
@@ -81,6 +83,8 @@ export const MCP_MEMORY_TOOL_NAMES = [
   MCP_TOOL_NAMES.timelineThoughts,
   MCP_TOOL_NAMES.getStats,
   MCP_TOOL_NAMES.captureThought,
+  MCP_TOOL_NAMES.listInvestments,
+  MCP_TOOL_NAMES.getInvestment,
 ] as const;
 
 export type McpToolProfile = "memory" | "full";

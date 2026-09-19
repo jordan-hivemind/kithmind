@@ -30,7 +30,7 @@
 //     keyword leg still answers. The three vector-backed tools therefore open
 //     two read-only transactions; every other read tool opens one.
 
-import { documents, embeddings, memory, records } from "@repo/kith-store";
+import { admin, documents, embeddings, memory, records } from "@repo/kith-store";
 import type { EmbedQuery } from "@repo/kith-store/embeddings";
 import {
   getAuthorizedReadSpaceIds,
@@ -253,6 +253,31 @@ export type TimelineArgs = ReadSpaces & {
   type?: SearchThoughtsArgs["type"];
 };
 
+export type InvestmentListArgs = ReadSpaces & {
+  category?: string;
+  status?: "active" | "closed" | "written_off";
+  nameContains?: string;
+  includeArchived?: boolean;
+};
+
+/** One investment as the tools report it: the row's own fields, its computed
+ * totals, and the ids of the documents its entries link to. Amounts are exact
+ * decimal strings throughout, never numbers. */
+export type InvestmentToolRow = {
+  id: string;
+  spaceId: string;
+  name: string;
+  category: string | null;
+  signedOn: string | null;
+  status: string;
+  archived: boolean;
+  notes: string | null;
+  entryCount: number;
+  totals: unknown;
+  linkedDocumentIds: string[];
+  unlinkedDocumentCount: number;
+};
+
 /** One method per read tool. `server.ts` formats what these return. */
 export type McpReads = {
   listSpaces(): Promise<unknown>;
@@ -281,6 +306,25 @@ export type McpReads = {
   }>;
   listInventory(args: InventoryArgs): Promise<unknown>;
   listReviewQueue(args: ReviewQueueArgs): Promise<unknown>;
+  /**
+   * ADM-3, section 11's acceptance: committed versus sent versus outstanding,
+   * per investment, asked through the connector.
+   *
+   * The space set is `getAuthorizedReadSpaceIds`, which is what every other
+   * read tool in this file uses, so a `reader` member may ask about the
+   * investments they can already see. The admin *screen* is narrower
+   * (`getAdminSpaceIds`, owner or editor) because it is the operational
+   * surface -- editing, archiving, the spreadsheet import. Reading a total is
+   * not that, and giving these tools the narrower set would mean a reader's
+   * credential silently answering "no investments" for a space whose documents
+   * it can already search.
+   */
+  listInvestments(
+    args: InvestmentListArgs,
+  ): Promise<{ investments: InvestmentToolRow[] }>;
+  getInvestment(
+    args: ReadSpaces & { investmentId: string },
+  ): Promise<unknown>;
   searchFacts(
     args: ReadSpaces & {
       query: string;
@@ -381,6 +425,35 @@ async function prepareEmbedQuery(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * One investment as the two tools report it.
+ *
+ * `totals` is passed through exactly as the store computed it -- per currency
+ * and in USD, every figure an exact decimal string straight out of a
+ * `numeric` sum. Nothing here re-derives a total, so there is no second
+ * arithmetic implementation to disagree with the first.
+ */
+function investmentToolRow(
+  investment: admin.InvestmentRow,
+): InvestmentToolRow {
+  return {
+    id: investment.id,
+    spaceId: investment.spaceId,
+    name: investment.name,
+    category: investment.category,
+    signedOn: investment.signedOn,
+    status: investment.status,
+    archived: investment.archivedAt !== null,
+    notes: investment.notes,
+    entryCount: investment.entryCount,
+    totals: investment.totals,
+    // From the same aggregation as the totals, so listing investments never
+    // pulls the household's whole ledger to find them.
+    linkedDocumentIds: investment.linkedDocumentIds,
+    unlinkedDocumentCount: investment.unlinkedDocumentCount,
+  };
 }
 
 function factResult(fact: memory.HydratedFact): FactResult {
@@ -714,6 +787,50 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
           args as records.ReviewQueueListArgs,
         ),
       );
+    },
+    async listInvestments({ spaceIds, ...filters }) {
+      return await read(async ({ ctx, spaces }) => {
+        const authorized = await spaces(spaceIds);
+        // An empty authorized set is an empty answer here rather than the
+        // `unauthorized` the space predicate would raise: a credential with no
+        // readable space asked a question whose answer is "none", and the
+        // tool boundary would mask the raise into "Internal error" anyway.
+        if (authorized.length === 0) return { investments: [] };
+        // One read whatever the household holds: the linked document ids come
+        // from the same aggregation as the totals, so this never loads the
+        // entries themselves.
+        const investments = await admin.listInvestments(
+          ctx,
+          authorized,
+          filters,
+        );
+        return { investments: investments.map(investmentToolRow) };
+      });
+    },
+    async getInvestment({ spaceIds, investmentId }) {
+      return await read(async ({ ctx, spaces }) => {
+        const authorized = await spaces(spaceIds);
+        if (authorized.length === 0) return null;
+        const detail = await admin.getInvestment(
+          ctx,
+          authorized,
+          investmentId,
+        );
+        if (!detail) return null;
+        return {
+          ...investmentToolRow(detail),
+          entries: detail.entries.map((entry) => ({
+            id: entry.id,
+            entryType: entry.entryType,
+            entryDate: entry.entryDate,
+            amount: entry.amount,
+            currency: entry.currency,
+            exchangeRate: entry.exchangeRate,
+            note: entry.note,
+            documentId: entry.documentId,
+          })),
+        };
+      });
     },
     async searchFacts({ spaceIds, query, limit, includeHistorical }) {
       return await read(async ({ ctx, spaces }) => {
