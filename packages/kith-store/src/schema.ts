@@ -205,6 +205,14 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "typed extraction: the document_extraction deferred-work kind and kith.document_extractions (ADM-5a)",
     url: new URL("../migrations/027_document_extraction.sql", import.meta.url),
   },
+  {
+    version: 28,
+    name: "source roots: host root alias and relative path, many roots per source account, and the per-pass report state (ADM-4b)",
+    url: new URL(
+      "../migrations/028_source_root_locations.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

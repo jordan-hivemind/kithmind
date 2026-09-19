@@ -26,6 +26,7 @@ export * from "./providerOriginalForget.js";
 export * from "./rateLimit.js";
 export * from "./rows.js";
 export * from "./scans.js";
+export * from "./sourceRoots.js";
 export * from "./status.js";
 
 /**

@@ -56,6 +56,10 @@ import {
   reconcileWorkerScan,
   sealWorkerScan,
 } from "./scans.js";
+import {
+  getWorkerSourceRoots,
+  recordWorkerSourceRootReport,
+} from "./sourceRoots.js";
 import { getWorkerSourceStatus } from "./status.js";
 import { workerCtx } from "./db.js";
 
@@ -76,6 +80,10 @@ export async function dispatchWorkerRequest(
     switch (request.operation) {
       case "source.status":
         return getWorkerSourceStatus(ctx, principal, request);
+      case "source.roots":
+        return getWorkerSourceRoots(ctx, principal, request);
+      case "source.rootReport":
+        return recordWorkerSourceRootReport(ctx, principal, request);
       case "diagnostics.status":
         return getWorkerDiagnosticsStatus(ctx, principal, request);
       case "diagnostics.heartbeat":
