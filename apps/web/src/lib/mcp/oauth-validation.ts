@@ -78,11 +78,14 @@ export const authorizationConsentSchema = authorizationRequestSchema.extend({
 /**
  * Either decision on the consent screen. A denial carries the request and no
  * grant, and is listed first so a body that says "deny" is never read as
- * consent.
+ * consent. Consent names its decision so that any other value fails both
+ * branches, rather than being stripped and read as consent.
  */
 export const authorizationDecisionSchema = z.union([
   authorizationRequestSchema.extend({ decision: z.literal("deny") }),
-  authorizationConsentSchema,
+  authorizationConsentSchema.extend({
+    decision: z.literal("approve").optional(),
+  }),
 ]);
 
 export const tokenRequestSchema = z.object({

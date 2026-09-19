@@ -262,7 +262,7 @@ export async function POST(req: Request) {
 
   // RFC 6749 section 4.1.2.1. A denial writes nothing and needs no session:
   // it grants nothing, and the redirect is one the client registered.
-  if ("decision" in request) {
+  if (request.decision === "deny") {
     return redirectWith({ error: "access_denied" });
   }
 

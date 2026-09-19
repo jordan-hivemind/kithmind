@@ -56,6 +56,7 @@ function issuedGrant() {
 function request(
   grants: Record<string, unknown>,
   redirectUri = "https://client.example.test/callback",
+  origin = "https://brain.example.test",
 ) {
   const clientId = encryptClientRegistration({
     clientName: "Synthetic client",
@@ -66,7 +67,7 @@ function request(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Origin: "https://brain.example.test",
+      Origin: origin,
     },
     body: JSON.stringify({
       clientId,
@@ -238,6 +239,44 @@ describe("OAuth space consent", () => {
     );
     expect(response.status).toBe(400);
     expect(await response.json()).not.toHaveProperty("redirect_url");
+    expect(mocks.begin).not.toHaveBeenCalled();
+  });
+
+  test.each(["denied", "approve ", "Deny", null, 1])(
+    "refuses an unknown decision %j with no code issued",
+    async (decision) => {
+      const response = await POST(
+        request({ decision, spaceIds: ["space"], capabilities: ["read"] }),
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).not.toHaveProperty("redirect_url");
+      expect(mocks.begin).not.toHaveBeenCalled();
+    },
+  );
+
+  test("an explicit approve decision is consent", async () => {
+    const response = await POST(
+      request({ decision: "approve", spaceIds: ["space"], capabilities: ["read"] }),
+    );
+    const location = new URL((await response.json()).redirect_url);
+    expect(location.searchParams.has("code")).toBe(true);
+    expect(location.searchParams.has("error")).toBe(false);
+  });
+
+  test.each([
+    { decision: "deny" },
+    { spaceIds: ["space"], capabilities: ["read"] },
+  ])("refuses an untrusted origin before anything else", async (body) => {
+    const response = await POST(
+      request(
+        body,
+        "https://client.example.test/callback",
+        "https://attacker.example.test",
+      ),
+    );
+    expect(response.status).toBe(403);
+    expect(await response.json()).not.toHaveProperty("redirect_url");
+    expect(mocks.principal).not.toHaveBeenCalled();
     expect(mocks.begin).not.toHaveBeenCalled();
   });
 });
