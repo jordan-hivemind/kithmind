@@ -23,7 +23,9 @@ import { headers } from "next/headers";
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 
+import { AttentionBadge } from "@/components/admin/attention-badge";
 import { QueryProvider } from "@/components/query-provider";
+import { loadAttentionCounts } from "@/lib/kith/attention-data";
 import { loadAdminAccess } from "@/lib/kith/sources-data";
 
 const SCREENS = [
@@ -45,9 +47,11 @@ export default async function AdminLayout({
 }: {
   children: React.ReactNode;
 }) {
-  const allowed = await loadAdminAccess((await headers()).get("cookie"));
+  const cookie = (await headers()).get("cookie");
+  const allowed = await loadAdminAccess(cookie);
   if (allowed === null) redirect("/sign-in");
   if (!allowed) notFound();
+  const attentionCounts = await loadAttentionCounts(cookie);
 
   return (
     <QueryProvider>
@@ -59,9 +63,12 @@ export default async function AdminLayout({
                 <li key={screen.href}>
                   <Link
                     href={screen.href}
-                    className="block rounded-tag px-2 py-1.5 text-gray-700 hover:bg-accent-50 hover:text-accent-700"
+                    className="flex items-center rounded-tag px-2 py-1.5 text-gray-700 hover:bg-accent-50 hover:text-accent-700"
                   >
                     {screen.label}
+                    {screen.href === "/admin/attention" ? (
+                      <AttentionBadge initial={attentionCounts} />
+                    ) : null}
                   </Link>
                 </li>
               ) : (

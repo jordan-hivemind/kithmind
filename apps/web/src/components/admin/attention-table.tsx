@@ -167,6 +167,26 @@ export function AttentionTable({
   const [beforeDate, setBeforeDate] = useState("");
   const [confirmBeforeDate, setConfirmBeforeDate] = useState(false);
 
+  // The confirm dialog below states a real count rather than "some": the
+  // action is unbounded and owner-visible. Fetched live as the date
+  // changes, from the same filter the dismiss itself will use.
+  const { data: beforeDateCount } = useQuery({
+    queryKey: ["attention-before-date-count", beforeDate, spaceId],
+    enabled: beforeDate !== "" && spaceId !== null,
+    queryFn: async (): Promise<number> => {
+      const response = await fetch("/api/kith/attention/count", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          spaceId,
+          filter: { kind: "beforeDate", beforeDate },
+        }),
+      });
+      if (!response.ok) throw new Error("count fetch failed");
+      return ((await response.json()) as { count: number }).count;
+    },
+  });
+
   const queryKey = useMemo(
     () => [...ATTENTION_KEY, { showInfo, showEverything }],
     [showInfo, showEverything],
@@ -479,7 +499,7 @@ export function AttentionTable({
               value={beforeDate}
               onChange={(event) => setBeforeDate(event.target.value)}
               className={`${inputClass} w-32`}
-              aria-label="Dismiss everything before"
+              aria-label="Documents dated before"
             />
             <button
               type="button"
@@ -487,7 +507,7 @@ export function AttentionTable({
               disabled={beforeDate === "" || spaceId === null}
               onClick={() => setConfirmBeforeDate(true)}
             >
-              Dismiss everything before
+              Documents dated before
             </button>
           </>
         }
@@ -519,11 +539,13 @@ export function AttentionTable({
           <AlertDialog.Overlay className="fixed inset-0 z-50 bg-gray-900/20" />
           <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-tag border border-gray-200 bg-white p-4 shadow-xl">
             <AlertDialog.Title className="text-sm font-medium text-gray-900">
-              Dismiss everything before {beforeDate}?
+              Dismiss {beforeDateCount ?? "…"} item
+              {beforeDateCount === 1 ? "" : "s"} for documents dated before {beforeDate}?
             </AlertDialog.Title>
             <AlertDialog.Description className="mt-1 text-xs text-gray-600">
-              This can&apos;t be undone. Every open item created before this date, of any
-              detector, is marked not worth backfilling.
+              This can&apos;t be undone. Every open item for a document dated before
+              this date -- by its own extracted date, or its file's modified date
+              when the document states none -- is marked not worth backfilling.
             </AlertDialog.Description>
             <div className="mt-3 flex justify-end gap-2">
               <AlertDialog.Cancel className={buttonClass}>Cancel</AlertDialog.Cancel>
