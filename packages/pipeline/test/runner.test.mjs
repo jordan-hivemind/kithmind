@@ -5781,3 +5781,613 @@ test("a plan under a new parser fingerprint needs work while old rows are retain
     await rm(f.setup.base, { recursive: true, force: true });
   }
 });
+
+// ADM-4a. Identity by the provider's stable file id.
+//
+// The pass is driven only as far as it needs to be: `startCycle` has already
+// decided every identity question by the time `scan.begin` is answered, and
+// the entries the server would see are built one step later. Stopping at the
+// chosen step keeps each case about identity and nothing else, and the
+// terminal checkpoint still records the bindings the next pass would read.
+
+function identityTransport({ failAt, entries, requests }) {
+  return {
+    async call(request) {
+      requests.push(request);
+      if (request.operation === "source.status") {
+        return {
+          operation: "source.status",
+          sourceAccountId: "source",
+          inventoryEpoch: 1,
+          completedInventoryEpoch: 1,
+          manifestVersion: 1,
+          enumeration: {
+            state: "complete",
+            scanId: "old_scan",
+            completedAt: 1,
+          },
+          processing: { state: "not_assessed" },
+          recordCoverage: "not_established",
+        };
+      }
+      if (request.operation === "scan.begin") {
+        if (failAt === "begin")
+          return { error: { code: "source_unavailable" } };
+        return {
+          operation: "scan.begin",
+          scanId: "scan_identity",
+          inventoryEpoch: 2,
+          manifestVersion: 2,
+          state: "open",
+          reused: false,
+        };
+      }
+      if (request.operation === "scan.appendPage") {
+        entries.push(...request.entries);
+        return { error: { code: "source_unavailable" } };
+      }
+      throw new Error(`unexpected operation ${request.operation}`);
+    },
+  };
+}
+
+function terminalCheckpoint(bindings) {
+  return {
+    version: 1,
+    phase: "terminal",
+    outcome: "complete",
+    credentialSessionActive: false,
+    bindings,
+    scanned: bindings.length,
+    published: bindings.length,
+  };
+}
+
+/**
+ * One pass over `setup`'s root with a stubbed provider. `ids` maps a relative
+ * path to the id the provider answers with; `lookupFailure` makes the provider
+ * unreachable instead. `asked` records exactly which paths were looked up, so
+ * a test can assert that a steady pass asks nothing.
+ */
+async function identityPass({
+  setup,
+  bindings,
+  ids = {},
+  lookupFailure,
+  failAt = "append",
+}) {
+  const entries = [];
+  const requests = [];
+  const asked = [];
+  const journal = await openJournal(
+    setup.journalDir,
+    terminalCheckpoint(bindings),
+  );
+  try {
+    const runner = new PipelineRunner(
+      setup.config,
+      journal,
+      identityTransport({ failAt, entries, requests }),
+      undefined,
+      {},
+      {
+        rootAlias: "fixture",
+        async lookup(relativePaths) {
+          asked.push(...relativePaths);
+          if (lookupFailure) throw new Error(lookupFailure);
+          return new Map(
+            relativePaths.flatMap((path) =>
+              ids[path] === undefined ? [] : [[path, ids[path]]],
+            ),
+          );
+        },
+      },
+    );
+    const result = await runner.runSafely();
+    const begin = requests.find((row) => row.operation === "scan.begin");
+    return {
+      result,
+      mode: begin?.mode,
+      entries,
+      asked,
+      bindings: journal.checkpoint.bindings,
+    };
+  } finally {
+    await journal.close();
+  }
+}
+
+function journalTerminal(bindings) {
+  return { ...terminalCheckpoint(bindings), scanned: bindings.length };
+}
+
+/** The binding for one path, by path, for an assertion that names the path. */
+function bindingAt(bindings, relativePath) {
+  return bindings.find((row) => row.relativePath === relativePath);
+}
+
+test("a renamed file keeps its identity through the provider file id", async () => {
+  const setup = await fixture(0);
+  const externalId = randomUUID();
+  await writeFile(join(setup.root, "renamed.txt"), "synthetic");
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "original.txt",
+          externalId,
+          providerFileId: "id:file_a",
+        },
+      ],
+      ids: { "renamed.txt": "id:file_a" },
+    });
+    assert.equal(pass.mode, "normal", "a rename is not an identity failure");
+    assert.deepEqual(pass.asked, ["renamed.txt"], "only the unknown path");
+    assert.equal(pass.entries.length, 1);
+    assert.equal(pass.entries[0].externalId, externalId);
+    assert.equal(pass.entries[0].uri, "fs://fixture/renamed.txt");
+    assert.deepEqual(pass.bindings, [
+      {
+        rootAlias: "fixture",
+        relativePath: "renamed.txt",
+        externalId,
+        providerFileId: "id:file_a",
+      },
+    ]);
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("renaming a parent folder moves every file under it without losing one", async () => {
+  const setup = await fixture(0);
+  const externalIds = [randomUUID(), randomUUID(), randomUUID()];
+  await mkdir(join(setup.root, "statements 2026"), { mode: 0o700 });
+  for (let index = 0; index < externalIds.length; index += 1) {
+    await writeFile(
+      join(setup.root, "statements 2026", `page-${index}.txt`),
+      `synthetic-${index}`,
+      { mode: 0o600 },
+    );
+  }
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: externalIds.map((externalId, index) => ({
+        rootAlias: "fixture",
+        relativePath: `statements/page-${index}.txt`,
+        externalId,
+        providerFileId: `id:file_${index}`,
+      })),
+      ids: Object.fromEntries(
+        externalIds.map((_, index) => [
+          `statements 2026/page-${index}.txt`,
+          `id:file_${index}`,
+        ]),
+      ),
+    });
+    assert.equal(pass.mode, "normal");
+    assert.deepEqual(
+      pass.entries.map((entry) => entry.externalId),
+      externalIds,
+    );
+    assert.deepEqual(
+      pass.bindings.map((row) => row.relativePath),
+      externalIds.map((_, index) => `statements 2026/page-${index}.txt`),
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a file moved between two subtrees of one root keeps its identity", async () => {
+  const setup = await fixture(0);
+  const moved = randomUUID();
+  const stayed = randomUUID();
+  await mkdir(join(setup.root, "inbox"), { mode: 0o700 });
+  await mkdir(join(setup.root, "filed"), { mode: 0o700 });
+  await writeFile(join(setup.root, "filed", "moved.txt"), "synthetic-moved");
+  await writeFile(join(setup.root, "inbox", "stayed.txt"), "synthetic-stayed");
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "inbox/moved.txt",
+          externalId: moved,
+          providerFileId: "id:moved",
+        },
+        {
+          rootAlias: "fixture",
+          relativePath: "inbox/stayed.txt",
+          externalId: stayed,
+          providerFileId: "id:stayed",
+        },
+      ],
+      ids: { "filed/moved.txt": "id:moved" },
+    });
+    assert.equal(pass.mode, "normal");
+    assert.deepEqual(
+      pass.asked,
+      ["filed/moved.txt"],
+      "the file that did not move is not looked up again",
+    );
+    assert.equal(bindingAt(pass.bindings, "filed/moved.txt").externalId, moved);
+    assert.equal(
+      bindingAt(pass.bindings, "inbox/stayed.txt").externalId,
+      stayed,
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a copy is a second item: same bytes, a different provider file id", async () => {
+  const setup = await fixture(0);
+  const externalId = randomUUID();
+  await writeFile(join(setup.root, "original.txt"), "synthetic");
+  await writeFile(join(setup.root, "copy.txt"), "synthetic");
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "original.txt",
+          externalId,
+          providerFileId: "id:file_a",
+        },
+      ],
+      ids: { "copy.txt": "id:file_b" },
+    });
+    assert.equal(pass.mode, "normal", "nothing went missing, so no recovery");
+    assert.equal(pass.entries.length, 2);
+    const [copy, original] = pass.entries;
+    assert.equal(original.uri, "fs://fixture/original.txt");
+    assert.equal(original.externalId, externalId);
+    assert.equal(copy.uri, "fs://fixture/copy.txt");
+    assert.notEqual(copy.externalId, externalId);
+    assert.equal(
+      copy.content.sha256,
+      original.content.sha256,
+      "the duplicate is a duplicate; joining the two is the UI's job",
+    );
+    assert.equal(pass.bindings.length, 2);
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("an unreachable provider falls back to path identity without failing the pass", async () => {
+  const setup = await fixture(0);
+  const externalId = randomUUID();
+  await writeFile(join(setup.root, "renamed.txt"), "synthetic");
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "original.txt",
+          externalId,
+          providerFileId: "id:file_a",
+        },
+      ],
+      lookupFailure: "provider unreachable",
+      failAt: "begin",
+    });
+    assert.equal(
+      pass.mode,
+      "identity_recovery",
+      "with no id to go on, a rename is exactly what it was before",
+    );
+    assert.equal(pass.result.state, "failed");
+    assert.equal(
+      bindingAt(pass.bindings, "original.txt").externalId,
+      externalId,
+      "and nothing guessed a new identity for the remembered file",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a journal written before provider ids is upgraded in place, then survives a rename", async () => {
+  const setup = await fixture(0);
+  const externalId = randomUUID();
+  await writeFile(join(setup.root, "original.txt"), "synthetic");
+  try {
+    const upgrade = await identityPass({
+      setup,
+      // The old shape: a path and an external id, and nothing else.
+      bindings: [
+        { rootAlias: "fixture", relativePath: "original.txt", externalId },
+      ],
+      ids: { "original.txt": "id:file_a" },
+    });
+    assert.equal(upgrade.mode, "normal", "an upgrade is not a re-ingest");
+    assert.equal(upgrade.entries.length, 1);
+    assert.equal(
+      upgrade.entries[0].externalId,
+      externalId,
+      "the file keeps the identity it already had",
+    );
+    assert.deepEqual(upgrade.bindings, [
+      {
+        rootAlias: "fixture",
+        relativePath: "original.txt",
+        externalId,
+        providerFileId: "id:file_a",
+      },
+    ]);
+
+    // Nothing changed: the upgraded journal asks the provider nothing.
+    const steady = await identityPass({
+      setup,
+      bindings: upgrade.bindings,
+      ids: { "original.txt": "id:file_a" },
+    });
+    assert.deepEqual(steady.asked, []);
+
+    // And now the rename the upgrade bought.
+    await rename(
+      join(setup.root, "original.txt"),
+      join(setup.root, "renamed.txt"),
+    );
+    const renamed = await identityPass({
+      setup,
+      bindings: steady.bindings,
+      ids: { "renamed.txt": "id:file_a" },
+    });
+    assert.equal(renamed.mode, "normal");
+    assert.equal(renamed.entries[0].externalId, externalId);
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a file that took a renamed file's place does not inherit its identity", async () => {
+  const setup = await fixture(0);
+  const externalId = randomUUID();
+  await writeFile(join(setup.root, "renamed.txt"), "synthetic");
+  await writeFile(join(setup.root, "original.txt"), "a different document");
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "original.txt",
+          externalId,
+          providerFileId: "id:file_a",
+        },
+      ],
+      ids: { "renamed.txt": "id:file_a" },
+    });
+    assert.equal(
+      bindingAt(pass.bindings, "renamed.txt").externalId,
+      externalId,
+      "the moved file is still itself",
+    );
+    const replacement = bindingAt(pass.bindings, "original.txt");
+    assert.notEqual(replacement.externalId, externalId);
+    assert.equal(
+      replacement.providerFileId,
+      undefined,
+      "and the id the old path remembered went with the file, not the path",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("two watched paths that resolve to one provider file both keep path identity", async () => {
+  const setup = await fixture(0);
+  // A provider that normalizes or folds case answers for two watched paths
+  // with one file id: the same name in NFC and NFD, or a case-only twin. This
+  // filesystem collapses both of those into one file, so the collision is
+  // staged with two plainly distinct paths instead. What is under test is the
+  // runner's response to one id arriving on two plans, not how it arose.
+  await mkdir(join(setup.root, "a"), { mode: 0o700 });
+  await mkdir(join(setup.root, "b"), { mode: 0o700 });
+  await writeFile(join(setup.root, "a", "statement.txt"), "synthetic-a");
+  await writeFile(join(setup.root, "b", "statement.txt"), "synthetic-b");
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: [],
+      ids: {
+        "a/statement.txt": "id:one_file",
+        "b/statement.txt": "id:one_file",
+      },
+    });
+    assert.equal(
+      pass.entries.length,
+      2,
+      "both files are still their own entry",
+    );
+    assert.notEqual(
+      pass.entries[0].externalId,
+      pass.entries[1].externalId,
+      "and each one has its own identity",
+    );
+    for (const binding of pass.bindings) {
+      assert.equal(
+        binding.providerFileId,
+        undefined,
+        "an id neither path solely owns is kept by neither",
+      );
+    }
+    // The journal has to accept what the pass wrote.
+    assert.equal(
+      parseRunnerCheckpoint(journalTerminal(pass.bindings)).bindings.length,
+      2,
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a journal naming one provider file twice loads without its ids rather than refusing", async () => {
+  const left = randomUUID();
+  const right = randomUUID();
+  const checkpoint = parseRunnerCheckpoint({
+    version: 1,
+    phase: "terminal",
+    outcome: "complete",
+    credentialSessionActive: false,
+    scanned: 2,
+    published: 2,
+    bindings: [
+      {
+        rootAlias: "fixture",
+        relativePath: "one.txt",
+        externalId: left,
+        providerFileId: "id:same",
+      },
+      {
+        rootAlias: "fixture",
+        relativePath: "two.txt",
+        externalId: right,
+        providerFileId: "id:same",
+      },
+    ],
+  });
+  assert.deepEqual(checkpoint.bindings, [
+    { rootAlias: "fixture", relativePath: "one.txt", externalId: left },
+    { rootAlias: "fixture", relativePath: "two.txt", externalId: right },
+  ]);
+  // The identity itself still fails closed.
+  assert.throws(() =>
+    parseRunnerCheckpoint({
+      version: 1,
+      phase: "terminal",
+      outcome: "complete",
+      credentialSessionActive: false,
+      scanned: 2,
+      published: 2,
+      bindings: [
+        { rootAlias: "fixture", relativePath: "one.txt", externalId: left },
+        { rootAlias: "fixture", relativePath: "one.txt", externalId: right },
+      ],
+    }),
+  );
+});
+
+test("a different file at a vacated path inherits it, exactly as path identity does", async () => {
+  const setup = await fixture(0);
+  const externalId = randomUUID();
+  // The remembered file has moved out of every watched root, or has not synced
+  // yet, so no lookup can see it. Something else now sits at its path.
+  await writeFile(join(setup.root, "statement.txt"), "a different document");
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "statement.txt",
+          externalId,
+          providerFileId: "id:moved_away",
+        },
+      ],
+      // Even if the provider would answer for this path, it is not asked: the
+      // path is remembered and already carries an id.
+      ids: { "statement.txt": "id:the_newcomer" },
+    });
+    assert.deepEqual(pass.asked, []);
+    assert.equal(pass.mode, "normal");
+    assert.equal(
+      pass.entries[0].externalId,
+      externalId,
+      // This is the documented limit of the fallback and it is unchanged from
+      // path identity: the new bytes become a new revision of the same item
+      // rather than a new item. Provider ids narrow this rather than widen it
+      // -- see the test above, where the moved file is still inside the root
+      // and the newcomer is therefore refused the identity.
+      "the newcomer inherits the path's identity, as it does on the old build",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a folder rename larger than any batch resolves in one pass, upgrades last", async () => {
+  const setup = await fixture(0);
+  const count = 70;
+  const moved = [];
+  const settled = [];
+  await mkdir(join(setup.root, "moved"), { mode: 0o700 });
+  for (let index = 0; index < count; index += 1) {
+    moved.push(randomUUID());
+    await writeFile(
+      join(setup.root, "moved", `page-${index}.txt`),
+      `synthetic-${index}`,
+      { mode: 0o600 },
+    );
+  }
+  // Two files that did not move and have no id yet: the lazy upgrade, which
+  // any later pass can finish and which must not be asked about first.
+  for (let index = 0; index < 2; index += 1) {
+    settled.push(randomUUID());
+    await writeFile(join(setup.root, `settled-${index}.txt`), "synthetic", {
+      mode: 0o600,
+    });
+  }
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: [
+        ...moved.map((externalId, index) => ({
+          rootAlias: "fixture",
+          relativePath: `page-${index}.txt`,
+          externalId,
+          providerFileId: `id:file_${index}`,
+        })),
+        ...settled.map((externalId, index) => ({
+          rootAlias: "fixture",
+          relativePath: `settled-${index}.txt`,
+          externalId,
+        })),
+      ],
+      ids: {
+        ...Object.fromEntries(
+          moved.map((_, index) => [
+            `moved/page-${index}.txt`,
+            `id:file_${index}`,
+          ]),
+        ),
+        ...Object.fromEntries(
+          settled.map((_, index) => [
+            `settled-${index}.txt`,
+            `id:settled_${index}`,
+          ]),
+        ),
+      },
+    });
+    assert.equal(
+      pass.mode,
+      "normal",
+      "a rename bigger than one batch must not fall into identity recovery",
+    );
+    assert.deepEqual(
+      pass.asked.slice(0, count).sort(),
+      moved.map((_, index) => `moved/page-${index}.txt`).sort(),
+      "every rename candidate is asked about before any lazy upgrade",
+    );
+    const after = pass.bindings.filter((row) =>
+      row.relativePath.startsWith("moved/"),
+    );
+    assert.equal(after.length, count);
+    assert.deepEqual(
+      after.map((row) => row.externalId).sort(),
+      [...moved].sort(),
+      "and every one of them followed its identity in this one pass",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});

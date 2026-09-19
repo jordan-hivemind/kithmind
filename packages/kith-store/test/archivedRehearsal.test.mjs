@@ -21,6 +21,8 @@
 
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { mkdir, rename, utimes } from "node:fs/promises";
+import { join } from "node:path";
 import test from "node:test";
 
 import { createKithPool, newKithId } from "../dist/index.js";
@@ -581,5 +583,131 @@ test(
       assert.ok(Number(row.attempts) <= 2, `attempts: ${row.attempts}`);
     }
     assert.equal(await assessment(f), "complete");
+  },
+);
+
+/** Every live item of this source, with the path the server last recorded. */
+async function sourceItems(f) {
+  const { rows } = await f.client.query(
+    `SELECT i.id, i.external_id, i.uri, i.lifecycle,
+            (SELECT count(*) FROM kith.source_alias_digests a
+              WHERE a.source_item_id = i.id) AS aliases
+       FROM kith.source_items i
+      WHERE i.source_account_id = $1
+      ORDER BY i.created_at, i.id`,
+    [f.sourceAccountId],
+  );
+  return rows;
+}
+
+async function reviewEntries(f) {
+  const { rows } = await f.client.query(
+    `SELECT state, issue_code FROM kith.worker_scan_entries
+      WHERE source_account_id = $1 AND issue_code IS NOT NULL
+      ORDER BY created_at, id`,
+    [f.sourceAccountId],
+  );
+  return rows;
+}
+
+// ADM-4a. The claim this slice exists for, against the real handlers and a
+// real database: renaming a file, and renaming the folder above it, leaves the
+// same documents behind. Nothing is re-ingested, nothing needs review.
+test(
+  "a renamed file and a renamed folder keep their documents",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const transport = inProcessWorkerTransport(f.pool, {
+      userId: f.userId,
+      credentialId: f.credential.id,
+    });
+    const workspace = await rehearsalWorkspace(t, { documents: 2 });
+    const dropbox = installFakeDropbox(t, workspace);
+    const runtime = rehearsalProfile();
+    const pass = () => ({
+      config: rehearsalConfig({
+        endpoint: "http://127.0.0.1:0/api/worker",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        workspace,
+        runtime,
+        provider: true,
+      }),
+      credential: f.credential.rawKey,
+      transport,
+      runtime,
+    });
+
+    const first = await rehearsalUntilSettled(pass());
+    assert.equal(first.at(-1).state, "complete", JSON.stringify(first));
+    const before = await sourceItems(f);
+    assert.equal(before.length, 2);
+    const identities = before.map((row) => row.external_id).sort();
+
+    // First the general case a rename is one instance of: inventory metadata
+    // changed, the bytes did not. A sync client does this on its own.
+    const when = new Date(Date.now() + 120_000);
+    await utimes(join(workspace.root, "document-0.pdf"), when, when);
+    const touched = await rehearsalUntilSettled(pass());
+    assert.deepEqual(
+      touched,
+      [{ state: "complete", scanned: 2, published: 0 }],
+      `a new modification time publishes nothing: ${JSON.stringify(touched)}`,
+    );
+
+    // One file renamed in place.
+    await rename(
+      join(workspace.root, "document-0.pdf"),
+      join(workspace.root, "bank statement.pdf"),
+    );
+    dropbox.rename("document-0.pdf", "bank statement.pdf");
+    const renamed = await rehearsalUntilSettled(pass());
+    assert.deepEqual(
+      renamed,
+      [{ state: "complete", scanned: 2, published: 0 }],
+      `a rename publishes nothing: ${JSON.stringify(renamed)}`,
+    );
+
+    // And the folder above both files renamed, which moves every file at once.
+    await mkdir(join(workspace.root, "filed 2026"), { mode: 0o700 });
+    for (const [from, to] of [
+      ["bank statement.pdf", "filed 2026/bank statement.pdf"],
+      ["document-1.pdf", "filed 2026/document-1.pdf"],
+    ]) {
+      await rename(join(workspace.root, from), join(workspace.root, to));
+      dropbox.rename(from, to);
+    }
+    const moved = await rehearsalUntilSettled(pass());
+    assert.deepEqual(
+      moved,
+      [{ state: "complete", scanned: 2, published: 0 }],
+      `a folder rename publishes nothing: ${JSON.stringify(moved)}`,
+    );
+
+    const after = await sourceItems(f);
+    assert.equal(after.length, 2, "no second document was created");
+    assert.deepEqual(
+      after.map((row) => row.external_id).sort(),
+      identities,
+      "the same two identities",
+    );
+    for (const row of after) assert.equal(row.lifecycle, "available");
+    assert.deepEqual(
+      after.map((row) => Number(row.aliases)).sort(),
+      // One file was seen at three paths and the other at two: every path an
+      // item has been seen at is an alias of that one item.
+      [2, 3],
+    );
+    assert.deepEqual(
+      await reviewEntries(f),
+      [],
+      "and nothing was sent for identity review",
+    );
+    assert.deepEqual(
+      (await activeGenerations(f)).map((row) => row.publication_state),
+      ["active", "active"],
+      "both documents are still the published ones",
+    );
   },
 );

@@ -53,10 +53,13 @@ const PROVIDER_ROOT_PATH = "/rehearsal root";
 const sha256Hex = (value) => createHash("sha256").update(value).digest("hex");
 
 /**
- * Stands in for the two Dropbox API routes `verifyDropboxOriginal` reads, and
- * nothing else: the worker transport here is in process and never fetches.
- * Every rehearsal file is far below one 4 MiB block, so the Dropbox content
- * hash is the hash of the one block hash.
+ * Stands in for the two Dropbox API routes `verifyDropboxOriginal` and
+ * `lookupDropboxFileIds` read, and nothing else: the worker transport here is
+ * in process and never fetches. Every rehearsal file is far below one 4 MiB
+ * block, so the Dropbox content hash is the hash of the one block hash.
+ *
+ * The returned handle renames a file the way the provider does: a new path,
+ * the same id. ADM-4a is exactly the claim that the watcher follows the id.
  */
 export function installFakeDropbox(t, workspace) {
   const files = workspace.files.map((file, index) => ({
@@ -81,12 +84,23 @@ export function installFakeDropbox(t, workspace) {
     const found = `${url}`.endsWith("/users/get_current_account")
       ? { account_id: PROVIDER_ACCOUNT_ID, disabled: false }
       : [root, ...files].find(
-          (row) => row.id === body.path || row.path_lower === body.path,
+          (row) =>
+            row.id === body.path ||
+            row.path_lower === `${body.path}`.toLowerCase(),
         );
     return new Response(JSON.stringify(found ?? { error: "not_found" }), {
       status: found ? 200 : 409,
       headers: { "content-type": "application/json" },
     });
+  };
+  return {
+    rename(fromRelativePath, toRelativePath) {
+      const file = files.find(
+        (row) => row.path_lower === `${PROVIDER_ROOT_PATH}/${fromRelativePath}`,
+      );
+      if (!file) throw new Error(`no fake provider file ${fromRelativePath}`);
+      file.path_lower = `${PROVIDER_ROOT_PATH}/${toRelativePath}`;
+    },
   };
 }
 

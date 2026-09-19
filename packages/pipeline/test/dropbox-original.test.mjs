@@ -10,7 +10,10 @@ import {
   verifyDropboxCredentialConfig,
   verifyDropboxDirectoryBinding,
 } from "../dist/dropboxCredentials.js";
-import { hashDropboxCapture } from "../dist/dropboxOriginal.js";
+import {
+  hashDropboxCapture,
+  lookupDropboxFileIds,
+} from "../dist/dropboxOriginal.js";
 import { verifyDropboxOriginal } from "../dist/dropboxOriginal.js";
 
 const sha = (b) => createHash("sha256").update(b).digest("hex");
@@ -324,6 +327,77 @@ test("rejects provider substitutions, mutation, oversized responses and errors w
       (error) =>
         String(error).includes("metadata request failed") &&
         !String(error).includes("TOKEN_SENTINEL"),
+    );
+  } finally {
+    globalThis.fetch = oldFetch;
+    await rm(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("looks up file ids by path and skips what the provider will not answer for", async () => {
+  const f = await fixture();
+  const account = "dbid:account_1";
+  const rows = {
+    [id]: { ".tag": "folder", id, path_lower: "/root" },
+    "/root/one.pdf": {
+      ".tag": "file",
+      id: "id:file_1",
+      path_lower: "/root/one.pdf",
+    },
+    // A folder, not a file: it is not an item and must not be mapped.
+    "/root/sub": {
+      ".tag": "folder",
+      id: "id:folder_1",
+      path_lower: "/root/sub",
+    },
+  };
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body ?? "null");
+    if (`${url}`.endsWith("/users/get_current_account")) {
+      return Response.json({ account_id: account, disabled: false });
+    }
+    const found = rows[body.path];
+    return found
+      ? Response.json(found)
+      : new Response(JSON.stringify({ error: "not_found" }), { status: 409 });
+  };
+  try {
+    const ids = await lookupDropboxFileIds(
+      {
+        credentials: f.config,
+        refreshPath: "root",
+        providerAccountIdHash: sha(account),
+        providerRootDirectoryIdHash: sha(id),
+        providerRootDirectoryId: id,
+      },
+      ["one.pdf", "sub", "gone.pdf", "../escape.pdf"],
+    );
+    assert.deepEqual([...ids], [["one.pdf", "id:file_1"]]);
+  } finally {
+    globalThis.fetch = oldFetch;
+    await rm(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("a lookup refuses a mismatched account rather than answering", async () => {
+  const f = await fixture();
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    Response.json({ account_id: "dbid:someone_else", disabled: false });
+  try {
+    await assert.rejects(
+      lookupDropboxFileIds(
+        {
+          credentials: f.config,
+          refreshPath: "root",
+          providerAccountIdHash: sha("dbid:account_1"),
+          providerRootDirectoryIdHash: sha(id),
+          providerRootDirectoryId: id,
+        },
+        ["one.pdf"],
+      ),
+      /provider account mismatch/,
     );
   } finally {
     globalThis.fetch = oldFetch;
