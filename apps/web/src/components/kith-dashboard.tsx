@@ -109,6 +109,7 @@ export function KithDashboard({ stats, recent }: DashboardData) {
         id: "createdAt",
         accessorKey: "createdAt",
         header: "Created",
+        meta: { nowrap: true },
         cell: ({ row }) => (
           <span className="text-gray-600 tabular-nums">
             {shortDate(row.original.createdAt)}
@@ -132,6 +133,7 @@ export function KithDashboard({ stats, recent }: DashboardData) {
       <KithQuickCapture />
       <h2 className="mt-6 mb-2 text-sm font-semibold">Recent thoughts</h2>
       <DataTable
+        id="dashboard-recent-thoughts"
         data={rows}
         columns={columns}
         filterColumns={["type"]}

@@ -170,6 +170,7 @@ export function KithFamilySpaceManager({ overview: server }: { overview: FamilyO
 
       <div className="mb-8">
         <DataTable
+          id="spaces-list"
           data={spaces}
           columns={columns}
           actions={actions}
@@ -403,6 +404,7 @@ function SpaceDetail({
       {
         label: "Remove",
         disabled: isOwnerRow,
+        danger: true,
         onSelect: (member) => remove.mutate(member.membershipId),
       },
     ];
@@ -443,6 +445,7 @@ function SpaceDetail({
         id: "expiresAt",
         accessorKey: "expiresAt",
         header: "Expires",
+        meta: { nowrap: true },
         cell: ({ row }) => (
           <span className="text-gray-600 tabular-nums">{shortDate(row.original.expiresAt)}</span>
         ),
@@ -460,6 +463,7 @@ function SpaceDetail({
       },
       {
         label: "Revoke",
+        danger: true,
         onSelect: (invitation) => revoke.mutate(invitation.invitationId),
       },
     ],
@@ -537,6 +541,7 @@ function SpaceDetail({
         )}
         <h3 className="mb-1 text-xs font-semibold text-gray-700">Members</h3>
         <DataTable
+          id="spaces-members"
           data={members}
           columns={memberColumns}
           actions={memberActions}
@@ -549,6 +554,7 @@ function SpaceDetail({
           <>
             <h3 className="mt-6 mb-1 text-xs font-semibold text-gray-700">Invitations</h3>
             <DataTable
+              id="spaces-invitations"
               data={invitations}
               columns={invitationColumns}
               actions={invitationActions}

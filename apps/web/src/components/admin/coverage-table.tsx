@@ -57,24 +57,30 @@ export function CoverageTable({
         id: "sources",
         accessorKey: "sources",
         header: "Sources",
+        meta: { nowrap: true },
         cell: ({ row }) => number(row.original.sources),
       },
       {
         id: "documents",
         accessorKey: "documents",
         header: "Documents",
+        meta: { nowrap: true },
         cell: ({ row }) => number(row.original.documents),
       },
       {
         id: "records",
         accessorKey: "records",
         header: "Records",
+        meta: { nowrap: true },
         cell: ({ row }) => number(row.original.records),
       },
       {
         id: "range",
         accessorFn: (row) => row.from ?? "",
         header: "Dates",
+        meta: { nowrap: true },
+        size: 180,
+        minSize: 110,
         cell: ({ row }) => (
           <span className="tabular-nums text-gray-600">
             {row.original.from === null
@@ -87,6 +93,7 @@ export function CoverageTable({
         id: "gaps",
         accessorKey: "gaps",
         header: "Gaps",
+        meta: { nowrap: true },
         cell: ({ row }) => (
           <Detail
             label={number(row.original.gaps)}
@@ -118,6 +125,7 @@ export function CoverageTable({
         </div>
       ) : null}
       <DataTable
+        id="admin-coverage"
         data={data.areas}
         columns={columns}
         filterColumns={["status"]}

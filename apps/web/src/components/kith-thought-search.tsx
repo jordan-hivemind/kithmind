@@ -68,6 +68,7 @@ const columns: ColumnDef<ThoughtRow, unknown>[] = [
     id: "createdAt",
     accessorKey: "createdAt",
     header: "Created",
+    meta: { nowrap: true },
     cell: ({ row }) => (
       <span className="text-gray-600 tabular-nums">{shortDate(row.original.createdAt)}</span>
     ),
@@ -127,6 +128,7 @@ export function KithThoughtSearch({
 
   return (
     <DataTable
+      id="browse-thoughts"
       data={rows}
       columns={columns}
       filterColumns={["type"]}

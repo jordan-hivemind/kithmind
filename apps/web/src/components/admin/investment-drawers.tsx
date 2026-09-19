@@ -170,6 +170,7 @@ export function EntryDrawer({
       open={open}
       onOpenChange={onOpenChange}
       title={editingEntryId === null ? "Add entry" : "Edit entry"}
+      dirty={JSON.stringify(draft) !== JSON.stringify(initial)}
     >
       <form
         className="flex flex-col gap-3"
@@ -397,6 +398,7 @@ export function InvestmentDrawer({
       open={open}
       onOpenChange={onOpenChange}
       title={editingId === null ? "Add investment" : "Edit investment"}
+      dirty={JSON.stringify(draft) !== JSON.stringify(initial)}
     >
       <form
         className="flex flex-col gap-3"
