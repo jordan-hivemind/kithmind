@@ -8,15 +8,35 @@
 // Quick Capture posts to `POST /api/kith/thoughts/capture`
 // (`lib/kith/capture.ts`), the same model-backed admission gate the MCP
 // `capture_thought` tool runs.
+//
+// Editing and deleting a recent thought are `useOptimisticMutation` against
+// this same `["dashboard"]` cache: `apply` patches `recent` at once, a
+// failure rolls it back and shows a toast, and either way the mutation
+// settling -- and the live change feed, once the write lands -- resyncs from
+// the server render.
 
+import { type memory } from "@repo/kith-store";
 import { type ColumnDef } from "@tanstack/react-table";
-import { useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 
 import { KithQuickCapture } from "@/components/kith-quick-capture";
+import {
+  type ThoughtDraft,
+  ThoughtDrawer,
+} from "@/components/kith-thought-drawer";
 import { PageHeader } from "@/components/ui/controls";
-import { DataTable, Detail, Tag } from "@/components/ui/data-table";
+import {
+  DataTable,
+  Detail,
+  type RowAction,
+  Tag,
+} from "@/components/ui/data-table";
 import { label, shortDate } from "@/lib/kith/format";
-import { useServerData } from "@/lib/kith/use-server-data";
+import { mutateJson } from "@/lib/kith/optimistic";
+import {
+  useOptimisticMutation,
+  useServerData,
+} from "@/lib/kith/use-server-data";
 
 type DashboardStats = {
   totalFacts: number;
@@ -52,19 +72,79 @@ type Row = {
   createdAt: number;
 };
 
+type EditVars = {
+  id: string;
+  content: string;
+  type: memory.ThoughtType;
+  topics: string[];
+  people: string[];
+};
+
 const LIVE_TABLES = ["thoughts", "facts"] as const;
+const DASHBOARD_KEY = ["dashboard"];
 
 function Stat({ value, name }: { value: number; name: string }) {
   return (
     <div className="min-w-24 rounded-tag border border-gray-200 px-3 py-2">
-      <div className="text-lg leading-6 font-semibold tabular-nums">{value}</div>
+      <div className="text-lg leading-6 font-semibold tabular-nums">
+        {value}
+      </div>
       <div className="text-[11px] text-gray-600">{name}</div>
     </div>
   );
 }
 
 export function KithDashboard({ stats, recent }: DashboardData) {
-  const data = useServerData<DashboardData>(["dashboard"], { stats, recent }, LIVE_TABLES);
+  const data = useServerData<DashboardData>(
+    DASHBOARD_KEY,
+    { stats, recent },
+    LIVE_TABLES,
+  );
+  const [editing, setEditing] = useState<{
+    id: string;
+    draft: ThoughtDraft;
+  } | null>(null);
+
+  const edit = useOptimisticMutation<DashboardData, EditVars>({
+    queryKey: DASHBOARD_KEY,
+    mutationFn: (vars) =>
+      mutateJson(`/api/kith/thoughts/${vars.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          content: vars.content,
+          type: vars.type,
+          topics: vars.topics,
+          people: vars.people,
+        }),
+      }),
+    apply: (current, vars) => ({
+      ...current,
+      recent: current.recent.map((thought) =>
+        thought.id === vars.id
+          ? {
+              ...thought,
+              content: vars.content,
+              metadata: {
+                ...thought.metadata,
+                type: vars.type,
+                topics: vars.topics,
+                people: vars.people,
+              },
+            }
+          : thought,
+      ),
+    }),
+  });
+
+  const remove = useOptimisticMutation<DashboardData, string>({
+    queryKey: DASHBOARD_KEY,
+    mutationFn: (id) =>
+      mutateJson(`/api/kith/thoughts/${id}`, { method: "DELETE" }),
+    apply: (current, id) => ({
+      ...current,
+      recent: current.recent.filter((thought) => thought.id !== id),
+    }),
+  });
 
   const rows = useMemo<Row[]>(
     () =>
@@ -120,6 +200,40 @@ export function KithDashboard({ stats, recent }: DashboardData) {
     [],
   );
 
+  // Shared by the kebab's Edit item and clicking the row.
+  const openEdit = useCallback(
+    (row: Row) => {
+      const thought = data.recent.find((item) => item.id === row.id);
+      if (!thought) return;
+      setEditing({
+        id: row.id,
+        draft: {
+          content: thought.content,
+          type: thought.metadata.type as memory.ThoughtType,
+          topics: thought.metadata.topics.join(", "),
+          people: thought.metadata.people.join(", "),
+        },
+      });
+    },
+    [data.recent],
+  );
+
+  const actions = useMemo<RowAction<Row>[]>(
+    () => [
+      { label: "Edit", onSelect: openEdit },
+      {
+        label: "Delete",
+        danger: true,
+        onSelect: (row) => void remove.mutateAsync(row.id),
+      },
+      {
+        label: "Copy id",
+        onSelect: (row) => void navigator.clipboard.writeText(row.id),
+      },
+    ],
+    [openEdit, remove],
+  );
+
   return (
     <div>
       <PageHeader title="Dashboard" />
@@ -138,9 +252,24 @@ export function KithDashboard({ stats, recent }: DashboardData) {
         columns={columns}
         filterColumns={["type"]}
         initialSorting={[{ id: "createdAt", desc: true }]}
+        actions={actions}
+        onRowClick={openEdit}
         searchPlaceholder="Search thoughts"
         empty="No thoughts"
       />
+
+      {editing === null ? null : (
+        <ThoughtDrawer
+          open
+          onOpenChange={(open) => {
+            if (!open) setEditing(null);
+          }}
+          initial={editing.draft}
+          onSave={async (values) => {
+            await edit.mutateAsync({ id: editing.id, ...values });
+          }}
+        />
+      )}
     </div>
   );
 }

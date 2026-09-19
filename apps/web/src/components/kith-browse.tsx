@@ -9,19 +9,36 @@
 // type with more than one page of thoughts is still reachable. The thoughts
 // view's free-text search is not in the URL (`lib/kith/browse.ts` says why);
 // `kith-thought-search.tsx` posts it instead.
+//
+// Editing, deleting and retiring are `useOptimisticMutation` against this
+// page's own `["browse", view, type, historical]` cache -- owned here, not in
+// `FactsTable` or `KithThoughtSearch`, because both read from the one
+// `BrowseData` this component holds. `KithThoughtSearch` gets the mutate
+// functions as props and additionally patches its own local search-result
+// state on success, so an edit or delete made mid-search reaches the rows a
+// typed query is currently showing too.
 
-import type { memory } from "@repo/kith-store";
+import { type memory } from "@repo/kith-store";
 import { type ColumnDef } from "@tanstack/react-table";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 
+import {
+  type EditableFactValue,
+  type FactDraft,
+  FactDrawer,
+} from "@/components/kith-fact-drawer";
 import { KithThoughtSearch } from "@/components/kith-thought-search";
 import { inputClass, PageHeader } from "@/components/ui/controls";
-import { DataTable, Tag } from "@/components/ui/data-table";
+import { DataTable, type RowAction, Tag } from "@/components/ui/data-table";
 import type { BrowseData, BrowseView } from "@/lib/kith/browse";
 import { label, shortDate } from "@/lib/kith/format";
-import { useServerData } from "@/lib/kith/use-server-data";
+import { mutateJson } from "@/lib/kith/optimistic";
+import {
+  useOptimisticMutation,
+  useServerData,
+} from "@/lib/kith/use-server-data";
 
 const THOUGHT_TYPES = [
   "decision",
@@ -33,6 +50,50 @@ const THOUGHT_TYPES = [
 ] as const;
 
 const LIVE_TABLES = ["thoughts", "facts"] as const;
+
+/** Editable value types only -- `entity` and `datetime` facts get no Edit
+ * action (see `actions` below), so `FactDrawer` never has to render one.
+ * Takes `HydratedFact["value"]` rather than the narrower `memory.FactValue`:
+ * its `entity` member carries a resolved entity rather than a bare id, but
+ * every other member is identical, which is all this needs. */
+function editableValue(
+  value: memory.HydratedFact["value"],
+): EditableFactValue | null {
+  return value.type === "entity" || value.type === "datetime" ? null : value;
+}
+
+function factValueBody(value: EditableFactValue): {
+  value: unknown;
+  unit?: string;
+} {
+  return value.type === "number" && value.unit !== undefined
+    ? { value: value.value, unit: value.unit }
+    : { value: value.value };
+}
+
+function displayedValue(value: EditableFactValue): string {
+  return value.type === "boolean"
+    ? value.value
+      ? "yes"
+      : "no"
+    : String(value.value);
+}
+
+/** Recomputes a fact's statement after its value changes, without
+ * re-deriving `rememberFact`'s subject/predicate formatting: the value is
+ * always the text after the statement's last ": ", so only that tail moves. */
+function withUpdatedValue(
+  fact: memory.HydratedFact,
+  value: EditableFactValue,
+): memory.HydratedFact {
+  const marker = ": ";
+  const cut = fact.statement.lastIndexOf(marker);
+  const statement =
+    cut === -1
+      ? fact.statement
+      : `${fact.statement.slice(0, cut + marker.length)}${displayedValue(value)}.`;
+  return { ...fact, value, statement };
+}
 
 function href(view: BrowseView, historical: boolean, type = ""): string {
   const params = new URLSearchParams({ view });
@@ -98,10 +159,19 @@ type FactRow = {
 function FactsTable({
   facts,
   includeHistorical,
+  onEdit,
+  onRetire,
 }: {
   facts: readonly memory.HydratedFact[];
   includeHistorical: boolean;
+  onEdit: (id: string, value: EditableFactValue) => Promise<void>;
+  onRetire: (id: string) => Promise<void>;
 }) {
+  const [editing, setEditing] = useState<{
+    id: string;
+    draft: FactDraft;
+  } | null>(null);
+
   const rows = useMemo<FactRow[]>(
     () =>
       facts.map((fact) => ({
@@ -123,7 +193,9 @@ function FactsTable({
         accessorKey: "statement",
         header: "Fact",
         cell: ({ row }) => (
-          <span className={row.original.status === "current" ? "" : "text-gray-500"}>
+          <span
+            className={row.original.status === "current" ? "" : "text-gray-500"}
+          >
             {row.original.statement}
           </span>
         ),
@@ -152,7 +224,9 @@ function FactsTable({
         header: "From",
         meta: { nowrap: true },
         cell: ({ row }) => (
-          <span className="text-gray-600 tabular-nums">{shortDate(row.original.validFrom)}</span>
+          <span className="text-gray-600 tabular-nums">
+            {shortDate(row.original.validFrom)}
+          </span>
         ),
       },
       {
@@ -161,27 +235,97 @@ function FactsTable({
         header: "Until",
         meta: { nowrap: true },
         cell: ({ row }) => (
-          <span className="text-gray-600 tabular-nums">{shortDate(row.original.validTo)}</span>
+          <span className="text-gray-600 tabular-nums">
+            {shortDate(row.original.validTo)}
+          </span>
         ),
       },
     ],
     [],
   );
+
+  const editableFacts = useMemo(
+    () => new Map(facts.map((fact) => [fact.id, editableValue(fact.value)])),
+    [facts],
+  );
+
+  // Shared by the kebab's Edit item and clicking the row. Rows for a fact
+  // whose value has no editable form (`entity`, `datetime`) do not open one.
+  const openEdit = useCallback(
+    (row: FactRow) => {
+      const fact = facts.find((item) => item.id === row.id);
+      const value = fact ? editableValue(fact.value) : null;
+      if (!fact || !value) return;
+      setEditing({
+        id: row.id,
+        draft: {
+          statement: fact.statement,
+          subject: fact.subject.name,
+          predicate: row.predicate,
+          value,
+        },
+      });
+    },
+    [facts],
+  );
+
+  const actions = useMemo<RowAction<FactRow>[]>(
+    () => [
+      {
+        label: "Edit",
+        hidden: (row) =>
+          row.status !== "current" || editableFacts.get(row.id) === null,
+        onSelect: openEdit,
+      },
+      {
+        label: "Retire",
+        hidden: (row) => row.status !== "current",
+        danger: true,
+        onSelect: (row) => void onRetire(row.id),
+      },
+      {
+        label: "Copy id",
+        onSelect: (row) => void navigator.clipboard.writeText(row.id),
+      },
+    ],
+    [editableFacts, onRetire, openEdit],
+  );
+
   return (
-    <DataTable
-      id="browse-facts"
-      data={rows}
-      columns={columns}
-      filterColumns={["status", "core", "predicate"]}
-      initialSorting={[{ id: "subject", desc: false }]}
-      searchPlaceholder="Search facts"
-      empty="No facts"
-      toolbar={
-        <span className="ml-auto">
-          <HistoryToggle on={includeHistorical} to={href("facts", !includeHistorical)} />
-        </span>
-      }
-    />
+    <>
+      <DataTable
+        id="browse-facts"
+        data={rows}
+        columns={columns}
+        filterColumns={["status", "core", "predicate"]}
+        initialSorting={[{ id: "subject", desc: false }]}
+        actions={actions}
+        onRowClick={openEdit}
+        searchPlaceholder="Search facts"
+        empty="No facts"
+        toolbar={
+          <span className="ml-auto">
+            <HistoryToggle
+              on={includeHistorical}
+              to={href("facts", !includeHistorical)}
+            />
+          </span>
+        }
+      />
+
+      {editing === null ? null : (
+        <FactDrawer
+          open
+          onOpenChange={(open) => {
+            if (!open) setEditing(null);
+          }}
+          initial={editing.draft}
+          onSave={async (value) => {
+            await onEdit(editing.id, value);
+          }}
+        />
+      )}
+    </>
   );
 }
 
@@ -195,18 +339,115 @@ export function KithBrowse({
   type: string;
 }) {
   const router = useRouter();
-  const data = useServerData<BrowseData>(
-    ["browse", server.view, type, includeHistorical],
-    server,
-    LIVE_TABLES,
+  const queryKey = useMemo(
+    () => ["browse", server.view, type, includeHistorical],
+    [server.view, type, includeHistorical],
   );
+  const data = useServerData<BrowseData>(queryKey, server, LIVE_TABLES);
+
+  const editFact = useOptimisticMutation<
+    BrowseData,
+    { id: string; value: EditableFactValue }
+  >({
+    queryKey,
+    mutationFn: ({ id, value }) =>
+      mutateJson(`/api/kith/facts/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify(factValueBody(value)),
+      }),
+    apply: (current, { id, value }) =>
+      current.view !== "facts"
+        ? current
+        : {
+            ...current,
+            facts: current.facts.map((fact) =>
+              fact.id === id ? withUpdatedValue(fact, value) : fact,
+            ),
+          },
+  });
+
+  const retireFact = useOptimisticMutation<BrowseData, string>({
+    queryKey,
+    mutationFn: (id) =>
+      mutateJson(`/api/kith/facts/${id}`, { method: "DELETE" }),
+    apply: (current, id) =>
+      current.view !== "facts"
+        ? current
+        : {
+            ...current,
+            facts: includeHistorical
+              ? current.facts.map((fact) =>
+                  fact.id === id ? { ...fact, validTo: Date.now() } : fact,
+                )
+              : current.facts.filter((fact) => fact.id !== id),
+          },
+  });
+
+  type ThoughtEditVars = {
+    id: string;
+    content: string;
+    type: memory.ThoughtType;
+    topics: string[];
+    people: string[];
+  };
+
+  const editThought = useOptimisticMutation<BrowseData, ThoughtEditVars>({
+    queryKey,
+    mutationFn: (vars) =>
+      mutateJson(`/api/kith/thoughts/${vars.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          content: vars.content,
+          type: vars.type,
+          topics: vars.topics,
+          people: vars.people,
+        }),
+      }),
+    apply: (current, vars) =>
+      current.view !== "thoughts"
+        ? current
+        : {
+            ...current,
+            thoughts: current.thoughts.map((thought) =>
+              thought.id === vars.id
+                ? {
+                    ...thought,
+                    content: vars.content,
+                    metadata: {
+                      ...thought.metadata,
+                      type: vars.type,
+                      topics: vars.topics,
+                      people: vars.people,
+                    },
+                  }
+                : thought,
+            ),
+          },
+  });
+
+  const deleteThought = useOptimisticMutation<BrowseData, string>({
+    queryKey,
+    mutationFn: (id) =>
+      mutateJson(`/api/kith/thoughts/${id}`, { method: "DELETE" }),
+    apply: (current, id) =>
+      current.view !== "thoughts"
+        ? current
+        : {
+            ...current,
+            thoughts: current.thoughts.filter((thought) => thought.id !== id),
+          },
+  });
 
   return (
     <div>
       <PageHeader title="Browse">
         <Segment
           options={[
-            { href: href("facts", includeHistorical), label: "Facts", active: data.view === "facts" },
+            {
+              href: href("facts", includeHistorical),
+              label: "Facts",
+              active: data.view === "facts",
+            },
             {
               href: href("thoughts", includeHistorical, type),
               label: "Thoughts",
@@ -217,13 +458,28 @@ export function KithBrowse({
       </PageHeader>
 
       {data.view === "facts" ? (
-        <FactsTable facts={data.facts} includeHistorical={includeHistorical} />
+        <FactsTable
+          facts={data.facts}
+          includeHistorical={includeHistorical}
+          onEdit={async (id, value) => {
+            await editFact.mutateAsync({ id, value });
+          }}
+          onRetire={async (id) => {
+            await retireFact.mutateAsync(id);
+          }}
+        />
       ) : (
         <KithThoughtSearch
           key={`${type}-${includeHistorical}`}
           initialThoughts={data.thoughts}
           type={type}
           includeHistorical={includeHistorical}
+          onEdit={async (id, values) => {
+            await editThought.mutateAsync({ id, ...values });
+          }}
+          onDelete={async (id) => {
+            await deleteThought.mutateAsync(id);
+          }}
           toolbar={
             <span className="ml-auto flex items-center gap-2">
               <label htmlFor="thought-type" className="sr-only">
@@ -233,7 +489,9 @@ export function KithBrowse({
                 id="thought-type"
                 value={type}
                 onChange={(event) =>
-                  router.push(href("thoughts", includeHistorical, event.target.value))
+                  router.push(
+                    href("thoughts", includeHistorical, event.target.value),
+                  )
                 }
                 className={inputClass}
               >
