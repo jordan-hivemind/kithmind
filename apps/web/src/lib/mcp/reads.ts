@@ -778,20 +778,22 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
       });
     },
     async listInventory({ spaceIds, ...args }) {
-      return await read(async ({ ctx, spaces }) =>
+      return await read(async ({ ctx, principal, spaces }) =>
         documents.listInventory(
           ctx.client,
           await spaces(spaceIds),
           args as documents.InventoryListArgs,
+          principalMaxSensitivity(principal),
         ),
       );
     },
     async listReviewQueue({ spaceIds, ...args }) {
-      return await read(async ({ ctx, spaces }) =>
+      return await read(async ({ ctx, principal, spaces }) =>
         records.listReviewQueue(
           ctx.client,
           await spaces(spaceIds),
           args as records.ReviewQueueListArgs,
+          principalMaxSensitivity(principal),
         ),
       );
     },

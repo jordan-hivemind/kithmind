@@ -276,10 +276,17 @@ const SCANNERS: ReadonlyArray<{
     kind: "routing_number",
     pattern: /\b\d{9}\b/g,
     accept: (raw) => {
+      // A label is ALWAYS required, even with a valid checksum and a real
+      // Federal Reserve prefix. Those two together still admit roughly one
+      // unlabelled nine-digit reference number in twenty-five: the checksum
+      // passes one in ten, and the assigned prefix ranges cover about a third
+      // of the leading pairs. That is frequent enough to muddy the diagnostics
+      // these log lines exist for, and a real routing number is virtually
+      // always printed next to the word, so requiring it costs almost nothing
+      // and buys back the false positives.
       if (!abaValid(raw)) return { ok: false, selfEvident: false };
-      // Checksum plus a real Federal Reserve prefix stands alone; checksum
-      // alone still needs the word "routing" nearby.
-      return { ok: true, selfEvident: routingPrefixValid(raw) };
+      if (!routingPrefixValid(raw)) return { ok: false, selfEvident: false };
+      return { ok: true, selfEvident: false };
     },
   },
   {

@@ -29,7 +29,11 @@ export type SensitivityChoice = "normal" | "sensitive" | "restricted";
  * owner from himself, they narrow what he chooses to hand out.
  *
  * Tooltips rather than a paragraph, per the house style: the labels carry the
- * choice and the detail is available on hover.
+ * choice and the detail is available on hover. The detail has to say exactly
+ * what a lowered ceiling covers, because a restriction that is believed to be
+ * wider than it is is worse than none -- it covers documents, their text and
+ * the values extracted from them, and it does NOT cover notes, facts or
+ * investments, which are not document-derived.
  */
 const SENSITIVITY_OPTIONS: {
   value: SensitivityChoice;
@@ -43,20 +47,26 @@ const SENSITIVITY_OPTIONS: {
   },
   {
     value: "sensitive",
-    label: "Up to sensitive",
+    label: "No restricted",
     detail:
-      "Withholds documents marked restricted, such as tax returns. The client is told how many were withheld, not what they were.",
+      "Hides documents marked restricted, such as tax returns: the document, its text, and values extracted from it. Notes, facts and investments are not affected. The client is told how many were hidden, never what they were.",
   },
   {
     value: "normal",
     label: "Ordinary only",
     detail:
-      "Withholds documents marked sensitive or restricted, such as financial and medical records.",
+      "Hides documents marked sensitive or restricted, such as financial and medical records: the document, its text, and values extracted from it. Notes, facts and investments are not affected. The client is told how many were hidden, never what they were.",
   },
 ];
 
-/** Square segmented control, the same shape as `kith-fact-drawer.tsx`'s. */
-function SensitivityControl({
+/**
+ * Square segmented control, the same shape as `kith-fact-drawer.tsx`'s.
+ *
+ * Exported because Settings reuses it in the kebab's Edit panel to change an
+ * existing key's ceiling: the create form and the edit panel must offer the
+ * same three options with the same wording, and two copies would drift.
+ */
+export function SensitivityControl({
   value,
   onChange,
 }: {

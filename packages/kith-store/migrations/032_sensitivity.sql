@@ -85,34 +85,32 @@ ALTER TABLE kith.api_keys
   ADD COLUMN max_sensitivity text NOT NULL DEFAULT 'restricted'
     CHECK (max_sensitivity IN ('normal', 'sensitive', 'restricted'));
 
--- The effective level of a document, as a view.
+-- The effective level, as two views.
 --
--- A view rather than a column on `documents`, because the inputs change under
--- it: editing a kind's level, marking a folder, or re-extracting a document
--- into a different kind all change the answer, and a stored column would need
--- triggers on four tables to stay true. Only the narrowed-ceiling read path
--- joins this, so on the default path it costs nothing at all.
+-- Views rather than a column, because the inputs change under them: editing a
+-- kind's level, marking a folder, or re-extracting a document into a different
+-- kind all change the answer, and a stored column would need triggers on four
+-- tables to stay true. Only the narrowed-ceiling read path joins these, so on
+-- the default path they cost nothing at all.
 --
 -- The level is the MAXIMUM of the kind's and the two overrides', never the
 -- minimum and never the last one written. An override raises; it cannot lower a
 -- kind's own level. Marking a folder `restricted` therefore cannot be undone by
 -- a kind that forgot to declare itself.
 --
--- The kind comes from the extraction when there is one (`document_extractions`
--- records which type version actually read the document) and falls back to the
--- free-text `documents.doc_type` matched against an active type of the same
--- name. The fallback matters: every document ingested before ADM-5a has no
--- extraction row, and a bank statement from last year must not label itself
--- `normal` merely because it predates typed extraction.
+-- SOURCE ITEM first, because that is the grain almost everything else uses:
+-- `observations`, `event_versions`, `source_inventory`, the review queue's
+-- binding and drop rows and `document_extractions` all carry `source_item_id`,
+-- while only `documents` carries a document id. Defining the rule here and
+-- letting the document view build on it is what keeps one definition for both.
 --
 -- `starts_with` rather than LIKE for the root match: `relative_path` is owner
 -- input and a LIKE pattern built from it would read a `%` in a folder name as a
 -- wildcard. The trailing slash keeps "Taxes" from matching "Taxes Archive".
-CREATE VIEW kith.document_sensitivity AS
+CREATE VIEW kith.source_item_sensitivity AS
 SELECT
-  d.id AS document_id,
-  d.space_id,
-  d.source_item_id,
+  item.id AS source_item_id,
+  item.space_id,
   CASE GREATEST(
          kith.sensitivity_rank(coalesce(kind_type.sensitivity, 'normal')),
          kith.sensitivity_rank(coalesce(item.sensitivity, 'normal')),
@@ -121,38 +119,20 @@ SELECT
     WHEN 1 THEN 'sensitive'
     ELSE 'normal'
   END AS sensitivity
-FROM kith.documents d
-LEFT JOIN kith.source_items item
-  ON item.id = d.source_item_id AND item.space_id = d.space_id
+FROM kith.source_items item
 LEFT JOIN LATERAL (
-  -- The extraction's own type first; the doc_type name second. Highest level
-  -- wins when both answer, for the same reason the three sources do.
-  --
-  -- The UNION is wrapped rather than ordered directly: an ORDER BY attached to
-  -- a UNION may only name an output column, never an expression over one, so
-  -- ranking has to happen outside it.
-  SELECT candidate.sensitivity
-    FROM (
-      SELECT dt.sensitivity
-        FROM kith.document_extractions de
-        JOIN kith.document_types dt
-          ON dt.id = de.document_type_id AND dt.space_id = de.space_id
-       WHERE de.source_item_id = d.source_item_id AND de.space_id = d.space_id
-       UNION ALL
-      SELECT dt.sensitivity
-        FROM kith.document_types dt
-       WHERE dt.space_id = d.space_id
-         AND dt.active
-         AND d.doc_type IS NOT NULL
-         AND dt.kind = d.doc_type
-    ) candidate
-   ORDER BY kith.sensitivity_rank(coalesce(candidate.sensitivity, 'normal')) DESC
+  SELECT dt.sensitivity
+    FROM kith.document_extractions de
+    JOIN kith.document_types dt
+      ON dt.id = de.document_type_id AND dt.space_id = de.space_id
+   WHERE de.source_item_id = item.id AND de.space_id = item.space_id
+   ORDER BY kith.sensitivity_rank(coalesce(dt.sensitivity, 'normal')) DESC
    LIMIT 1
 ) kind_type ON true
 LEFT JOIN LATERAL (
   SELECT sr.sensitivity
     FROM kith.source_roots sr
-   WHERE sr.space_id = d.space_id
+   WHERE sr.space_id = item.space_id
      AND sr.root_alias IS NOT NULL
      AND sr.relative_path IS NOT NULL
      AND item.uri IS NOT NULL
@@ -162,3 +142,36 @@ LEFT JOIN LATERAL (
    ORDER BY kith.sensitivity_rank(coalesce(sr.sensitivity, 'normal')) DESC
    LIMIT 1
 ) root ON true;
+
+-- The document's own level: its source item's, raised by the level of a kind
+-- matching its free-text `doc_type`.
+--
+-- The doc_type fallback matters and is document-grained, which is why it lives
+-- here and not in the view above: every document ingested before ADM-5a has no
+-- extraction row, and a bank statement from last year must not label itself
+-- `normal` merely because it predates typed extraction.
+CREATE VIEW kith.document_sensitivity AS
+SELECT
+  d.id AS document_id,
+  d.space_id,
+  d.source_item_id,
+  CASE GREATEST(
+         kith.sensitivity_rank(coalesce(item.sensitivity, 'normal')),
+         kith.sensitivity_rank(coalesce(named_type.sensitivity, 'normal')))
+    WHEN 2 THEN 'restricted'
+    WHEN 1 THEN 'sensitive'
+    ELSE 'normal'
+  END AS sensitivity
+FROM kith.documents d
+LEFT JOIN kith.source_item_sensitivity item
+  ON item.source_item_id = d.source_item_id AND item.space_id = d.space_id
+LEFT JOIN LATERAL (
+  SELECT dt.sensitivity
+    FROM kith.document_types dt
+   WHERE dt.space_id = d.space_id
+     AND dt.active
+     AND d.doc_type IS NOT NULL
+     AND dt.kind = d.doc_type
+   ORDER BY kith.sensitivity_rank(coalesce(dt.sensitivity, 'normal')) DESC
+   LIMIT 1
+) named_type ON true;

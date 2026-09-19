@@ -728,8 +728,17 @@ export async function searchDocuments(
     });
   }
   // SENS-1. Before the limit slice, so `withheld` counts what the ceiling hid
-  // rather than what the page happened to cut, and so a page is not left short
-  // by rows removed after it was filled.
+  // rather than what the page happened to cut.
+  //
+  // A narrowed search CAN still return fewer than `limit` results even when
+  // more matches exist: the candidate scan is capped upstream
+  // (`MAX_SEARCH_CANDIDATES`), so withheld rows consume candidate budget that
+  // is never refilled. Over-fetching to compensate would mean widening the cap
+  // by an unknown factor -- the fraction withheld is not known until after the
+  // scan -- and re-scanning until the page fills is an unbounded loop over the
+  // whole archive. `withheld` is the honest signal instead: a caller that sees
+  // a short page and a non-zero count knows why it is short. The default path
+  // is unaffected, since nothing is withheld on it.
   const gated = await applyCeiling(client, results, (hit) => hit.documentId, ceiling);
   const truncated = gated.visible.length > limit;
   return {

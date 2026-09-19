@@ -139,10 +139,80 @@ export async function documentSensitivity(
 }
 
 /**
+ * The effective level of each of these source items.
+ *
+ * The sibling of `documentSensitivity`, at the grain almost everything that is
+ * not a document row uses: `observations`, `event_versions`, `source_inventory`
+ * and the review queue's rows all carry `source_item_id`. Both read the same
+ * rule from the same pair of views, so a document and the values extracted from
+ * it cannot disagree about how sensitive they are.
+ */
+export async function sourceItemSensitivity(
+  client: ClientBase,
+  sourceItemIds: readonly string[],
+): Promise<Map<string, SensitivityLevel>> {
+  const levels = new Map<string, SensitivityLevel>();
+  if (sourceItemIds.length === 0) return levels;
+  const result = await client.query<{
+    source_item_id: string;
+    sensitivity: string;
+  }>(
+    `SELECT source_item_id, sensitivity
+       FROM kith.source_item_sensitivity
+      WHERE source_item_id = ANY($1::kith.kith_id[])`,
+    [[...sourceItemIds]],
+  );
+  for (const row of result.rows) {
+    levels.set(row.source_item_id, readLevel(row.sensitivity));
+  }
+  return levels;
+}
+
+/**
+ * A WHERE fragment excluding rows whose source item is above the ceiling.
+ *
+ * For the record queries, which must filter in SQL rather than afterwards:
+ * `sum_money` adds up what it selects, and a total computed over withheld rows
+ * and then trimmed is simply a wrong total. The aggregation must not see them.
+ *
+ * Returns `""` on the default ceiling, so the default path's SQL is byte for
+ * byte what it was before this feature existed.
+ *
+ * `column` MUST be qualified (`kith.observations.source_item_id`), not bare.
+ * The subquery selects from a table that has a `source_item_id` of its own, so
+ * a bare name binds to the INNER one -- making the condition `sens.x = sens.x`,
+ * which is always true, which makes NOT EXISTS false for every row as soon as
+ * a single above-ceiling item exists anywhere. That silently returns nothing
+ * instead of filtering, so the qualification is required rather than advised.
+ *
+ * `column` is an identifier this module's own callers supply and is never
+ * request input; the rank is an integer derived from the closed enum. Both are
+ * checked here rather than interpolated on trust.
+ */
+export function ceilingWhereSql(
+  ceiling: SensitivityLevel,
+  column: string,
+): string {
+  if (ceiling === "restricted") return "";
+  if (!(ceiling in RANK)) throw new Error("Unknown sensitivity ceiling");
+  if (!/^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)+$/i.test(column)) {
+    // Bare names are refused outright: see the note above on why an unqualified
+    // reference silently filters everything instead of filtering correctly.
+    throw new Error("Ceiling column must be a qualified column reference");
+  }
+  return ` AND NOT EXISTS (
+    SELECT 1 FROM kith.source_item_sensitivity sens
+     WHERE sens.source_item_id = ${column}
+       AND kith.sensitivity_rank(sens.sensitivity) > ${RANK[ceiling]})`;
+}
+
+/**
  * Split rows into what this ceiling may see and a count of what it may not.
  *
- * Generic over the row so the document search, the inventory and the review
- * queue share one implementation: the shapes differ, the rule does not.
+ * Generic over the row AND over the grain: `idOf` returns a document id when
+ * `levels` is `documentSensitivity` and a source item id when it is
+ * `sourceItemSensitivity`. The document search uses the first, the inventory
+ * and the review queue the second; the shapes differ, the rule does not.
  *
  * The early return is the important line in this function. On the default
  * ceiling -- which is every credential the owner has not deliberately narrowed
@@ -153,20 +223,24 @@ export async function documentSensitivity(
 export async function applyCeiling<T>(
   client: ClientBase,
   rows: readonly T[],
-  documentIdOf: (row: T) => string | null | undefined,
+  idOf: (row: T) => string | null | undefined,
   ceiling: SensitivityLevel,
+  grain: "document" | "sourceItem" = "document",
 ): Promise<{ visible: T[]; withheld: number }> {
   if (rows.length === 0 || ceiling === "restricted") {
     return { visible: [...rows], withheld: 0 };
   }
   const ids = rows
-    .map(documentIdOf)
+    .map(idOf)
     .filter((id): id is string => typeof id === "string" && id.length > 0);
-  const levels = await documentSensitivity(client, ids);
+  const levels =
+    grain === "document"
+      ? await documentSensitivity(client, ids)
+      : await sourceItemSensitivity(client, ids);
   const visible: T[] = [];
   let hidden = 0;
   for (const row of rows) {
-    const id = documentIdOf(row);
+    const id = idOf(row);
     const level = id
       ? (levels.get(id) ?? DEFAULT_SENSITIVITY)
       : DEFAULT_SENSITIVITY;
