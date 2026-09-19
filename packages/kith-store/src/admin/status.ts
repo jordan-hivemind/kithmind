@@ -61,7 +61,17 @@ export type HealthCheck = {
    * not sent (`identityRefused`), which is a different pill and a different
    * fix.
    */
-  watcher?: { stuck: readonly string[]; identity: boolean };
+  watcher?: {
+    stuck: readonly string[];
+    identity: boolean;
+    /**
+     * ADM-10 review. Two live hosts are heartbeating as one watcher. Its own
+     * pill, because it is the opposite failure from the other two -- the
+     * heartbeat is arriving, twice -- and the fix is to stop one host, not to
+     * re-register anything.
+     */
+    splitBrain: boolean;
+  };
 };
 
 const MINUTE = 60_000;
@@ -213,6 +223,9 @@ function watcherStatus(watcher: WatcherFact, now: number): HealthStatus {
   if (!watcher.enabled) return "not_configured";
   if (watcher.watcherState === null) return "unknown";
   if (watcher.watcherState === "awaiting_heartbeat") return "unknown";
+  // ADM-10 review: a split brain is a problem even though the heartbeat is
+  // current, which is the one failure here that would otherwise read as ok.
+  if (watcher.splitBrainAt !== null) return "problem";
   if (passProblem(watcher, now)) return "problem";
   if (watcher.nextExpectedAt === null) return "unknown";
   return watcher.nextExpectedAt < now ? "problem" : "ok";
@@ -251,11 +264,16 @@ function watcherCheck(
   );
   const overdue = silent.length;
   const stuck = watching.filter((watcher) => passProblem(watcher, now)).length;
+  // ADM-10 review. Not part of `silent`: a split-brain watcher is heartbeating
+  // more than it should, not less, so it is never overdue and would never be
+  // counted by the line above.
+  const split = watching.some((watcher) => watcher.splitBrainAt !== null);
   const detail = [
     `last pass ${ago(lastCheckedAt, now)}`,
     `${watching.length} watched`,
     ...(overdue > 0 ? [`${overdue} overdue`] : []),
     ...(stuck > 0 ? [`${stuck} stuck`] : []),
+    ...(split ? ["2 hosts"] : []),
   ].join(", ");
   // One line per source: its latest assessment's state, then why items were
   // not ready, then how its last pass ended. These are closed literals
@@ -302,12 +320,13 @@ function watcherCheck(
             problem: passProblem(shown, now),
           },
         }),
-    ...(silent.length === 0
+    ...(silent.length === 0 && !split
       ? {}
       : {
           watcher: {
             stuck: silent.map((watcher) => watcher.sourceAccountId),
             identity: silent.some((watcher) => identityRefused(watcher, now)),
+            splitBrain: split,
           },
         }),
   };

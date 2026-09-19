@@ -21,6 +21,7 @@ import test from "node:test";
 
 import { newKithId } from "../dist/index.js";
 import {
+  WATCHER_SPLIT_BRAIN_QUIET_MS,
   WorkerProtocolError,
   getWorkerDiagnosticsStatus,
   recordWorkerHeartbeat,
@@ -164,12 +165,16 @@ function heartbeat(f, overrides = {}) {
 
 async function storedWatcher(f, sourceAccountId = f.sourceAccountId) {
   const found = await f.client.query(
-    `SELECT watcher_id, state, last_seen_at FROM kith.worker_watcher_states
-       WHERE source_account_id = $1`,
+    `SELECT watcher_id, state, last_seen_at, heartbeat_nonce,
+            heartbeat_nonce_previous, split_brain_at
+       FROM kith.worker_watcher_states WHERE source_account_id = $1`,
     [sourceAccountId],
   );
   return found.rows[0];
 }
+
+/** 32 lowercase hex, the shape the wire and the column both require. */
+const nonce = (seed) => seed.repeat(32).slice(0, 32);
 
 test(
   "a watcher registered under its legacy id keeps its registration",
@@ -269,12 +274,18 @@ test(
     assert.equal(old.receivedAt, NOW);
     assert.equal((await storedWatcher(f)).watcher_id, STABLE);
 
-    // The other direction -- a new worker's extra key against an old server --
-    // is refused by that server's request parser before it reaches this
-    // function, and is asserted in `@repo/worker-protocol`'s runtime suite.
-    // What matters here is that the worker's own pass does not depend on it:
-    // no other operation in the protocol carries a watcher identity that this
-    // one can invalidate.
+    // The other direction -- a new worker's extra keys against an old server --
+    // never reaches this function: that server's request parser refuses the
+    // unknown key, and `WatchHeartbeat` drops both ADM-10 fields for the rest
+    // of the process and retries at once, so the heartbeat survives the skew
+    // instead of dying on it. Asserted in `@repo/worker-protocol`'s runtime
+    // suite and in the pipeline's `diagnostics` suite.
+    //
+    // A pass is unaffected either way. `diagnostics.passOutcome` does carry a
+    // `watcherId` (ADM-9) and would be refused alongside the heartbeat if the
+    // registration were wrong, but neither it nor the heartbeat can fail a
+    // pass: both are reported after the work is done and their refusals are
+    // swallowed by design.
   },
 );
 
@@ -447,5 +458,203 @@ test(
       ),
       (error) => error instanceof WorkerProtocolError,
     );
+  },
+);
+
+// ADM-10 review, finding 1. Two live hosts on one copied journal.
+//
+// Removing `configFingerprint` from the identity was right and it removed an
+// accidental tripwire with it: two hosts used to disagree about their roots'
+// absolute paths and register as two watchers. They are now the same watcher
+// by design, which is what makes a host move work, and nothing else on the
+// heartbeat separates them. The owner is about to copy a journal from his
+// laptop to an always-on host, and the journal lock is a loopback port.
+
+test(
+  "two live hosts on one journal are found, and a restart is not",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const ping = (nonceValue, now) =>
+      recordWorkerHeartbeat(
+        workerCtx(f.client, now),
+        f.worker,
+        heartbeat(f, { heartbeatNonce: nonceValue }),
+      );
+    const A = nonce("a");
+    const B = nonce("b");
+    const C = nonce("c");
+
+    // One host, pinging steadily: nothing to report.
+    await ping(A, NOW);
+    await ping(A, NOW + 30_000);
+    let stored = await storedWatcher(f);
+    assert.equal(stored.heartbeat_nonce, A);
+    assert.equal(stored.heartbeat_nonce_previous, null);
+    assert.equal(stored.split_brain_at, null);
+
+    // An ordinary restart: a new process, a nonce never seen before. This is
+    // the case a count of changes inside a window would have flagged.
+    await ping(B, NOW + 60_000);
+    stored = await storedWatcher(f);
+    assert.equal(stored.heartbeat_nonce, B);
+    assert.equal(stored.heartbeat_nonce_previous, A);
+    assert.equal(stored.split_brain_at, null, "a restart is not a split brain");
+
+    // A nonce coming *back* after a different one: the only way that happens
+    // is a process that already heartbeated heartbeating again, which is two
+    // live processes.
+    await ping(A, NOW + 75_000);
+    stored = await storedWatcher(f);
+    assert.equal(
+      stored.split_brain_at.getTime(),
+      NOW + 75_000,
+      "an alternating pair is caught on its third ping",
+    );
+
+    // It keeps re-proving itself while both hosts are up, rather than settling
+    // into a state that reads as resolved.
+    await ping(B, NOW + 90_000);
+    assert.equal(
+      (await storedWatcher(f)).split_brain_at.getTime(),
+      NOW + 90_000,
+    );
+
+    // And heartbeats are still accepted throughout. Refusing one of the two
+    // would put the watcher straight back into the state ADM-10 removes, and
+    // would hide the second host rather than name it.
+    const accepted = await ping(B, NOW + 120_000);
+    assert.equal(accepted.receivedAt, NOW + 120_000);
+    assert.equal((await storedWatcher(f)).state, "active");
+  },
+);
+
+test(
+  "a crash loop is never mistaken for a second host",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    // Four processes in a row, each with a fresh nonce and none returning.
+    let now = NOW;
+    for (const seed of ["a", "b", "c", "d", "e"]) {
+      await recordWorkerHeartbeat(
+        workerCtx(f.client, now),
+        f.worker,
+        heartbeat(f, { heartbeatNonce: nonce(seed) }),
+      );
+      now += 30_000;
+    }
+    assert.equal(
+      (await storedWatcher(f)).split_brain_at,
+      null,
+      "restarting repeatedly is a different problem, and not this one",
+    );
+  },
+);
+
+test(
+  "stopping the second host clears the split brain on its own",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const A = nonce("a");
+    const B = nonce("b");
+    const ping = (nonceValue, now) =>
+      recordWorkerHeartbeat(
+        workerCtx(f.client, now),
+        f.worker,
+        heartbeat(f, { heartbeatNonce: nonceValue }),
+      );
+    await ping(A, NOW);
+    await ping(B, NOW + 30_000);
+    await ping(A, NOW + 60_000);
+    const detectedAt = NOW + 60_000;
+    assert.equal(
+      (await storedWatcher(f)).split_brain_at.getTime(),
+      detectedAt,
+    );
+
+    // Host B is stopped. A keeps pinging alone; just short of the quiet
+    // window the screen still says so. One heartbeat interval short, not one
+    // second: two pings a second apart are damped by
+    // WORKER_HEARTBEAT_MIN_WRITE_MS, so the second would not write at all and
+    // the clear below would be attributed to the wrong thing.
+    await ping(A, detectedAt + WATCHER_SPLIT_BRAIN_QUIET_MS - 30_000);
+    assert.notEqual((await storedWatcher(f)).split_brain_at, null);
+
+    // Past it, one process has held the heartbeat alone for twenty pings and
+    // the owner does not have to click anything.
+    await ping(A, detectedAt + WATCHER_SPLIT_BRAIN_QUIET_MS);
+    assert.equal((await storedWatcher(f)).split_brain_at, null);
+  },
+);
+
+test(
+  "the write damping never hides a second host",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const A = nonce("a");
+    const B = nonce("b");
+    await recordWorkerHeartbeat(
+      workerCtx(f.client, NOW),
+      f.worker,
+      heartbeat(f, { heartbeatNonce: A }),
+    );
+    // Inside WORKER_HEARTBEAT_MIN_WRITE_MS. The same process is damped, as it
+    // has always been -- this is the write budget the heartbeat is held to.
+    await recordWorkerHeartbeat(
+      workerCtx(f.client, NOW + 1_000),
+      f.worker,
+      heartbeat(f, { heartbeatNonce: A }),
+    );
+    assert.equal((await storedWatcher(f)).last_seen_at.getTime(), NOW);
+
+    // A different process inside the same window is not damped: two hosts that
+    // happen to land within five seconds of each other would otherwise never
+    // have their nonces recorded, and the damping would hide exactly what it
+    // is being asked to notice.
+    await recordWorkerHeartbeat(
+      workerCtx(f.client, NOW + 2_000),
+      f.worker,
+      heartbeat(f, { heartbeatNonce: B }),
+    );
+    const stored = await storedWatcher(f);
+    assert.equal(stored.heartbeat_nonce, B);
+    assert.equal(stored.heartbeat_nonce_previous, A);
+  },
+);
+
+test(
+  "a worker too old to send a nonce changes nothing it does not know about",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const A = nonce("a");
+    const B = nonce("b");
+    const ping = (nonceValue, now) =>
+      recordWorkerHeartbeat(
+        workerCtx(f.client, now),
+        f.worker,
+        heartbeat(f, { heartbeatNonce: nonceValue }),
+      );
+    await ping(A, NOW);
+    await ping(B, NOW + 30_000);
+    await ping(A, NOW + 60_000);
+    const detectedAt = NOW + 60_000;
+
+    // An ADM-9 worker, or one that downgraded against an old server, sends no
+    // nonce. That is not evidence the second host went away, so the record
+    // stands rather than being nulled by a client that cannot speak to it.
+    const old = await recordWorkerHeartbeat(
+      workerCtx(f.client, NOW + 90_000),
+      f.worker,
+      heartbeat(f),
+    );
+    assert.equal(old.receivedAt, NOW + 90_000);
+    const stored = await storedWatcher(f);
+    assert.equal(stored.heartbeat_nonce, A);
+    assert.equal(stored.heartbeat_nonce_previous, B);
+    assert.equal(stored.split_brain_at.getTime(), detectedAt);
   },
 );

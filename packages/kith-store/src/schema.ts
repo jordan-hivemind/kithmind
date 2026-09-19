@@ -223,6 +223,22 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "the attention queue: corrections gains dismissed/snoozed states and severity, and kith.attention_mutes (ADM-8a)",
     url: new URL("../migrations/030_attention_queue.sql", import.meta.url),
   },
+  // `applyKithSchema` requires `migration.version === current + 1` and refuses
+  // a gap with `schema_version_gap`, so a number cannot be reserved ahead of
+  // the ones beside it: it is a position in this list, not a label. This was
+  // 30 when main was at 29 and became 31 when PR #321 landed its own 30. PR
+  // #319 (sensitivity) still holds a number below this one and takes 32 after
+  // this lands. Renumber this *up*, never down into a gap, and never reuse a
+  // version that has been applied anywhere -- the hosted schema is already at
+  // 30, so 30 is spent.
+  {
+    version: 31,
+    name: "watcher heartbeat nonce: telling two live hosts on one copied journal apart (ADM-10)",
+    url: new URL(
+      "../migrations/031_watcher_heartbeat_nonce.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

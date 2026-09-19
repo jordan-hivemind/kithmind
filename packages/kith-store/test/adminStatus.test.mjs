@@ -47,6 +47,8 @@ function watcher(overrides = {}) {
     lastPassCode: null,
     lastPassAt: NOW - MINUTE,
     unhealthySince: null,
+    // ADM-10 review. Null unless two live hosts have been seen.
+    splitBrainAt: null,
     ...overrides,
   };
 }
@@ -353,7 +355,11 @@ test("a heartbeat that is refused reads differently from one that stopped", () =
     "documents_watcher",
   );
   assert.equal(refused.status, "problem");
-  assert.deepEqual(refused.watcher, { stuck: ["src-1"], identity: true });
+  assert.deepEqual(refused.watcher, {
+    stuck: ["src-1"],
+    identity: true,
+    splitBrain: false,
+  });
 
   // A host that is simply switched off: nothing has arrived from it at all.
   const silent = checkById(
@@ -372,7 +378,11 @@ test("a heartbeat that is refused reads differently from one that stopped", () =
     "documents_watcher",
   );
   assert.equal(silent.status, "problem");
-  assert.deepEqual(silent.watcher, { stuck: ["src-1"], identity: false });
+  assert.deepEqual(silent.watcher, {
+    stuck: ["src-1"],
+    identity: false,
+    splitBrain: false,
+  });
 
   // An assessment written in the same pass as the last accepted ping proves
   // nothing about the window since, so it must not read as a refusal.
@@ -430,4 +440,58 @@ test("a healthy watcher offers nothing to re-register", () => {
     "documents_watcher",
   );
   assert.deepEqual(mixed.watcher.stuck, ["src-2"]);
+});
+
+// ADM-10 review, finding 4. The derived `identity` state needs both a missed
+// deadline and a newer assessment, so a quiet source whose heartbeat is being
+// refused reads as plain `overdue` and never earns the pill. That is fine
+// precisely because the kebab does not wait for the pill.
+test("a plainly overdue watcher can still be re-registered", () => {
+  const check = checkById(
+    deriveHealthChecks(
+      facts({
+        watchers: [
+          watcher({
+            lastSeenAt: NOW - 17 * HOUR,
+            nextExpectedAt: NOW - 17 * HOUR + 3 * MINUTE,
+            // No assessment since the heartbeat stopped: from here this is
+            // indistinguishable from a host that was switched off, which is
+            // exactly the case the pill cannot diagnose.
+            assessmentAt: NOW - 17 * HOUR,
+          }),
+        ],
+      }),
+      NOW,
+    ),
+    "documents_watcher",
+  );
+  assert.equal(check.status, "problem");
+  assert.equal(check.watcher.identity, false, "no pill");
+  assert.equal(check.watcher.splitBrain, false);
+  assert.deepEqual(
+    check.watcher.stuck,
+    ["src-1"],
+    "but the action is offered, which is what the owner actually needs",
+  );
+});
+
+// ADM-10 review, finding 1. Two live hosts heartbeating as one watcher: the
+// opposite failure from the other two, because the heartbeat is arriving.
+test("a split brain is a problem even while the heartbeat is current", () => {
+  const split = checkById(
+    deriveHealthChecks(
+      facts({ watchers: [watcher({ splitBrainAt: NOW - MINUTE })] }),
+      NOW,
+    ),
+    "documents_watcher",
+  );
+  // Without this it would read `ok`: the watcher is current, its passes are
+  // completing, and every other check on this row is satisfied.
+  assert.equal(split.status, "problem");
+  assert.equal(split.watcher.splitBrain, true);
+  assert.match(split.detail, /2 hosts/);
+  // Nothing to re-register: both hosts are the registered watcher, and the
+  // fix is to stop one of them.
+  assert.deepEqual(split.watcher.stuck, []);
+  assert.equal(split.watcher.identity, false);
 });

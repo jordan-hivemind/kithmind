@@ -312,6 +312,26 @@ export type WorkerRequest =
        * heartbeat runs on its own timer. Deploy the server first.
        */
       legacyWatcherId?: string;
+      /**
+       * ADM-10 review. 32 lowercase hex characters, minted once per worker
+       * process, so the server can tell two live hosts sharing one copied
+       * journal apart -- they present the same `watcherId` by design and
+       * nothing else on this request differs.
+       *
+       * Optional in both directions, exactly as `legacyWatcherId` is, and it
+       * adds no skew exposure that field does not already impose: a server
+       * older than ADM-10 refuses either unknown key with `invalid_request`,
+       * which costs that deployment its heartbeat until the server is updated
+       * and costs its passes nothing. Deploy the server first.
+       *
+       * A field of its own rather than a suffix on `connectorVersion`, which
+       * was the other option considered: that string is shared with
+       * `scan.begin`, is stored on two different rows, and is read as a
+       * version. Parsing a nonce back out of it later is the kind of cleverness
+       * that is decoded at 3am, and it would buy nothing, because the skew rule
+       * above is already fixed by `legacyWatcherId`.
+       */
+      heartbeatNonce?: string;
       connectorVersion: string;
     })
   | (WorkerSourceRequest & {
@@ -1354,6 +1374,14 @@ function paginationOptions(value: unknown): WorkerPaginationOptions {
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+/**
+ * ADM-10 review. A worker process's heartbeat nonce: 128 bits as 32 lowercase
+ * hex characters, matching the column's own CHECK in migration 031. A closed
+ * shape and not a bounded string, because the server stores it and it is one
+ * join from the health screen -- the same rule `WORKER_PASS_CODE` follows, and
+ * what keeps a host name or a path out of a column the screen can render.
+ */
+const HEARTBEAT_NONCE = /^[0-9a-f]{32}$/;
 // The pipeline's local ParserProcessFailureCode identifiers, e.g.
 // "conversion_failed"; a plain bounded shape since convex does not need to
 // know the exact set (it only records the class, never document text).
@@ -1935,7 +1963,7 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
       exactKeys(
         input,
         [...baseKeys, "watcherId", "connectorVersion"],
-        ["legacyWatcherId"],
+        ["legacyWatcherId", "heartbeatNonce"],
       );
       return {
         ...base,
@@ -1947,6 +1975,14 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
               legacyWatcherId: string(input.legacyWatcherId, {
                 maxUtf16: 36,
                 pattern: UUID,
+              }),
+            }),
+        ...(input.heartbeatNonce === undefined
+          ? {}
+          : {
+              heartbeatNonce: string(input.heartbeatNonce, {
+                maxUtf16: 32,
+                pattern: HEARTBEAT_NONCE,
               }),
             }),
         connectorVersion: string(input.connectorVersion, { maxUtf8: 100 }),

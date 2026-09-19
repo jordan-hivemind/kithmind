@@ -36,6 +36,15 @@ watcher" in that row's kebab. It clears the registration and the next heartbeat,
 within thirty seconds, claims it. Do not stop the watcher first; the host that
 is running is the one that should claim the source.
 
+Copying a journal to a second machine copies the watcher identity with it, so
+both hosts heartbeat as the same watcher. Run only one. If both run, the
+Documents watcher row shows a `2 hosts` pill within about a minute: each worker
+process sends a random nonce, and a nonce arriving again after a different one
+can only mean two live processes. Stop one host; the pill clears itself once
+the survivor has held the heartbeat alone for ten minutes. Heartbeats are
+accepted from both throughout, so neither host stops ingesting while this is
+sorted out.
+
 After rotating a credential with a quiescent journal, use one authorized
 `run` to validate and accept the replacement before restarting `watch`.
 Watch refuses an unaccepted credential binding before sending a heartbeat.

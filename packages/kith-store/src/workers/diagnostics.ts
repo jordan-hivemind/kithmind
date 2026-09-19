@@ -21,6 +21,18 @@ export const WORKER_HEARTBEAT_OVERDUE_MS = 180_000;
 export const WORKER_HEARTBEAT_MIN_WRITE_MS = 5_000;
 /** How many active watchers the daily incident writer inspects per call. */
 export const WORKER_MISSING_INCIDENT_SWEEP_LIMIT = 500;
+/**
+ * ADM-10 review. How long one process must hold the heartbeat alone before a
+ * recorded split brain is treated as over.
+ *
+ * Ten minutes is twenty heartbeats at the 30-second interval. A second host
+ * that is still running cannot stay quiet that long -- it would have to miss
+ * twenty of its own pings -- and a second host that has been stopped clears
+ * the screen without anyone having to click anything. Shorter, and the two
+ * hosts' own interleaving could clear it between their pings; longer, and a
+ * fixed problem stays red for no reason.
+ */
+export const WATCHER_SPLIT_BRAIN_QUIET_MS = 10 * 60_000;
 
 type Watcher = {
   id: string;
@@ -39,6 +51,14 @@ type Watcher = {
   /** ADM-9, migration 029. Null until a pass has reported one. */
   lastPassFinishedAt: Date | null;
   lastPassUnhealthySince: Date | null;
+  /**
+   * ADM-10 review, migration 031. The last two heartbeat nonces accepted for
+   * this watcher, and when a returning one was last seen. Null on a watcher
+   * that has never sent one.
+   */
+  heartbeatNonce: string | null;
+  heartbeatNoncePrevious: string | null;
+  splitBrainAt: Date | null;
 };
 
 type Incident = {
@@ -266,6 +286,80 @@ function adoptsLegacyWatcherId(
   );
 }
 
+/**
+ * ADM-10 review, finding 1. Two live hosts on one copied journal.
+ *
+ * The old derivation hashed the configuration fingerprint, which included the
+ * watched roots with their absolute paths, so two hosts almost always
+ * disagreed about something, registered as two watchers, and the second was
+ * refused. That was an accident rather than a design, but it was a tripwire,
+ * and deriving the identity from the salt and the authority binding alone
+ * removes it: a copied journal is deliberately the same watcher now. That is
+ * what makes a host move work, and it is also what makes two hosts
+ * indistinguishable -- `connectorVersion` is a compile-time constant,
+ * `actorCredentialId` is the same key, and `receivedAt` is clamped forward.
+ * The journal lock is a loopback port and does not reach across machines, so
+ * nothing else stops the owner running his laptop and his new always-on host
+ * at once.
+ *
+ * So the worker sends a nonce minted once per process and this keeps the last
+ * two. The rule is that a nonce *returns*: 128 random bits cannot recur unless
+ * a process that already heartbeated heartbeats again after a different one
+ * did, which is two live processes and is never a restart. A restart mints a
+ * fresh nonce and never comes back, and so does a crash loop -- which is why
+ * counting changes inside a window would have confused a crash loop with a
+ * split brain, and why a returning nonce cannot. An alternating pair is caught
+ * on its third ping, about a minute in.
+ *
+ * The record goes stale on its own after `WATCHER_SPLIT_BRAIN_QUIET_MS` of one
+ * process holding the heartbeat alone, so stopping the second host clears the
+ * screen without anyone clicking anything.
+ *
+ * A worker too old to send a nonce leaves all three columns as they are rather
+ * than nulling them: an old worker is not evidence that a second host went
+ * away.
+ */
+function nextNonceState(
+  current: Watcher | undefined,
+  request: Extract<WorkerRequest, { operation: "diagnostics.heartbeat" }>,
+  now: number,
+): {
+  current: string | null;
+  previous: string | null;
+  splitBrainAt: number | null;
+} {
+  const stored = {
+    current: current?.heartbeatNonce ?? null,
+    previous: current?.heartbeatNoncePrevious ?? null,
+    splitBrainAt: current?.splitBrainAt?.getTime() ?? null,
+  };
+  const seen = request.heartbeatNonce;
+  if (seen === undefined) return stored;
+  if (seen === stored.current) {
+    // One process, pinging steadily. Let a recorded split brain age out.
+    return {
+      ...stored,
+      splitBrainAt:
+        stored.splitBrainAt !== null &&
+        now - stored.splitBrainAt >= WATCHER_SPLIT_BRAIN_QUIET_MS
+          ? null
+          : stored.splitBrainAt,
+    };
+  }
+  // A nonce already seen, arriving again after a different one: two live
+  // processes. Shift anyway, so an alternating pair keeps re-proving it rather
+  // than settling into a state that would read as resolved.
+  if (stored.previous !== null && seen === stored.previous) {
+    return { current: seen, previous: stored.current, splitBrainAt: now };
+  }
+  // A nonce never seen before: a first heartbeat, or an ordinary restart.
+  return {
+    current: seen,
+    previous: stored.current,
+    splitBrainAt: stored.splitBrainAt,
+  };
+}
+
 export async function recordWorkerHeartbeat(
   ctx: WorkerCtx,
   principal: PrincipalRef,
@@ -309,6 +403,13 @@ export async function recordWorkerHeartbeat(
     // would answer the ping and leave the row on the legacy id, so the next
     // ping outside the window would have to adopt all over again.
     current.watcherId === request.watcherId &&
+    // So is a ping from a different process. Two hosts that happen to land
+    // within five seconds of each other would otherwise both be damped, and
+    // the nonce that proves they are two would never be recorded. This is the
+    // one case where the damping would hide exactly what it is being asked to
+    // notice.
+    (request.heartbeatNonce === undefined ||
+      current.heartbeatNonce === request.heartbeatNonce) &&
     ctx.now >= current.lastSeenAt!.getTime() &&
     ctx.now - current.lastSeenAt!.getTime() < WORKER_HEARTBEAT_MIN_WRITE_MS
   ) {
@@ -322,13 +423,16 @@ export async function recordWorkerHeartbeat(
   }
   const receivedAt = Math.max(ctx.now, current?.lastSeenAt?.getTime() ?? 0);
   const nextExpectedAt = nextExpected(receivedAt);
+  const nonce = nextNonceState(current, request, ctx.now);
   if (current) {
     await exec(
       ctx,
       `UPDATE kith.worker_watcher_states SET state = 'active', watcher_id = $7,
       connector_version = $1,
       actor_user_id = $2, actor_credential_id = $3, last_seen_at = $4, next_expected_at = $5,
-      sweep_after = $5, updated_at = $4 WHERE id = $6`,
+      sweep_after = $5, updated_at = $4,
+      heartbeat_nonce = $8, heartbeat_nonce_previous = $9, split_brain_at = $10
+      WHERE id = $6`,
       [
         request.connectorVersion,
         source.principal.userId,
@@ -337,6 +441,9 @@ export async function recordWorkerHeartbeat(
         at(nextExpectedAt),
         current.id,
         request.watcherId,
+        nonce.current,
+        nonce.previous,
+        nonce.splitBrainAt === null ? null : at(nonce.splitBrainAt),
       ],
     );
   } else {
@@ -344,8 +451,9 @@ export async function recordWorkerHeartbeat(
       ctx,
       `INSERT INTO kith.worker_watcher_states
       (id, space_id, created_at, source_account_id, watcher_id, state, connector_version,
-       actor_user_id, actor_credential_id, last_seen_at, next_expected_at, sweep_after, created_at_field, updated_at)
-      VALUES ($1,$2,transaction_timestamp(),$3,$4,'active',$5,$6,$7,$8,$9,$9,$8,$8)`,
+       actor_user_id, actor_credential_id, last_seen_at, next_expected_at, sweep_after, created_at_field, updated_at,
+       heartbeat_nonce)
+      VALUES ($1,$2,transaction_timestamp(),$3,$4,'active',$5,$6,$7,$8,$9,$9,$8,$8,$10)`,
       [
         newKithId(),
         source.spaceId,
@@ -356,6 +464,7 @@ export async function recordWorkerHeartbeat(
         source.principal.credentialId,
         at(receivedAt),
         at(nextExpectedAt),
+        nonce.current,
       ],
     );
   }

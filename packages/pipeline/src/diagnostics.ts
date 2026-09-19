@@ -1,3 +1,5 @@
+import { randomBytes } from "node:crypto";
+
 import type {
   PipelineConfig,
   WorkerErrorCode,
@@ -184,8 +186,10 @@ export function parseHeartbeatResponse(
  * one is answered `identity_review_required` by `recordWorkerHeartbeat` on
  * every tick, forever. The id is derived from a random salt in the journal's
  * state file (`credentialSalt`, journal.ts), so recreating the journal
- * directory changes it; passes carry on working, because no other operation in
- * the protocol carries a `watcherId`, and the only symptom is
+ * directory changes it; passes carry on working, because the one other
+ * operation that carries a `watcherId` (ADM-9's `diagnostics.passOutcome`) is
+ * reported after the work is done and its refusal is swallowed too, so the
+ * only symptom is
  * `worker_watcher_states.last_seen_at` frozen at the instant the journal
  * changed while the watcher looks busy and healthy from the host.
  *
@@ -193,6 +197,15 @@ export function parseHeartbeatResponse(
  * is a log nobody reads, and none of the conditions worth naming here resolve
  * on their own.
  */
+let downgradeWarned = false;
+function warnDowngradeOnce(): void {
+  if (downgradeWarned) return;
+  downgradeWarned = true;
+  console.warn(
+    "[pipeline] this server is older than ADM-10 and refuses the heartbeat's watcher-identity fields; sending without them, so a legacy registration will not be adopted and two live hosts will not be detected until the server is updated. Not repeating this warning.",
+  );
+}
+
 let heartbeatWarned = false;
 function warnHeartbeatOnce(reason: string): void {
   if (heartbeatWarned) return;
@@ -218,7 +231,36 @@ export class WatchHeartbeat {
      * until the owner re-registers it.
      */
     readonly legacyWatcherId?: string,
+    /**
+     * ADM-10 review. One value per worker process, so that two hosts sharing a
+     * copied journal -- which now present the same `watcherId` on purpose --
+     * are still two things on the wire. Defaulted here rather than passed in
+     * because "once per process" is the whole property: a caller that
+     * constructed two of these with two nonces would be inventing the split
+     * brain this exists to find.
+     */
+    readonly heartbeatNonce: string = randomBytes(16).toString("hex"),
   ) {}
+
+  /** Whether this server has been seen to accept the ADM-10 fields. */
+  private extended = true;
+
+  private request(): Record<string, unknown> {
+    return {
+      protocolVersion: 1,
+      operation: "diagnostics.heartbeat",
+      spaceId: this.config.spaceId,
+      sourceAccountId: this.config.sourceAccountId,
+      watcherId: this.watcherId,
+      ...(!this.extended ||
+      this.legacyWatcherId === undefined ||
+      this.legacyWatcherId === this.watcherId
+        ? {}
+        : { legacyWatcherId: this.legacyWatcherId }),
+      ...(this.extended ? { heartbeatNonce: this.heartbeatNonce } : {}),
+      connectorVersion: "kithmind-filesystem-worker-v1",
+    };
+  }
 
   start(): void {
     this.schedule(0);
@@ -246,25 +288,38 @@ export class WatchHeartbeat {
       HEARTBEAT_REQUEST_TIMEOUT_MS,
     );
     try {
-      const result = await this.transport.call(
-        {
-          protocolVersion: 1,
-          operation: "diagnostics.heartbeat",
-          spaceId: this.config.spaceId,
-          sourceAccountId: this.config.sourceAccountId,
-          watcherId: this.watcherId,
-          ...(this.legacyWatcherId === undefined ||
-          this.legacyWatcherId === this.watcherId
-            ? {}
-            : { legacyWatcherId: this.legacyWatcherId }),
-          connectorVersion: "kithmind-filesystem-worker-v1",
-        },
+      let result = await this.transport.call(
+        this.request(),
         controller.signal,
       );
       // ADM-9 follow-up. The refusal code, before the parser turns every
       // failure into one indistinguishable throw: it is the only thing that
       // tells a stopped heartbeat apart from a broken one.
-      const refused = errorCode(result);
+      let refused = errorCode(result);
+      // ADM-10 review, version skew. A server older than ADM-10 has never
+      // heard of `legacyWatcherId` or `heartbeatNonce`, and its request parser
+      // refuses an unknown key outright rather than ignoring it. That would
+      // kill the heartbeat -- which is the bug this whole task exists to fix --
+      // so the first `invalid_request` drops both fields for the rest of the
+      // process and retries at once. The result is a worker that is safe to
+      // deploy before or after its server, in either order, with no capability
+      // handshake and no extra round trip in the steady state.
+      //
+      // `invalid_request` is the right signal to key on: every other value in
+      // this request is a constant or comes from the journal, all of them
+      // already valid, so the shape is the only thing left for the server to
+      // object to. A false positive costs the split-brain nonce and nothing
+      // else, and the worker says so once.
+      if (refused === "invalid_request" && this.extended && !this.stopped) {
+        this.extended = false;
+        // Its own one-shot line, deliberately not `warnHeartbeatOnce`: that
+        // one means "this host is not being counted", and after the retry
+        // below it is. Spending it here would swallow the next genuine
+        // refusal, which is the message that matters.
+        warnDowngradeOnce();
+        result = await this.transport.call(this.request(), controller.signal);
+        refused = errorCode(result);
+      }
       if (refused !== undefined) warnHeartbeatOnce(refused);
       if (!this.stopped && refused === undefined)
         parseHeartbeatResponse(

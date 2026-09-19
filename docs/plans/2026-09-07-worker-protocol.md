@@ -427,6 +427,20 @@ from `diagnostics.status` can present it and take the row over. It gains the
 heartbeat row and nothing else, and the host it displaces is refused from its
 next ping and says so.
 
+Because a copied journal is deliberately the same watcher, two hosts running
+one journal are one identity on the wire, and the configuration fingerprint is
+no longer there to accidentally separate them. So `diagnostics.heartbeat` also
+carries `heartbeatNonce`, 32 hex characters minted once per worker process, and
+the server keeps the last two it accepted. A nonce that *returns* -- arrives
+again after a different one -- is two live processes, and is never a restart or
+a crash loop, both of which mint a nonce that never comes back. Both hosts keep
+being accepted; refusing one would put the watcher back into the state this
+section's ADM-10 exception exists to remove.
+
+Both optional fields are dropped for the rest of the process on the first
+`invalid_request`, and the request is retried at once, so a worker is safe to
+deploy before or after its server.
+
 Only a current-session owner operation may replace or clear the binding. A
 worker must not re-register its own host: that is the self-approval this
 section already forbids, so there is no worker subcommand for it, and the owner

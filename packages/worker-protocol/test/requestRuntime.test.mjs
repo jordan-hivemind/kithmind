@@ -182,3 +182,36 @@ test("diagnostics.heartbeat takes an optional legacy watcher id", () => {
     assert.throws(() => parseWorkerRequest(bad), WorkerProtocolParseError);
   }
 });
+
+// ADM-10 review, finding 1. The per-process nonce that tells two live hosts
+// sharing one copied journal apart.
+test("diagnostics.heartbeat takes an optional per-process nonce", () => {
+  const heartbeat = {
+    ...source,
+    operation: "diagnostics.heartbeat",
+    watcherId: outcome.watcherId,
+    connectorVersion: "1.2.3",
+  };
+  const withNonce = { ...heartbeat, heartbeatNonce: "a".repeat(32) };
+  assert.deepEqual(parseWorkerRequest(withNonce), withNonce);
+
+  // Both optional fields together, which is what a current worker sends.
+  const both = {
+    ...withNonce,
+    legacyWatcherId: "10000000-0000-4000-8000-000000000002",
+  };
+  assert.deepEqual(parseWorkerRequest(both), both);
+
+  // A closed shape, not a bounded string: the server stores it and it is one
+  // join from the health screen, so a host name or a path must not fit.
+  for (const bad of [
+    { ...heartbeat, heartbeatNonce: "A".repeat(32) },
+    { ...heartbeat, heartbeatNonce: "a".repeat(31) },
+    { ...heartbeat, heartbeatNonce: "a".repeat(33) },
+    { ...heartbeat, heartbeatNonce: "" },
+    { ...heartbeat, heartbeatNonce: "worker-host.local".padEnd(32, "0") },
+    { ...heartbeat, heartbeatNonce: null },
+  ]) {
+    assert.throws(() => parseWorkerRequest(bad), WorkerProtocolParseError);
+  }
+});
