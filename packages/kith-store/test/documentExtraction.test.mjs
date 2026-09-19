@@ -849,3 +849,112 @@ test("a correction reaches query_records, not only get_document", { skip }, asyn
     currency: "USD",
   });
 });
+
+test("a correction survives re-extraction on both sides of the store", { skip }, async (t) => {
+  const f = await fixture(t);
+  await f.seed();
+  const ingested = await f.ingest();
+  await f.extract(
+    stubModel(goodReading()),
+    ingested.sourceItemId,
+    ingested.generationId,
+  );
+  await withKithTransaction(f.pool, (client) =>
+    applyCorrection(client, {
+      spaceId: f.spaceId,
+      sourceItemId: ingested.sourceItemId,
+      fieldName: "total",
+      correctedValue: { type: "money", amount: "16.50", currency: "USD" },
+      actorUserId: f.userId,
+      now: NOW + 4_000,
+    }),
+  );
+  // Re-extract the same reading. The replace rewrites every observation from
+  // the model, so without re-applying the correction the exact side reverts to
+  // 15.50 while the document read keeps showing 16.50.
+  await f.extract(
+    stubModel(goodReading()),
+    ingested.sourceItemId,
+    ingested.generationId,
+    NOW + 5_000,
+  );
+  const entityId = (
+    await f.rows(
+      "SELECT id FROM kith.entities WHERE space_id = $1 AND key = 'other:document'",
+      [f.spaceId],
+    )
+  )[0].id;
+  const latest = await withKithTransaction(f.pool, (client) =>
+    executeRecordQuery(
+      { client, now: NOW + 6_000 },
+      {
+        principal: {
+          userId: f.userId,
+          credentialId: f.principal.credentialId,
+        },
+        query: {
+          operation: "latest_observation",
+          spaceId: f.spaceId,
+          entityId,
+          observationType: "total",
+        },
+      },
+    ),
+  );
+  assert.equal(latest.status, "match");
+  assert.deepEqual(latest.candidates[0].value, {
+    type: "money",
+    amount: "16.5",
+    currency: "USD",
+  });
+  const document = await getDocument(f.client, [f.spaceId], ingested.documentId);
+  const total = document.extraction.statements.find(
+    (statement) => statement.field === "total",
+  );
+  assert.equal(total.corrected, true);
+  assert.deepEqual(total.value, {
+    type: "money",
+    amount: "16.50",
+    currency: "USD",
+  });
+  // The uncorrected fields still read as the model left them.
+  const vendor = document.extraction.statements.find(
+    (statement) => statement.field === "vendor",
+  );
+  assert.equal(vendor.corrected, undefined);
+});
+
+test("correcting one line item leaves the others alone", { skip }, async (t) => {
+  const f = await fixture(t);
+  await f.seed();
+  const ingested = await f.ingest();
+  await f.extract(
+    stubModel(goodReading()),
+    ingested.sourceItemId,
+    ingested.generationId,
+  );
+  await withKithTransaction(f.pool, (client) =>
+    applyCorrection(client, {
+      spaceId: f.spaceId,
+      sourceItemId: ingested.sourceItemId,
+      // The observation key of one item, not the field name.
+      fieldName: "line_items:1",
+      correctedValue: { type: "money", amount: "6.50", currency: "USD" },
+      actorUserId: f.userId,
+      now: NOW + 4_000,
+    }),
+  );
+  const items = await f.rows(
+    `SELECT observation_key, value FROM kith.observations
+      WHERE space_id = $1 AND observation_type = 'line_items'
+      ORDER BY observation_key`,
+    [f.spaceId],
+  );
+  assert.deepEqual(
+    items.map((row) => [row.observation_key, row.value.amount]),
+    [
+      ["line_items:0", "10"],
+      ["line_items:1", "6.5"],
+    ],
+  );
+});

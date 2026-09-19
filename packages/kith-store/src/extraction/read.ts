@@ -106,16 +106,21 @@ export async function readDocumentExtraction(
     return {
       field: statement.field,
       valueType: statement.valueType,
-      // The correction wins. The model's reading is kept beside it rather
-      // than replaced, which is what makes a re-extraction safe.
+      // The correction wins. `read` is the observation, which the correction
+      // was written through to, so the two agree; the correction row is read
+      // anyway because a field the owner settled before it was ever extracted
+      // has no observation to carry it.
       value: fix === undefined ? read : fix,
       page: statement.page,
       quote: statement.quote,
       evidenceSpanId: statement.evidenceSpanId,
       ...(statement.currencyAssumed ? { currencyAssumed: true as const } : {}),
+      // The model's own reading, from the extraction row rather than from the
+      // observation: the observation now carries the correction, so it is no
+      // longer a record of what was corrected.
       ...(fix === undefined
         ? {}
-        : { corrected: true as const, originalValue: read }),
+        : { corrected: true as const, originalValue: statement.modelValue }),
     };
   });
   // A corrected field the model never read at all is still a fact the owner

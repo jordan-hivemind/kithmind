@@ -68,7 +68,6 @@ test("a parsed value must appear in the quote that cites it", () => {
     gate({ valueType: "money", value: "15.50", quote: "Total $15.50" }).ok,
     true,
   );
-  // Sign is the reader's; the digits are the document's.
   assert.equal(
     gate({ valueType: "money", value: "-1234.56", quote: "Refund (1,234.56)" })
       .ok,
@@ -97,6 +96,79 @@ test("a parsed value must appear in the quote that cites it", () => {
     { ok: false, reason: "value_not_in_quote" },
   );
   assert.deepEqual(amountsInText("Hammer 10.00 Nails 5.50"), ["10", "5.5"]);
+});
+
+test("the quote's sign has to agree with the value's", () => {
+  // A refund read as a charge is the same class of error as a wrong digit and
+  // harder to notice, so the sign is part of the claim.
+  assert.deepEqual(
+    gate({ valueType: "money", value: "-42.00", quote: "Payment 42.00" }),
+    { ok: false, reason: "value_not_in_quote" },
+  );
+  assert.deepEqual(
+    gate({ valueType: "money", value: "42.00", quote: "Credit (42.00)" }),
+    { ok: false, reason: "value_not_in_quote" },
+  );
+  assert.equal(
+    gate({ valueType: "money", value: "-42.00", quote: "Credit (42.00)" }).ok,
+    true,
+  );
+  assert.equal(
+    gate({ valueType: "money", value: "42.00", quote: "Payment 42.00" }).ok,
+    true,
+  );
+  // The three shapes a document uses for a negative.
+  assert.deepEqual(amountsInText("Balance (1,234.56)"), ["-1234.56"]);
+  assert.deepEqual(amountsInText("Balance 1,234.56-"), ["-1234.56"]);
+  assert.deepEqual(amountsInText("Balance 1,234.56 CR"), ["-1234.56"]);
+  assert.deepEqual(amountsInText("Balance -$5.00"), ["-5"]);
+  // Parentheses already say negative; a sign inside them is not a number.
+  assert.equal(parseAmount("(-5)"), undefined);
+  assert.equal(parseAmount("(+5)"), undefined);
+});
+
+test("a date needs its month as well as its year and day", () => {
+  const value = "2026-01-02";
+  // Every one of these used to pass on the year and the day alone.
+  for (const quote of [
+    "Invoice date 15/03/2026 - 2 pages",
+    "Due 2026-11-02",
+    "Feb 2, 2026",
+  ]) {
+    assert.deepEqual(
+      gate({ valueType: "date", value, quote }),
+      { ok: false, reason: "value_not_in_quote" },
+      quote,
+    );
+  }
+  for (const quote of [
+    "Dated 2026-01-02",
+    "02/01/2026",
+    "January 2, 2026",
+    "Jan 2, 2026",
+    "2 Jan 2026",
+  ]) {
+    assert.equal(gate({ valueType: "date", value, quote }).ok, true, quote);
+  }
+  // A day and a month that are the same number need two runs of it, or the
+  // month's name.
+  assert.equal(
+    gate({ valueType: "date", value: "2026-03-03", quote: "3/3/2026" }).ok,
+    true,
+  );
+  assert.equal(
+    gate({ valueType: "date", value: "2026-03-03", quote: "Mar 3, 2026" }).ok,
+    true,
+  );
+  assert.deepEqual(
+    gate({ valueType: "date", value: "2026-03-03", quote: "Line 3 of 2026" }),
+    { ok: false, reason: "value_not_in_quote" },
+  );
+  // A word is not a month because it starts with the same three letters.
+  assert.deepEqual(
+    gate({ valueType: "date", value: "2026-03-04", quote: "4 Market St, 2026" }),
+    { ok: false, reason: "value_not_in_quote" },
+  );
 });
 
 test("a percentage keeps its decimal comma", () => {

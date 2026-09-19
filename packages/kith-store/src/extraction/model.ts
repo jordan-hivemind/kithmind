@@ -54,7 +54,11 @@ import { sha256Utf8 } from "../provenance/sql.js";
 import { occurrenceColumns, occurrenceSortKey } from "../records/model.js";
 import type { ObservationValue, Occurrence } from "../records/values.js";
 import { withKithTransaction } from "../schema.js";
-import { openCorrection, resolvedCorrections } from "./corrections.js";
+import {
+  openCorrection,
+  reapplyCorrections,
+  resolvedCorrections,
+} from "./corrections.js";
 import { seedDocumentTypes } from "./seed.js";
 import {
   checkValue,
@@ -399,6 +403,16 @@ export type StoredStatement = {
   observationKeys: string[];
   evidenceSpanId: string;
   currencyAssumed?: true;
+  /**
+   * What the model read, as stored at extraction time.
+   *
+   * Kept here rather than inferred from the observation, because the
+   * observation is the *current* value and a correction overwrites it (and is
+   * re-applied after every re-extraction). Without this column the model's
+   * reading would vanish the moment the owner corrected it, and the document
+   * read could no longer show what was being corrected.
+   */
+  modelValue: ObservationValue | ObservationValue[];
 };
 
 type Prepared = {
@@ -662,18 +676,30 @@ async function prepare(
       quote: entry.quote,
       observationKeys: keys,
       evidenceSpanId: entry.spanId,
+      modelValue: entry.values.length > 1 ? entry.values : entry.values[0]!,
       ...(entry.currencyAssumed ? { currencyAssumed: true as const } : {}),
     });
   }
 
   // `sums_to_total`, the one check that spans two fields.
   //
-  // Driven by the field's own declared check, not by a field called
-  // `line_items`, because the check is data like everything else here. The
-  // comparison is against the subtotal when the document states one and the
-  // total otherwise: on a taxed receipt the items sum to the subtotal and the
-  // total carries the tax, so comparing to the total was a false mismatch on
-  // every receipt with sales tax on it.
+  // Which field is doing the summing is data: a field whose `check_kind` is
+  // `sums_to_total`. What it is summed *against* is a naming convention, not
+  // data, and this is where it is written down: **a document type whose field
+  // carries `sums_to_total` states the sum in a money field named `subtotal`,
+  // or in one named `total` when it has no subtotal.** The preference matters
+  // on a taxed receipt, where the items sum to the subtotal and the total
+  // carries the tax; comparing to the total was a false mismatch on every
+  // receipt with sales tax on it.
+  //
+  // A convention rather than a column because the alternative is a
+  // `sums_into` foreign key on `document_type_fields` that every kind but
+  // three would leave null, and the two names are already what every one of
+  // the starter kinds calls them. Section 8 of
+  // docs/plans/2026-09-18-admin-panel-and-ingestion.md states it too, so a
+  // kind added from the admin screen can follow it. A kind that names its sum
+  // something else simply gets no sum check, which is the same as declaring
+  // none.
   //
   // Zero tolerance. The items are kept and the compared field opens the
   // correction.
@@ -907,6 +933,18 @@ async function store(
       JSON.stringify(prepared.statements),
     ],
   );
+
+  // A human fix outlives this replace. The observations above are the model's
+  // newest reading of every field, including fields the owner has already
+  // corrected, so without this line a re-extraction silently reverts a
+  // correction on the exact-arithmetic side -- `latest_observation` and
+  // `sum_money` back to the model's number -- while `get_document` goes on
+  // showing the owner's. Re-applied inside the same transaction as the
+  // replace, so no reader ever sees the reverted state.
+  await reapplyCorrections(client, {
+    spaceId: loaded.spaceId,
+    sourceItemId: loaded.sourceItemId,
+  });
 
   // Corrections. A field a human already fixed does not get a new open item:
   // the fix stands, the new reading is kept alongside it, and re-raising it

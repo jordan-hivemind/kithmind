@@ -227,13 +227,47 @@ async function writeThrough(
   } catch {
     return 0;
   }
+  // `observation_key`, not `observation_type`. A single-value field's key is
+  // its own name, so the two are the same there; a `line_item_list` field has
+  // one observation per item keyed `line_items:0`, `line_items:1`, and
+  // matching on the type would overwrite every line of the receipt with the
+  // correction meant for one of them.
   const updated = await client.query(
     `UPDATE kith.observations SET value = $4
       WHERE space_id = $1 AND source_item_id = $2
-        AND event_type = 'document_statement' AND observation_type = $3`,
+        AND event_type = 'document_statement' AND observation_key = $3`,
     [input.spaceId, input.sourceItemId, input.fieldName, JSON.stringify(value)],
   );
   return updated.rowCount ?? 0;
+}
+
+/**
+ * Re-applies every resolved correction for one document to the observations
+ * that were just written.
+ *
+ * The extraction writer replaces its observations wholesale on every run, so
+ * without this a re-extraction quietly undoes the owner's fix on the exact
+ * side while `get_document` goes on showing it: `latest_observation` would say
+ * 15.50 and the document read 16.50, from the same transaction, about the same
+ * field. Called at the end of the replace, inside it.
+ */
+export async function reapplyCorrections(
+  client: ClientBase,
+  input: { spaceId: string; sourceItemId: string },
+): Promise<number> {
+  let applied = 0;
+  for (const [fieldName, correctedValue] of await resolvedCorrections(
+    client,
+    input.spaceId,
+    input.sourceItemId,
+  )) {
+    applied += await writeThrough(client, {
+      ...input,
+      fieldName,
+      correctedValue,
+    });
+  }
+  return applied;
 }
 
 /** What the extraction currently says about one field, for the record of what
@@ -249,34 +283,40 @@ async function currentReading(
       `SELECT o.value FROM kith.observations o
          WHERE o.space_id = $1 AND o.source_item_id = $2
            AND o.event_type = 'document_statement'
-           AND o.observation_type = $3
-         ORDER BY o.observation_key LIMIT 1`,
+           AND o.observation_key = $3
+         LIMIT 1`,
       [spaceId, sourceItemId, fieldName],
     )
   ).rows[0];
   return found?.value ?? null;
 }
 
-/** The field names of one document that a human has already settled. The
- * extraction writer reads this so a re-run never re-opens a fixed field. */
+/**
+ * What a human has already settled on this document, by field name.
+ *
+ * Two readers. The extraction writer uses the keys, so a re-run never re-opens
+ * a field the owner has fixed; `reapplyCorrections` uses the values, so the
+ * fix survives the observations being replaced.
+ */
 export async function resolvedCorrections(
   client: ClientBase,
   spaceId: string,
   sourceItemId: string,
-): Promise<Set<string>> {
+): Promise<Map<string, unknown>> {
   const rows = (
-    await client.query<{ field_name: string | null }>(
-      `SELECT field_name FROM kith.corrections
+    await client.query<{ field_name: string | null; corrected_value: unknown }>(
+      `SELECT field_name, corrected_value FROM kith.corrections
         WHERE space_id = $1 AND target_kind = 'document' AND target_id = $2
-          AND state = 'resolved' LIMIT 512`,
+          AND state = 'resolved'
+        ORDER BY resolved_at, id LIMIT 512`,
       [spaceId, sourceItemId],
     )
   ).rows;
-  return new Set(
-    rows
-      .map((row) => row.field_name)
-      .filter((name): name is string => name !== null),
-  );
+  const settled = new Map<string, unknown>();
+  for (const row of rows) {
+    if (row.field_name !== null) settled.set(row.field_name, row.corrected_value);
+  }
+  return settled;
 }
 
 /** Every correction on one document, newest first. Used by the read side to

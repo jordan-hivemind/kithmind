@@ -169,6 +169,10 @@ export function parseAmount(raw: string): string | undefined {
   if (accounting) {
     negative = true;
     text = accounting[1]!.trim();
+    // Parentheses already say negative. A sign inside them is either a second
+    // negation or a contradiction, and `(-5)` is not a number any ledger
+    // prints, so it is refused rather than read as one of the two.
+    if (/[-+]/.test(text)) return undefined;
   }
   text = text.replace(/[A-Z]{3}/g, "");
   for (const [symbol] of CURRENCY_SYMBOLS) text = text.split(symbol).join("");
@@ -227,57 +231,117 @@ function realIsoDate(value: string): boolean {
 }
 
 /**
- * Every number the quote prints, as exact decimals.
+ * Every number the quote prints, as exact decimals, with the sign the quote
+ * gives it.
  *
- * The runs are taken greedily (`1,234.56` is one token, not three) and each is
- * parsed by the same function that parses the value itself, so the quote and
- * the value are read under one set of rules. A token that does not parse is
- * dropped rather than reported: the quote is prose, and prose contains things
- * like `4471` and `2026-09-01` that are not amounts.
+ * The digit runs are taken greedily (`1,234.56` is one token, not three) and
+ * each is parsed by the same function that parses the value itself, so the
+ * quote and the value are read under one set of rules. A token that does not
+ * parse is dropped rather than reported: the quote is prose, and prose
+ * contains things like `4471` that are not amounts.
+ *
+ * The sign lives around the token, not in it, because that is where a document
+ * puts it: a leading minus or open parenthesis before the digits, a closing
+ * parenthesis, a trailing minus or a `CR` after them. Reading it is what lets
+ * the caller refuse `-42.00` cited to "Payment 42.00".
  */
 export function amountsInText(text: string): string[] {
+  const normalized = text.normalize("NFKC");
   const found: string[] = [];
-  for (const token of text.normalize("NFKC").match(/\d[\d.,]*/g) ?? []) {
-    const amount = parseAmount(token.replace(/[.,]+$/, ""));
-    if (amount !== undefined) found.push(amount);
+  const runs = /\d[\d.,]*/g;
+  let match: RegExpExecArray | null;
+  while ((match = runs.exec(normalized)) !== null) {
+    const amount = parseAmount(match[0].replace(/[.,]+$/, ""));
+    if (amount === undefined) continue;
+    const before = normalized.slice(Math.max(0, match.index - 12), match.index);
+    const after = normalized.slice(
+      match.index + match[0].length,
+      match.index + match[0].length + 4,
+    );
+    const negative =
+      /[-(]\s*(?:[$\u20ac\u00a3\u00a5\u20b9\u20a9]|[A-Z]{3})?\s*$/.test(before) ||
+      /^\s*[)-]/.test(after) ||
+      /^\s*CR\b/i.test(after);
+    found.push(negative ? negate(amount) : amount);
   }
   return found;
 }
 
-function absolute(decimal: string): string {
-  return decimal.startsWith("-") ? decimal.slice(1) : decimal;
+function negate(decimal: string): string {
+  if (compareDecimals(decimal, "0") === 0) return decimal;
+  return decimal.startsWith("-") ? decimal.slice(1) : `-${decimal}`;
 }
 
 /**
- * Whether the quote actually prints this amount.
+ * Whether the quote actually prints this amount, sign and all.
  *
- * Signs are compared by magnitude. A document writes a negative as `(1,234.56)`
- * or as `1,234.56 CR` under a heading that means "you are owed", and the sign
- * is the reader's, not the digits'. The digits are what must match.
+ * Sign agreement is part of the claim. A refund read as a charge is the same
+ * class of error as a wrong digit and it is harder to notice, so `42.00` cited
+ * to "Credit (42.00)" fails here rather than becoming a positive balance the
+ * owner reconciles against a statement that disagrees.
  */
 function amountInQuote(amount: string, quote: string): boolean {
-  const target = absolute(amount);
   return amountsInText(quote).some(
-    (found) => compareDecimals(absolute(found), target) === 0,
+    (found) => compareDecimals(found, amount) === 0,
+  );
+}
+
+const MONTH_NAMES = [
+  "january",
+  "february",
+  "march",
+  "april",
+  "may",
+  "june",
+  "july",
+  "august",
+  "september",
+  "october",
+  "november",
+  "december",
+] as const;
+
+/** Whether the quote names this month in words. A word counts when the month's
+ * full name starts with it and it is at least three letters, so `Sep`, `Sept`
+ * and `September` all name September and `Market` does not name March. */
+function monthNamed(month: number, quote: string): boolean {
+  const name = MONTH_NAMES[month - 1]!;
+  return (quote.toLowerCase().match(/[a-z]+/g) ?? []).some(
+    (word) => word.length >= 3 && name.startsWith(word),
   );
 }
 
 /**
  * Whether the quote prints this ISO date.
  *
- * The year and the day of the month both have to be there, as their own digit
- * runs, which holds for `2026-09-01`, `09/01/2026` and `September 1, 2026`
- * alike and fails for a quote that happens to carry some other year. The month
- * is not required: a document writes it as a word as often as a number.
+ * All three parts have to be there: the year, the day of the month and the
+ * month, each as its own digit run, or the month as a word. Without the month
+ * `2026-01-02` was supported by "Due 2026-11-02" and by "Feb 2, 2026", which
+ * is a wrong date with a citation that looks right -- the one failure this
+ * gate exists to prevent.
+ *
+ * The runs are consumed as they are matched, so a day and a month that are the
+ * same number need two runs of it, or one run and the month's name. A quote
+ * that prints the ISO date outright is taken as it stands.
+ *
+ * Deliberately strict. A date this refuses opens a correction the owner
+ * resolves in a moment; a date it wrongly accepts is a stored fact nobody
+ * looks at again.
  */
 function dateInQuote(iso: string, quote: string): boolean {
-  const [year, , day] = iso.split("-") as [string, string, string];
-  const runs = (quote.normalize("NFKC").match(/\d+/g) ?? []).slice(0, 64);
-  const yearAt = runs.indexOf(year);
-  if (yearAt < 0) return false;
-  const rest = [...runs.slice(0, yearAt), ...runs.slice(yearAt + 1)];
-  const bare = String(Number(day));
-  return rest.some((run) => run === day || run === bare);
+  const [year, month, day] = iso.split("-") as [string, string, string];
+  const text = quote.normalize("NFKC");
+  if (text.includes(iso)) return true;
+  const runs = (text.match(/\d+/g) ?? []).slice(0, 64);
+  const take = (candidates: readonly string[]): boolean => {
+    const at = runs.findIndex((run) => candidates.includes(run));
+    if (at < 0) return false;
+    runs.splice(at, 1);
+    return true;
+  };
+  if (!take([year])) return false;
+  if (!take([day, String(Number(day))])) return false;
+  return monthNamed(Number(month), text) || take([month, String(Number(month))]);
 }
 
 function asLineItems(value: unknown): LineItem[] | undefined {
