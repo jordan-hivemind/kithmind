@@ -228,6 +228,17 @@ The model reads a page as numbered lines and cites line ids rather than
 copying text. The server builds the quote from the cited lines, so a citation
 is checkable arithmetic and the value gates run against the page's own words.
 
+**Pages and lines are both 1-based in the prompt, and neither is the page's
+own ordinal.** `source_pages.ordinal` is 0-based and may be sparse; a page's
+number in the prompt is its position in the list actually shown, and citations
+resolve only through that map. A page with no words on it is not shown, which
+shifts nothing because there is no hole to shift over. A cited page that is not
+in the map is `citation_page_unknown` and nothing is shifted to make it fit.
+
+A line longer than 240 characters is split into citable pieces at whitespace,
+with exact offsets, so a 2,000-character line does not become one citation
+holding dozens of numbers.
+
 | Knob | Where | Effect |
 | --- | --- | --- |
 | `KITH_EXTRACT_MODEL` | daemon environment | The default model. Unchanged. |

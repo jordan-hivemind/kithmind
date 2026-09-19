@@ -34,9 +34,9 @@ import {
   amountsInText,
   checkValue,
   citationRange,
+  pageLines,
   readPrintedDate,
   numberedPage,
-  pageLines,
   parseModelReading,
   printedDateToIso,
   runDocumentExtractionJob,
@@ -101,7 +101,7 @@ const OCR_INVOICE = [
 ].join("\n");
 
 function statement(field, value, lines, extra = {}) {
-  return { field, value, line_items: null, page: 0, lines, ...extra };
+  return { field, value, line_items: null, page: 1, lines, ...extra };
 }
 
 function fakeModel(reading) {
@@ -510,16 +510,18 @@ test("a citation outside the page is a named failure, not a wrong fact", { skip 
         // A range too wide to be a citation.
         statement("subtotal", "20.00", [1, 8]),
         // A page that does not exist.
-        { ...statement("tax", "1.60", [1]), page: 4 },
+        { ...statement("tax", "1.60", [1]), page: 9 },
       ],
     }),
     ids,
   );
   assert.equal(outcome.stored, 1);
+  // A page the document does not have is its own reason, so the counts can
+  // tell "we number pages differently" from "that line id is off the end".
   assert.deepEqual(await f.corrections(), [
     { field_name: "subtotal", reason: "citation_out_of_range" },
-    { field_name: "tax", reason: "citation_out_of_range" },
     { field_name: "total", reason: "citation_out_of_range" },
+    { field_name: "tax", reason: "citation_page_unknown" },
   ]);
 });
 
@@ -531,8 +533,8 @@ test("the old quote shape still reads, for an endpoint with no schema", { skip }
       kind: "receipt",
       summary: "Hardware receipt.",
       statements: [
-        { field: "vendor", value: "BRACKEN TOOLS", page: 0, quote: "BRACKEN TOOLS" },
-        { field: "total", value: "21.60", page: 0, quote: "Total | 21.60" },
+        { field: "vendor", value: "BRACKEN TOOLS", page: 1, quote: "BRACKEN TOOLS" },
+        { field: "total", value: "21.60", page: 1, quote: "Total | 21.60" },
       ],
     }),
     ids,
@@ -660,10 +662,10 @@ test("the shape the old contract produced, for the record", { skip }, async (t) 
       kind: "receipt",
       summary: "Hardware receipt.",
       statements: [
-        { field: "vendor", value: "BRACKEN TOOLS", page: 0, quote: "BRACKEN TOOLS" },
-        { field: "subtotal", value: "20.00", page: 0, quote: "Subtotal 20.00" },
-        { field: "tax", value: "1.60", page: 0, quote: "Tax 1.60" },
-        { field: "total", value: "21.60", page: 0, quote: "Total 21.60" },
+        { field: "vendor", value: "BRACKEN TOOLS", page: 1, quote: "BRACKEN TOOLS" },
+        { field: "subtotal", value: "20.00", page: 1, quote: "Subtotal 20.00" },
+        { field: "tax", value: "1.60", page: 1, quote: "Tax 1.60" },
+        { field: "total", value: "21.60", page: 1, quote: "Total 21.60" },
       ],
     }),
     ids,
@@ -844,4 +846,190 @@ test("a page longer than the line bound is marked partially read", { skip }, asy
   )[0];
   // Every page was shown; it is the lines that were cut.
   assert.equal(Number(row.pages_read), Number(row.pages_total));
+});
+
+// ---------------------------------------------------------------------------
+// Page numbering. The regression that cost every document in the live trial.
+// ---------------------------------------------------------------------------
+
+/**
+ * Inserts pages at the ordinals given, on the document's own sealed text
+ * version, replacing whatever the inline lane wrote.
+ *
+ * Production ordinals are 0-based and need not be dense, and a blank page
+ * comes through as empty text. A fixture that numbered from 1 agreed with the
+ * broken code by accident, which is how the bug reached the owner's machine.
+ */
+async function repaginate(f, ids, pages) {
+  const textVersionId = (
+    await f.rows(
+      "SELECT source_text_version_id FROM kith.processing_generations WHERE id = $1",
+      [ids.generationId],
+    )
+  )[0].source_text_version_id;
+  // The inline lane staged a page and its spans; both go before the fixture's
+  // own pages arrive.
+  await f.client.query(
+    "DELETE FROM kith.evidence_spans WHERE source_text_version_id = $1",
+    [textVersionId],
+  );
+  await f.client.query(
+    "DELETE FROM kith.source_pages WHERE source_text_version_id = $1",
+    [textVersionId],
+  );
+  for (const [ordinal, text] of pages) {
+    await f.client.query(
+      `INSERT INTO kith.source_pages
+         (id,space_id,created_at,source_text_version_id,ordinal,start,"end",
+          text,text_hash)
+       VALUES ($1,$2,transaction_timestamp(),$3,$4,0,$5,$6,$7)`,
+      [
+        newKithId(),
+        f.spaceId,
+        textVersionId,
+        ordinal,
+        text.length,
+        text,
+        "d".repeat(64),
+      ],
+    );
+  }
+}
+
+test("a single-page document at ordinal 0 reads through line citations", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(TABLE_RECEIPT, "synthetic-ordinal-zero");
+  // Exactly what the inline and parsed lanes both produce for a one-page
+  // document: one row, ordinal 0. The model is shown "=== page 1 ===" and
+  // answers page 1; before this fix the server looked the page up by its
+  // ordinal, found nothing, and lost every field on the document.
+  await repaginate(f, ids, [[0, TABLE_RECEIPT]]);
+  assert.equal(
+    Number(
+      (
+        await f.rows(
+          `SELECT ordinal FROM kith.source_pages
+            WHERE space_id = $1 ORDER BY ordinal LIMIT 1`,
+          [f.spaceId],
+        )
+      )[0].ordinal,
+    ),
+    0,
+    "the fixture is 0-based, like production",
+  );
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt from Bracken Tools.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS", [1]),
+        statement("purchase_date", "09/18/26", [2]),
+        statement("total", "21.60", [8]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.failed, 0);
+  assert.deepEqual(
+    (await f.stored()).map((row) => row.observation_key).sort(),
+    ["purchase_date", "total", "vendor"],
+  );
+  assert.deepEqual(await f.corrections(), []);
+});
+
+test("sparse 0-based ordinals and a blank page number from one", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(TABLE_RECEIPT, "synthetic-sparse-ordinals");
+  // 0-based, with a gap, and a blank verso in the middle. The blank page is
+  // not offered to the model at all, and leaving it out shifts nothing:
+  // numbering is by position in the list actually shown.
+  await repaginate(f, ids, [
+    [0, "HALLOWAY JOINERY\nInvoice 88120"],
+    [1, ""],
+    [4, "Invoice date: 9 Apr 2026\nAmount due $165.00"],
+  ]);
+  const model = fakeModel({
+    kind: "invoice",
+    summary: "Joinery invoice.",
+    statements: [
+      statement("vendor", "HALLOWAY JOINERY", [1]),
+      statement("invoice_number", "88120", [2]),
+      { ...statement("invoice_date", "9 Apr 2026", [1]), page: 2 },
+      { ...statement("total", "$165.00", [2]), page: 2 },
+    ],
+  });
+  const outcome = await f.extract(model, ids);
+  // Two pages shown, headed 1 and 2. The blank one is absent.
+  const prompt = model.requests[0].prompt;
+  assert.match(prompt, /=== page 1 ===\n1\| HALLOWAY JOINERY/);
+  assert.match(prompt, /=== page 2 ===\n1\| Invoice date: 9 Apr 2026/);
+  assert.doesNotMatch(prompt, /=== page 3 ===/);
+  assert.match(prompt, /Pages and lines both count from 1\./);
+
+  assert.equal(outcome.failed, 0);
+  assert.deepEqual(
+    (await f.stored()).map((row) => row.observation_key).sort(),
+    ["invoice_date", "invoice_number", "total", "vendor"],
+  );
+  // The spans point at the real page rows, ordinals and all.
+  const spans = await f.rows(
+    `SELECT p.ordinal FROM kith.evidence_spans s
+       JOIN kith.source_pages p ON p.id = s.source_page_id
+      WHERE s.space_id = $1 ORDER BY p.ordinal`,
+    [f.spaceId],
+  );
+  assert.deepEqual(
+    [...new Set(spans.map((row) => Number(row.ordinal)))],
+    [0, 4],
+  );
+  // A blank page is not a dropped page, so nothing claims the document was
+  // read partially.
+  assert.equal(outcome.truncated, false);
+  assert.deepEqual(await f.corrections(), []);
+});
+
+test("a very long line becomes several citable pieces", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(TABLE_RECEIPT, "synthetic-long-line");
+  // One 2,000-character line, as some real pages carry. Cited whole it would
+  // hold dozens of numbers, and any of them would satisfy a check meant for
+  // one.
+  const filler = Array.from(
+    { length: 120 },
+    (_, index) => `item ${index} at ${index}.00`,
+  ).join(" ");
+  const page = `HALLOWAY JOINERY ${filler} amount due 4242.00`;
+  assert.ok(page.length > 2_000);
+  await repaginate(f, ids, [[0, page]]);
+
+  const model = fakeModel({
+    kind: "invoice",
+    summary: "Joinery invoice.",
+    statements: [statement("vendor", "HALLOWAY JOINERY", [1])],
+  });
+  await f.extract(model, ids);
+  const shown = model.requests[0].prompt;
+  // Split, and each piece is its own citable line.
+  assert.match(shown, /^1\| HALLOWAY JOINERY/m);
+  assert.match(shown, /^2\| /m);
+  // The pieces cover the page exactly: every one is a real slice, and joined
+  // they are the page.
+  const lines = pageLines(page);
+  assert.ok(lines.length > 1);
+  assert.equal(lines.map((line) => line.text).join(""), page);
+  for (const line of lines) {
+    assert.equal(page.slice(line.start, line.end), line.text);
+    assert.ok(line.end - line.start <= 240);
+  }
+  // A value on a far piece is not supported by citing the first one.
+  assert.deepEqual(
+    checkValue({
+      valueType: "money",
+      value: "4242.00",
+      quote: lines[0].text,
+      pageText: page,
+      defaultCurrency: "USD",
+    }),
+    { ok: false, reason: "value_not_in_quote" },
+  );
 });

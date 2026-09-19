@@ -62,19 +62,19 @@ function goodReading(overrides = {}) {
       {
         field: "vendor",
         value: "Acme Hardware",
-        page: 0,
+        page: 1,
         quote: "Acme Hardware",
       },
       {
         field: "purchase_date",
         value: "2026-09-01",
-        page: 0,
+        page: 1,
         quote: "Date: 2026-09-01",
       },
       {
         field: "total",
         value: "$15.50",
-        page: 0,
+        page: 1,
         quote: "Total due $15.50",
       },
       {
@@ -83,7 +83,7 @@ function goodReading(overrides = {}) {
           { description: "Hammer", amount: "10.00" },
           { description: "Nails", amount: "5.50" },
         ],
-        page: 0,
+        page: 1,
         // Spans four physical lines: the quote locator folds whitespace, so
         // this resolves to one span over the page's own text.
         quote: "Hammer\n  10.00\nNails\n  5.50",
@@ -393,19 +393,19 @@ test("a failed gate opens a correction instead of storing a guess", { skip }, as
   const reading = goodReading();
   reading.statements = [
     // A quote that is not on the page at all.
-    { field: "vendor", value: "Fictional Co", page: 0, quote: "Fictional Co" },
+    { field: "vendor", value: "Fictional Co", page: 1, quote: "Fictional Co" },
     // A quote that is, with a value that does not parse.
-    { field: "total", value: "about fifteen", page: 0, quote: "Total due $15.50" },
+    { field: "total", value: "about fifteen", page: 1, quote: "Total due $15.50" },
     // A field the type does not have.
-    { field: "warranty", value: "1 year", page: 0, quote: "Acme Hardware" },
+    { field: "warranty", value: "1 year", page: 1, quote: "Acme Hardware" },
     // Line items that do not sum to the stated total.
     {
       field: "line_items",
       value: [{ description: "Hammer", amount: "10.00" }],
-      page: 0,
+      page: 1,
       quote: "Hammer\n  10.00",
     },
-    { field: "subtotal", value: "$15.50", page: 0, quote: "Subtotal $15.50" },
+    { field: "subtotal", value: "$15.50", page: 1, quote: "Subtotal $15.50" },
   ];
   const outcome = await f.extract(
     stubModel(reading),
@@ -531,8 +531,8 @@ test("a kind added as a row is used with no code change", { skip }, async (t) =>
     kind: "hardware_warranty",
     summary: "A warranty from Acme Hardware.",
     statements: [
-      { field: "issuer", value: "Acme Hardware", page: 0, quote: "Acme Hardware" },
-      { field: "term_months", value: "4471", page: 0, quote: "Invoice 4471" },
+      { field: "issuer", value: "Acme Hardware", page: 1, quote: "Acme Hardware" },
+      { field: "term_months", value: "4471", page: 1, quote: "Invoice 4471" },
     ],
   });
   const outcome = await f.extract(
@@ -759,12 +759,12 @@ test("taxed line items are compared to the subtotal, not the total", { skip }, a
             { description: "Widget", amount: "10.00" },
             { description: "Gadget", amount: "20.00" },
           ],
-          page: 0,
+          page: 1,
           quote: "Widget\n  10.00\nGadget\n  20.00",
         },
-        { field: "subtotal", value: "$30.00", page: 0, quote: "Subtotal $30.00" },
-        { field: "tax", value: "$2.40", page: 0, quote: "Sales tax $2.40" },
-        { field: "total", value: "$32.40", page: 0, quote: "Total due $32.40" },
+        { field: "subtotal", value: "$30.00", page: 1, quote: "Subtotal $30.00" },
+        { field: "tax", value: "$2.40", page: 1, quote: "Sales tax $2.40" },
+        { field: "total", value: "$32.40", page: 1, quote: "Total due $32.40" },
       ],
     }),
     ingested.sourceItemId,
@@ -794,10 +794,10 @@ test("two readings of one field store neither and open a correction", { skip }, 
       kind: "receipt",
       summary: "A receipt the model could not settle.",
       statements: [
-        { field: "total", value: "$15.50", page: 0, quote: "Total due $15.50" },
-        { field: "total", value: "$15.50", page: 0, quote: "Subtotal $15.50" },
-        { field: "vendor", value: "Acme Hardware", page: 0, quote: "Acme Hardware" },
-        { field: "vendor", value: "Acme", page: 0, quote: "Acme Hardware" },
+        { field: "total", value: "$15.50", page: 1, quote: "Total due $15.50" },
+        { field: "total", value: "$15.50", page: 1, quote: "Subtotal $15.50" },
+        { field: "vendor", value: "Acme Hardware", page: 1, quote: "Acme Hardware" },
+        { field: "vendor", value: "Acme", page: 1, quote: "Acme Hardware" },
       ],
     }),
     ingested.sourceItemId,
