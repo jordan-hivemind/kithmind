@@ -333,7 +333,7 @@ async function prepare(f) {
   });
 }
 
-test("paired rebind preserves journal state and rotates heartbeat identity", async () => {
+test("paired rebind preserves journal state and the heartbeat identity", async () => {
   const f = await fixture();
   let journal = f.journal;
   try {
@@ -347,8 +347,11 @@ test("paired rebind preserves journal state and rotates heartbeat identity", asy
       intentPath: f.intentPath,
     });
     journal = result.journal;
-    assert.equal(result.watcherIdentityChanged, true);
-    assert.notEqual(result.previousWatcherId, result.currentWatcherId);
+    // ADM-10: a relocation moves the archive root, not the watcher. The id
+    // is derived from the journal salt and the authority binding, neither of
+    // which a relocation touches, so it must survive one unchanged.
+    assert.equal(result.watcherIdentityChanged, false);
+    assert.equal(result.previousWatcherId, result.currentWatcherId);
     assert.deepEqual(journal.binding, journalBindingForConfig(f.proposed));
     assert.deepEqual(journal.checkpoint, { version: 1, phase: "idle" });
     const after = JSON.parse(
@@ -480,7 +483,7 @@ test("static production recovery reopens the real catalog after either half-writ
       });
       assert.equal(recovered.state, "rebound");
       assert.equal(recovered.relocationId, f.mapping.relocationId);
-      assert.equal(recovered.watcherIdentityChanged, true);
+      assert.equal(recovered.watcherIdentityChanged, false);
       const reopened = await Journal.open({
         directory: f.proposed.journalDir,
         binding: journalBindingForConfig(f.proposed),

@@ -392,7 +392,13 @@ medical test, or date range has been captured.
 Only the long-running `watch` command sends `diagnostics.heartbeat`. A one-shot
 `run` does not establish a monitoring expectation. The watcher ID is a
 canonical lowercase UUID derived from the journal's immutable random salt and
-full authority binding. The server supplies
+its authority binding: endpoint, space, source account and credential slot.
+ADM-10 removed the configuration fingerprint from that derivation. It hashed
+the watched roots with their absolute paths and the whole `pdfDocQa` block, so
+adding a root, moving the parser or upgrading it minted a new identity that the
+server then refused for good. What the salt still decides is unchanged: a
+copied journal keeps its identity across a host move, and a journal created
+from nothing is a new watcher. The server supplies
 `receivedAt` and fixes `nextExpectedAt` at 180 seconds later. Clients cannot
 submit timestamps, intervals, hostnames, paths, pass outcomes, exception text,
 or coverage claims.
@@ -404,9 +410,32 @@ retry; no durable request receipt is created.
 
 The first authorized heartbeat claims an unbound source. Later heartbeats must
 use the same watcher ID. A different watcher receives
-`identity_review_required` and makes no write. Only a current-session owner
-operation may replace or clear the binding. A replacement selected by the owner
-has state `awaiting_heartbeat`; it has no liveness deadline and cannot be called
+`identity_review_required` and makes no write. What the refusal protects is
+operational rather than cryptographic: the credential already authorizes scans
+and publication, so the refusal is what keeps one registered host per source
+account, so that a host which goes silent reads as missing instead of being
+masked by a second host's pings.
+
+ADM-10 adds one exception and no others. A heartbeat may carry
+`legacyWatcherId`, the ID the same journal would have computed under the old
+derivation; when the registered ID equals it, the row is carried to the ID the
+request claims and the ping is accepted. That is one installation restating its
+own registration in the new spelling, it happens once, and a request presenting
+neither ID is refused exactly as before. The cost is stated where it is
+implemented: a second host on the same credential that reads the registered ID
+from `diagnostics.status` can present it and take the row over. It gains the
+heartbeat row and nothing else, and the host it displaces is refused from its
+next ping and says so.
+
+Only a current-session owner operation may replace or clear the binding. A
+worker must not re-register its own host: that is the self-approval this
+section already forbids, so there is no worker subcommand for it, and the owner
+action (`reregisterWorkerWatcher`, the health screen's "Re-register watcher")
+is the whole recovery surface. It clears the binding rather than naming a
+replacement, because only the worker knows its own ID; the next heartbeat
+claims the unbound source, so the window is one heartbeat wide and the host
+that is up is the one that closes it. A replacement selected by the owner has
+state `awaiting_heartbeat`; it has no liveness deadline and cannot be called
 current until that watcher first authenticates successfully.
 
 `diagnostics.status.watcher` is exactly one of:

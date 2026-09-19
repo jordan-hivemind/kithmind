@@ -249,6 +249,67 @@ function bindingEqual(left: JournalBinding, right: JournalBinding): boolean {
 }
 
 /**
+ * ADM-10. The binding without its configuration fingerprint: what names *this
+ * installation of this watcher for this source account*, and nothing about how
+ * it happens to be configured today.
+ *
+ * Written as a literal rather than by deleting a key, because the key order is
+ * part of the hash input in `mintWatcherId` and a spread would carry whatever
+ * order `parseBinding` happened to freeze.
+ */
+function authorityOf(binding: JournalBinding): Record<string, unknown> {
+  return {
+    protocolVersion: binding.protocolVersion,
+    endpoint: binding.endpoint,
+    spaceId: binding.spaceId,
+    sourceAccountId: binding.sourceAccountId,
+    credentialSlot: binding.credentialSlot,
+  };
+}
+
+/**
+ * A canonical lowercase v5-shaped UUID over a salt and a payload.
+ *
+ * ADM-10. Two versions exist and both are computed on every open:
+ *
+ * `v2` (`watcherId`, what the heartbeat presents) hashes the salt and
+ * `authorityOf(binding)`. `v1` (`legacyWatcherId`) hashes the salt and the
+ * whole binding, including `configFingerprint`.
+ *
+ * `configFingerprint` hashes the endpoint, space, account, the watched roots
+ * with their absolute paths and the whole `pdfDocQa` block
+ * (`journalBindingForConfig`, config.ts). Under `v1` every ordinary
+ * configuration change -- adding a root, moving the parser, upgrading it --
+ * minted a new watcher identity, and `recordWorkerHeartbeat` refuses an
+ * identity it did not register, before any write, forever. The watcher went on
+ * completing passes while the server recorded it as missing; PR #316 made it
+ * say so once per process, and this is the derivation that stops it happening.
+ *
+ * What stays: the salt (`credentialSalt`, 32 random bytes minted with the
+ * state file) still decides the identity, so a copied journal on a new host
+ * keeps its registration and a fresh journal is a genuinely new watcher that
+ * the server must be told about. The authority fields still bind the id to one
+ * endpoint, space, account and credential slot, so a journal pointed at a
+ * different account is a different watcher.
+ */
+function mintWatcherId(
+  domain: string,
+  salt: string,
+  payload: unknown,
+): string {
+  const bytes = createHash("sha256")
+    .update(domain)
+    .update(salt, "utf8")
+    .update(JSON.stringify(payload), "utf8")
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/**
  * True when two bindings name the same worker identity and differ only in the
  * configuration fingerprint.
  *
@@ -1090,6 +1151,12 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
   readonly directory: string;
   readonly binding: JournalBinding;
   readonly watcherId: string;
+  /**
+   * ADM-10. The `v1` id this journal would have computed, presented beside
+   * `watcherId` so a watcher already registered under it keeps its
+   * registration. See `mintWatcherId`.
+   */
+  readonly legacyWatcherId: string;
   private readonly statePath: string;
   private readonly codec: JournalCodec<C, R>;
   private locks: Server[];
@@ -1115,16 +1182,16 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
     this.directory = args.directory;
     this.statePath = join(args.directory, STATE_FILE);
     this.binding = args.binding;
-    const bytes = createHash("sha256")
-      .update("kithmind-worker-heartbeat:v1\0")
-      .update(args.state.credentialSalt, "utf8")
-      .update(JSON.stringify(args.binding), "utf8")
-      .digest()
-      .subarray(0, 16);
-    bytes[6] = (bytes[6]! & 0x0f) | 0x50;
-    bytes[8] = (bytes[8]! & 0x3f) | 0x80;
-    const hex = bytes.toString("hex");
-    this.watcherId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    this.watcherId = mintWatcherId(
+      "kithmind-worker-heartbeat:v2\0",
+      args.state.credentialSalt,
+      authorityOf(args.binding),
+    );
+    this.legacyWatcherId = mintWatcherId(
+      "kithmind-worker-heartbeat:v1\0",
+      args.state.credentialSalt,
+      args.binding,
+    );
     this.codec = args.codec;
     this.locks = args.locks;
     this.directoryIdentity = args.directoryIdentity;

@@ -23,6 +23,19 @@ reachability. It does not prove file access, queue coverage, record
 completeness, or a supervised process. `run` and `doctor` never send
 heartbeats.
 
+The watcher identity the heartbeat presents comes from the journal's random
+salt and its endpoint, space, source account and credential slot. Changing the
+watched roots, the parser path or the `pdfDocQa` block does not change it, and
+neither does moving the journal to a new host. Creating a new journal does: the
+salt is new, so the watcher is new, and the server has to be told.
+
+If the health screen shows the Documents watcher with an `identity` pill, this
+host's heartbeats are being refused -- it is up and its passes are landing, but
+the server has a different watcher registered for the source. Use "Re-register
+watcher" in that row's kebab. It clears the registration and the next heartbeat,
+within thirty seconds, claims it. Do not stop the watcher first; the host that
+is running is the one that should claim the source.
+
 After rotating a credential with a quiescent journal, use one authorized
 `run` to validate and accept the replacement before restarting `watch`.
 Watch refuses an unaccepted credential binding before sending a heartbeat.
