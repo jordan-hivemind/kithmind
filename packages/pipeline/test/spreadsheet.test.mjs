@@ -278,22 +278,49 @@ test("a row or column index past its bound is refused", () => {
 test("empty formatted cells outside the grid are ignored, but values and formulas are refused", () => {
   const { maxColumnsPerSheet } = SPREADSHEET_V1_BOUNDS;
   const beyond = `${COLUMN_NAME(maxColumnsPerSheet)}1`;
-  const sheet = (cell) => workbookOf([{ name: "S", xml: `<?xml version="1.0"?><worksheet><sheetData><row r="1">${cell}</row></sheetData></worksheet>` }]);
+  const sheet = (cell) =>
+    workbookOf([
+      {
+        name: "S",
+        xml: `<?xml version="1.0"?><worksheet><sheetData><row r="1">${cell}</row></sheetData></worksheet>`,
+      },
+    ]);
   assert.doesNotThrow(() => readWorkbook(sheet(`<c r="${beyond}" s="1"/>`)));
   assert.equal(refusal(sheet(`<c r="${beyond}"><v>1</v></c>`)), "oversized");
-  assert.equal(refusal(sheet(`<c r="${beyond}"><f>SUM(A1:A1)</f></c>`)), "oversized");
+  assert.equal(
+    refusal(sheet(`<c r="${beyond}"><f>SUM(A1:A1)</f></c>`)),
+    "oversized",
+  );
 });
 
 test("an in-bound formula without cached text remains metadata only", () => {
-  const workbook = readWorkbook(workbookOf([{ name: "S", xml: `<?xml version="1.0"?><worksheet><sheetData><row r="1"><c r="B1"><f>SUM(A1:A1)</f></c></row></sheetData></worksheet>` }]));
+  const workbook = readWorkbook(
+    workbookOf([
+      {
+        name: "S",
+        xml: `<?xml version="1.0"?><worksheet><sheetData><row r="1"><c r="B1"><f>SUM(A1:A1)</f></c></row></sheetData></worksheet>`,
+      },
+    ]),
+  );
   assert.equal(workbook.pages[0].columnCount, 0);
-  assert.deepEqual(workbook.pages[0].formulas, [{ row: 0, column: 1, formula: "SUM(A1:A1)" }]);
+  assert.deepEqual(workbook.pages[0].formulas, [
+    { row: 0, column: 1, formula: "SUM(A1:A1)" },
+  ]);
 });
 
 test("an explicit empty formula is preserved as metadata", () => {
-  const workbook = readWorkbook(workbookOf([{ name: "S", xml: `<?xml version="1.0"?><worksheet><sheetData><row r="1"><c r="A1"><f></f></c></row></sheetData></worksheet>` }]));
+  const workbook = readWorkbook(
+    workbookOf([
+      {
+        name: "S",
+        xml: `<?xml version="1.0"?><worksheet><sheetData><row r="1"><c r="A1"><f></f></c></row></sheetData></worksheet>`,
+      },
+    ]),
+  );
   assert.equal(workbook.pages[0].columnCount, 0);
-  assert.deepEqual(workbook.pages[0].formulas, [{ row: 0, column: 0, formula: "" }]);
+  assert.deepEqual(workbook.pages[0].formulas, [
+    { row: 0, column: 0, formula: "" },
+  ]);
 });
 
 test("the total rendered text bound refuses what no text version could hold", () => {

@@ -50,6 +50,9 @@ import { archiveConfig, archiveTools } from "./archiveTools.mjs";
 const PROVIDER_ACCOUNT_ID = "dbid:synthetic_rehearsal_account";
 const PROVIDER_ROOT_ID = "id:synthetic_rehearsal_root";
 const PROVIDER_ROOT_PATH = "/rehearsal root";
+/** ADM-4c: one provider folder per watched root, keyed by the root's alias. */
+const providerRootId = (alias) => `id:synthetic_rehearsal_root_${alias}`;
+const providerRootPath = (alias) => `/rehearsal ${alias}`;
 const sha256Hex = (value) => createHash("sha256").update(value).digest("hex");
 
 /**
@@ -75,6 +78,7 @@ export function installFakeDropbox(t, workspace) {
     id: PROVIDER_ROOT_ID,
     path_lower: PROVIDER_ROOT_PATH,
   };
+  const extra = [];
   const real = globalThis.fetch;
   t.after(() => {
     globalThis.fetch = real;
@@ -83,7 +87,7 @@ export function installFakeDropbox(t, workspace) {
     const body = JSON.parse(options.body ?? "null");
     const found = `${url}`.endsWith("/users/get_current_account")
       ? { account_id: PROVIDER_ACCOUNT_ID, disabled: false }
-      : [root, ...files].find(
+      : [root, ...files, ...extra].find(
           (row) =>
             row.id === body.path ||
             row.path_lower === `${body.path}`.toLowerCase(),
@@ -100,6 +104,25 @@ export function installFakeDropbox(t, workspace) {
       );
       if (!file) throw new Error(`no fake provider file ${fromRelativePath}`);
       file.path_lower = `${PROVIDER_ROOT_PATH}/${toRelativePath}`;
+    },
+    /** ADM-4c: a second watched root, with its own provider folder. */
+    addRoot(added) {
+      const path = providerRootPath(added.alias);
+      extra.push({
+        ".tag": "folder",
+        id: providerRootId(added.alias),
+        path_lower: path,
+      });
+      for (const [index, file] of added.files.entries()) {
+        extra.push({
+          ".tag": "file",
+          id: `id:synthetic_${added.alias}_file_${index}`,
+          rev: `rev${index}`,
+          size: file.byteLength,
+          content_hash: sha256Hex(Buffer.from(file.sha256, "hex")),
+          path_lower: `${path}/${file.relativePath}`.toLowerCase(),
+        });
+      }
     },
   };
 }
@@ -180,7 +203,50 @@ export async function rehearsalWorkspace(t, { documents = 3 } = {}) {
   }
   // The tools keep their own base: an executable inside a private directory
   // is what the shipping config parser refuses.
-  return { ...paths, files, tools: await archiveTools(t) };
+  return { ...paths, files, extraRoots: [], tools: await archiveTools(t) };
+}
+
+/**
+ * ADM-4c. A second watched root, added to a workspace whose first root is
+ * already published. `unsupported` writes one of each class the PDF lane does
+ * not handle beside the documents, so the pass has to skip them by name.
+ */
+export async function addRehearsalRoot(
+  workspace,
+  alias,
+  { documents = 0, unsupported = false } = {},
+) {
+  const path = join(workspace.base, alias);
+  await mkdir(path, { mode: 0o700 });
+  const files = [];
+  const write = async (relativePath, bytes) => {
+    await writeFile(join(path, relativePath), bytes, { mode: 0o600 });
+    return {
+      relativePath,
+      byteLength: bytes.byteLength,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
+  };
+  for (let index = 0; index < documents; index += 1) {
+    files.push(
+      await write(`${alias}-${index}.pdf`, pdfBytes(`${alias}${index}`)),
+    );
+  }
+  const skipped = [];
+  if (unsupported) {
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
+    skipped.push(
+      await write("photo.jpg", Buffer.concat([jpeg, Buffer.alloc(2_048, 7)])),
+      await write(
+        "large-photo.jpg",
+        Buffer.concat([jpeg, Buffer.alloc(100_000, 7)]),
+      ),
+      await write("blank.pdf", Buffer.alloc(0)),
+    );
+  }
+  const added = { alias, path, files, skipped };
+  workspace.extraRoots.push(added);
+  return added;
 }
 
 export function rehearsalConfig({
@@ -197,7 +263,13 @@ export function rehearsalConfig({
     spaceId,
     sourceAccountId,
     credentialEnv: "SYNTHETIC_WORKER_TOKEN",
-    roots: [{ alias: "fixture", path: workspace.root }],
+    roots: [
+      { alias: "fixture", path: workspace.root },
+      ...workspace.extraRoots.map((root) => ({
+        alias: root.alias,
+        path: root.path,
+      })),
+    ],
     journalDir: workspace.journalDir,
     watchIntervalMs: 1_000,
     maxFiles: 256,
@@ -221,14 +293,39 @@ export function rehearsalConfig({
       archive: archiveConfig(workspace.tools),
       ...(provider
         ? {
-            providerOriginal: {
-              rootAlias: "fixture",
-              providerRootDirectoryId: PROVIDER_ROOT_ID,
-              providerAccountIdHash: sha256Hex(PROVIDER_ACCOUNT_ID),
-              providerRootDirectoryIdHash: sha256Hex(PROVIDER_ROOT_ID),
-              refreshPath: "Processing",
-              registryDirectory: workspace.registryDirectory,
-            },
+            providerOriginal:
+              // ADM-4c: one root keeps the pre-ADM-4c single-root shape
+              // verbatim, so the rehearsal proves that config still parses and
+              // still binds. More than one root takes the `roots` list.
+              workspace.extraRoots.length === 0
+                ? {
+                    rootAlias: "fixture",
+                    providerRootDirectoryId: PROVIDER_ROOT_ID,
+                    providerAccountIdHash: sha256Hex(PROVIDER_ACCOUNT_ID),
+                    providerRootDirectoryIdHash: sha256Hex(PROVIDER_ROOT_ID),
+                    refreshPath: "Processing",
+                    registryDirectory: workspace.registryDirectory,
+                  }
+                : {
+                    providerAccountIdHash: sha256Hex(PROVIDER_ACCOUNT_ID),
+                    refreshPath: "Processing",
+                    registryDirectory: workspace.registryDirectory,
+                    roots: [
+                      {
+                        rootAlias: "fixture",
+                        providerRootDirectoryId: PROVIDER_ROOT_ID,
+                        providerRootDirectoryIdHash:
+                          sha256Hex(PROVIDER_ROOT_ID),
+                      },
+                      ...workspace.extraRoots.map((root) => ({
+                        rootAlias: root.alias,
+                        providerRootDirectoryId: providerRootId(root.alias),
+                        providerRootDirectoryIdHash: sha256Hex(
+                          providerRootId(root.alias),
+                        ),
+                      })),
+                    ],
+                  },
           }
         : {}),
     },

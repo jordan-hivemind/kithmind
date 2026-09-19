@@ -121,8 +121,7 @@ export function relocationAuthorizesArtifact(input: {
   if (
     JSON.stringify(relocation.oldBoundary) !==
       JSON.stringify(input.oldBoundary) ||
-    JSON.stringify(relocation.newBoundary) !==
-      JSON.stringify(input.newBoundary)
+    JSON.stringify(relocation.newBoundary) !== JSON.stringify(input.newBoundary)
   )
     return false;
   return relocation.artifacts.some(

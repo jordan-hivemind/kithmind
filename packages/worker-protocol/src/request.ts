@@ -82,7 +82,16 @@ export class WorkerProtocolParseError extends Error {
 }
 
 export const MAX_WORKER_PAGE_ITEMS = 4;
-export const MAX_WORKER_SCAN_PAGES = 64;
+/**
+ * ADM-4c: raised from 64 so a scan can carry 1024 entries. The page size is
+ * deliberately unchanged: a journal that crashed mid-append resumes by page
+ * ordinal, and `ordinal * MAX_WORKER_PAGE_ITEMS` must name the same slice of
+ * the plan after an upgrade as it did before.
+ */
+export const MAX_WORKER_SCAN_PAGES = 256;
+/** The most entries one sealed scan can describe. */
+export const MAX_WORKER_SCAN_ENTRIES =
+  MAX_WORKER_PAGE_ITEMS * MAX_WORKER_SCAN_PAGES;
 export const MAX_WORKER_INVENTORY_PAGE_ITEMS = 50;
 export const MAX_WORKER_RECONCILE_ITEMS = 50;
 export const MAX_WORKER_RESERVATION_ITEMS = 4;
@@ -102,7 +111,15 @@ export type FsDiscoveryGapCode =
   | "unreadable"
   | "unstable"
   | "unsupported"
-  | "encrypted";
+  | "encrypted"
+  /**
+   * ADM-4c. The entry is there and has a length, but none of its bytes are on
+   * the watcher host: a provider placeholder the sync client has not
+   * downloaded. Distinct from `unreadable`, which is a permission or device
+   * problem the owner has to fix; this one clears itself when the file syncs,
+   * and the sources screen should say so rather than call it an error.
+   */
+  | "not_downloaded";
 
 export type WorkerJobFailureCode =
   | "worker_interrupted"
@@ -230,8 +247,7 @@ export const SOURCE_ROOT_REPORT_STATES = [
   "unreadable",
   "over_limit",
 ] as const;
-export type SourceRootReportState =
-  (typeof SOURCE_ROOT_REPORT_STATES)[number];
+export type SourceRootReportState = (typeof SOURCE_ROOT_REPORT_STATES)[number];
 
 /** The kinds `kith.source_roots.kind` allows, as the worker reads them. */
 export const SOURCE_ROOT_KINDS = ["folder", "institution", "manual"] as const;
@@ -1289,6 +1305,7 @@ const GAP_CODES = new Set<FsDiscoveryGapCode>([
   "unstable",
   "unsupported",
   "encrypted",
+  "not_downloaded",
 ]);
 const JOB_FAILURE_CODES = new Set<WorkerJobFailureCode>([
   "worker_interrupted",

@@ -1121,7 +1121,9 @@ async function durableProviderOriginal(catalog, verifiedAt) {
     catalogId: row.originalCatalogId,
     expectedRevision: row.rowRevision,
     update(locator) {
-      locator.preparationIntent = { tempName: `${locator.archiveObjectId}.tmp` };
+      locator.preparationIntent = {
+        tempName: `${locator.archiveObjectId}.tmp`,
+      };
       locator.prepared = {
         state: "prepared",
         tempName: locator.preparationIntent.tempName,
@@ -1677,6 +1679,47 @@ test("a catalog written before P2-31f reads its single reconcile note as a one-e
     assert.equal(reopened.receiptReconcile.length, 1);
   } finally {
     await journal.close();
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
+// ADM-4c review. The catalog is never pruned, so its bounds are a lifetime
+// bound on one journal, not a per-pass one. At 256 originals the owner's third
+// watched folder would have stopped with `catalog_capacity_exceeded` around
+// its two hundred and fifty-sixth file, with nothing but a hand edit to clear
+// it. This measures a catalog four times larger than the scan ceiling.
+test("a catalog holds far more originals than one scan, and reloads them", async () => {
+  const f = await setup();
+  try {
+    const started = Date.now();
+    // 300, not 1024: the catalog is rewritten whole per row, so 1024 takes
+    // about four minutes. 300 is past the old 256 bound, which is the
+    // regression this guards; the 1024 measurement is in the PR body.
+    for (let index = 0; index < 300; index += 1) {
+      const row = await f.catalog.createOriginalIntent(original());
+      await f.catalog.createProcessingIntent(processing(row.originalCatalogId));
+    }
+    const wrote = Date.now() - started;
+    const bytes = (await readFile(join(f.directory, "archive-catalog.json")))
+      .byteLength;
+    const reopenedAt = Date.now();
+    const reloaded = await openArchiveCatalog({ journal: f.journal });
+    const loadMs = Date.now() - reopenedAt;
+    assert.equal(reloaded.listOriginals().length, 300);
+    assert.equal(reloaded.listProcessings().length, 300);
+    // Measured at 1024 + 1024: 4.49 MiB, load under a millisecond. Asserted
+    // rather than printed so a row field added later fails here instead of on
+    // a live watcher part-way through a backfill.
+    assert.ok(
+      bytes < 32 * 1024 * 1024,
+      `catalog is ${bytes} bytes, outside MAX_CATALOG_BYTES`,
+    );
+    assert.ok(
+      loadMs < 10_000,
+      `catalog took ${loadMs}ms to load (write ${wrote}ms)`,
+    );
+  } finally {
+    await f.journal.close();
     await rm(f.directory, { recursive: true, force: true });
   }
 });

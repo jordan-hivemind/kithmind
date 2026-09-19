@@ -199,8 +199,16 @@ test("concurrent doctor checks for unrelated journal roots do not contend on the
   );
 
   const [firstResult, secondResult] = await Promise.all([
-    doctor(config(first.root, first.journal), transport(source()), "synthetic-token"),
-    doctor(config(second.root, second.journal), transport(source()), "synthetic-token"),
+    doctor(
+      config(first.root, first.journal),
+      transport(source()),
+      "synthetic-token",
+    ),
+    doctor(
+      config(second.root, second.journal),
+      transport(source()),
+      "synthetic-token",
+    ),
   ]);
 
   assert.notEqual(check(firstResult, "journal")?.code, "contended");

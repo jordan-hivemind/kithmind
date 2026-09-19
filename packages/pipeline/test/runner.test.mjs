@@ -10,6 +10,7 @@ import {
   realpath,
   rename,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -32,6 +33,7 @@ import {
   PipelineRunner,
 } from "../dist/runner.js";
 import { ParserProcessError } from "../dist/parserProcess.js";
+import { canonicalRoots, discoverFiles } from "../dist/filesystem.js";
 import { persistProviderBinding } from "../dist/providerRegistry.js";
 import {
   formatReconcileResult,
@@ -39,6 +41,7 @@ import {
   runReconcileReceipts,
 } from "../dist/reconcileReceipts.js";
 import { parseRunnerCheckpoint } from "../dist/runnerState.js";
+import { MAX_WORKER_SCAN_PAGES } from "@repo/worker-protocol/request";
 
 const HASH = "a".repeat(64);
 
@@ -5855,34 +5858,60 @@ async function identityPass({
   ids = {},
   lookupFailure,
   failAt = "append",
+  // ADM-4c: extra watched roots, and per-root provider stubs. `ids` and
+  // `lookupFailure` stay the single-root spelling every existing case uses.
+  roots = [],
+  overrides = {},
+  acceptRetirement,
+  providers = [
+    { rootAlias: "fixture", ids, ...(lookupFailure ? { lookupFailure } : {}) },
+  ],
 }) {
   const entries = [];
   const requests = [];
   const asked = [];
+  const askedByRoot = [];
   const journal = await openJournal(
     setup.journalDir,
     terminalCheckpoint(bindings),
   );
   try {
     const runner = new PipelineRunner(
-      setup.config,
+      {
+        ...setup.config,
+        ...overrides,
+        roots: [...setup.config.roots, ...roots],
+      },
       journal,
       identityTransport({ failAt, entries, requests }),
       undefined,
-      {},
-      {
-        rootAlias: "fixture",
+      acceptRetirement === undefined ? {} : { acceptRetirement },
+      providers.map((provider) => ({
+        rootAlias: provider.rootAlias,
         async lookup(relativePaths) {
           asked.push(...relativePaths);
-          if (lookupFailure) throw new Error(lookupFailure);
+          askedByRoot.push(
+            ...relativePaths.map((path) => `${provider.rootAlias}/${path}`),
+          );
+          if (provider.lookupFailure) throw new Error(provider.lookupFailure);
           return new Map(
             relativePaths.flatMap((path) =>
-              ids[path] === undefined ? [] : [[path, ids[path]]],
+              provider.ids?.[path] === undefined
+                ? []
+                : [[path, provider.ids[path]]],
             ),
           );
         },
-      },
+      })),
     );
+    // ADM-4c: the binary lane only runs behind a verified profile preparation.
+    // A stub stands in for it so a discovery-classification case does not have
+    // to launch a parser; nothing past discovery runs in these passes.
+    if (overrides.pdfDocQa) {
+      runner.preparePdfProfile = async () => {
+        runner.preparedPdfProfile = {};
+      };
+    }
     const result = await runner.runSafely();
     const begin = requests.find((row) => row.operation === "scan.begin");
     return {
@@ -5890,6 +5919,7 @@ async function identityPass({
       mode: begin?.mode,
       entries,
       asked,
+      askedByRoot,
       bindings: journal.checkpoint.bindings,
     };
   } finally {
@@ -6387,6 +6417,959 @@ test("a folder rename larger than any batch resolves in one pass, upgrades last"
       [...moved].sort(),
       "and every one of them followed its identity in this one pass",
     );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// ADM-4c. More than one watched root.
+
+/** A second root beside `setup.root`, with `files` written into it. */
+async function secondRoot(setup, alias, files) {
+  const path = join(setup.base, alias);
+  await mkdir(path, { mode: 0o700 });
+  await chmod(path, 0o700);
+  for (const [name, contents] of Object.entries(files)) {
+    await writeFile(join(path, name), contents, { mode: 0o600 });
+  }
+  return { alias, path };
+}
+
+test("a root added mid life leaves the first root's items exactly where they were", async () => {
+  const setup = await fixture(0);
+  const kept = randomUUID();
+  await writeFile(join(setup.root, "statement.txt"), "synthetic-first");
+  const added = await secondRoot(setup, "investing", {
+    "term-sheet.txt": "synthetic-second",
+  });
+  try {
+    const pass = await identityPass({
+      setup,
+      roots: [added],
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "statement.txt",
+          externalId: kept,
+          providerFileId: "id:file_a",
+        },
+      ],
+      providers: [
+        { rootAlias: "fixture", ids: { "statement.txt": "id:file_a" } },
+        { rootAlias: "investing", ids: { "term-sheet.txt": "id:file_b" } },
+      ],
+    });
+    assert.equal(
+      pass.mode,
+      "normal",
+      "a new root is new items, never an identity failure for the old ones",
+    );
+    assert.deepEqual(
+      pass.askedByRoot,
+      ["investing/term-sheet.txt"],
+      "the first root is steady, so its provider is not asked anything",
+    );
+    assert.equal(
+      bindingAt(pass.bindings, "statement.txt").externalId,
+      kept,
+      "the first root's document keeps the identity it published under",
+    );
+    const fresh = bindingAt(pass.bindings, "term-sheet.txt");
+    assert.equal(fresh.rootAlias, "investing");
+    assert.notEqual(fresh.externalId, kept);
+    assert.equal(fresh.providerFileId, "id:file_b");
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("removing a root turns its items into ordinary gaps, not a failed pass", async () => {
+  const setup = await fixture(0);
+  const kept = randomUUID();
+  const dropped = [randomUUID(), randomUUID()];
+  await writeFile(join(setup.root, "statement.txt"), "synthetic-first");
+  try {
+    // The journal remembers a root the configuration no longer lists.
+    const pass = await identityPass({
+      setup,
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "statement.txt",
+          externalId: kept,
+          providerFileId: "id:file_a",
+        },
+        ...dropped.map((externalId, index) => ({
+          rootAlias: "investing",
+          relativePath: `gone-${index}.txt`,
+          externalId,
+          providerFileId: `id:gone_${index}`,
+        })),
+      ],
+      providers: [
+        { rootAlias: "fixture", ids: { "statement.txt": "id:file_a" } },
+      ],
+    });
+    // Removing a root is a removal the owner has to mean: the breaker holds
+    // the pass until they say so. See the escape-hatch cases below.
+    assert.equal(pass.result.code, "root_selection_would_retire_items");
+    assert.deepEqual(
+      pass.bindings.map((row) => row.relativePath).sort(),
+      ["gone-0.txt", "gone-1.txt", "statement.txt"],
+      "and nothing was forgotten in the meantime",
+    );
+
+    const confirmed = await identityPass({
+      setup,
+      acceptRetirement: "root_selection_would_retire_items",
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "statement.txt",
+          externalId: kept,
+          providerFileId: "id:file_a",
+        },
+        ...dropped.map((externalId, index) => ({
+          rootAlias: "investing",
+          relativePath: `gone-${index}.txt`,
+          externalId,
+          providerFileId: `id:gone_${index}`,
+        })),
+      ],
+      providers: [
+        { rootAlias: "fixture", ids: { "statement.txt": "id:file_a" } },
+      ],
+    });
+    assert.equal(
+      confirmed.mode,
+      "normal",
+      "items that went away with their root are removals, not lost identities",
+    );
+    assert.equal(
+      confirmed.entries.length,
+      1,
+      "the removed root contributes nothing to the scan",
+    );
+    assert.equal(confirmed.entries[0].uri, "fs://fixture/statement.txt");
+    assert.equal(
+      confirmed.result.code,
+      "source_unavailable",
+      "the only failure left is the one this transport injects at append",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a whole root's worth of vanished items does not exhaust binding capacity", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic-first");
+  try {
+    const pass = await identityPass({
+      setup,
+      // 600 files deleted from a root this pass still reads. Summed with the
+      // surviving plan, that used to refuse the pass outright on capacity.
+      // The collapse breaker would hold it too, so the operator confirms the
+      // deletion; capacity is what is being measured here.
+      acceptRetirement: "root_contents_collapsed",
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "statement.txt",
+          externalId: randomUUID(),
+        },
+        ...Array.from({ length: 600 }, (_, index) => ({
+          rootAlias: "fixture",
+          relativePath: `gone-${index}.txt`,
+          externalId: randomUUID(),
+        })),
+      ],
+      providers: [],
+    });
+    assert.equal(pass.result.code, "source_unavailable");
+    assert.notEqual(
+      pass.mode,
+      undefined,
+      "the scan opened rather than failing",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("one root's provider being unreachable leaves the other root's ids intact", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic-first");
+  const added = await secondRoot(setup, "investing", {
+    "term-sheet.txt": "synthetic-second",
+  });
+  try {
+    const pass = await identityPass({
+      setup,
+      roots: [added],
+      bindings: [],
+      providers: [
+        { rootAlias: "fixture", lookupFailure: "provider unreachable" },
+        { rootAlias: "investing", ids: { "term-sheet.txt": "id:file_b" } },
+      ],
+    });
+    assert.equal(pass.mode, "normal");
+    assert.equal(
+      bindingAt(pass.bindings, "statement.txt").providerFileId,
+      undefined,
+      "the unreachable root falls back to path identity for this pass",
+    );
+    assert.equal(
+      bindingAt(pass.bindings, "term-sheet.txt").providerFileId,
+      "id:file_b",
+      "and the reachable root still resolves its own ids",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("the provider lookup budget is the pass's, not each root's", async () => {
+  const setup = await fixture(0);
+  const perRoot = 200;
+  for (let index = 0; index < perRoot; index += 1) {
+    await writeFile(join(setup.root, `a-${index}.txt`), `synthetic-${index}`, {
+      mode: 0o600,
+    });
+  }
+  const files = {};
+  for (let index = 0; index < perRoot; index += 1) {
+    files[`b-${index}.txt`] = `synthetic-${index}`;
+  }
+  const added = await secondRoot(setup, "investing", files);
+  try {
+    const pass = await identityPass({
+      setup,
+      roots: [added],
+      overrides: { maxFiles: 1024 },
+      bindings: [],
+      providers: [
+        { rootAlias: "fixture", ids: {} },
+        { rootAlias: "investing", ids: {} },
+      ],
+    });
+    assert.equal(pass.mode, "normal");
+    assert.equal(
+      pass.askedByRoot.length,
+      256,
+      "two roots of 200 files ask 256 questions in one pass, not 400",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a 1024-file checkpoint with a full binding list round-trips through the journal", async () => {
+  const setup = await fixture(0);
+  const files = Array.from({ length: 1024 }, (_, index) =>
+    pdfPlan({
+      relativePath: `folder-${index % 20}/a reasonably long document name ${index}.pdf`,
+      externalId: randomUUID(),
+      sourceItemId: `source-item-${index}`,
+      providerFileId: `id:AbCdEfGhIjKlMnOpQrStU${index}`,
+    }),
+  );
+  const missingBindings = Array.from({ length: 4096 }, (_, index) => ({
+    rootAlias: "fixture",
+    relativePath: `retired/folder-${index % 20}/gone-${index}.pdf`,
+    externalId: randomUUID(),
+    providerFileId: `id:ZyXwVuTsRqPoNmLkJiHg${index}`,
+  }));
+  const checkpoint = archivedCheckpoint(files[0], { files, missingBindings });
+  const checkpointBytes = Buffer.byteLength(JSON.stringify(checkpoint), "utf8");
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  try {
+    // The measurement this slice's ceiling rests on. It is asserted, not
+    // printed, so a plan field added later fails here rather than in the field.
+    assert.ok(
+      checkpointBytes > 1_500_000 && checkpointBytes < 3 * 1024 * 1024,
+      `checkpoint is ${checkpointBytes} bytes, outside the journal's bound`,
+    );
+    const stateBytes = (await lstat(join(setup.journalDir, "state.json"))).size;
+    assert.ok(
+      stateBytes < 6 * 1024 * 1024,
+      `state file is ${stateBytes} bytes, outside the journal's bound`,
+    );
+    assert.equal(journal.checkpoint.files.length, 1024);
+    assert.equal(journal.checkpoint.missingBindings.length, 4096);
+    assert.deepEqual(parseRunnerCheckpoint(checkpoint), checkpoint);
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a second root of files the PDF lane cannot read is skipped, never failed", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic-first");
+  const jpeg = Buffer.concat([
+    Buffer.from([0xff, 0xd8, 0xff, 0xe0]),
+    Buffer.alloc(2_048, 7),
+  ]);
+  const added = await secondRoot(setup, "investing", {
+    "photo.jpg": jpeg,
+    "large-photo.jpg": Buffer.concat([jpeg, Buffer.alloc(100_000, 7)]),
+    "blank.pdf": Buffer.alloc(0),
+  });
+  try {
+    const pass = await identityPass({
+      setup,
+      roots: [added],
+      bindings: [],
+      providers: [],
+      overrides: {
+        pdfDocQa: {
+          profile: {
+            parserProfileId: "pdf_docqa_v1",
+            parserFingerprint: HASH,
+            extractionConfigurationFingerprint: HASH,
+            extractorFingerprint: "extractor-v1",
+            recordSchemaFingerprint: "records-disabled-v1",
+            normalizationFingerprint: "normalization-v1",
+            chunkerFingerprint: HASH,
+            correctionRevision: "correction-v1",
+          },
+        },
+      },
+    });
+    assert.equal(pass.mode, "normal");
+    const gaps = Object.fromEntries(
+      pass.entries
+        .filter((entry) => entry.content.status === "gap")
+        .map((entry) => [entry.uri, entry.content.code]),
+    );
+    assert.deepEqual(gaps, {
+      "fs://investing/blank.pdf": "empty",
+      "fs://investing/large-photo.jpg": "oversized",
+      "fs://investing/photo.jpg": "unsupported",
+    });
+    assert.equal(
+      pass.result.code,
+      "source_unavailable",
+      "the only failure is the one this transport injects at append",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// ADM-4c. The server's watched-folder list, resolved on the host.
+//
+// The host's JSON config is the allow-list; a row selects a subtree inside it.
+// These cases are the three steps the protocol contract requires of a client,
+// run against a real directory rather than a mock filesystem, because the one
+// they exist for -- a symbolic link inside an allowed root -- is invisible to
+// anything that does not resolve paths.
+
+async function resolvePass(setup, rows, extraRoots = []) {
+  const journal = await openJournal(setup.journalDir, terminalCheckpoint([]));
+  try {
+    const runner = new PipelineRunner(
+      { ...setup.config, roots: [...setup.config.roots, ...extraRoots] },
+      journal,
+      {
+        async call() {
+          throw new Error("no transport in this case");
+        },
+      },
+    );
+    const allowed = await canonicalRoots(runner.config);
+    return await runner.resolveServerRoots(allowed, rows);
+  } finally {
+    await journal.close();
+  }
+}
+
+function folderRow(overrides) {
+  return {
+    sourceRootId: randomUUID().replaceAll("-", ""),
+    kind: "folder",
+    state: "active",
+    expectedTypes: [],
+    ...overrides,
+  };
+}
+
+test("a server row narrows an allow-listed root to a subtree, keeping its alias", async () => {
+  const setup = await fixture(0);
+  await mkdir(join(setup.root, "investing"), { mode: 0o700 });
+  await mkdir(join(setup.root, "elsewhere"), { mode: 0o700 });
+  await writeFile(join(setup.root, "investing", "term-sheet.txt"), "synthetic");
+  await writeFile(join(setup.root, "elsewhere", "other.txt"), "synthetic");
+  try {
+    const row = folderRow({ rootAlias: "fixture", relativePath: "investing" });
+    const plan = await resolvePass(setup, [row]);
+    assert.deepEqual(plan.reports, [
+      {
+        sourceRootId: row.sourceRootId,
+        state: "ok",
+        rootAlias: "fixture",
+        relativePath: "investing",
+      },
+    ]);
+    assert.equal(plan.roots.length, 1);
+    assert.deepEqual(plan.roots[0].includePrefixes, ["investing"]);
+    assert.equal(
+      plan.roots[0].alias,
+      "fixture",
+      "the alias stays the host's, so item URIs keep joining",
+    );
+    // And the narrowing is real: only the chosen subtree is read.
+    const observed = await discoverFiles(setup.config, plan.roots);
+    assert.deepEqual(
+      observed.map((file) => file.uri),
+      ["fs://fixture/investing/term-sheet.txt"],
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("an alias the host does not allow-list is skipped and reported missing", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  try {
+    const row = folderRow({ rootAlias: "not-a-host-root" });
+    const plan = await resolvePass(setup, [row]);
+    assert.deepEqual(plan.reports, [
+      { sourceRootId: row.sourceRootId, state: "missing" },
+    ]);
+    assert.deepEqual(
+      plan.roots.map((root) => root.alias),
+      ["fixture"],
+      "reading nothing would retire the source, so the allow-list stands",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a stored relative path is re-checked as text, decoding nothing", async () => {
+  const setup = await fixture(0);
+  await mkdir(join(setup.root, "investing"), { mode: 0o700 });
+  try {
+    for (const relativePath of [
+      "/etc",
+      "..",
+      "investing/../../etc",
+      "investing/./notes",
+      "investing//notes",
+      "investing\\notes",
+      `investing/notes${String.fromCharCode(0)}`,
+      " investing",
+      "investing ",
+      // Not decoded before the check: an encoded traversal stays text and
+      // simply names a directory that is not there.
+      "%2e%2e/%2e%2e/etc",
+    ]) {
+      const row = folderRow({ rootAlias: "fixture", relativePath });
+      const plan = await resolvePass(setup, [row]);
+      assert.equal(
+        plan.reports[0].state,
+        "missing",
+        `${JSON.stringify(relativePath)} must not resolve to a watched root`,
+      );
+      assert.deepEqual(
+        plan.roots.map((root) => root.includePrefixes),
+        [undefined],
+      );
+    }
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a symlink inside an allowed root cannot point the watcher out of it", async () => {
+  const setup = await fixture(0);
+  const outside = join(setup.base, "outside");
+  await mkdir(outside, { mode: 0o700 });
+  await writeFile(join(outside, "secret.txt"), "synthetic");
+  await symlink(outside, join(setup.root, "escape"));
+  // The sibling a prefix comparison alone would let through.
+  await mkdir(`${setup.root}-evil`, { mode: 0o700 });
+  await symlink(`${setup.root}-evil`, join(setup.root, "sibling"));
+  try {
+    for (const relativePath of ["escape", "sibling"]) {
+      const row = folderRow({ rootAlias: "fixture", relativePath });
+      const plan = await resolvePass(setup, [row]);
+      assert.deepEqual(plan.reports, [
+        { sourceRootId: row.sourceRootId, state: "unreadable" },
+      ]);
+      assert.deepEqual(
+        plan.roots.map((root) => root.includePrefixes),
+        [undefined],
+        "and the pass falls back to the whole allow-listed root",
+      );
+    }
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a subtree that is gone or is not a directory is reported, not failed", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  try {
+    const gone = folderRow({ rootAlias: "fixture", relativePath: "gone" });
+    assert.equal(
+      (await resolvePass(setup, [gone])).reports[0].state,
+      "missing",
+    );
+    const file = folderRow({
+      rootAlias: "fixture",
+      relativePath: "statement.txt",
+    });
+    assert.equal(
+      (await resolvePass(setup, [file])).reports[0].state,
+      "unreadable",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a paused root keeps its subtree selected; only its state is reported", async () => {
+  const setup = await fixture(0);
+  await mkdir(join(setup.root, "investing"), { mode: 0o700 });
+  await mkdir(join(setup.root, "medical"), { mode: 0o700 });
+  try {
+    const active = folderRow({
+      rootAlias: "fixture",
+      relativePath: "investing",
+    });
+    const paused = folderRow({
+      rootAlias: "fixture",
+      relativePath: "medical",
+      state: "paused",
+    });
+    const plan = await resolvePass(setup, [active, paused]);
+    assert.deepEqual(
+      plan.reports.map((report) => report.state),
+      ["ok", "ok"],
+      "a paused root is reported on, not hidden",
+    );
+    // The review's finding 2: leaving the paused subtree out of the selection
+    // takes its items out of the scan, and the server's reconcile marks
+    // anything not in the scan unavailable. Pausing must not read as deleting.
+    assert.deepEqual(plan.roots[0].includePrefixes, ["investing", "medical"]);
+    const onlyPaused = await resolvePass(setup, [paused]);
+    assert.equal(onlyPaused.reports[0].state, "ok");
+    assert.deepEqual(onlyPaused.roots[0].includePrefixes, ["medical"]);
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// Review finding 1. The admin API cannot create a whole-root row at all
+// (`assertSourceRootLocation` refuses an empty path, and migration 028's CHECK
+// requires length >= 1), so the owner's existing root can never be named by a
+// row. Dropping unnamed roots therefore meant the first pass after adding one
+// folder in the UI would take every existing document out of the scan, and
+// `reconcileWorkerScan` is account-wide.
+test("a root no server row names is watched whole, not dropped", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  const added = await secondRoot(setup, "investing", {
+    "term-sheet.txt": "synthetic",
+  });
+  await mkdir(join(added.path, "2026"), { mode: 0o700 });
+  await writeFile(join(added.path, "2026", "call.txt"), "synthetic");
+  try {
+    // The only row the UI can write: a subtree of the new root.
+    const row = folderRow({ rootAlias: "investing", relativePath: "2026" });
+    const plan = await resolvePass(setup, [row], [added]);
+    assert.deepEqual(
+      plan.roots.map((root) => [root.alias, root.includePrefixes]),
+      [
+        ["fixture", undefined],
+        ["investing", ["2026"]],
+      ],
+      "the named root narrows; the unnamed one is read exactly as before",
+    );
+    const observed = await discoverFiles(
+      { ...setup.config, roots: [] },
+      plan.roots,
+    );
+    assert.deepEqual(
+      observed.map((file) => file.uri).sort(),
+      ["fs://fixture/statement.txt", "fs://investing/2026/call.txt"],
+      "so the first root's items are still in the scan",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("the prefix is the path the host has, not the row's spelling of it", async () => {
+  const setup = await fixture(0);
+  await mkdir(join(setup.root, "Investing"), { mode: 0o700 });
+  await writeFile(join(setup.root, "Investing", "note.txt"), "synthetic");
+  try {
+    // On a case-insensitive filesystem `realpath` resolves "investing" to the
+    // directory spelled "Investing", and discovery only ever produces the
+    // on-disk spelling. A raw-text prefix would match no file at all, which
+    // reads as every document under the root vanishing at once.
+    const row = folderRow({ rootAlias: "fixture", relativePath: "investing" });
+    const plan = await resolvePass(setup, [row]);
+    if (plan.reports[0].state !== "ok") {
+      // A case-sensitive filesystem: the row names nothing, which is the other
+      // correct answer, and the root is still watched whole.
+      assert.equal(plan.reports[0].state, "missing");
+      assert.deepEqual(plan.roots[0].includePrefixes, undefined);
+      return;
+    }
+    assert.deepEqual(plan.roots[0].includePrefixes, ["Investing"]);
+    assert.equal(plan.reports[0].relativePath, "Investing");
+    const observed = await discoverFiles(
+      { ...setup.config, roots: [] },
+      plan.roots,
+    );
+    assert.deepEqual(
+      observed.map((file) => file.uri),
+      ["fs://fixture/Investing/note.txt"],
+      "and the subtree is actually read",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("no server rows means the host's allow-listed roots, exactly as before", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  try {
+    const plan = await resolvePass(setup, []);
+    assert.deepEqual(plan.reports, []);
+    assert.deepEqual(
+      plan.roots.map((root) => [root.alias, root.includePrefixes]),
+      [["fixture", undefined]],
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// Review finding 1, second half. Whatever the root-selection logic does, a
+// pass that would take a large share of the account out of the scan refuses
+// instead. `reconcileWorkerScan` marks everything not in the scan unavailable,
+// so a config or server mistake would otherwise look exactly like the owner's
+// documents being deleted.
+test("a pass that would retire most of the account refuses to scan", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  try {
+    const remembered = [
+      {
+        rootAlias: "fixture",
+        relativePath: "statement.txt",
+        externalId: randomUUID(),
+      },
+      // Forty items under a root this config no longer lists.
+      ...Array.from({ length: 40 }, (_, index) => ({
+        rootAlias: "investing",
+        relativePath: `gone-${index}.txt`,
+        externalId: randomUUID(),
+      })),
+    ];
+    const pass = await identityPass({
+      setup,
+      bindings: remembered,
+      providers: [],
+    });
+    assert.equal(pass.result.state, "incomplete");
+    assert.equal(pass.result.code, "root_selection_would_retire_items");
+    assert.equal(pass.mode, undefined, "the scan never opened");
+    assert.deepEqual(
+      pass.bindings.map((row) => row.externalId).sort(),
+      remembered.map((row) => row.externalId).sort(),
+      "and nothing was forgotten: the next pass sees the same journal",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// Second review, blocker 1. `watchedLocation` only catches a root leaving the
+// list. A root that is still listed, still resolves and is simply empty --
+// a disk that did not mount, a Dropbox folder mid-sync on a host the watcher
+// has just moved to -- gives `retiring = 0`, and every document under it is
+// retired by an account-wide reconcile. That is the scenario this project is
+// about to run into, so it gets its own refusal.
+test("a root that is still watched but has lost its contents refuses", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "statement.txt",
+          externalId: randomUUID(),
+        },
+        ...Array.from({ length: 40 }, (_, index) => ({
+          rootAlias: "fixture",
+          relativePath: `gone-${index}.txt`,
+          externalId: randomUUID(),
+        })),
+      ],
+      providers: [],
+    });
+    assert.equal(pass.result.state, "incomplete");
+    assert.equal(pass.result.code, "root_contents_collapsed");
+    assert.equal(pass.mode, undefined, "the scan never opened");
+    assert.equal(pass.bindings.length, 41, "and nothing was forgotten");
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a watched root that has gone completely empty refuses", async () => {
+  const setup = await fixture(0);
+  try {
+    // Four remembered items, nothing on disk. This is the half-synced host.
+    const pass = await identityPass({
+      setup,
+      bindings: Array.from({ length: 4 }, (_, index) => ({
+        rootAlias: "fixture",
+        relativePath: `document-${index}.pdf`,
+        externalId: randomUUID(),
+      })),
+      providers: [],
+    });
+    assert.equal(pass.result.code, "root_contents_collapsed");
+    assert.equal(pass.bindings.length, 4);
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a root that loses two of ten proceeds: that is an ordinary edit", async () => {
+  const setup = await fixture(0);
+  for (let index = 0; index < 8; index += 1) {
+    await writeFile(join(setup.root, `kept-${index}.txt`), "synthetic");
+  }
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: [
+        ...Array.from({ length: 8 }, (_, index) => ({
+          rootAlias: "fixture",
+          relativePath: `kept-${index}.txt`,
+          externalId: randomUUID(),
+        })),
+        ...Array.from({ length: 2 }, (_, index) => ({
+          rootAlias: "fixture",
+          relativePath: `gone-${index}.txt`,
+          externalId: randomUUID(),
+        })),
+      ],
+      providers: [],
+    });
+    assert.equal(
+      pass.result.code,
+      "source_unavailable",
+      "the only failure is the one this transport injects at append",
+    );
+    assert.equal(pass.mode, "normal");
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a brand-new empty root is a folder with nothing in it yet, not a collapse", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  const added = await secondRoot(setup, "investing", {});
+  try {
+    const pass = await identityPass({
+      setup,
+      roots: [added],
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "statement.txt",
+          externalId: randomUUID(),
+        },
+      ],
+      providers: [],
+    });
+    assert.equal(pass.result.code, "source_unavailable");
+    assert.equal(pass.mode, "normal", "there was nothing there to lose");
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// Second review, blocker 2. The floor of ten could never trip for an account
+// of ten items or fewer, which is the owner's account today and exactly when
+// a mistake is least recoverable.
+test("a small source is not exempt: one item of four leaving refuses", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  try {
+    const bindings = [
+      {
+        rootAlias: "fixture",
+        relativePath: "statement.txt",
+        externalId: randomUUID(),
+      },
+      ...Array.from({ length: 3 }, (_, index) => ({
+        rootAlias: "investing",
+        relativePath: `gone-${index}.txt`,
+        externalId: randomUUID(),
+      })),
+    ];
+    const pass = await identityPass({ setup, bindings, providers: [] });
+    assert.equal(pass.result.code, "root_selection_would_retire_items");
+
+    // And the way through, which must name the exact code it is accepting.
+    const wrongCode = await identityPass({
+      setup,
+      bindings,
+      providers: [],
+      acceptRetirement: "root_contents_collapsed",
+    });
+    assert.equal(
+      wrongCode.result.code,
+      "root_selection_would_retire_items",
+      "confirming one kind of removal never confirms the other",
+    );
+    const confirmed = await identityPass({
+      setup,
+      bindings,
+      providers: [],
+      acceptRetirement: "root_selection_would_retire_items",
+    });
+    assert.equal(confirmed.result.code, "source_unavailable");
+    assert.equal(confirmed.mode, "normal", "the scan opened");
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a subtree selection that watches nothing it used to also refuses", async () => {
+  const setup = await fixture(0);
+  await mkdir(join(setup.root, "investing"), { mode: 0o700 });
+  await writeFile(join(setup.root, "investing", "kept.txt"), "synthetic");
+  for (let index = 0; index < 40; index += 1) {
+    await writeFile(join(setup.root, `loose-${index}.txt`), "synthetic");
+  }
+  try {
+    const row = folderRow({ rootAlias: "fixture", relativePath: "investing" });
+    const journal = await openJournal(
+      setup.journalDir,
+      terminalCheckpoint([
+        {
+          rootAlias: "fixture",
+          relativePath: "investing/kept.txt",
+          externalId: randomUUID(),
+        },
+        ...Array.from({ length: 40 }, (_, index) => ({
+          rootAlias: "fixture",
+          relativePath: `loose-${index}.txt`,
+          externalId: randomUUID(),
+        })),
+      ]),
+    );
+    try {
+      const runner = new PipelineRunner(
+        setup.config,
+        journal,
+        identityTransport({ failAt: "append", entries: [], requests: [] }),
+      );
+      const allowed = await canonicalRoots(setup.config);
+      const plan = await runner.resolveServerRoots(allowed, [row]);
+      await runner.startCycle(plan.roots, { inventoryEpoch: 1 });
+      assert.equal(journal.checkpoint.phase, "terminal");
+      assert.equal(journal.checkpoint.outcome, "incomplete");
+      assert.equal(
+        journal.checkpoint.code,
+        "root_selection_would_retire_items",
+        "narrowing a root away from where the items are is the same mistake",
+      );
+    } finally {
+      await journal.close();
+    }
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// Second review, item 6. The two bounds the round-one work moved that had no
+// test of their own.
+
+test("the checkpoint accepts every page ordinal the protocol allows, and no more", () => {
+  const plan = pdfPlan();
+  const base = {
+    version: 1,
+    phase: "append",
+    mode: "normal",
+    scanId: "scan-1",
+    inventoryEpoch: 1,
+    manifestVersion: 1,
+    missingBindings: [],
+    files: [plan],
+    identities: [],
+    reviewSeen: false,
+  };
+  // 64 was hardcoded here while the protocol allowed 64 pages. Raising the
+  // protocol without this made a scan past 256 files write a checkpoint its
+  // own validator then refused, mid-pass, with nothing to clear it.
+  assert.equal(
+    parseRunnerCheckpoint({ ...base, nextOrdinal: 80 }).nextOrdinal,
+    80,
+    "80 pages is 320 files, which the old bound refused",
+  );
+  assert.equal(
+    parseRunnerCheckpoint({ ...base, nextOrdinal: MAX_WORKER_SCAN_PAGES })
+      .nextOrdinal,
+    MAX_WORKER_SCAN_PAGES,
+  );
+  assert.throws(() =>
+    parseRunnerCheckpoint({ ...base, nextOrdinal: MAX_WORKER_SCAN_PAGES + 1 }),
+  );
+});
+
+test("the seal check re-enumerates from the same roots the scan was planned from", async () => {
+  const setup = await fixture(0);
+  await mkdir(join(setup.root, "investing"), { mode: 0o700 });
+  await writeFile(join(setup.root, "investing", "kept.txt"), "synthetic");
+  await writeFile(join(setup.root, "outside.txt"), "synthetic");
+  try {
+    const row = folderRow({ rootAlias: "fixture", relativePath: "investing" });
+    const journal = await openJournal(setup.journalDir, terminalCheckpoint([]));
+    try {
+      let rootsCalls = 0;
+      const runner = new PipelineRunner(setup.config, journal, {
+        async call(request) {
+          if (request.operation === "source.roots") {
+            rootsCalls += 1;
+            return {
+              operation: "source.roots",
+              sourceAccountId: "source",
+              roots: [row],
+            };
+          }
+          throw new Error(`unexpected operation ${request.operation}`);
+        },
+      });
+      const first = await runner.currentRoots();
+      assert.deepEqual(first[0].includePrefixes, ["investing"]);
+      // The seal check calls this again. Given the allow-list instead of the
+      // selection it would find `outside.txt`, disagree with the sealed
+      // manifest, and end the scan `unstable` -- on every pass, forever.
+      const second = await runner.currentRoots();
+      assert.equal(second, first, "resolved once, reused");
+      assert.equal(rootsCalls, 1, "and the server is asked once per pass");
+    } finally {
+      await journal.close();
+    }
   } finally {
     await rm(setup.base, { recursive: true, force: true });
   }

@@ -3,11 +3,19 @@ import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { resolve } from "node:path";
 
+import { MAX_WORKER_SCAN_ENTRIES } from "@repo/worker-protocol/request";
+
 import {
   PDF_DOCQA_CHUNKING_FINGERPRINT,
   PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT,
 } from "./parsedBundleMapping.js";
-import type { PdfDocQaConfig, PipelineConfig, RootConfig } from "./types.js";
+import type {
+  PdfDocQaConfig,
+  PdfDocQaProviderOriginal,
+  PdfDocQaProviderRoot,
+  PipelineConfig,
+  RootConfig,
+} from "./types.js";
 import type { JournalBinding } from "./journalTypes.js";
 
 const ROOT_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
@@ -291,6 +299,126 @@ function archiveIdentity(value: Record<string, unknown>, label: string) {
       `${label}.storageFailureDomainFingerprint`,
     ),
   };
+}
+
+const PROVIDER_ROOT_FIELDS = [
+  "rootAlias",
+  "providerRootDirectoryId",
+  "providerRootDirectoryIdHash",
+] as const;
+const PROVIDER_ACCOUNT_FIELDS = [
+  "providerAccountIdHash",
+  "refreshPath",
+  "registryDirectory",
+] as const;
+
+function providerRoot(
+  entry: Record<string, unknown>,
+  roots: RootConfig[],
+  label: string,
+): PdfDocQaProviderRoot {
+  const rootAlias = string(entry.rootAlias, `${label}.rootAlias`);
+  if (
+    !ROOT_ALIAS.test(rootAlias) ||
+    !roots.some((root) => root.alias === rootAlias)
+  )
+    fail("pdfDocQa provider rootAlias is invalid");
+  const rootId = string(
+    entry.providerRootDirectoryId,
+    `${label}.providerRootDirectoryId`,
+  );
+  if (!/^id:[A-Za-z0-9_-]{1,256}$/.test(rootId))
+    fail("pdfDocQa provider root ID is invalid");
+  const rootHash = sha256(
+    entry.providerRootDirectoryIdHash,
+    `${label}.providerRootDirectoryIdHash`,
+  );
+  if (createHash("sha256").update(rootId).digest("hex") !== rootHash)
+    fail("pdfDocQa provider root identity mismatch");
+  return {
+    rootAlias,
+    providerRootDirectoryId: rootId,
+    providerRootDirectoryIdHash: rootHash,
+  };
+}
+
+/**
+ * ADM-4c. Both shapes of `pdfDocQa.providerOriginal`, normalized to one.
+ *
+ * The pre-ADM-4c shape named one root beside the account fields. It is still
+ * accepted verbatim and becomes a one-element `roots`, so an existing config
+ * file needs no edit. The new shape carries `roots`, one entry per watched root
+ * that has a provider folder; roots absent from the list are archived without a
+ * provider binding.
+ */
+function providerOriginalConfig(
+  value: unknown,
+  roots: RootConfig[],
+): PdfDocQaProviderOriginal {
+  const label = "pdfDocQa.providerOriginal";
+  const provider = object(value, label);
+  const legacy = !("roots" in provider);
+  exact(
+    provider,
+    legacy
+      ? [...PROVIDER_ROOT_FIELDS, ...PROVIDER_ACCOUNT_FIELDS]
+      : [...PROVIDER_ACCOUNT_FIELDS, "roots"],
+  );
+  let parsed: PdfDocQaProviderRoot[];
+  if (legacy) parsed = [providerRoot(provider, roots, label)];
+  else {
+    const list = provider.roots;
+    if (!Array.isArray(list) || list.length < 1 || list.length > 16)
+      fail(`${label}.roots must contain 1 through 16 entries`);
+    parsed = list.map((entry, index) => {
+      const child = object(entry, `${label}.roots[${index}]`);
+      exact(child, PROVIDER_ROOT_FIELDS);
+      return providerRoot(child, roots, `${label}.roots[${index}]`);
+    });
+  }
+  if (new Set(parsed.map((root) => root.rootAlias)).size !== parsed.length)
+    fail("pdfDocQa provider rootAlias entries must be unique");
+  if (
+    new Set(parsed.map((root) => root.providerRootDirectoryId)).size !==
+    parsed.length
+  )
+    fail("pdfDocQa provider root IDs must be unique");
+  return {
+    providerAccountIdHash: sha256(
+      provider.providerAccountIdHash,
+      `${label}.providerAccountIdHash`,
+    ),
+    refreshPath: remoteRootPath(provider.refreshPath, {
+      minSegments: 1,
+      label: `${label}.refreshPath`,
+    }),
+    registryDirectory: absolutePath(
+      provider.registryDirectory,
+      `${label}.registryDirectory`,
+    ),
+    roots: parsed,
+  };
+}
+
+/**
+ * ADM-4c. The provider folder bound to one watched root, or `undefined` when
+ * that root has none. Tolerates the pre-ADM-4c single-root object so a
+ * hand-built config in a test keeps working.
+ */
+export function providerRootsOf(
+  provider: PdfDocQaProviderOriginal | undefined,
+): PdfDocQaProviderRoot[] {
+  if (!provider) return [];
+  if (provider.roots) return provider.roots;
+  const legacy = provider as unknown as PdfDocQaProviderRoot;
+  return legacy.rootAlias === undefined ? [] : [legacy];
+}
+
+export function providerRootFor(
+  provider: PdfDocQaProviderOriginal | undefined,
+  rootAlias: string,
+): PdfDocQaProviderRoot | undefined {
+  return providerRootsOf(provider).find((root) => root.rootAlias === rootAlias);
 }
 
 function containsPath(parent: string, candidate: string): boolean {
@@ -603,60 +731,26 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
   const providerOriginal =
     input.providerOriginal === undefined
       ? undefined
-      : (() => {
-          const provider = object(
-            input.providerOriginal,
-            "pdfDocQa.providerOriginal",
-          );
-          exact(provider, [
-            "rootAlias",
-            "providerRootDirectoryId",
-            "providerAccountIdHash",
-            "providerRootDirectoryIdHash",
-            "refreshPath",
-            "registryDirectory",
-          ]);
-          const rootAlias = string(
-            provider.rootAlias,
-            "pdfDocQa.providerOriginal.rootAlias",
-          );
-          if (
-            !ROOT_ALIAS.test(rootAlias) ||
-            !roots.some((root) => root.alias === rootAlias)
-          )
-            fail("pdfDocQa provider rootAlias is invalid");
-          const rootId = string(
-            provider.providerRootDirectoryId,
-            "pdfDocQa.providerOriginal.providerRootDirectoryId",
-          );
-          if (!/^id:[A-Za-z0-9_-]{1,256}$/.test(rootId))
-            fail("pdfDocQa provider root ID is invalid");
-          const rootHash = sha256(
-            provider.providerRootDirectoryIdHash,
-            "pdfDocQa.providerOriginal.providerRootDirectoryIdHash",
-          );
-          if (createHash("sha256").update(rootId).digest("hex") !== rootHash)
-            fail("pdfDocQa provider root identity mismatch");
-          return {
-            rootAlias,
-            providerRootDirectoryId: rootId,
-            providerAccountIdHash: sha256(
-              provider.providerAccountIdHash,
-              "pdfDocQa.providerOriginal.providerAccountIdHash",
-            ),
-            providerRootDirectoryIdHash: rootHash,
-            refreshPath: remoteRootPath(provider.refreshPath, {
-              minSegments: 1,
-              label: "pdfDocQa.providerOriginal.refreshPath",
-            }),
-            registryDirectory: absolutePath(
-              provider.registryDirectory,
-              "pdfDocQa.providerOriginal.registryDirectory",
-            ),
-          };
-        })();
+      : providerOriginalConfig(input.providerOriginal, roots);
   if (providerOriginal !== undefined && !("repository" in independentBackup))
     fail("pdfDocQa provider original requires remote independent backup");
+  // ADM-4c review. A provider original config forces a remote independent
+  // backup, and `resticLocation` refuses a remote repository for original
+  // bytes on purpose: the provider reference is what holds the original, so
+  // there is nowhere for a provider-less root's independent copy to go. Such a
+  // root would fail `archive_remote_original_unsupported` on every pass, for
+  // every document under it. Refuse it here, where the operator can see why,
+  // rather than in the middle of a pass.
+  if (providerOriginal !== undefined) {
+    const bound = new Set(providerOriginal.roots.map((root) => root.rootAlias));
+    const unbound = roots.filter((root) => !bound.has(root.alias));
+    if (unbound.length > 0)
+      fail(
+        `pdfDocQa provider original must name every watched root; ${unbound
+          .map((root) => root.alias)
+          .join(", ")} has no provider folder`,
+      );
+  }
   const privatePaths = [
     captureDirectory,
     parserOutputRoot,
@@ -861,7 +955,15 @@ export function parseConfig(value: unknown): PipelineConfig {
       1_000,
       3_600_000,
     ),
-    maxFiles: integer(source.maxFiles ?? 256, "maxFiles", 1, 256),
+    // ADM-4c: raised from 256 so three watched folders fit in one pass. The
+    // ceiling is the scan manifest's `MAX_WORKER_SCAN_PAGES * 4` entries; the
+    // default stays 256 so an existing config keeps its behaviour.
+    maxFiles: integer(
+      source.maxFiles ?? 256,
+      "maxFiles",
+      1,
+      MAX_WORKER_SCAN_ENTRIES,
+    ),
     maxDepth: integer(source.maxDepth ?? 16, "maxDepth", 1, 64),
     maxFileBytes: integer(
       source.maxFileBytes ?? 65_536,

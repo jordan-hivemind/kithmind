@@ -21,12 +21,13 @@
 
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { mkdir, rename, utimes } from "node:fs/promises";
+import { mkdir, rename, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
 import { createKithPool, newKithId } from "../dist/index.js";
 import {
+  addRehearsalRoot,
   installFakeDropbox,
   rehearsalConfig,
   rehearsalPass,
@@ -709,5 +710,441 @@ test(
       ["active", "active"],
       "both documents are still the published ones",
     );
+  },
+);
+
+// ADM-4c. A second watched root added to a journal that already has a
+// published history. Three claims, against the real handlers and a real
+// database:
+//
+//   1. the first root's documents are untouched: no identity recovery, no
+//      re-parse, no re-publish;
+//   2. the second root's PDFs publish once, each bound to its own provider
+//      folder;
+//   3. the files the PDF lane does not handle are counted and skipped by name,
+//      and a third pass publishes nothing.
+test(
+  "a second watched root publishes its own documents and leaves the first alone",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const transport = inProcessWorkerTransport(f.pool, {
+      userId: f.userId,
+      credentialId: f.credential.id,
+    });
+    const workspace = await rehearsalWorkspace(t, { documents: 2 });
+    const dropbox = installFakeDropbox(t, workspace);
+    const runtime = rehearsalProfile();
+    const pass = () => ({
+      config: rehearsalConfig({
+        endpoint: "http://127.0.0.1:0/api/worker",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        workspace,
+        runtime,
+        provider: true,
+      }),
+      credential: f.credential.rawKey,
+      transport,
+      runtime,
+    });
+
+    // One root, published, under the pre-ADM-4c single-root provider config.
+    const first = await rehearsalUntilSettled(pass());
+    assert.equal(first.at(-1).state, "complete", JSON.stringify(first));
+    const before = await activeGenerations(f);
+    assert.equal(before.length, 2);
+    const untouched = new Map(
+      before.map((row) => [row.item_id, row.active_generation_id]),
+    );
+    const firstRootItems = (await sourceItems(f)).map((row) => row.external_id);
+
+    // Now the owner adds a folder: two more documents and three files the PDF
+    // lane cannot read.
+    const added = await addRehearsalRoot(workspace, "investing", {
+      documents: 2,
+      unsupported: true,
+    });
+    dropbox.addRoot(added);
+
+    const second = await rehearsalUntilSettled(pass());
+    assert.equal(second.at(-1).state, "complete", JSON.stringify(second));
+    assert.equal(
+      second.reduce((total, result) => total + (result.published ?? 0), 0),
+      2,
+      `only the new root's documents published: ${JSON.stringify(second)}`,
+    );
+
+    // 1. The first root's documents are the ones they were.
+    const after = await activeGenerations(f);
+    for (const [itemId, generationId] of untouched) {
+      const row = after.find((candidate) => candidate.item_id === itemId);
+      assert.ok(row, "the first root's item is still here");
+      assert.equal(
+        row.active_generation_id,
+        generationId,
+        "and its published generation was neither re-parsed nor replaced",
+      );
+      assert.equal(row.publication_state, "active");
+    }
+    assert.deepEqual(
+      (await reviewEntries(f)).filter((row) => row.state !== "gap"),
+      [],
+      "adding a root is not an identity failure for the root already there",
+    );
+
+    // 2. The new root's PDFs published exactly once each.
+    const items = await sourceItems(f);
+    const fresh = items.filter(
+      (row) => !firstRootItems.includes(row.external_id),
+    );
+    const published = fresh.filter((row) =>
+      after.some(
+        (generation) =>
+          generation.item_id === row.id &&
+          generation.publication_state === "active",
+      ),
+    );
+    assert.deepEqual(
+      published.map((row) => row.uri).sort(),
+      ["fs://investing/investing-0.pdf", "fs://investing/investing-1.pdf"],
+      "the second root's two documents, and only those",
+    );
+
+    // 3. Its unsupported files are items with a named skip reason and no
+    // processing at all.
+    const skippedUris = added.skipped
+      .map((file) => `fs://investing/${file.relativePath}`)
+      .sort();
+    assert.deepEqual(
+      fresh
+        .filter((row) => skippedUris.includes(row.uri))
+        .map((row) => row.uri)
+        .sort(),
+      skippedUris,
+      "every skipped file is still an item the sources screen can count",
+    );
+    assert.deepEqual(
+      await gapEntries(f),
+      [
+        { uri: "fs://investing/blank.pdf", code: "empty" },
+        { uri: "fs://investing/large-photo.jpg", code: "oversized" },
+        { uri: "fs://investing/photo.jpg", code: "unsupported" },
+      ],
+      "each under its own closed-enum reason",
+    );
+    for (const row of fresh.filter((candidate) =>
+      skippedUris.includes(candidate.uri),
+    )) {
+      assert.equal(
+        after.some((generation) => generation.item_id === row.id),
+        false,
+        "and none of them produced a processing generation",
+      );
+    }
+
+    // And the world has stopped moving.
+    const third = await rehearsalUntilSettled(pass());
+    assert.deepEqual(
+      third,
+      [{ state: "complete", scanned: 7, published: 0 }],
+      `a third pass publishes nothing: ${JSON.stringify(third)}`,
+    );
+  },
+);
+
+/** The skip reason the server recorded for each gap entry, by item. */
+async function gapEntries(f) {
+  const { rows } = await f.client.query(
+    `SELECT DISTINCT i.uri, e.issue_code
+       FROM kith.worker_scan_entries e
+       JOIN kith.source_items i ON i.id = e.source_item_id
+      WHERE e.source_account_id = $1 AND e.state = 'gap'
+      ORDER BY i.uri`,
+    [f.sourceAccountId],
+  );
+  return rows.map((row) => ({ uri: row.uri, code: row.issue_code }));
+}
+
+/** ADM-4c. The desired watched-folder list, as the owner's UI would write it. */
+async function addSourceRoot(f, { rootAlias, relativePath, state = "active" }) {
+  const id = newKithId();
+  await f.client.query(
+    `INSERT INTO kith.source_roots
+       (id, space_id, source_account_id, kind, root_alias, relative_path,
+        expected_types, state)
+     VALUES ($1,$2,$3,'folder',$4,$5,'[]'::jsonb,$6)`,
+    [id, f.spaceId, f.sourceAccountId, rootAlias, relativePath, state],
+  );
+  return id;
+}
+
+async function rootReports(f) {
+  const { rows } = await f.client.query(
+    `SELECT r.root_alias, r.relative_path, p.state, p.item_count
+       FROM kith.source_root_reports p
+       JOIN kith.source_roots r ON r.id = p.source_root_id
+      WHERE r.source_account_id = $1
+      ORDER BY r.root_alias, r.relative_path`,
+    [f.sourceAccountId],
+  );
+  return rows.map((row) => ({
+    alias: row.root_alias,
+    path: row.relative_path,
+    state: row.state,
+    items: Number(row.item_count),
+  }));
+}
+
+// ADM-4c review, findings 1 and 4. The shape the owner's first use of the
+// sources screen actually has: an account whose documents are already
+// published under a root no server row can ever name, and one new folder added
+// in the UI. `reconcileWorkerScan` is account-wide, so a client that dropped
+// the unnamed root would take every existing document out of the scan and the
+// server would mark them all unavailable on the very next pass.
+test(
+  "a server row for one new folder leaves the root it does not name alone",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const transport = inProcessWorkerTransport(f.pool, {
+      userId: f.userId,
+      credentialId: f.credential.id,
+    });
+    const workspace = await rehearsalWorkspace(t, { documents: 2 });
+    const dropbox = installFakeDropbox(t, workspace);
+    const runtime = rehearsalProfile();
+    const pass = () => ({
+      config: rehearsalConfig({
+        endpoint: "http://127.0.0.1:0/api/worker",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        workspace,
+        runtime,
+        provider: true,
+      }),
+      credential: f.credential.rawKey,
+      transport,
+      runtime,
+    });
+
+    const first = await rehearsalUntilSettled(pass());
+    assert.equal(first.at(-1).state, "complete", JSON.stringify(first));
+    const before = await activeGenerations(f);
+    assert.equal(before.length, 2);
+    const untouched = new Map(
+      before.map((row) => [row.item_id, row.active_generation_id]),
+    );
+
+    // The owner adds one folder in the UI. The admin API cannot write a row
+    // for the whole of the existing root: `relative_path` must be at least one
+    // character, so the original root is named by nothing.
+    const added = await addRehearsalRoot(workspace, "investing", {
+      documents: 2,
+    });
+    await mkdir(join(added.path, "2026"), { mode: 0o700 });
+    dropbox.addRoot(added);
+    const rootId = await addSourceRoot(f, {
+      rootAlias: "investing",
+      relativePath: "2026",
+    });
+    assert.ok(rootId);
+
+    const second = await rehearsalUntilSettled(pass());
+    assert.equal(second.at(-1).state, "complete", JSON.stringify(second));
+
+    // The claim: nothing the owner already had was retired.
+    const items = await sourceItems(f);
+    for (const row of items.filter((candidate) =>
+      untouched.has(candidate.id),
+    )) {
+      assert.equal(
+        row.lifecycle,
+        "available",
+        "a root no row names is watched whole, so its items stay available",
+      );
+    }
+    const after = await activeGenerations(f);
+    for (const [itemId, generationId] of untouched) {
+      const row = after.find((candidate) => candidate.item_id === itemId);
+      assert.equal(row?.active_generation_id, generationId);
+      assert.equal(row?.publication_state, "active");
+    }
+    // The new root was narrowed to the empty subtree the row names, so its own
+    // two documents are outside it and are not ingested. That is the row doing
+    // exactly what it says.
+    assert.deepEqual(await rootReports(f), [
+      { alias: "investing", path: "2026", state: "ok", items: 0 },
+    ]);
+    assert.equal(
+      items.length,
+      2,
+      "and nothing outside the named subtree was read",
+    );
+  },
+);
+
+// ADM-4c review, finding 4 and the 1024 ceiling. More files than the old
+// `maxFiles` and the old catalog bound, across two roots, driven to a settled
+// world. The documents are gaps rather than PDFs: what this measures is the
+// scan, the checkpoint, the identity bindings and the catalog at scale, and
+// parsing 300 synthetic PDFs through real age and restic would take an hour
+// and prove nothing the cases above do not.
+test(
+  "a scan of more than 256 files across two roots settles",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const transport = inProcessWorkerTransport(f.pool, {
+      userId: f.userId,
+      credentialId: f.credential.id,
+    });
+    const workspace = await rehearsalWorkspace(t, { documents: 0 });
+    installFakeDropbox(t, workspace);
+    const runtime = rehearsalProfile();
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
+    for (let index = 0; index < 160; index += 1) {
+      await writeFile(
+        join(workspace.root, `skipped-${index}.jpg`),
+        Buffer.concat([jpeg, Buffer.alloc(512, 7)]),
+        { mode: 0o600 },
+      );
+    }
+    const added = await addRehearsalRoot(workspace, "investing");
+    for (let index = 0; index < 160; index += 1) {
+      await writeFile(
+        join(added.path, `skipped-${index}.jpg`),
+        Buffer.concat([jpeg, Buffer.alloc(512, 7)]),
+        { mode: 0o600 },
+      );
+    }
+    const pass = () => ({
+      config: {
+        ...rehearsalConfig({
+          endpoint: "http://127.0.0.1:0/api/worker",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          workspace,
+          runtime,
+          provider: true,
+        }),
+        maxFiles: 1024,
+      },
+      credential: f.credential.rawKey,
+      transport,
+      runtime,
+    });
+
+    const results = await rehearsalUntilSettled(pass());
+    assert.equal(results.at(-1).state, "complete", JSON.stringify(results));
+    assert.equal(
+      results.at(-1).scanned,
+      320,
+      "every file in both roots, well past the old 256 ceiling",
+    );
+    const items = await sourceItems(f);
+    assert.equal(items.length, 320);
+    for (const row of items) assert.equal(row.lifecycle, "available");
+    // A second pass changes nothing, which is the claim the ceiling rests on:
+    // 320 plans and 320 bindings round-trip through the journal unchanged.
+    const again = await rehearsalUntilSettled(pass());
+    assert.deepEqual(again, [
+      { state: "complete", scanned: 320, published: 0 },
+    ]);
+  },
+);
+
+// ADM-4c review, finding 1's second half. The breaker is the last line: it
+// does not care why the roots changed, only that a pass is about to take a
+// large share of the account out of the scan.
+test(
+  "a config that stops watching most of the account refuses to scan",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const transport = inProcessWorkerTransport(f.pool, {
+      userId: f.userId,
+      credentialId: f.credential.id,
+    });
+    const workspace = await rehearsalWorkspace(t, { documents: 0 });
+    installFakeDropbox(t, workspace);
+    const runtime = rehearsalProfile();
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
+    await writeFile(
+      join(workspace.root, "kept.jpg"),
+      Buffer.concat([jpeg, Buffer.alloc(512, 7)]),
+      { mode: 0o600 },
+    );
+    const added = await addRehearsalRoot(workspace, "investing");
+    for (let index = 0; index < 40; index += 1) {
+      await writeFile(
+        join(added.path, `file-${index}.jpg`),
+        Buffer.concat([jpeg, Buffer.alloc(512, 7)]),
+        { mode: 0o600 },
+      );
+    }
+    const base = rehearsalConfig({
+      endpoint: "http://127.0.0.1:0/api/worker",
+      spaceId: f.spaceId,
+      sourceAccountId: f.sourceAccountId,
+      workspace,
+      runtime,
+      provider: true,
+    });
+    const settled = await rehearsalUntilSettled({
+      config: base,
+      credential: f.credential.rawKey,
+      transport,
+      runtime,
+    });
+    assert.equal(settled.at(-1).state, "complete", JSON.stringify(settled));
+    assert.equal((await sourceItems(f)).length, 41);
+
+    // Now the second root disappears from the config: a typo, a rolled-back
+    // edit, a disk that did not mount. Forty of forty-one items would be
+    // retired, so the pass refuses instead.
+    const narrowed = {
+      ...base,
+      roots: base.roots.filter((root) => root.alias !== "investing"),
+      pdfDocQa: {
+        ...base.pdfDocQa,
+        providerOriginal: {
+          ...base.pdfDocQa.providerOriginal,
+          roots: base.pdfDocQa.providerOriginal.roots.filter(
+            (root) => root.rootAlias !== "investing",
+          ),
+        },
+      },
+    };
+    const refused = await rehearsalPass({
+      config: narrowed,
+      credential: f.credential.rawKey,
+      transport,
+      runtime,
+    });
+    assert.deepEqual(refused, {
+      state: "incomplete",
+      code: "root_selection_would_retire_items",
+      scanned: 0,
+      published: 0,
+    });
+    for (const row of await sourceItems(f)) {
+      assert.equal(
+        row.lifecycle,
+        "available",
+        "and not one item was marked unavailable",
+      );
+    }
+
+    // Putting the config back costs nothing: the journal never forgot.
+    const restored = await rehearsalUntilSettled({
+      config: base,
+      credential: f.credential.rawKey,
+      transport,
+      runtime,
+    });
+    assert.deepEqual(restored, [
+      { state: "complete", scanned: 41, published: 0 },
+    ]);
   },
 );

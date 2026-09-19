@@ -2,11 +2,35 @@ import {
   isBinaryParserProfileId,
   type BinaryParserProfileId,
 } from "@repo/worker-protocol";
+import {
+  MAX_WORKER_SCAN_ENTRIES,
+  MAX_WORKER_SCAN_PAGES,
+} from "@repo/worker-protocol/request";
 
 import type { IdentityBinding, WorkerErrorCode } from "./types.js";
 
-const MAX_FILES = 256;
+/**
+ * ADM-4c: the checkpoint's plan bound, raised from 256 to the scan manifest's
+ * own ceiling so three watched folders fit in one pass. A plan carries seven
+ * 64-hex fingerprints, so 1024 of them is about 940 KiB of checkpoint; see
+ * `MAX_CHECKPOINT_BYTES` in journal.ts, which was raised with it.
+ */
+const MAX_FILES = MAX_WORKER_SCAN_ENTRIES;
 const MAX_IDENTITIES = 4_096;
+/**
+ * ADM-4c. Identity bindings are bounded separately from file plans: the list
+ * is every item this journal remembers, which outlives the files currently on
+ * disk. Removing a watched root leaves its items here until the server has
+ * retired them, and that must not refuse the journal.
+ */
+export const MAX_IDENTITY_BINDINGS = MAX_IDENTITIES;
+/**
+ * ADM-4c review. The scan page ordinal was bounded by a hardcoded 64, the old
+ * `MAX_WORKER_SCAN_PAGES`. Raising the protocol ceiling without this made a
+ * scan past 256 files write a checkpoint its own validator refused, mid-pass.
+ * `round` and `reservationRound` below are different counters with their own
+ * bounds and are deliberately left alone.
+ */
 const MAX_PATH_BYTES = 2_048;
 const ID = /^[A-Za-z0-9_-]{1,256}$/;
 const UUID =
@@ -64,7 +88,7 @@ export type PdfFilePlan = PlanLocation & {
 
 export type GapFilePlan = PlanLocation & {
   kind: "gap";
-  code: "empty" | "oversized" | "unsupported" | "encrypted";
+  code: "empty" | "oversized" | "unsupported" | "encrypted" | "not_downloaded";
 };
 
 export type FilePlan = Utf8FilePlan | PdfFilePlan | GapFilePlan;
@@ -384,7 +408,7 @@ function boolean(value: unknown): boolean {
 }
 
 function bindings(value: unknown): IdentityBinding[] {
-  if (!Array.isArray(value) || value.length > MAX_FILES) fail();
+  if (!Array.isArray(value) || value.length > MAX_IDENTITY_BINDINGS) fail();
   const paths = new Set<string>();
   const externalIds = new Set<string>();
   const owners = new Map<string, number>();
@@ -518,7 +542,8 @@ function files(value: unknown): FilePlan[] {
         row.code !== "empty" &&
         row.code !== "oversized" &&
         row.code !== "unsupported" &&
-        row.code !== "encrypted"
+        row.code !== "encrypted" &&
+        row.code !== "not_downloaded"
       )
         fail();
       return { ...location, kind: "gap" as const, code: row.code };
@@ -882,7 +907,7 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       version: 1,
       phase: "append",
       ...scanBase(input),
-      nextOrdinal: integer(input.nextOrdinal, 0, 64),
+      nextOrdinal: integer(input.nextOrdinal, 0, MAX_WORKER_SCAN_PAGES),
       identities: identities(input.identities),
       reviewSeen: boolean(input.reviewSeen),
     };
@@ -893,7 +918,7 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       version: 1,
       phase: "seal_check",
       ...scanBase(input),
-      nextOrdinal: integer(input.nextOrdinal, 0, 64),
+      nextOrdinal: integer(input.nextOrdinal, 0, MAX_WORKER_SCAN_PAGES),
       reviewSeen: boolean(input.reviewSeen),
     };
   }
@@ -909,7 +934,7 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       version: 1,
       phase: "seal",
       ...scanBase(input),
-      nextOrdinal: integer(input.nextOrdinal, 0, 64),
+      nextOrdinal: integer(input.nextOrdinal, 0, MAX_WORKER_SCAN_PAGES),
       reviewSeen: boolean(input.reviewSeen),
       health:
         health.status === "healthy"

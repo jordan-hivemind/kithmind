@@ -14,6 +14,7 @@ import {
   PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT,
 } from "../dist/parsedBundleMapping.js";
 import { HttpWorkerTransport, parseWorkerResponse } from "../dist/transport.js";
+import { MAX_WORKER_SCAN_ENTRIES } from "@repo/worker-protocol/request";
 
 test("config accepts only bounded absolute worker config", () => {
   const config = parseConfig({
@@ -338,7 +339,18 @@ test("PDF document-Q&A config is closed, bound, and keeps legacy bindings stable
     registryDirectory: "/private/provider-registry",
   };
   const parsedProvider = parseConfig({ ...base, pdfDocQa: providerPdf });
-  assert.equal(parsedProvider.pdfDocQa.providerOriginal.rootAlias, "notes");
+  // ADM-4c: the pre-ADM-4c single-root shape is accepted verbatim and becomes
+  // a one-element `roots`, so the owner's config file needs no edit.
+  assert.deepEqual(parsedProvider.pdfDocQa.providerOriginal.roots, [
+    {
+      rootAlias: "notes",
+      providerRootDirectoryId: providerRootId,
+      providerRootDirectoryIdHash: createHash("sha256")
+        .update(providerRootId)
+        .digest("hex"),
+    },
+  ]);
+  assert.equal(parsedProvider.pdfDocQa.providerOriginal.rootAlias, undefined);
   assert.notEqual(
     journalBindingForConfig(parsedProvider).configFingerprint,
     journalBindingForConfig(parsedRemote).configFingerprint,
@@ -1389,4 +1401,238 @@ test("the request deadline aborts an unresolved fetch", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+// ADM-4c. More than one watched root, and more than one provider folder.
+
+function multiRootBase() {
+  return {
+    protocolVersion: 1,
+    endpoint: "http://127.0.0.1:3100/api/worker",
+    spaceId: "space_1",
+    sourceAccountId: "source_1",
+    credentialEnv: "PIPELINE_TOKEN",
+    roots: [
+      { alias: "notes", path: "/tmp/root" },
+      { alias: "investing", path: "/tmp/investing" },
+      { alias: "medical", path: "/tmp/medical" },
+    ],
+    journalDir: "/tmp/journal",
+  };
+}
+
+function providerRootEntry(id) {
+  return {
+    providerRootDirectoryId: id,
+    providerRootDirectoryIdHash: createHash("sha256").update(id).digest("hex"),
+  };
+}
+
+test("provider originals are per root", () => {
+  const base = multiRootBase();
+  const pdf = pdfDocQaConfig();
+  delete pdf.archive.independentBackup.repositoryPath;
+  pdf.archive.independentBackup.repository = {
+    kind: "rclone_dropbox_v1",
+    remoteName: "kithmind_dropbox",
+    rootPath: "Kith Mind Backups/Processing",
+    rcloneBinary: "/tools/rclone",
+    configPath: "/credentials/kithmind-rclone.conf",
+    configIdentityFingerprint: "c".repeat(64),
+    expectedRootDirectoryIdHash: "d".repeat(64),
+  };
+  pdf.providerOriginal = {
+    providerAccountIdHash: "e".repeat(64),
+    refreshPath: "Kith Mind/Inbox",
+    registryDirectory: "/private/provider-registry",
+    roots: [
+      { rootAlias: "notes", ...providerRootEntry("id:notes_root") },
+      { rootAlias: "investing", ...providerRootEntry("id:investing_root") },
+    ],
+  };
+  // Review finding 3: once one root has a provider folder, every watched root
+  // must, so `medical` gets one here. The case where none does is the
+  // provider-less config, which is unchanged.
+  pdf.providerOriginal.roots.push({
+    rootAlias: "medical",
+    ...providerRootEntry("id:medical_root"),
+  });
+  const parsed = parseConfig({ ...base, pdfDocQa: pdf });
+  assert.deepEqual(
+    parsed.pdfDocQa.providerOriginal.roots.map((root) => root.rootAlias),
+    ["notes", "investing", "medical"],
+  );
+
+  const unknownAlias = structuredClone(pdf);
+  unknownAlias.providerOriginal.roots[1].rootAlias = "not-a-watched-root";
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: unknownAlias }));
+
+  const duplicateAlias = structuredClone(pdf);
+  duplicateAlias.providerOriginal.roots[1].rootAlias = "notes";
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: duplicateAlias }));
+
+  const duplicateFolder = structuredClone(pdf);
+  duplicateFolder.providerOriginal.roots[1] = {
+    rootAlias: "investing",
+    ...providerRootEntry("id:notes_root"),
+  };
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: duplicateFolder }));
+
+  const mismatchedHash = structuredClone(pdf);
+  mismatchedHash.providerOriginal.roots[0].providerRootDirectoryIdHash =
+    "f".repeat(64);
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: mismatchedHash }));
+
+  const emptyList = structuredClone(pdf);
+  emptyList.providerOriginal.roots = [];
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: emptyList }));
+
+  const mixedShape = structuredClone(pdf);
+  mixedShape.providerOriginal.rootAlias = "notes";
+  assert.throws(
+    () => parseConfig({ ...base, pdfDocQa: mixedShape }),
+    "the two shapes are alternatives, never a merge",
+  );
+
+  const extraField = structuredClone(pdf);
+  extraField.providerOriginal.roots[0].refreshPath = "Kith Mind/Inbox";
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: extraField }));
+});
+
+test("the maxFiles ceiling is the scan manifest's, and the default is unchanged", () => {
+  const base = multiRootBase();
+  assert.equal(parseConfig(base).maxFiles, 256, "the default did not move");
+  assert.equal(parseConfig({ ...base, maxFiles: 1024 }).maxFiles, 1024);
+  assert.throws(() => parseConfig({ ...base, maxFiles: 1025 }));
+  assert.equal(MAX_WORKER_SCAN_ENTRIES, 1024);
+});
+
+test("the watched-folder list and its report are validated against closed shapes", () => {
+  const ok = {
+    operation: "source.roots",
+    sourceAccountId: "source_1",
+    roots: [
+      {
+        sourceRootId: "root_1",
+        kind: "folder",
+        state: "active",
+        rootAlias: "investing",
+        relativePath: "Investing/2026",
+        providerFolderId: "id:abc",
+        area: "finance",
+        expectedTypes: ["capital_call_notice"],
+      },
+      {
+        sourceRootId: "root_2",
+        kind: "manual",
+        state: "paused",
+        expectedTypes: [],
+      },
+    ],
+  };
+  assert.deepEqual(parseWorkerResponse(JSON.stringify(ok), "source.roots"), ok);
+  assert.deepEqual(
+    parseWorkerResponse(
+      JSON.stringify({
+        operation: "source.roots",
+        sourceAccountId: "source_1",
+        roots: [],
+      }),
+      "source.roots",
+    ).roots,
+    [],
+    "no rows is a valid answer and means the host's allow-list stands",
+  );
+  for (const mutate of [
+    (value) => {
+      value.roots[0].kind = "drive";
+    },
+    (value) => {
+      value.roots[0].state = "retired";
+    },
+    (value) => {
+      value.roots[0].rootAlias = "Investing";
+    },
+    (value) => {
+      value.roots[0].unexpected = true;
+    },
+    (value) => {
+      delete value.roots[0].expectedTypes;
+    },
+    (value) => {
+      value.roots = Array.from({ length: 101 }, () => value.roots[0]);
+    },
+  ]) {
+    const invalid = structuredClone(ok);
+    mutate(invalid);
+    assert.throws(() =>
+      parseWorkerResponse(JSON.stringify(invalid), "source.roots"),
+    );
+  }
+
+  const report = {
+    operation: "source.rootReport",
+    sourceRootId: "root_1",
+    reportId: "report_1",
+    observedAt: 1_758_000_000_000,
+  };
+  assert.deepEqual(
+    parseWorkerResponse(JSON.stringify(report), "source.rootReport"),
+    report,
+  );
+  assert.throws(() =>
+    parseWorkerResponse(
+      JSON.stringify({ ...report, state: "ok" }),
+      "source.rootReport",
+    ),
+  );
+});
+
+// Review finding 3. A provider original config forces a remote independent
+// backup, and the runner refuses a remote repository for original bytes on
+// purpose. A root with no provider entry then has nowhere to put its
+// independent copy and would fail `archive_remote_original_unsupported` on
+// every pass, for every document under it. Refuse it where it can be read.
+test("every watched root must have a provider folder once one root does", () => {
+  const base = multiRootBase();
+  const pdf = pdfDocQaConfig();
+  delete pdf.archive.independentBackup.repositoryPath;
+  pdf.archive.independentBackup.repository = {
+    kind: "rclone_dropbox_v1",
+    remoteName: "kithmind_dropbox",
+    rootPath: "Kith Mind Backups/Processing",
+    rcloneBinary: "/tools/rclone",
+    configPath: "/credentials/kithmind-rclone.conf",
+    configIdentityFingerprint: "c".repeat(64),
+    expectedRootDirectoryIdHash: "d".repeat(64),
+  };
+  pdf.providerOriginal = {
+    providerAccountIdHash: "e".repeat(64),
+    refreshPath: "Kith Mind/Inbox",
+    registryDirectory: "/private/provider-registry",
+    roots: [
+      { rootAlias: "notes", ...providerRootEntry("id:notes_root") },
+      { rootAlias: "investing", ...providerRootEntry("id:investing_root") },
+    ],
+  };
+  // `medical` is watched but has no provider folder.
+  assert.throws(
+    () => parseConfig({ ...base, pdfDocQa: pdf }),
+    /medical has no provider folder/,
+  );
+  const complete = structuredClone(pdf);
+  complete.providerOriginal.roots.push({
+    rootAlias: "medical",
+    ...providerRootEntry("id:medical_root"),
+  });
+  assert.equal(
+    parseConfig({ ...base, pdfDocQa: complete }).pdfDocQa.providerOriginal.roots
+      .length,
+    3,
+  );
+  // With no provider original at all, a root needs nothing: both archive
+  // copies are the pipeline's own, which is how every non-provider source runs.
+  const noProvider = structuredClone(pdf);
+  delete noProvider.providerOriginal;
+  assert.equal(parseConfig({ ...base, pdfDocQa: noProvider }).roots.length, 3);
 });

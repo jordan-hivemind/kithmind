@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, realpath } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, join, relative, sep } from "node:path";
 
 import {
   BINARY_CLASSES,
@@ -15,6 +15,11 @@ import {
   type ParsedStagePhase,
   type ParserArtifactSelection,
 } from "@repo/worker-protocol";
+import {
+  MAX_WORKER_SCAN_ENTRIES,
+  type SourceRootReportState,
+  type WorkerSourceRoot,
+} from "@repo/worker-protocol/request";
 
 import {
   ArchiveCommandError,
@@ -75,6 +80,7 @@ import {
 } from "./captureStore.js";
 import {
   lookupDropboxFileIds,
+  validRelativePath,
   verifyDropboxOriginal,
 } from "./dropboxOriginal.js";
 import {
@@ -84,6 +90,7 @@ import {
 
 import {
   canonicalRoots,
+  contains,
   discoverFiles,
   discoverSourceObservations,
   FilesystemFailure,
@@ -119,7 +126,9 @@ import {
   recoverNormalizedBundleSpool,
   removeNormalizedBundleSpoolExact,
 } from "./spoolStore.js";
+import { providerRootFor, providerRootsOf } from "./config.js";
 import { Journal } from "./journal.js";
+import { JournalScanCache } from "./scanCache.js";
 import {
   runJournaledCall,
   resumePendingCall,
@@ -132,6 +141,7 @@ import type {
   JsonValue,
 } from "./journalTypes.js";
 import {
+  MAX_IDENTITY_BINDINGS,
   parseRunnerCheckpoint,
   workerErrorCode,
   type DiscoveryLease,
@@ -155,6 +165,8 @@ import type {
   DiscoveryFile,
   IdentityBinding,
   PdfDocQaProfile,
+  PdfDocQaProviderOriginal,
+  PdfDocQaProviderRoot,
   PipelineConfig,
   PipelineRunResult,
   SourceObservation,
@@ -390,6 +402,125 @@ function providerProofFresh(
     (at) => at >= now - 9 * 60_000 && at <= now + 4 * 60_000,
   );
 }
+
+/**
+ * ADM-4c. The account fields plus the folder bound to this plan's root, as one
+ * object, for the two drivers that work on an original already carrying
+ * provider state.
+ *
+ * Reaching either of those with an unbound root means an original was given a
+ * provider binding under a configuration that no longer binds its root, so
+ * `provider_original_root_mismatch` still stands. A root that was never bound
+ * never gets provider state in the first place (`createArchivedIntents`), so it
+ * never arrives here.
+ */
+function providerBinding(
+  account: PdfDocQaProviderOriginal,
+  rootAlias: string,
+): PdfDocQaProviderOriginal & PdfDocQaProviderRoot {
+  const root = providerRootFor(account, rootAlias);
+  if (!root) throw new PipelineWorkerError("provider_original_root_mismatch");
+  return { ...account, ...root };
+}
+
+/**
+ * ADM-4c review. Whether a remembered item's location is still one this pass
+ * reads: its root is in the list, and inside a selected subtree when the root
+ * has any.
+ */
+function watchedLocation(roots: SafeRoot[], binding: IdentityBinding): boolean {
+  const root = roots.find((candidate) => candidate.alias === binding.rootAlias);
+  if (!root) return false;
+  if (root.includePrefixes === undefined) return true;
+  return root.includePrefixes.some(
+    (prefix) =>
+      binding.relativePath === prefix ||
+      binding.relativePath.startsWith(`${prefix}${sep}`),
+  );
+}
+
+/**
+ * ADM-4c review. The share of what the journal remembers that may leave the
+ * watched set in one pass before the pass refuses instead: a quarter, and at
+ * least one.
+ *
+ * The first cut of this had a floor of ten, which could never trip for an
+ * account of ten items or fewer -- which is the owner's account today, and
+ * exactly when a mistake is least recoverable because there is nothing else
+ * left to notice it by.
+ */
+function retirementCircuitBreaker(remembered: number): number {
+  return Math.max(1, Math.ceil(remembered * 0.25));
+}
+
+/**
+ * ADM-4c review. A watched root whose contents collapsed, rather than whose
+ * location changed.
+ *
+ * `watchedLocation` catches a root leaving the list. It cannot catch a root
+ * that is still listed, still resolves, and is simply *empty* -- a disk that
+ * did not mount, a Dropbox folder mid-sync on a host the watcher just moved
+ * to, a folder the owner renamed on the provider side. Discovery reports no
+ * files, the scan opens with none, and `reconcileWorkerScan` retires every
+ * document under it.
+ *
+ * Two shapes, per root, against what the journal remembers for that root:
+ * it held items and now holds no files at all, or more than half of its
+ * remembered items are gone and at least three of them. Three so a folder of
+ * four losing two is an ordinary edit rather than a standing refusal; a half
+ * so a large folder cannot quietly lose most of itself.
+ *
+ * A root with nothing remembered cannot collapse: a brand-new empty folder is
+ * a folder with nothing in it yet. Nor can a root the pass no longer watches,
+ * which `watchedLocation` and the retirement breaker above already answer for.
+ */
+function collapsedRoots(
+  roots: SafeRoot[],
+  prior: IdentityBinding[],
+  plans: FilePlan[],
+  matched: Map<FilePlan, IdentityBinding>,
+): string[] {
+  // Only roots this pass actually looks at. A root that left the list, or an
+  // item narrowed out of one, is the other breaker's business, and counting
+  // it here would refuse a removal the operator has already confirmed.
+  const remembered = new Map<string, number>();
+  for (const binding of prior) {
+    if (!watchedLocation(roots, binding)) continue;
+    remembered.set(
+      binding.rootAlias,
+      (remembered.get(binding.rootAlias) ?? 0) + 1,
+    );
+  }
+  const seen = new Map<string, number>();
+  const kept = new Map<string, number>();
+  for (const plan of plans) {
+    seen.set(plan.rootAlias, (seen.get(plan.rootAlias) ?? 0) + 1);
+    if (matched.has(plan)) {
+      kept.set(plan.rootAlias, (kept.get(plan.rootAlias) ?? 0) + 1);
+    }
+  }
+  const collapsed: string[] = [];
+  for (const [rootAlias, held] of remembered) {
+    if (held < 1) continue;
+    const found = seen.get(rootAlias) ?? 0;
+    if (found === 0) {
+      collapsed.push(rootAlias);
+      continue;
+    }
+    const lost = held - (kept.get(rootAlias) ?? 0);
+    if (lost >= 3 && lost * 2 > held) collapsed.push(rootAlias);
+  }
+  return collapsed.sort();
+}
+
+/** ADM-4c. What one pass will tell the server about one of its roots. */
+type SourceRootReport = {
+  sourceRootId: string;
+  state: SourceRootReportState;
+  rootAlias?: string;
+  relativePath?: string;
+  providerFolderId?: string;
+};
 
 type ArchivedCheckpoint = Extract<RunnerCheckpoint, { phase: "archived" }>;
 
@@ -773,7 +904,8 @@ function records(value: unknown, label: string): Record<string, unknown>[] {
 
 function request(
   config: PipelineConfig,
-  operation: JournalOperation | "source.status",
+  operation:
+    JournalOperation | "source.status" | "source.roots" | "source.rootReport",
   extra: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
@@ -1033,7 +1165,10 @@ function bindingsFromScan(checkpoint: {
   const result = [...byExternalId.values()].sort((left, right) =>
     Buffer.compare(Buffer.from(fileKey(left)), Buffer.from(fileKey(right))),
   );
-  if (result.length > 256) {
+  // ADM-4c: bindings are bounded by `MAX_IDENTITIES`, not by the plan count.
+  // The union is what is here now plus what is remembered and gone, and a
+  // removed root leaves a whole root's worth of the second kind behind.
+  if (result.length > MAX_IDENTITY_BINDINGS) {
     throw new PipelineWorkerError("identity_capacity_exceeded");
   }
   const paths = new Set<string>();
@@ -1236,6 +1371,11 @@ export type ProviderFileIdSource = {
 
 export class PipelineRunner {
   private preparedPdfProfile: PreparedPdfDocQaProfile | undefined;
+  /** ADM-4c review: resolved once per pass; see `currentRoots`. */
+  private effectiveRoots: SafeRoot[] | undefined;
+  /** ADM-4c review: opened once per pass; see `scanCache`. */
+  private openScanCache: JournalScanCache | undefined;
+  private pendingRootReports: SourceRootReport[] = [];
   private archiveCatalog: ArchiveCatalog | undefined;
   /** P2-31f: receipts `--operator-clear` has retired in this pass. */
   private operatorClears = 0;
@@ -1250,14 +1390,20 @@ export class PipelineRunner {
       retryParked?: boolean;
       operatorClear?: boolean;
       maxClears?: number;
+      /**
+       * ADM-4c review. The one retirement code this pass is allowed to go
+       * through with, named exactly. See `refuseRetirement`.
+       */
+      acceptRetirement?: string;
     } = {},
     /**
-     * ADM-4a. The provider identity source, when the caller supplies its own.
-     * The runner builds the Dropbox one from its configuration otherwise, and
-     * a source with no provider configured has none at all.
+     * ADM-4a, a list since ADM-4c. The provider identity sources, when the
+     * caller supplies its own. The runner builds one Dropbox source per bound
+     * root from its configuration otherwise, and a root with no provider has
+     * none at all.
      */
-    private readonly providerFileIdSource:
-      ProviderFileIdSource | undefined = undefined,
+    private readonly providerFileIdSources:
+      ProviderFileIdSource[] | undefined = undefined,
   ) {}
 
   /**
@@ -1740,7 +1886,10 @@ export class PipelineRunner {
       mediaType: planMediaType(plan),
     });
     if (!original) {
-      const provider = pdf.providerOriginal;
+      // ADM-4c: a watched root with no provider entry archives its own
+      // independent copy, exactly as every root does when `providerOriginal`
+      // is absent. Only a root that is bound gets a provider original.
+      const provider = providerRootFor(pdf.providerOriginal, plan.rootAlias);
       original = await catalog.createOriginalIntent({
         originalCatalogId: originalSeed,
         sourceExternalId: plan.externalId,
@@ -1871,6 +2020,217 @@ export class PipelineRunner {
     );
   }
 
+  /**
+   * ADM-4c. The watched-folder list the server holds, or `undefined` when this
+   * pass could not read it.
+   *
+   * Never fails the pass. A server that has no rows, or that this worker
+   * cannot ask, means "watch the host's allow-listed roots as today", which is
+   * every pass before ADM-4b and the safe answer for every pass after it.
+   */
+  private async serverRoots(): Promise<WorkerSourceRoot[] | undefined> {
+    try {
+      const result = object(
+        await this.transport.call(request(this.config, "source.roots")),
+        "source.roots",
+      );
+      if (result.sourceAccountId !== this.config.sourceAccountId) {
+        throw new PipelineWorkerError("source_mismatch");
+      }
+      return result.roots as WorkerSourceRoot[];
+    } catch (error) {
+      console.warn(
+        `[pipeline] watched-folder list unavailable this pass; the host's allow-listed roots stand (${
+          error instanceof Error ? error.message : "unknown error"
+        })`,
+      );
+      return undefined;
+    }
+  }
+
+  /**
+   * ADM-4c. The roots this pass reads, and what to report about each server
+   * row.
+   *
+   * The host's JSON config is the allow-list and the server's rows select
+   * subtrees inside it. The three steps the protocol requires of a client (see
+   * the contract above `FS_ROOT_ALIAS` in `@repo/worker-protocol/request`) all
+   * happen here, in order, on text this worker treats as untrusted:
+   *
+   * 1. the alias must be a key in the host's own list, or the row is skipped;
+   * 2. the stored relative path is re-checked as text, decoding nothing;
+   * 3. the joined path is resolved and must be a separator-aligned descendant
+   *    of the resolved allow-listed root, so a symlink inside an allowed root
+   *    cannot point the watcher somewhere else.
+   *
+   * A row that fails any of them is reported `missing` or `unreadable` and
+   * left out of the pass. None of it fails the pass: a folder the owner
+   * mistyped in the UI must show a problem on the sources screen, not stop the
+   * watcher reading the folders that are fine.
+   */
+  private async resolveServerRoots(
+    allowed: SafeRoot[],
+    rows: WorkerSourceRoot[],
+  ): Promise<{ roots: SafeRoot[]; reports: SourceRootReport[] }> {
+    const byAlias = new Map(allowed.map((root) => [root.alias, root]));
+    const prefixes = new Map<string, string[]>();
+    /** Aliases a row selects whole, which no other row may then narrow. */
+    const whole = new Set<string>();
+    const reports: SourceRootReport[] = [];
+    for (const row of rows) {
+      if (row.kind !== "folder") continue;
+      const host = row.rootAlias ? byAlias.get(row.rootAlias) : undefined;
+      if (!host) {
+        reports.push({ sourceRootId: row.sourceRootId, state: "missing" });
+        continue;
+      }
+      const relativePath = row.relativePath ?? "";
+      if (relativePath !== "" && !validRelativePath(relativePath)) {
+        reports.push({ sourceRootId: row.sourceRootId, state: "missing" });
+        continue;
+      }
+      const joined =
+        relativePath === ""
+          ? host.canonicalPath
+          : join(host.canonicalPath, relativePath);
+      let resolved: string;
+      try {
+        resolved = await realpath(joined);
+      } catch (error) {
+        reports.push({
+          sourceRootId: row.sourceRootId,
+          state:
+            (error as NodeJS.ErrnoException).code === "ENOENT"
+              ? "missing"
+              : "unreadable",
+        });
+        continue;
+      }
+      if (!contains(host.canonicalPath, resolved)) {
+        reports.push({ sourceRootId: row.sourceRootId, state: "unreadable" });
+        continue;
+      }
+      const entry = await lstat(resolved).catch(() => undefined);
+      if (!entry?.isDirectory()) {
+        reports.push({ sourceRootId: row.sourceRootId, state: "unreadable" });
+        continue;
+      }
+      // ADM-4c review: the subtree is named by the path the host actually
+      // has, derived from the resolved directory, never by the row's raw
+      // text. On a case-insensitive filesystem, or one that stores NFD where
+      // the row says NFC, `realpath` succeeds for a spelling discovery never
+      // produces, and a raw-text prefix would then match no file at all --
+      // which reads as every document under the root vanishing.
+      const prefix = relative(host.canonicalPath, resolved);
+      reports.push({
+        sourceRootId: row.sourceRootId,
+        state: "ok",
+        rootAlias: host.alias,
+        relativePath: prefix,
+        ...(row.providerFolderId === undefined
+          ? {}
+          : { providerFolderId: row.providerFolderId }),
+      });
+      // A paused row still selects its subtree. Only its state is reported.
+      // Dropping it from the selection would leave its items out of the scan,
+      // and the server's reconcile marks anything not in the scan
+      // unavailable, so pausing a folder would read as deleting it.
+      if (prefix === "") whole.add(host.alias);
+      else if (prefixes.has(host.alias)) {
+        prefixes.get(host.alias)!.push(prefix);
+      } else prefixes.set(host.alias, [prefix]);
+    }
+    // ADM-4c review: rows may only NARROW a root they name. A root no row
+    // names is watched whole, exactly as it is with no rows at all. Dropping
+    // an unnamed root would take every item under it out of the scan, and
+    // `reconcileWorkerScan` is account-wide: the first pass after the owner
+    // adds one folder in the UI would mark every existing document
+    // unavailable. No server answer may ever remove a root from this list.
+    const roots = allowed.map((root) => {
+      const selected = whole.has(root.alias)
+        ? undefined
+        : prefixes.get(root.alias);
+      return selected === undefined || selected.length === 0
+        ? root
+        : { ...root, includePrefixes: [...new Set(selected)].sort() };
+    });
+    return { roots, reports };
+  }
+
+  /**
+   * ADM-4c review. The roots this pass reads, resolved once and reused.
+   *
+   * Every phase that re-enumerates has to see the same set the scan was
+   * planned from. `driveSealCheck` in particular re-discovers and compares
+   * against the sealed manifest: given the allow-list rather than the
+   * selection, it found files the scan deliberately left out and called the
+   * whole scan `unstable`. A pass resumed in a new process re-reads the
+   * server's list, which is right -- a selection that changed mid-pass should
+   * fail the seal check.
+   */
+  private async currentRoots(): Promise<SafeRoot[]> {
+    if (this.effectiveRoots) return this.effectiveRoots;
+    // ADM-4c review: the provider original config already says which roots a
+    // provider backs, and that is the only place an entry with no blocks is
+    // read as "not downloaded yet" rather than as a compressed file.
+    const backed = new Set(
+      providerRootsOf(this.config.pdfDocQa?.providerOriginal).map(
+        (root) => root.rootAlias,
+      ),
+    );
+    const allowed = (await canonicalRoots(this.config)).map((root) =>
+      backed.has(root.alias) ? { ...root, providerBacked: true } : root,
+    );
+    const rows = await this.serverRoots();
+    const plan =
+      rows === undefined
+        ? { roots: allowed, reports: [] as SourceRootReport[] }
+        : await this.resolveServerRoots(allowed, rows);
+    this.effectiveRoots = plan.roots;
+    this.pendingRootReports = plan.reports;
+    return plan.roots;
+  }
+
+  /** ADM-4c. Tells the server what this pass saw at each of its roots. */
+  private async reportRoots(
+    reports: SourceRootReport[],
+    files: FilePlan[],
+  ): Promise<void> {
+    const observedAt = Date.now();
+    for (const report of reports) {
+      const itemCount =
+        report.state !== "ok"
+          ? 0
+          : files.filter(
+              (file) =>
+                file.rootAlias === report.rootAlias &&
+                (report.relativePath === "" ||
+                  file.relativePath === report.relativePath ||
+                  file.relativePath.startsWith(`${report.relativePath}/`)),
+            ).length;
+      try {
+        await this.transport.call(
+          request(this.config, "source.rootReport", {
+            sourceRootId: report.sourceRootId,
+            observedAt,
+            itemCount,
+            state: report.state,
+            ...(report.providerFolderId === undefined
+              ? {}
+              : { providerFolderId: report.providerFolderId }),
+          }),
+        );
+      } catch (error) {
+        console.warn(
+          `[pipeline] a watched-folder report could not be sent (${
+            error instanceof Error ? error.message : "unknown error"
+          })`,
+        );
+        return;
+      }
+    }
+  }
+
   private async preparePdfProfile(): Promise<void> {
     const pdf = this.config.pdfDocQa;
     if (pdf === undefined) return;
@@ -1900,6 +2260,26 @@ export class PipelineRunner {
     }
   }
 
+  /**
+   * ADM-4c review. The scan cache, opened once per pass and shared by every
+   * phase that enumerates.
+   *
+   * The seal check used to re-discover without it, which meant every byte was
+   * still read and hashed once per pass -- the cost the cache exists to
+   * remove -- and, worse, that a cache entry discovery trusted and the seal
+   * check did not would make the two disagree and end the scan `unstable` on
+   * every pass until the daily rehash cleared it. One cache, one answer.
+   */
+  private async scanCache(): Promise<JournalScanCache | undefined> {
+    if (this.openScanCache === undefined) {
+      this.openScanCache = await JournalScanCache.open({
+        journalDir: this.config.journalDir,
+        authority: `${this.config.spaceId}\0${this.config.sourceAccountId}`,
+      }).catch(() => undefined);
+    }
+    return this.openScanCache;
+  }
+
   private async discoverPlans(roots: SafeRoot[]): Promise<FilePlan[]> {
     if (this.config.pdfDocQa === undefined) {
       return (await discoverFiles(this.config, roots)).map(filePlan);
@@ -1907,9 +2287,14 @@ export class PipelineRunner {
     if (this.preparedPdfProfile === undefined) {
       throw new PipelineWorkerError("parser_profile_unverified");
     }
-    return (await discoverSourceObservations(this.config, roots)).map(
-      (observation) => observationPlan(observation, this.config.pdfDocQa!),
-    );
+    const cache = await this.scanCache();
+    try {
+      return (await discoverSourceObservations(this.config, roots, cache)).map(
+        (observation) => observationPlan(observation, this.config.pdfDocQa!),
+      );
+    } finally {
+      await cache?.flush();
+    }
   }
 
   private async sameDiscoveredSnapshot(
@@ -1922,7 +2307,11 @@ export class PipelineRunner {
     if (this.preparedPdfProfile === undefined) {
       throw new PipelineWorkerError("parser_profile_unverified");
     }
-    const observations = await discoverSourceObservations(this.config, roots);
+    const observations = await discoverSourceObservations(
+      this.config,
+      roots,
+      await this.scanCache(),
+    );
     return (
       observations.length === plans.length &&
       observations.every((observation, index) => {
@@ -2430,33 +2819,36 @@ export class PipelineRunner {
     return asWorkerResponse(result);
   }
 
-  /** ADM-4a. The configured provider identity source, if there is one. */
-  private providerFileIds(): ProviderFileIdSource | undefined {
-    if (this.providerFileIdSource) return this.providerFileIdSource;
+  /**
+   * ADM-4a, widened in ADM-4c: one identity source per bound root. A watched
+   * root with no provider entry has none, and keeps path identity.
+   */
+  private providerFileIds(): ProviderFileIdSource[] {
+    if (this.providerFileIdSources) return this.providerFileIdSources;
     const pdf = this.config.pdfDocQa;
-    const provider = pdf?.providerOriginal;
-    const backup = pdf?.archive.independentBackup;
-    const repository = backup?.repository;
-    if (!provider || !repository) return undefined;
-    return {
-      rootAlias: provider.rootAlias,
+    const account = pdf?.providerOriginal;
+    const repository = pdf?.archive.independentBackup.repository;
+    if (!account || !repository) return [];
+    const credentials = {
+      rcloneBinary: repository.rcloneBinary,
+      configPath: repository.configPath,
+      remoteName: repository.remoteName,
+      configIdentityFingerprint: repository.configIdentityFingerprint,
+    };
+    return providerRootsOf(account).map((root) => ({
+      rootAlias: root.rootAlias,
       lookup: async (relativePaths) =>
         await lookupDropboxFileIds(
           {
-            credentials: {
-              rcloneBinary: repository.rcloneBinary,
-              configPath: repository.configPath,
-              remoteName: repository.remoteName,
-              configIdentityFingerprint: repository.configIdentityFingerprint,
-            },
-            refreshPath: provider.refreshPath,
-            providerAccountIdHash: provider.providerAccountIdHash,
-            providerRootDirectoryId: provider.providerRootDirectoryId,
-            providerRootDirectoryIdHash: provider.providerRootDirectoryIdHash,
+            credentials,
+            refreshPath: account.refreshPath,
+            providerAccountIdHash: account.providerAccountIdHash,
+            providerRootDirectoryId: root.providerRootDirectoryId,
+            providerRootDirectoryIdHash: root.providerRootDirectoryIdHash,
           },
           relativePaths,
         ),
-    };
+    }));
   }
 
   /**
@@ -2478,9 +2870,10 @@ export class PipelineRunner {
     plans: FilePlan[],
     byPath: Map<string, IdentityBinding>,
   ): Promise<void> {
-    const source = this.providerFileIds();
-    if (!source) return;
-    const under = plans.filter((plan) => plan.rootAlias === source.rootAlias);
+    const sources = this.providerFileIds();
+    if (sources.length === 0) return;
+    const bound = new Map(sources.map((source) => [source.rootAlias, source]));
+    const under = plans.filter((plan) => bound.has(plan.rootAlias));
     for (const plan of under) {
       const remembered = byPath.get(fileKey(plan))?.providerFileId;
       if (remembered !== undefined) plan.providerFileId = remembered;
@@ -2496,25 +2889,33 @@ export class PipelineRunner {
           Number(byPath.has(fileKey(left))) -
           Number(byPath.has(fileKey(right))),
       );
+    // ADM-4c: the budget is the pass's, not each root's, so adding a root
+    // cannot multiply the provider calls one pass makes. One root's provider
+    // being unreachable leaves that root on path identity and does not stop
+    // the others.
     const ask = new Set(wanted.slice(0, MAX_PROVIDER_LOOKUPS_PER_PASS));
     if (ask.size === 0) return;
-    let ids: Map<string, string>;
-    try {
-      ids = await source.lookup([...ask].map((plan) => plan.relativePath));
-    } catch (error) {
-      console.warn(
-        `[pipeline] provider file ids unavailable this pass; identity falls back to paths (${
-          error instanceof Error ? error.message : "unknown error"
-        })`,
-      );
-      return;
-    }
     const fresh = new Set<string>();
-    for (const plan of ask) {
-      const id = ids.get(plan.relativePath);
-      if (id === undefined) continue;
-      plan.providerFileId = id;
-      fresh.add(id);
+    for (const [rootAlias, source] of bound) {
+      const asking = [...ask].filter((plan) => plan.rootAlias === rootAlias);
+      if (asking.length === 0) continue;
+      let ids: Map<string, string>;
+      try {
+        ids = await source.lookup(asking.map((plan) => plan.relativePath));
+      } catch (error) {
+        console.warn(
+          `[pipeline] provider file ids unavailable this pass for root ${rootAlias}; identity falls back to paths (${
+            error instanceof Error ? error.message : "unknown error"
+          })`,
+        );
+        continue;
+      }
+      for (const plan of asking) {
+        const id = ids.get(plan.relativePath);
+        if (id === undefined) continue;
+        plan.providerFileId = id;
+        fresh.add(id);
+      }
     }
     // A remembered id the provider has just answered for another path belongs
     // to that path now: the file moved and something else took its place. The
@@ -2594,10 +2995,64 @@ export class PipelineRunner {
     return matched;
   }
 
+  /**
+   * ADM-4c review. Ends the pass rather than opening a scan that would retire
+   * documents, and leaves the owner a way forward.
+   *
+   * Nothing is written but the terminal checkpoint: every binding the journal
+   * held is kept, so the next pass sees exactly what this one did. The code
+   * travels out in `PipelineRunResult`, which is what the health check reads,
+   * so a refusal is visible on the health page rather than only in a log.
+   *
+   * `--accept-retirement <code>` is the way through. It is per pass, it must
+   * name the exact code being accepted, and it is recorded here with the
+   * counts it is overriding, because "the owner confirmed this deletion" is a
+   * thing a later reader has to be able to check.
+   */
+  private async refuseRetirement(input: {
+    code: "root_selection_would_retire_items" | "root_contents_collapsed";
+    detail: string;
+    prior: IdentityBinding[];
+    roots?: string[];
+  }): Promise<FilePlan[] | undefined> {
+    if (this.options.acceptRetirement === input.code) {
+      console.warn(
+        `[pipeline] operator accepted ${input.code} for this pass: ${input.detail}`,
+      );
+      return undefined;
+    }
+    console.warn(
+      `[pipeline] ${input.detail}; refusing the scan rather than retiring them. Re-run with --accept-retirement ${input.code} to confirm this is a real removal.`,
+    );
+    // The sources screen should name the folder, not just the pass.
+    if (input.roots?.length) {
+      const reports = this.pendingRootReports.filter(
+        (report) =>
+          report.rootAlias !== undefined &&
+          input.roots!.includes(report.rootAlias),
+      );
+      if (reports.length > 0) await this.reportRoots(reports, []);
+    }
+    await this.journal.transitionCheckpoint({
+      checkpoint: {
+        version: 1,
+        phase: "terminal",
+        outcome: "incomplete",
+        credentialSessionActive: false,
+        code: input.code,
+        scanned: 0,
+        published: 0,
+        bindings: input.prior,
+      },
+      credentialSessionActive: false,
+    });
+    return [];
+  }
+
   private async startCycle(
     roots: SafeRoot[],
     status: Record<string, unknown>,
-  ): Promise<void> {
+  ): Promise<FilePlan[]> {
     const prior =
       this.journal.checkpoint.phase === "terminal"
         ? this.journal.checkpoint.bindings
@@ -2627,11 +3082,49 @@ export class PipelineRunner {
         plan.externalId = retained ?? randomUUID();
       }
     }
-    if (plans.length + missingBindings.length > 256) {
+    // ADM-4c: each side is checked against the checkpoint validator's own
+    // bound rather than their sum. The sum refused a full scan beside a whole
+    // watched root's worth of vanished items, which is exactly what removing a
+    // root looks like: that must become ordinary gaps, not a failed pass.
+    if (
+      plans.length > MAX_WORKER_SCAN_ENTRIES ||
+      missingBindings.length > MAX_IDENTITY_BINDINGS
+    ) {
       throw new FilesystemFailure(
         "oversized",
         "identity binding capacity exceeded",
       );
+    }
+    // ADM-4c review. `reconcileWorkerScan` marks every item not in the scan
+    // unavailable, and it runs over the whole account. So a scan that is
+    // missing a root, or missing a root's contents, is indistinguishable to
+    // the server from every file under it being deleted at once. Neither a
+    // config edit, nor a server answer, nor a half-synced disk may be able to
+    // say that by accident.
+    //
+    // Two refusals, because they are two different mistakes. The first is
+    // about where the watcher was told to look; the second is about what it
+    // found when it looked there.
+    const retiring = missingBindings.filter(
+      (binding) => !watchedLocation(roots, binding),
+    ).length;
+    if (retiring >= retirementCircuitBreaker(prior.length)) {
+      const refused = await this.refuseRetirement({
+        code: "root_selection_would_retire_items",
+        detail: `${retiring} of ${prior.length} remembered items are no longer under any watched root`,
+        prior,
+      });
+      if (refused) return refused;
+    }
+    const collapsed = collapsedRoots(roots, prior, plans, matched);
+    if (collapsed.length > 0) {
+      const refused = await this.refuseRetirement({
+        code: "root_contents_collapsed",
+        detail: `watched ${collapsed.length === 1 ? "root" : "roots"} ${collapsed.join(", ")} held documents but this pass found few or none of them`,
+        prior,
+        roots: collapsed,
+      });
+      if (refused) return refused;
     }
     await this.journal.transitionCheckpoint({
       checkpoint: {
@@ -2647,6 +3140,7 @@ export class PipelineRunner {
       },
       credentialSessionActive: true,
     });
+    return plans;
   }
 
   private async driveScanBegin(): Promise<void> {
@@ -2968,7 +3462,7 @@ export class PipelineRunner {
     }
     let health: { status: "healthy" } | { status: "failed"; code: string };
     try {
-      const roots = await canonicalRoots(this.config);
+      const roots = await this.currentRoots();
       health = (await this.sameDiscoveredSnapshot(roots, checkpoint.files))
         ? { status: "healthy" }
         : { status: "failed", code: "unstable" };
@@ -3897,14 +4391,13 @@ export class PipelineRunner {
     authorizedAction?: NonNullable<ArchivedCheckpoint["preflightAction"]>,
   ): Promise<RunnerCheckpoint | void> {
     const pdf = this.requirePdfConfig();
-    const provider = pdf.providerOriginal;
+    const account = pdf.providerOriginal;
     const state = original.providerOriginal;
-    if (!provider || !state || !("repository" in pdf.archive.independentBackup))
+    if (!account || !state || !("repository" in pdf.archive.independentBackup))
       throw new PipelineWorkerError("provider_original_configuration_missing");
     const remoteRepository = pdf.archive.independentBackup.repository!;
     const plan = this.archivedPlan(checkpoint);
-    if (plan.rootAlias !== provider.rootAlias)
-      throw new PipelineWorkerError("provider_original_root_mismatch");
+    const provider = providerBinding(account, plan.rootAlias);
     if (state.locator.reviewCode)
       throw new PipelineWorkerError(
         "provider_locator_recovery_review_required",
@@ -4194,9 +4687,9 @@ export class PipelineRunner {
   ): Promise<void> {
     const { original, processing } = this.archivedRows(checkpoint);
     const pdf = this.requirePdfConfig();
-    const provider = pdf.providerOriginal;
+    const account = pdf.providerOriginal;
     const state = original.providerOriginal;
-    if (!provider || !state || !("repository" in pdf.archive.independentBackup))
+    if (!account || !state || !("repository" in pdf.archive.independentBackup))
       throw new PipelineWorkerError("provider_original_configuration_missing");
     const verified = state.verified;
     const copy = state.locator;
@@ -4207,8 +4700,7 @@ export class PipelineRunner {
         "provider_locator_recovery_review_required",
       );
     const plan = this.archivedPlan(checkpoint);
-    if (plan.rootAlias !== provider.rootAlias)
-      throw new PipelineWorkerError("provider_original_root_mismatch");
+    const provider = providerBinding(account, plan.rootAlias);
     const remoteRepository = pdf.archive.independentBackup.repository!;
     const configured = pdf.archive.independentBackup;
     const loaded = await loadProviderBinding({
@@ -6944,8 +7436,10 @@ export class PipelineRunner {
       this.journal.checkpoint.phase === "idle" ||
       this.journal.checkpoint.phase === "terminal"
     ) {
-      const roots = await canonicalRoots(this.config);
-      await this.startCycle(roots, status);
+      const plans = await this.startCycle(await this.currentRoots(), status);
+      if (this.pendingRootReports.length > 0) {
+        await this.reportRoots(this.pendingRootReports, plans);
+      }
     }
 
     for (let steps = 0; steps < 10_000; steps += 1) {
