@@ -29,6 +29,22 @@ export type ChangeRow = {
 /** The most rows one poll or one stream tick returns. */
 export const MAX_CHANGES_PER_READ = 500;
 
+/** `bigint`'s ceiling. A cursor above it is not a cursor: binding it would
+ * make the server raise 22003 on a cast, which is an ordinary bad input
+ * arriving as a database error. */
+const MAX_CURSOR = 9_223_372_036_854_775_807n;
+
+/** Whether `value` is a cursor this feed could have issued. Exported because
+ * the route refuses one before it opens a transaction, and the two must agree
+ * on what a cursor is. */
+export function isChangeCursor(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^\d{1,19}$/.test(value) &&
+    BigInt(value) <= MAX_CURSOR
+  );
+}
+
 /**
  * Every change past `sinceId` in the given spaces, oldest first.
  *
@@ -44,7 +60,7 @@ export async function listChangesSince(
   sinceId: string,
   limit = MAX_CHANGES_PER_READ,
 ): Promise<ChangeRow[]> {
-  if (!/^\d{1,19}$/.test(sinceId)) throw new ProofError("invalid_cursor");
+  if (!isChangeCursor(sinceId)) throw new ProofError("invalid_cursor");
   if (!Number.isInteger(limit) || limit < 1 || limit > MAX_CHANGES_PER_READ) {
     throw new ProofError("invalid_limit");
   }

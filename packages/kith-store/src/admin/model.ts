@@ -256,6 +256,46 @@ function epoch(value: Date | string | null): number | null {
   return value instanceof Date ? value.getTime() : new Date(value).getTime();
 }
 
+/**
+ * The spaces this principal may administer: the ones it can read, narrowed to
+ * the ones it can write.
+ *
+ * Every admin screen reads through this rather than through
+ * `getAuthorizedReadSpaceIds`, because the admin panel is a different kind of
+ * read from the ones a `reader` member is entitled to. A source row carries
+ * the watcher host's filesystem path, the problem text the host reported and
+ * the account's own id -- operational detail about how the household's records
+ * are collected, not the records themselves. `acceptsRole` in
+ * `../identity/authorization.ts` already draws that line for writes: only an
+ * `owner` or an `editor` passes a `"write"` check. This reuses it rather than
+ * inventing a second notion of who runs the system.
+ *
+ * A reader gets an empty set, which every caller below turns into an empty
+ * result, and which `apps/web`'s `/admin` layout turns into a 404.
+ */
+export async function getAdminSpaceIds(
+  ctx: IdentityCtx,
+  principal: Principal,
+  explicitSpaceIds?: readonly string[],
+): Promise<string[]> {
+  const readable = await getAuthorizedReadSpaceIds(
+    ctx,
+    principal,
+    explicitSpaceIds,
+  );
+  const administered: string[] = [];
+  for (const spaceId of readable) {
+    try {
+      await requireSpaceAccess(ctx, principal, spaceId, "write");
+      administered.push(spaceId);
+    } catch {
+      // A space this principal only reads is absent from the result, not an
+      // error: the same rule `getAuthorizedReadSpaceIds` applies one level up.
+    }
+  }
+  return administered;
+}
+
 type SourceInventoryDbRow = {
   id: string;
   space_id: string;
@@ -278,8 +318,8 @@ type SourceInventoryDbRow = {
 };
 
 /**
- * Screen 2, read-only: every source account in the caller's authorized spaces
- * with the four things the screen shows beside its name -- where it points
+ * Screen 2, read-only: every source account in the caller's administered
+ * spaces with the four things the screen shows beside its name -- where it points
  * (its root), how much it holds (its items), when it was last read, and
  * whether the host watching it is still reporting.
  *
@@ -293,11 +333,7 @@ export async function listSourcesInventory(
   ctx: IdentityCtx,
   args: { principal: Principal; spaceIds?: readonly string[] },
 ): Promise<SourceInventoryRow[]> {
-  const spaces = await getAuthorizedReadSpaceIds(
-    ctx,
-    args.principal,
-    args.spaceIds,
-  );
+  const spaces = await getAdminSpaceIds(ctx, args.principal, args.spaceIds);
   if (spaces.length === 0) return [];
   const predicate = spacePredicate(spaces, 1, "a.space_id");
   const records = await rows<SourceInventoryDbRow>(
@@ -429,11 +465,7 @@ export async function listSourceRoots(
   ctx: IdentityCtx,
   args: { principal: Principal; spaceIds?: readonly string[] },
 ): Promise<SourceRoot[]> {
-  const spaces = await getAuthorizedReadSpaceIds(
-    ctx,
-    args.principal,
-    args.spaceIds,
-  );
+  const spaces = await getAdminSpaceIds(ctx, args.principal, args.spaceIds);
   if (spaces.length === 0) return [];
   const predicate = spacePredicate(spaces, 1);
   const records = await rows<SourceRootDbRow>(

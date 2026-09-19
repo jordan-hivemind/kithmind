@@ -43,14 +43,39 @@ CREATE INDEX changes_committed_at_idx ON kith.changes (committed_at);
 -- One trigger function for every table, resolving `space_id` and `id` off the
 -- record at run time. A plain insert of four scalars: no `to_jsonb`, no
 -- per-table function, nothing that grows with the row's width.
-CREATE FUNCTION kith.record_change() RETURNS trigger
-  LANGUAGE plpgsql AS $$
+--
+-- `SECURITY DEFINER`, so it inserts as the migration role that owns it rather
+-- than as whoever made the write. This is what decouples the schema from the
+-- grants: applying this migration to a live database must not turn every
+-- `INSERT INTO kith.source_accounts` into a privilege failure at the trigger
+-- while the operator is still between `applyKithSchema` and the grant script.
+-- With the definer's rights the application role needs no write privilege on
+-- `kith.changes` at all, and it is not given one.
+--
+-- It is not an escalation path. The function takes no arguments and returns
+-- `trigger`, so PostgreSQL refuses to call it except as a trigger ("trigger
+-- functions can only be called as triggers"); there is no way to reach the
+-- definer's rights through it, and what it writes is fixed by the row the
+-- trigger fired on. `SET search_path` pins resolution to `pg_catalog` and
+-- `pg_temp` for the same reason every definer function should, and every name
+-- inside is schema-qualified so nothing depends on that path anyway.
+--
+-- `CREATE OR REPLACE`: `integration/postgres-proof.test.mjs` rewinds a
+-- database to version 1 by dropping the tables migration 4 created and
+-- replaying the chain. A function survives its triggers being dropped with
+-- their tables, so a plain `CREATE` fails the replay with 42723.
+CREATE OR REPLACE FUNCTION kith.record_change() RETURNS trigger
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = pg_catalog, pg_temp
+  AS $$
 DECLARE
   changed record;
 BEGIN
   IF TG_OP = 'DELETE' THEN changed := OLD; ELSE changed := NEW; END IF;
   INSERT INTO kith.changes (space_id, table_name, row_id, op)
-  VALUES (changed.space_id, TG_TABLE_NAME, changed.id::text, lower(TG_OP));
+  VALUES (changed.space_id, TG_TABLE_NAME, changed.id::pg_catalog.text,
+          pg_catalog.lower(TG_OP));
   RETURN NULL;
 END;
 $$;

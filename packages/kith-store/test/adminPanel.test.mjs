@@ -11,6 +11,8 @@ import test from "node:test";
 
 import { newKithId } from "../dist/index.js";
 import {
+  getAdminSpaceIds,
+  isChangeCursor,
   latestChangeId,
   listChangesSince,
   listSourceRoots,
@@ -21,6 +23,7 @@ import {
 import { deferredCtx, removeExpiredChanges } from "../dist/deferred/index.js";
 import {
   identityDatabase,
+  makeMember,
   makeSpace,
   makeUser,
   skip,
@@ -414,5 +417,66 @@ test("a cross-space reference is unrepresentable, not merely unqueried", { skip 
       [newKithId(), strangerSpace, f.sourceAccountId],
     ),
     /source_roots_source_account_id_space_id_fkey/,
+  );
+});
+
+test("only an owner or editor sees the sources inventory", { skip }, async (t) => {
+  // The admin screens carry operational detail -- the watcher host's
+  // filesystem path, the problem text it reported, the account's id -- which
+  // a `reader` member of the space is not entitled to. `getAdminSpaceIds`
+  // narrows the readable set to the writable one, and every admin read goes
+  // through it.
+  const f = await fixture(t);
+  const ctx = f.ctx(NOW);
+  await upsertSourceRoot(ctx, {
+    principal: f.principal,
+    sourceAccountId: f.sourceAccountId,
+    kind: "folder",
+    lastKnownPath: "/synthetic/statements",
+    area: "finance",
+  });
+
+  const editorId = await makeUser(ctx, { name: "Editor" });
+  await makeMember(ctx, { spaceId: f.spaceId, userId: editorId, role: "editor" });
+  const editor = { userId: editorId, credentialId: null };
+
+  const readerId = await makeUser(ctx, { name: "Reader" });
+  await makeMember(ctx, { spaceId: f.spaceId, userId: readerId, role: "reader" });
+  const reader = { userId: readerId, credentialId: null };
+
+  assert.deepEqual(await getAdminSpaceIds(ctx, f.principal), [f.spaceId]);
+  assert.deepEqual(await getAdminSpaceIds(ctx, editor), [f.spaceId]);
+  // The reader can read the space -- it is a member -- and still administers
+  // nothing, which is what the web layer turns into a 404.
+  assert.deepEqual(await getAdminSpaceIds(ctx, reader), []);
+
+  assert.equal((await listSourcesInventory(ctx, { principal: editor })).length, 1);
+  assert.deepEqual(await listSourcesInventory(ctx, { principal: reader }), []);
+  assert.deepEqual(await listSourceRoots(ctx, { principal: reader }), []);
+
+  // Naming the space explicitly does not get the reader past it either.
+  assert.deepEqual(
+    await listSourcesInventory(ctx, {
+      principal: reader,
+      spaceIds: [f.spaceId],
+    }),
+    [],
+  );
+});
+
+test("a cursor past the bigint ceiling is not a cursor", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ctx = f.ctx(NOW);
+  assert.equal(isChangeCursor("0"), true);
+  assert.equal(isChangeCursor("9223372036854775807"), true);
+  assert.equal(isChangeCursor("9223372036854775808"), false);
+  assert.equal(isChangeCursor("9999999999999999999"), false);
+  assert.equal(isChangeCursor("-1"), false);
+  assert.equal(isChangeCursor("1e3"), false);
+  // And the read refuses it before it reaches a statement, so an out-of-range
+  // cast never becomes a database error the caller sees as a server fault.
+  await assert.rejects(
+    () => listChangesSince(ctx, [f.spaceId], "9223372036854775808"),
+    /invalid_cursor/,
   );
 });

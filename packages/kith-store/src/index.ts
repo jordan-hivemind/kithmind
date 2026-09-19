@@ -308,21 +308,31 @@ export async function grantProofAppRole(
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.ingest_requests, kith.inline_work, kith.ingest_rate_limits,
     kith.source_fetch_requests TO "${appRole}"`);
-  // The admin panel (ADM-1, migrations 022 and 023): the seven configuration
-  // and investment tables the admin screens own, plus the change feed.
-  //
-  // `kith.changes` needs INSERT because `kith.record_change()` is a plain
-  // trigger function, not `SECURITY DEFINER`: it runs as whoever made the
-  // write, so a role that may write `kith.source_accounts` but not
-  // `kith.changes` would have every one of those writes fail at the trigger.
-  // DELETE is the prune sweep's (`removeExpiredChanges`, src/deferred/sweeps.ts).
-  // No sequence grant is needed: `changes.id` is an identity column, whose
-  // sequence is owned by the column and covered by the table's own INSERT.
+  // The admin panel (ADM-1, migration 022): the seven configuration and
+  // investment tables the admin screens own.
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.document_types, kith.document_type_fields,
     kith.source_roots, kith.source_root_reports,
-    kith.investments, kith.investment_entries, kith.corrections,
-    kith.changes TO "${appRole}"`);
+    kith.investments, kith.investment_entries, kith.corrections
+    TO "${appRole}"`);
+  // The change feed (migration 023) is deliberately not in the list above.
+  //
+  // Nothing in the application writes `kith.changes`: rows arrive only through
+  // `kith.record_change()`, which is `SECURITY DEFINER` and therefore inserts
+  // as the migration role that owns it. So the application credential gets no
+  // INSERT -- a write through it would be a forged change row, and now it is
+  // not merely unwritten but unwritable -- and no UPDATE, because a change
+  // already recorded is a fact about the past.
+  //
+  // DELETE is the one write it does need: `removeExpiredChanges`
+  // (src/deferred/sweeps.ts) runs on the daemon under this credential. SELECT
+  // comes from the schema-wide grant above, which is what the feed route
+  // reads through.
+  //
+  // The definer's rights are also what decouples the schema from the grants:
+  // applying 022 and 023 to a live database cannot break an app-role write on
+  // any triggered table, whether or not this function has run yet.
+  await owner.query(`GRANT DELETE ON kith.changes TO "${appRole}"`);
   // Deliberately still absent, and each one is a table an application write
   // would be a bug on: `kith.schema_version`, which only a migration runner
   // writes; the `proof_*` prototype pair, which only the owner role seeds; and
