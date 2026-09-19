@@ -171,13 +171,28 @@ test("a date needs its month as well as its year and day", () => {
   }
   for (const quote of [
     "Dated 2026-01-02",
-    "02/01/2026",
     "January 2, 2026",
     "Jan 2, 2026",
     "2 Jan 2026",
   ]) {
     assert.equal(gate({ valueType: "date", value, quote }).ok, true, quote);
   }
+  // ADM-5d: "02/01/2026" is the second of January and the first of February,
+  // and matching its runs in any order used to support both. It reads only
+  // when the kind declares an order.
+  assert.deepEqual(gate({ valueType: "date", value, quote: "02/01/2026" }), {
+    ok: false,
+    reason: "value_not_in_quote",
+  });
+  assert.equal(
+    gate({ valueType: "date", value, quote: "02/01/2026", dateOrder: "DMY" })
+      .ok,
+    true,
+  );
+  assert.deepEqual(
+    gate({ valueType: "date", value, quote: "02/01/2026", dateOrder: "MDY" }),
+    { ok: false, reason: "value_not_in_quote" },
+  );
   // A day and a month that are the same number need two runs of it, or the
   // month's name.
   assert.equal(
@@ -226,15 +241,28 @@ test("a date's parts have to be written together as a date", () => {
     }),
     { ok: false, reason: "value_not_in_quote" },
   );
-  // The windows themselves still read.
-  for (const quote of [
-    "Invoiced 02.01.2026 in full",
-    "Billed 1/2/2026",
-    "Signed May 2, 2026 at noon",
-  ]) {
-    const value = quote.includes("May") ? "2026-05-02" : "2026-01-02";
-    assert.equal(gate({ valueType: "date", value, quote }).ok, true, quote);
+  // The windows themselves still read. The two all-numeric ones are ambiguous,
+  // so they need the kind's declared order; the named month does not.
+  for (const quote of ["Invoiced 02.01.2026 in full", "Billed 1/2/2026"]) {
+    assert.equal(
+      gate({
+        valueType: "date",
+        value: "2026-01-02",
+        quote,
+        dateOrder: quote.includes("02.01") ? "DMY" : "MDY",
+      }).ok,
+      true,
+      quote,
+    );
   }
+  assert.equal(
+    gate({
+      valueType: "date",
+      value: "2026-05-02",
+      quote: "Signed May 2, 2026 at noon",
+    }).ok,
+    true,
+  );
 });
 
 test("a percentage keeps its decimal comma", () => {
@@ -294,12 +322,26 @@ test("dates must be real ISO calendar dates", () => {
   // ADM-5d: a printed form the cited text also carries is normalized rather
   // than refused. The prompt now asks the model to copy a date as printed,
   // so converting it is the server's job.
-  for (const printed of ["09/01/2026", "September 1, 2026", "2026-9-1"]) {
+  for (const printed of ["September 1, 2026", "2026-9-1"]) {
     assert.deepEqual(gate({ valueType: "date", value: printed, quote }), {
       ok: true,
       values: [{ type: "date", value: "2026-09-01" }],
     });
   }
+  // ADM-5d: an all-numeric one needs the kind to say which order it uses.
+  assert.deepEqual(gate({ valueType: "date", value: "09/01/2026", quote }), {
+    ok: false,
+    reason: "date_ambiguous",
+  });
+  assert.deepEqual(
+    gate({
+      valueType: "date",
+      value: "09/01/2026",
+      quote,
+      dateOrder: "MDY",
+    }),
+    { ok: true, values: [{ type: "date", value: "2026-09-01" }] },
+  );
   // What is not a date is still not a date.
   for (const bad of ["2026-02-30", "sometime in September", "the 1st"]) {
     assert.deepEqual(gate({ valueType: "date", value: bad, quote }), {

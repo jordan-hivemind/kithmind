@@ -55,6 +55,7 @@ import {
   citationRange,
   numberedPage,
   pageLines,
+  MAX_PAGE_LINES,
   type PageLine,
 } from "./lines.js";
 import { sha256Utf8 } from "../provenance/sql.js";
@@ -70,6 +71,7 @@ import {
 import { seedDocumentTypes } from "./seed.js";
 import {
   checkValue,
+  type DateOrder,
   isObservationFieldName,
   itemsSumToTotal,
   normalizeForMatch,
@@ -257,6 +259,9 @@ type LoadedType = {
   /** The model this kind asks for, when it asks for one. See
    * {@link extractionModelSetting}. */
   model: string | null;
+  /** How this kind writes a numeric date, when it says. See
+   * {@link documentTypeSetting}. */
+  dateOrder: DateOrder | null;
   fields: TypeField[];
 };
 
@@ -278,13 +283,16 @@ type LoadedType = {
  * Nothing here picks a model. With no such element the configured default is
  * used, which is what every kind does until the owner says otherwise.
  */
-export function extractionModelSetting(examples: unknown): string | null {
+export function documentTypeSetting(
+  examples: unknown,
+  name: string,
+): string | null {
   if (!Array.isArray(examples)) return null;
   for (const entry of examples) {
     if (!entry || typeof entry !== "object") continue;
     const setting = entry as { setting?: unknown; value?: unknown };
     if (
-      setting.setting === "extraction_model" &&
+      setting.setting === name &&
       typeof setting.value === "string" &&
       /^[a-zA-Z0-9._:/-]{1,200}$/.test(setting.value)
     ) {
@@ -292,6 +300,24 @@ export function extractionModelSetting(examples: unknown): string | null {
     }
   }
   return null;
+}
+
+/** The kind's model override, or null for the configured default. */
+export function extractionModelSetting(examples: unknown): string | null {
+  return documentTypeSetting(examples, "extraction_model");
+}
+
+/**
+ * How this kind writes a numeric date, or null.
+ *
+ * `01/02/26` is two different days and the string cannot settle which. Unset,
+ * an ambiguous date opens a correction rather than being guessed; set, it is
+ * read that way and stored. The owner's documents are overwhelmingly US, but
+ * that is the owner's statement to make per kind, not this code's to assume.
+ */
+export function dateOrderSetting(examples: unknown): DateOrder | null {
+  const value = documentTypeSetting(examples, "date_order");
+  return value === "MDY" || value === "DMY" ? value : null;
 }
 
 type LoadedPage = {
@@ -470,6 +496,7 @@ async function loadTypes(
       guidance: (row.guidance ?? null) as string | null,
       description: (row.description ?? null) as string | null,
       model: extractionModelSetting(row.examples),
+      dateOrder: dateOrderSetting(row.examples),
       fields,
     });
   }
@@ -504,10 +531,18 @@ export function buildRequest(loaded: Loaded): ExtractionRequest {
       (page) => `=== page ${page.ordinal} ===\n${numberedPage(page.lines)}`,
     )
     .join("\n\n");
-  const truncated =
+  const longest = Math.max(0, ...loaded.pages.map((p) => p.lines.length));
+  const truncated = [
     loaded.pages.length < loaded.pagesTotal
-      ? `\nOnly the first ${loaded.pages.length} of ${loaded.pagesTotal} pages are shown.\n`
-      : "";
+      ? `Only the first ${loaded.pages.length} of ${loaded.pagesTotal} pages are shown.`
+      : "",
+    longest > MAX_PAGE_LINES
+      ? `Only the first ${MAX_PAGE_LINES} lines of a page are shown.`
+      : "",
+  ]
+    .filter(Boolean)
+    .map((note) => `\n${note}\n`)
+    .join("");
   // Every field name of every active kind, deduplicated. The schema's enum and
   // the prompt's catalog are two statements of one contract.
   const fields = [
@@ -809,6 +844,7 @@ async function prepare(
       quote: located.quote,
       pageText: page.text,
       defaultCurrency: "USD",
+      ...(type?.dateOrder ? { dateOrder: type.dateOrder } : {}),
     });
     if (!gated.ok) {
       prepared.failures.push({
@@ -1040,6 +1076,7 @@ async function store(
   modelName: string,
   now: number,
   retryUnreadable: boolean,
+  refusedModel: string | null = null,
 ): Promise<ExtractionOutcome> {
   const type = loaded.types.find(
     (candidate) => candidate.kind === reading.kind,
@@ -1157,7 +1194,14 @@ async function store(
     }
   }
 
-  const truncated = loaded.pages.length < loaded.pagesTotal;
+  // Partially read either way: fewer pages shown than the document has, or a
+  // page longer than the model was shown. A limitation the owner cannot see is
+  // the same as no limitation at all.
+  const droppedPages = loaded.pages.length < loaded.pagesTotal;
+  const droppedLines = loaded.pages.some(
+    (page) => page.lines.length > MAX_PAGE_LINES,
+  );
+  const truncated = droppedPages || droppedLines;
   await client.query(
     `INSERT INTO kith.document_extractions
        (id,space_id,source_item_id,processing_generation_id,event_id,kind,
@@ -1237,6 +1281,17 @@ async function store(
       reading: failure.reading,
     });
   }
+  if (refusedModel !== null) {
+    // One row, named, saying which string the provider would not take. The
+    // reading beside it is the default model's, so the document is read.
+    await openCorrection(client, {
+      spaceId: loaded.spaceId,
+      sourceItemId: loaded.sourceItemId,
+      fieldName: null,
+      reason: "extraction_model_refused",
+      reading: { requestedModel: refusedModel, usedModel: modelName },
+    });
+  }
   if (truncated) {
     await openCorrection(client, {
       spaceId: loaded.spaceId,
@@ -1246,6 +1301,11 @@ async function store(
       reading: {
         pagesRead: loaded.pages.length,
         pagesTotal: loaded.pagesTotal,
+        linesShownPerPage: MAX_PAGE_LINES,
+        longestPageLines: Math.max(
+          0,
+          ...loaded.pages.map((page) => page.lines.length),
+        ),
       },
     });
   }
@@ -1313,15 +1373,41 @@ export async function runDocumentExtractionJob(
     ? (loaded.types.find((type) => type.kind === loaded.priorKind)?.model ??
       null)
     : null;
+  // A refused override falls back to the default, once.
+  //
+  // The override is a string an owner typed. A typo in it would otherwise
+  // wedge every document of that kind: the provider refuses the model, the
+  // job fails, the queue retries and fails again until the attempts run out,
+  // and the only sign is a provider error that names nothing. So a refusal
+  // costs one fallback call and one correction that says which string was
+  // refused, and the document is read with the default model meanwhile.
   let used = knownOverride ?? model.name;
-  let reading = await model.read(
-    knownOverride ? { ...request, model: knownOverride } : request,
-  );
+  let refusedModel: string | null = null;
+  let reading: ModelReading;
+  try {
+    reading = await model.read(
+      knownOverride ? { ...request, model: knownOverride } : request,
+    );
+  } catch (error) {
+    // Only an override can be fallen back from. A default that fails is the
+    // provider being down, which is the queue's business, not this branch's.
+    if (!knownOverride) throw error;
+    refusedModel = knownOverride;
+    used = model.name;
+    reading = await model.read(request);
+  }
   const wanted =
     loaded.types.find((type) => type.kind === reading.kind)?.model ?? null;
-  if (wanted && wanted !== used) {
-    used = wanted;
-    reading = await model.read({ ...request, model: wanted });
+  if (wanted && wanted !== used && refusedModel === null) {
+    try {
+      reading = await model.read({ ...request, model: wanted });
+      used = wanted;
+    } catch {
+      // Keep the reading the default already produced rather than losing the
+      // document to a string the provider will refuse again. No second try:
+      // that is the loop this guard exists to prevent.
+      refusedModel = wanted;
+    }
   }
 
   return await withKithTransaction(pool, async (client) => {
@@ -1345,6 +1431,7 @@ export async function runDocumentExtractionJob(
       used,
       now,
       job.attempts === 0,
+      refusedModel,
     );
   });
 }

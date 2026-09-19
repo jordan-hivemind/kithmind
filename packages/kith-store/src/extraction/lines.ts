@@ -46,8 +46,10 @@ export type PageLine = {
  * a citation spanning half a page is not a citation. */
 export const MAX_CITATION_SPAN = 4;
 
-/** Lines shown per page. A parsed page past this is presented truncated, and
- * the ids still address the page's real lines. */
+/** Lines shown per page. A page past this is presented truncated, and the ids
+ * still address the page's real lines -- so a citation into the unshown tail
+ * resolves correctly if the model somehow makes one. The document is marked
+ * partially read either way; see `linesTruncated` in `./model.ts`. */
 export const MAX_PAGE_LINES = 400;
 
 /**
@@ -97,14 +99,25 @@ export function citationRange(
   ids: readonly number[],
 ): CitationRange | null {
   if (ids.length === 0 || ids.length > 3) return null;
+  const unique = new Set<number>();
   let lowest = Number.POSITIVE_INFINITY;
   let highest = Number.NEGATIVE_INFINITY;
   for (const id of ids) {
     if (!Number.isInteger(id) || id < 1 || id > lines.length) return null;
+    unique.add(id);
     if (id < lowest) lowest = id;
     if (id > highest) highest = id;
   }
   if (highest - lowest + 1 > MAX_CITATION_SPAN) return null;
+  // Contiguous, or it is not a citation.
+  //
+  // The range covers everything between the lowest and highest id, so lines
+  // [2, 5] would hand the value gates lines 3 and 4 as well -- and a receipt's
+  // line 3 holds a different item's amount, which is enough to satisfy a check
+  // the cited lines do not. Requiring the ids to be adjacent makes the quote
+  // exactly what was cited. A model that means two separate places says so in
+  // two statements.
+  if (highest - lowest + 1 !== unique.size) return null;
   const first = lines[lowest - 1]!;
   const last = lines[highest - 1]!;
   if (last.end <= first.start) return null;

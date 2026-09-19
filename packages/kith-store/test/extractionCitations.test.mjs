@@ -32,7 +32,9 @@ import {
 } from "../dist/index.js";
 import {
   amountsInText,
+  checkValue,
   citationRange,
+  readPrintedDate,
   numberedPage,
   pageLines,
   parseModelReading,
@@ -257,23 +259,88 @@ test("a page splits into addressable lines and numbers them from one", () => {
   assert.equal(citationRange(lines, [1, 2, 3, 4]), null);
   assert.equal(citationRange(lines, [1, 8]), null);
   assert.equal(citationRange(lines, []), null);
+  // Non-adjacent ids are refused: the covering range would hand the gates a
+  // line nobody cited, and on a receipt that line holds another item's amount.
+  assert.equal(citationRange(lines, [2, 5]), null);
+  assert.equal(citationRange(lines, [2, 4]), null);
+  // Adjacent ones, in any order, are fine.
+  assert.deepEqual(citationRange(lines, [3, 2]), {
+    start: lines[1].start,
+    end: lines[2].end,
+  });
+  assert.ok(citationRange(lines, [1, 2, 3]));
 });
 
-test("an amount split by a rendering space is still one amount", () => {
-  // "$ 165 .00" is one number the column split, not 165 and 0.
+test("a rendering space closes only next to a currency mark", () => {
+  // Must read: the gap is inside an amount the column split.
   assert.deepEqual(amountsInText("Subtotal $ 165 .00"), ["165"]);
-  assert.deepEqual(amountsInText("Total 10. 80"), ["10.8"]);
-  // And a genuine pair of column amounts stays a pair.
+  assert.deepEqual(amountsInText("$ 10 .80"), ["10.8"]);
+  assert.deepEqual(amountsInText("Tax USD 13 .20"), ["13.2"]);
+
+  // Must NOT read. Each of these was joined into one fabricated amount by the
+  // first version of the repair, which is a value the page never stated under
+  // a citation that looked right.
+  assert.deepEqual(amountsInText("APPLES   12    .99"), ["12", "99"]);
+  assert.deepEqual(amountsInText("Invoice refs 1, 234, 567"), [
+    "1",
+    "234",
+    "567",
+  ]);
+  assert.deepEqual(amountsInText("3. 12 Pack Soda   5.99"), ["3", "12", "5.99"]);
+  assert.deepEqual(amountsInText("Milk 2. 5L"), ["2", "5"]);
+  // A bare column gap is two numbers, and becomes a correction rather than
+  // a guess.
+  assert.deepEqual(amountsInText("Total 10. 80"), ["10", "80"]);
+
+  // A genuine pair of column amounts stays a pair.
   assert.deepEqual(amountsInText("20.00      1.60   21.60"), [
     "20",
     "1.6",
     "21.6",
   ]);
-  // The four shapes a code or comma can take.
+  // The shapes a code or comma can take, unchanged.
   assert.deepEqual(amountsInText("Tax USD13.20"), ["13.2"]);
   assert.deepEqual(amountsInText("Tax 13.20 USD"), ["13.2"]);
   assert.deepEqual(amountsInText("Amount due 178,20"), ["178.2"]);
-  assert.deepEqual(amountsInText("$ 10 .80"), ["10.8"]);
+});
+
+test("the four fabrications cannot be stored", () => {
+  const cases = [
+    ["12.99", "APPLES   12    .99"],
+    ["1,234,567", "Invoice refs 1, 234, 567"],
+    ["3.12", "3. 12 Pack Soda   5.99"],
+    ["2.5", "Milk 2. 5L"],
+  ];
+  for (const [value, quote] of cases) {
+    assert.deepEqual(
+      checkValue({
+        valueType: "money",
+        value,
+        quote,
+        pageText: quote,
+        defaultCurrency: "USD",
+      }),
+      { ok: false, reason: "value_not_in_quote" },
+      quote,
+    );
+  }
+  // And the two that must still read.
+  for (const [value, quote] of [
+    ["165.00", "Subtotal $ 165 .00"],
+    ["10.80", "$ 10 .80"],
+  ]) {
+    assert.equal(
+      checkValue({
+        valueType: "money",
+        value,
+        quote,
+        pageText: quote,
+        defaultCurrency: "USD",
+      }).ok,
+      true,
+      quote,
+    );
+  }
 });
 
 test("a printed date normalizes to ISO, and nothing is invented", () => {
@@ -282,13 +349,22 @@ test("a printed date normalizes to ISO, and nothing is invented", () => {
   assert.equal(printedDateToIso("Apr 9, 2026"), "2026-04-09");
   assert.equal(printedDateToIso("2026-04-09"), "2026-04-09");
   assert.equal(printedDateToIso("2026/04/09"), "2026-04-09");
-  // Month-first for a numeric form, with the ambiguous pair swapped only when
-  // the first number cannot be a month.
-  assert.equal(printedDateToIso("03/04/26"), "2026-03-04");
+  // An all-numeric date that could be read two ways is neither, until the
+  // kind says which. Guessing month-first stored a coin flip.
+  assert.equal(printedDateToIso("03/04/26"), undefined);
+  assert.deepEqual(readPrintedDate("03/04/26"), { kind: "ambiguous" });
+  assert.equal(printedDateToIso("03/04/26", "MDY"), "2026-03-04");
+  assert.equal(printedDateToIso("03/04/26", "DMY"), "2026-04-03");
+  // One that settles itself needs no knob.
   assert.equal(printedDateToIso("18/09/2026"), "2026-09-18");
-  // The two-digit year rule, stated: 00-69 is this century.
-  assert.equal(printedDateToIso("01/02/69"), "2069-01-02");
-  assert.equal(printedDateToIso("01/02/70"), "1970-01-02");
+  assert.equal(printedDateToIso("13/02/2026"), "2026-02-13");
+  assert.equal(printedDateToIso("02/13/2026"), "2026-02-13");
+  assert.equal(printedDateToIso("03/03/26"), "2026-03-03");
+  assert.equal(printedDateToIso("9 Apr 26"), "2026-04-09");
+  // The two-digit year rule, stated: 00-69 is this century. Shown on a date
+  // that is not also ambiguous, since an ambiguous one never gets this far.
+  assert.equal(printedDateToIso("01/22/69"), "2069-01-22");
+  assert.equal(printedDateToIso("01/22/70"), "1970-01-22");
   // Not a date is not a date.
   assert.equal(printedDateToIso("sometime in April"), undefined);
   assert.equal(printedDateToIso("13/32/26"), undefined);
@@ -600,4 +676,172 @@ test("the shape the old contract produced, for the record", { skip }, async (t) 
     { field_name: "tax", reason: "quote_not_found" },
     { field_name: "total", reason: "quote_not_found" },
   ]);
+});
+
+const AMBIGUOUS_RECEIPT = [
+  "BRACKEN TOOLS",
+  "Date 01/02/26",
+  "Chisel | 12.00",
+  "Total | 12.00",
+].join("\n");
+
+test("an ambiguous printed date waits for the kind to say which order", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(AMBIGUOUS_RECEIPT, "synthetic-ambiguous-date");
+  const reading = {
+    kind: "receipt",
+    summary: "Hardware receipt.",
+    statements: [
+      statement("vendor", "BRACKEN TOOLS", [1]),
+      statement("purchase_date", "01/02/26", [2]),
+      statement("total", "12.00", [4]),
+    ],
+  };
+  // Unset: the date is one of two days and neither is stored.
+  await f.extract(fakeModel(reading), ids);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "purchase_date", reason: "date_ambiguous" },
+  ]);
+  assert.deepEqual(
+    (await f.stored()).map((row) => row.observation_key).sort(),
+    ["total", "vendor"],
+  );
+
+  // The kind says month-first, so it reads. Same data home as the model knob.
+  await f.client.query(
+    `UPDATE kith.document_types
+        SET examples = '[{"setting":"date_order","value":"MDY"}]'::jsonb
+      WHERE space_id = $1 AND kind = 'receipt'`,
+    [f.spaceId],
+  );
+  await f.extract(fakeModel(reading), ids, NOW + 3_000);
+  assert.deepEqual(await f.corrections(), []);
+  assert.equal(
+    (await f.stored()).find((row) => row.observation_key === "purchase_date")
+      .value.value,
+    "2026-01-02",
+  );
+
+  // And day-first reads the other day, from the same page.
+  await f.client.query(
+    `UPDATE kith.document_types
+        SET examples = '[{"setting":"date_order","value":"DMY"}]'::jsonb
+      WHERE space_id = $1 AND kind = 'receipt'`,
+    [f.spaceId],
+  );
+  await f.extract(fakeModel(reading), ids, NOW + 4_000);
+  assert.equal(
+    (await f.stored()).find((row) => row.observation_key === "purchase_date")
+      .value.value,
+    "2026-02-01",
+  );
+});
+
+test("a non-adjacent citation cannot borrow a line it did not cite", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(TABLE_RECEIPT, "synthetic-noncontiguous");
+  // Lines 4 and 6 are "Chisel | 12.00" and "Subtotal | 20.00"; line 5 in
+  // between is "Mallet | 8.00". Citing 4 and 6 must not let the 8.00 on line
+  // 5 support a value.
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS", [1]),
+        statement("total", "8.00", [4, 6]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "total", reason: "citation_out_of_range" },
+  ]);
+});
+
+test("a model the provider refuses falls back once and says so", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(TABLE_RECEIPT, "synthetic-refused-model");
+  await f.client.query(
+    `UPDATE kith.document_types
+        SET examples = '[{"setting":"extraction_model","value":"no-such-model"}]'::jsonb
+      WHERE space_id = $1 AND kind = 'receipt'`,
+    [f.spaceId],
+  );
+  const reading = {
+    kind: "receipt",
+    summary: "Hardware receipt.",
+    statements: [statement("vendor", "BRACKEN TOOLS", [1])],
+  };
+  const refusing = {
+    requests: [],
+    name: "default-model",
+    async read(request) {
+      refusing.requests.push(request);
+      if (request.model === "no-such-model") {
+        throw new Error("Extraction provider request failed");
+      }
+      return parseModelReading(JSON.stringify(reading));
+    },
+  };
+  // First run: the default reads, the kind asks for the bad model, that call
+  // is refused, and the default's reading stands.
+  const outcome = await f.extract(refusing, ids);
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: null, reason: "extraction_model_refused" },
+  ]);
+  assert.equal(
+    (
+      await f.rows(
+        "SELECT model FROM kith.document_extractions WHERE space_id = $1",
+        [f.spaceId],
+      )
+    )[0].model,
+    "default-model",
+  );
+
+  // Second run knows the kind, tries the override once, and falls back. Two
+  // calls, not a loop.
+  refusing.requests.length = 0;
+  const again = await f.extract(refusing, ids, NOW + 3_000);
+  assert.equal(again.stored, 1);
+  assert.deepEqual(
+    refusing.requests.map((request) => request.model ?? null),
+    ["no-such-model", null],
+  );
+  assert.deepEqual(await f.corrections(), [
+    { field_name: null, reason: "extraction_model_refused" },
+  ]);
+});
+
+test("a page longer than the line bound is marked partially read", { skip }, async (t) => {
+  const f = await fixture(t);
+  const long = [
+    "BRACKEN TOOLS",
+    ...Array.from({ length: 450 }, (_, index) => `Item ${index + 1} | 1.00`),
+  ].join("\n");
+  const ids = await f.ingest(long, "synthetic-long-page");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "A very long receipt.",
+      statements: [statement("vendor", "BRACKEN TOOLS", [1])],
+    }),
+    ids,
+  );
+  assert.equal(outcome.truncated, true, "the limitation is visible");
+  const item = (await f.corrections()).find(
+    (row) => row.reason === "input_truncated",
+  );
+  assert.ok(item, "a truncation item is open");
+  const row = (
+    await f.rows(
+      "SELECT pages_read, pages_total FROM kith.document_extractions WHERE space_id = $1",
+      [f.spaceId],
+    )
+  )[0];
+  // Every page was shown; it is the lines that were cut.
+  assert.equal(Number(row.pages_read), Number(row.pages_total));
 });
