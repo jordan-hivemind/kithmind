@@ -827,7 +827,28 @@ function archivedLookup(value: Record<string, unknown>): void {
     "processing",
   ] as const);
   if (value.found === false) {
-    exact(value, ["operation", "mode", "found"]);
+    // P2-104d. Present only when this client asked for it with
+    // `lookup.reuseParserArtifact`, so a server that does not know the field
+    // still answers a shape this accepts.
+    exact(value, ["operation", "mode", "found"], ["existingParserArtifact"]);
+    if (value.existingParserArtifact !== undefined) {
+      if (mode !== "processing") {
+        failure("existingParserArtifact is not a processing answer");
+      }
+      const artifact = record(value.existingParserArtifact);
+      exact(artifact, [
+        "parserArtifactId",
+        "primaryReceiptId",
+        "primaryBindingEpoch",
+        "backupReceiptId",
+        "backupBindingEpoch",
+      ]);
+      id(artifact.parserArtifactId, "parserArtifactId");
+      id(artifact.primaryReceiptId, "primaryReceiptId");
+      integer(artifact.primaryBindingEpoch, "primaryBindingEpoch", 0);
+      id(artifact.backupReceiptId, "backupReceiptId");
+      integer(artifact.backupBindingEpoch, "backupBindingEpoch", 0);
+    }
     return;
   }
   if (value.found !== true) failure("lookup found is invalid");

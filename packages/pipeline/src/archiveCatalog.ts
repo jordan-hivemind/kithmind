@@ -677,11 +677,14 @@ function archiveCopy(value: unknown, role: "primary" | "independent_backup") {
     result.readbackVerifiedAt = integer(row.readbackVerifiedAt);
   if (row.cloudReceipt !== undefined) {
     const receipt = object(row.cloudReceipt);
-    exact(receipt, ["receiptId", "requestDigest", "recordedAt"]);
+    exact(receipt, ["receiptId", "requestDigest", "recordedAt"], ["reused"]);
+    if (receipt.reused !== undefined && receipt.reused !== true)
+      fail("catalog_invalid");
     result.cloudReceipt = {
       receiptId: id(receipt.receiptId),
       requestDigest: sha(receipt.requestDigest),
       recordedAt: integer(receipt.recordedAt),
+      ...(receipt.reused === true ? { reused: true as const } : {}),
     };
   }
   if (row.deletion !== undefined) result.deletion = deletion(row.deletion);
@@ -714,7 +717,16 @@ function archiveCopy(value: unknown, role: "primary" | "independent_backup") {
       (role === "independent_backup" && result.readbackVerifiedAt !== undefined)
   )
     fail("catalog_invalid");
-  if (result.cloudReceipt && !result.published) fail("catalog_invalid");
+  // P2-104d. A receipt normally proves this row archived these bytes, so it
+  // requires the published object. A reused receipt proves the opposite and
+  // has to: the bytes were archived once, by the row that created the parser
+  // artifact, and this row must own no object of its own to be reusing them.
+  if (result.cloudReceipt?.reused) {
+    if (result.published || result.prepared || result.preparationIntent)
+      fail("catalog_invalid");
+  } else if (result.cloudReceipt && !result.published) {
+    fail("catalog_invalid");
+  }
   if (result.deletion && !result.published) fail("catalog_invalid");
   if (
     result.deletion?.state === "complete" &&
@@ -2531,17 +2543,30 @@ export class ArchiveCatalog {
     receiptId: string;
     requestDigest: string;
     recordedAt: number;
+    /**
+     * P2-104d. The receipt names bytes another row archived. This processing
+     * generation reused an existing parser artifact and the archived output
+     * already bound to it instead of writing a second copy of identical
+     * bytes, so it has no published object of its own -- which is the point.
+     * The usual "archive it before you may claim a receipt for it" rule
+     * cannot apply, and the row still owns nothing to delete, which is what
+     * the forget path reads `published` for.
+     */
+    reused?: true;
   }) {
     return await this.updateCopy(args, (copy) => {
       if (
-        !copy.published ||
-        (copy.role === "independent_backup" && !copy.backup)
+        args.reused
+          ? copy.published !== undefined || copy.prepared !== undefined
+          : !copy.published ||
+            (copy.role === "independent_backup" && !copy.backup)
       )
         fail("invalid_transition");
       const value = {
         receiptId: id(args.receiptId),
         requestDigest: sha(args.requestDigest),
         recordedAt: integer(args.recordedAt),
+        ...(args.reused ? { reused: true as const } : {}),
       };
       if (copy.cloudReceipt && !equal(copy.cloudReceipt, value))
         fail("catalog_conflict");
@@ -3059,8 +3084,7 @@ export async function inspectParkedItems(
   let oldestBlockedAt: number | undefined;
   for (const row of originals) {
     const block = (row as { admissionBlock?: unknown }).admissionBlock as
-      | { code?: unknown; blockedAt?: unknown; attempts?: unknown }
-      | undefined;
+      { code?: unknown; blockedAt?: unknown; attempts?: unknown } | undefined;
     if (!block || !ADMISSION_BLOCK_CODES.includes(block.code as never))
       continue;
     parked += 1;

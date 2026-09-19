@@ -140,6 +140,19 @@ export function createParserArtifactSelection(
   };
 }
 
+/**
+ * P2-104d. Select the parser artifact the server already holds. Used when a
+ * re-parse under a changed extraction configuration reproduced the same raw
+ * conversion: the artifact's identity is (source revision, parser
+ * fingerprint), so creating another one for the same bytes is refused, and
+ * rightly.
+ */
+export function existingParserArtifactSelection(
+  parserArtifactId: string,
+): ParserArtifactSelection {
+  return { kind: "existing", parserArtifactId };
+}
+
 export function createArchiveReceiptSelection(
   subjectKind: "original_bytes" | "parser_output",
   row: Pick<OriginalCatalogRow | ProcessingCatalogRow, "createdAt" | "copies">,

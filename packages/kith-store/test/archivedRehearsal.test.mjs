@@ -1,0 +1,457 @@
+// P2-104d. The rehearsal: what the owner's worker is about to do, done here
+// first, against real handlers and a real database.
+//
+// Publish N documents under one parser runtime, switch the runtime, and drive
+// passes until the world stops changing. Two switches matter and they are not
+// the same:
+//
+//   profile B1   the same parser fingerprint, a different extraction
+//                configuration. The parser re-runs and produces the same raw
+//                conversion, because the extraction configuration maps that
+//                conversion rather than changing it. The already-archived
+//                parser output and its artifact must be reused.
+//   profile B2   a different parser fingerprint. A different conversion, a new
+//                artifact, an ordinary archive and create.
+//
+// Two of the live oddities are here: a work row left leased with an expired
+// lease at one attempt, and never-activated processing debris in the local
+// catalog. The third, a second activated row naming a revision the original
+// does not, is the `original_receipt_revision_conflict` park, which is P2-31f's
+// and has its own test; fabricating it here would prove that test twice.
+
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import test from "node:test";
+
+import { createKithPool, newKithId } from "../dist/index.js";
+import {
+  rehearsalConfig,
+  rehearsalPass,
+  rehearsalProfile,
+  rehearsalUntilSettled,
+  rehearsalWorkspace,
+  withRehearsalCatalog,
+} from "./helpers/archivedRehearsal.mjs";
+import {
+  identityDatabase,
+  makeApiKey,
+  makeSpace,
+  makeUser,
+  skip as databaseSkip,
+} from "./helpers/identityFixture.mjs";
+import { inProcessWorkerTransport } from "./helpers/inProcessWorker.mjs";
+
+// Opt-in, for two reasons and no others.
+//
+// The archived lane requires the macOS process boundary (`requiredPlatform` in
+// the pipeline's parser process module), so this can only run where the lane
+// runs: not in CI, which is Linux.
+//
+// And it drives real `age` and `restic` child processes for every copy of
+// every document. On a fully loaded `pnpm test:once` -- every package's suite
+// at once -- an archive command occasionally fails to come up and the pass
+// reports `digest_mismatch`, which is the command's own refusal and nothing to
+// do with what is under test. A rehearsal is run deliberately before a risky
+// change, so it asks to be run:
+//
+//   KITH_REHEARSAL=1 KITH_STORE_DATABASE_URL=... \
+//     node --test packages/kith-store/test/archivedRehearsal.test.mjs
+const skip =
+  databaseSkip ||
+  (process.platform !== "darwin"
+    ? "the archived lane requires the macOS process boundary"
+    : process.env.KITH_REHEARSAL === "1"
+      ? false
+      : "set KITH_REHEARSAL=1 to run the archived-lane rehearsal");
+
+const DOCUMENTS = 4;
+
+async function fixture(t) {
+  const database = await identityDatabase(t);
+  const identity = database.ctx(Date.now());
+  const userId = await makeUser(identity, { name: "Rehearsal owner" });
+  const spaceId = await makeSpace(identity, {
+    createdBy: userId,
+    memberId: userId,
+    role: "owner",
+  });
+  const sourceAccountId = newKithId();
+  await database.client.query(
+    `INSERT INTO kith.source_accounts
+       (id, space_id, created_at, connector, account_id, name, enabled,
+        cursor_version, freshness_ms, inventory_epoch,
+        completed_inventory_epoch, manifest_version, created_by,
+        binary_profile_ids, binary_profile_audit_digest,
+        binary_profile_enabled_at)
+     VALUES ($1,$2,transaction_timestamp(),'fs','rehearsal-fs',
+             'Rehearsal fixture',true,0,60000,0,0,0,$3,$4,$5,
+             transaction_timestamp())`,
+    [
+      sourceAccountId,
+      spaceId,
+      userId,
+      JSON.stringify(["pdf_docqa_v1"]),
+      "a".repeat(64),
+    ],
+  );
+  const credential = await makeApiKey(identity, {
+    userId,
+    capabilities: ["ingest"],
+    spaceIds: [spaceId],
+    sourceAccountIds: [sourceAccountId],
+  });
+  const pool = createKithPool(database.databaseUrl, 4);
+  pool.on("error", () => {});
+  t.after(() => pool.end().catch(() => {}));
+  return { ...database, pool, userId, spaceId, sourceAccountId, credential };
+}
+
+async function activeGenerations(f) {
+  const { rows } = await f.client.query(
+    `SELECT i.id AS item_id, i.active_generation_id, g.extraction_fingerprint,
+            g.parser_artifact_id, g.parser_primary_receipt_id,
+            g.parser_backup_receipt_id, g.state, d.publication_state
+       FROM kith.source_items i
+       JOIN kith.processing_generations g ON g.id = i.active_generation_id
+       LEFT JOIN kith.documents d ON d.processing_generation_id = g.id
+      WHERE i.source_account_id = $1
+      ORDER BY i.id`,
+    [f.sourceAccountId],
+  );
+  return rows;
+}
+
+/** Every generation, with the publication state of the document it produced. */
+async function generations(f) {
+  const { rows } = await f.client.query(
+    `SELECT g.id, g.state, g.extraction_fingerprint,
+            d.publication_state,
+            (i.active_generation_id = g.id) AS active
+       FROM kith.processing_generations g
+       JOIN kith.source_items i ON i.id = g.source_item_id
+       LEFT JOIN kith.documents d ON d.processing_generation_id = g.id
+      WHERE g.source_account_id = $1
+      ORDER BY g.created_at, g.id`,
+    [f.sourceAccountId],
+  );
+  return rows;
+}
+
+async function workRows(f) {
+  const { rows } = await f.client.query(
+    `SELECT id, state, attempts FROM kith.worker_discovery_work
+      WHERE source_account_id = $1 ORDER BY created_at, id`,
+    [f.sourceAccountId],
+  );
+  return rows;
+}
+
+async function assessment(f) {
+  const { rows } = await f.client.query(
+    `SELECT state FROM kith.worker_processing_assessments
+      WHERE source_account_id = $1 ORDER BY created_at DESC LIMIT 1`,
+    [f.sourceAccountId],
+  );
+  return rows[0]?.state;
+}
+
+/**
+ * The live shape: one original carrying never-activated processing rows left
+ * by earlier configurations. The pass has to walk past all of them, create its
+ * own row, and keep theirs.
+ */
+function debrisId(slot, index) {
+  return `00000000-0000-4000-800${slot}-${String(index).padStart(12, "0")}`;
+}
+
+async function seedProcessingDebris(config, credential, count = 6) {
+  return await withRehearsalCatalog(config, credential, async (catalog) => {
+    const template = catalog.listProcessings()[0];
+    assert.ok(template, "a processing row to model the debris on");
+    const ids = [];
+    for (let index = 1; index <= count; index += 1) {
+      const processingCatalogId = debrisId(0, index);
+      await catalog.createProcessingIntent({
+        ...template,
+        processingCatalogId,
+        fingerprints: {
+          ...template.fingerprints,
+          correctionFingerprint: String(index).repeat(64).slice(0, 64),
+        },
+        parserIntent: {
+          ...template.parserIntent,
+          outputId: debrisId(1, index),
+          parserArtifactClientId: debrisId(2, index),
+        },
+        captureIntent: {
+          ...template.captureIntent,
+          captureId: debrisId(7, index),
+        },
+        spoolIntent: { ...template.spoolIntent, spoolId: debrisId(8, index) },
+        copies: {
+          primary: {
+            ...template.copies.primary,
+            clientReceiptId: debrisId(3, index),
+            archiveObjectId: debrisId(4, index),
+            objectName: `${debrisId(4, index)}.age`,
+          },
+          independent_backup: {
+            ...template.copies.independent_backup,
+            clientReceiptId: debrisId(5, index),
+            archiveObjectId: debrisId(6, index),
+            objectName: `${debrisId(6, index)}.age`,
+          },
+        },
+      });
+      ids.push(processingCatalogId);
+    }
+    return ids;
+  });
+}
+
+/**
+ * The live state, reproduced rather than asserted into being. One pass is let
+ * through the scan -- which is what re-queues the documents under the changed
+ * processing identity -- and then fails, exactly as the owner's worker did.
+ * One of the re-queued rows is then left leased with an expired lease and an
+ * attempt spent, which is the row that took every later pass down with it.
+ */
+async function strandOneWorkRow(f, options, transport) {
+  await assert.rejects(
+    rehearsalPass({
+      ...options,
+      transport: {
+        async call(request) {
+          if (request.operation === "discovery.preflightArchived") {
+            throw new Error("rehearsal interruption");
+          }
+          return await transport.call(request);
+        },
+      },
+    }),
+    /rehearsal interruption/,
+  );
+  return await expireOneLease(f);
+}
+
+async function expireOneLease(f) {
+  const { rows } = await f.client.query(
+    `SELECT id FROM kith.worker_discovery_work
+      WHERE source_account_id = $1 AND state = 'queued'
+      ORDER BY created_at, id LIMIT 1`,
+    [f.sourceAccountId],
+  );
+  assert.ok(rows[0], "a re-queued work row to strand");
+  await f.client.query(
+    `UPDATE kith.worker_discovery_work
+        SET state = 'leased', attempts = 1, lease_epoch = 1,
+            lease_token = $2, lease_owner_credential_id = $3,
+            lease_expires_at = transaction_timestamp() - interval '1 hour'
+      WHERE id = $1`,
+    [rows[0].id, randomBytes(32).toString("hex"), f.credential.id],
+  );
+  return rows[0].id;
+}
+
+test(
+  "a changed extraction configuration re-processes every document without re-archiving its parser output",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const transport = inProcessWorkerTransport(f.pool, {
+      userId: f.userId,
+      credentialId: f.credential.id,
+    });
+    const workspace = await rehearsalWorkspace(t, { documents: DOCUMENTS });
+    const profileA = rehearsalProfile({ mapping: "docling_utf16_pages_v2" });
+    const pass = (runtime) => ({
+      config: rehearsalConfig({
+        endpoint: "http://127.0.0.1:0/api/worker",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        workspace,
+        runtime,
+      }),
+      credential: f.credential.rawKey,
+      transport,
+      runtime,
+    });
+
+    const first = await rehearsalUntilSettled(pass(profileA));
+    assert.equal(
+      first.at(-1).state,
+      "complete",
+      `profile A settled: ${JSON.stringify(first)}`,
+    );
+    const published = await activeGenerations(f);
+    assert.equal(published.length, DOCUMENTS);
+    const artifactsA = published.map((row) => row.parser_artifact_id);
+    const receiptsA = published.map((row) => row.parser_primary_receipt_id);
+    for (const row of published) {
+      assert.equal(row.state, "ready");
+      assert.equal(row.publication_state, "active");
+    }
+
+    const debris = await seedProcessingDebris(
+      pass(profileA).config,
+      f.credential.rawKey,
+    );
+    const profileB = rehearsalProfile({ mapping: "docling_utf16_pages_v3" });
+    assert.equal(
+      profileB.profile.parserFingerprint,
+      profileA.profile.parserFingerprint,
+      "the parser did not change",
+    );
+    assert.notEqual(
+      profileB.profile.extractionConfigurationFingerprint,
+      profileA.profile.extractionConfigurationFingerprint,
+      "the extraction configuration did",
+    );
+
+    await strandOneWorkRow(f, pass(profileB), transport);
+
+    const second = await rehearsalUntilSettled(pass(profileB));
+    assert.equal(
+      second.at(-1).state,
+      "complete",
+      `profile B settled: ${JSON.stringify(second)}`,
+    );
+    assert.ok(second.length <= 4, `bounded passes: ${second.length}`);
+
+    const reprocessed = await activeGenerations(f);
+    assert.equal(reprocessed.length, DOCUMENTS);
+    for (const row of reprocessed) {
+      assert.equal(row.state, "ready");
+      assert.equal(row.publication_state, "active");
+    }
+    assert.deepEqual(
+      reprocessed.map((row) => row.parser_artifact_id),
+      artifactsA,
+      "the parser artifact was reused, not created again",
+    );
+    assert.deepEqual(
+      reprocessed.map((row) => row.parser_primary_receipt_id),
+      receiptsA,
+      "the archived parser output was reused, not archived again",
+    );
+    const extractionA = new Set(published.map((r) => r.extraction_fingerprint));
+    for (const row of reprocessed) {
+      assert.ok(
+        !extractionA.has(row.extraction_fingerprint),
+        "a new processing generation, not the old one",
+      );
+    }
+
+    const all = await generations(f);
+    assert.equal(
+      all.length,
+      DOCUMENTS * 2,
+      `the old generations were retired, not deleted: ${JSON.stringify(all)}`,
+    );
+    const retired = all.filter((row) => !row.active);
+    assert.equal(retired.length, DOCUMENTS);
+    for (const row of retired) {
+      assert.ok(
+        extractionA.has(row.extraction_fingerprint),
+        "the retired generations are the old ones",
+      );
+      assert.notEqual(
+        row.publication_state,
+        "active",
+        `a retired generation is not still published: ${JSON.stringify(row)}`,
+      );
+    }
+    for (const row of await workRows(f)) {
+      assert.ok(
+        ["admitted", "obsolete"].includes(row.state),
+        `no work row is stuck: ${JSON.stringify(row)}`,
+      );
+      assert.ok(row.attempts <= 2, `attempts stayed small: ${row.attempts}`);
+    }
+    assert.equal(await assessment(f), "complete");
+
+    const kept = await withRehearsalCatalog(
+      pass(profileB).config,
+      f.credential.rawKey,
+      (catalog) =>
+        catalog.listProcessings().map((row) => row.processingCatalogId),
+    );
+    for (const id of debris) {
+      assert.ok(kept.includes(id), "old catalog processing rows are kept");
+    }
+    assert.equal(
+      kept.length,
+      DOCUMENTS * 2 + debris.length,
+      `one new row per document, nothing else removed: ${kept.length}`,
+    );
+
+    const again = await rehearsalUntilSettled(pass(profileB), 1);
+    assert.deepEqual(again, [
+      { state: "complete", scanned: DOCUMENTS, published: 0 },
+    ]);
+  },
+);
+
+test(
+  "a changed parser fingerprint creates a new artifact and archives it",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const transport = inProcessWorkerTransport(f.pool, {
+      userId: f.userId,
+      credentialId: f.credential.id,
+    });
+    const workspace = await rehearsalWorkspace(t, { documents: 2 });
+    const pass = (runtime) => ({
+      config: rehearsalConfig({
+        endpoint: "http://127.0.0.1:0/api/worker",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        workspace,
+        runtime,
+      }),
+      credential: f.credential.rawKey,
+      transport,
+      runtime,
+    });
+    const profileA = rehearsalProfile();
+    const firstA = await rehearsalUntilSettled(pass(profileA));
+    assert.equal(firstA.at(-1).state, "complete", JSON.stringify(firstA));
+    const before = await activeGenerations(f);
+
+    const profileB = rehearsalProfile({
+      manifest: "5".repeat(64),
+      pageTexts: ["Rebuilt heading", "Rebuilt body one.", "Rebuilt body two."],
+    });
+    assert.notEqual(
+      profileB.profile.parserFingerprint,
+      profileA.profile.parserFingerprint,
+    );
+    await strandOneWorkRow(f, pass(profileB), transport);
+
+    const second = await rehearsalUntilSettled(pass(profileB));
+    assert.equal(second.at(-1).state, "complete", JSON.stringify(second));
+    for (const row of await workRows(f)) {
+      assert.ok(
+        ["admitted", "obsolete"].includes(row.state),
+        `no work row is stuck: ${JSON.stringify(row)}`,
+      );
+    }
+
+    const after = await activeGenerations(f);
+    assert.equal(after.length, 2);
+    for (const [index, row] of after.entries()) {
+      assert.equal(row.publication_state, "active");
+      assert.notEqual(
+        row.parser_artifact_id,
+        before[index].parser_artifact_id,
+        "a changed parser fingerprint is a new artifact",
+      );
+      assert.notEqual(
+        row.parser_primary_receipt_id,
+        before[index].parser_primary_receipt_id,
+        "and its own archived parser output",
+      );
+    }
+  },
+);

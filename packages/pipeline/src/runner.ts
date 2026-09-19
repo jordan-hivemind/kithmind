@@ -8,10 +8,12 @@ import {
   MAX_PARSED_REQUEST_BYTES,
   MAX_PARSED_ROW_BATCH,
   assertParsedRequestSize,
+  type ArchiveReceiptSelection,
   type ArchivedWorkIdentity,
   type BinaryMediaType,
   type BinaryParserProfileId,
   type ParsedStagePhase,
+  type ParserArtifactSelection,
 } from "@repo/worker-protocol";
 
 import {
@@ -60,6 +62,8 @@ import {
   createArchiveReceiptSelection,
   createParserArtifactSelection,
   digestArchiveIntent,
+  existingArchiveReceiptSelection,
+  existingParserArtifactSelection,
   parsedTextDeclaration,
 } from "./archivedRequestMapping.js";
 import {
@@ -133,6 +137,7 @@ import {
   type GapFilePlan,
   type InventoryIdentity,
   type JobLease,
+  type ParserArtifactReuse,
   type RunnerCheckpoint,
   type PdfFilePlan,
   type Utf8FilePlan,
@@ -686,6 +691,32 @@ function integer(value: unknown, label: string): number {
     throw new PipelineWorkerError(`${label}_invalid`);
   }
   return value as number;
+}
+
+/**
+ * P2-104d. Reads `existingParserArtifact` off a not-found processing lookup.
+ * `undefined` when the server offered nothing, which is also how the
+ * checkpoint records "archive this document's parser output yourself".
+ */
+function parserArtifactReuse(
+  value: Record<string, unknown>,
+): ParserArtifactReuse | undefined {
+  const offered = value.existingParserArtifact;
+  if (offered === undefined) return undefined;
+  if (!offered || typeof offered !== "object" || Array.isArray(offered)) {
+    throw new PipelineWorkerError("existing_parser_artifact_invalid");
+  }
+  const row = offered as Record<string, unknown>;
+  return {
+    parserArtifactId: text(row.parserArtifactId, "parser_artifact_id"),
+    primaryReceiptId: text(row.primaryReceiptId, "primary_receipt_id"),
+    primaryBindingEpoch: integer(
+      row.primaryBindingEpoch,
+      "primary_binding_epoch",
+    ),
+    backupReceiptId: text(row.backupReceiptId, "backup_receipt_id"),
+    backupBindingEpoch: integer(row.backupBindingEpoch, "backup_binding_epoch"),
+  };
 }
 
 function records(value: unknown, label: string): Record<string, unknown>[] {
@@ -1435,7 +1466,8 @@ export class PipelineRunner {
       !selected?.cloud ||
       !activation ||
       activation.jobId !== selected.cloud.ingestJobId ||
-      activation.processingGenerationId !== selected.cloud.processingGenerationId
+      activation.processingGenerationId !==
+        selected.cloud.processingGenerationId
     ) {
       throw new PipelineWorkerError("archive_catalog_revision_conflict");
     }
@@ -1465,7 +1497,10 @@ export class PipelineRunner {
     // The marker lives on the original row, which is keyed by content, so new
     // bytes land on a fresh row with no marker and release the item here
     // without anything having to notice that it changed.
-    if (original?.admissionBlock && admissionBlockHolds(original.admissionBlock))
+    if (
+      original?.admissionBlock &&
+      admissionBlockHolds(original.admissionBlock)
+    )
       return false;
     const reusable = this.reusableProcessingRow(matches, original);
     if (reusable?.activation) {
@@ -1559,8 +1594,9 @@ export class PipelineRunner {
     const original =
       this.requireCatalog()
         .listOriginals()
-        .find((row) => row.originalCatalogId === checkpoint.originalCatalogId) ??
-      this.matchingOriginal(this.archivedPlan(checkpoint));
+        .find(
+          (row) => row.originalCatalogId === checkpoint.originalCatalogId,
+        ) ?? this.matchingOriginal(this.archivedPlan(checkpoint));
     if (!original) {
       throw new PipelineWorkerError("archive_catalog_reference_missing");
     }
@@ -2067,6 +2103,9 @@ export class PipelineRunner {
             parserOutputByteLength: output.rawArtifact.byteLength,
             parserOutputMediaType: output.rawArtifact.mediaType,
             parsedText: mapped.declaration,
+            // P2-104d. A replay sends the persisted body, and this is the
+            // body this build sends, so the two have to agree here too.
+            reuseParserArtifact: true,
           },
         });
         break;
@@ -2098,33 +2137,7 @@ export class PipelineRunner {
           workId: lease.workId,
           leaseEpoch: lease.leaseEpoch,
           leaseToken: lease.leaseToken,
-          parserArtifact: createParserArtifactSelection(mapped.processing),
-          archives: [
-            createArchiveReceiptSelection(
-              "original_bytes",
-              mapped.original,
-              "primary",
-            ),
-            ...(providerOriginal === undefined
-              ? [
-                  createArchiveReceiptSelection(
-                    "original_bytes",
-                    mapped.original,
-                    "independent_backup",
-                  ),
-                ]
-              : []),
-            createArchiveReceiptSelection(
-              "parser_output",
-              mapped.processing,
-              "primary",
-            ),
-            createArchiveReceiptSelection(
-              "parser_output",
-              mapped.processing,
-              "independent_backup",
-            ),
-          ],
+          ...this.admissionSelections(checkpoint, mapped, providerOriginal),
           ...(providerOriginal === undefined ? {} : { providerOriginal }),
           parsedText: mapped.declaration,
         });
@@ -3478,10 +3491,19 @@ export class PipelineRunner {
             }
           : undefined;
     if (!source) throw new PipelineWorkerError("parser_output_missing");
+    // P2-104d. These exact bytes are already archived under the artifact this
+    // document is reusing, in both repositories, and admission will select
+    // those receipts. Encrypting and publishing a second copy would archive
+    // nothing new and then be refused: one parser artifact per (source
+    // revision, parser fingerprint), and a receipt may name only its own
+    // artifact. The original's copies are not affected, and the provider
+    // original still runs below.
     const roles =
-      subject === "original_bytes" && original.providerOriginal
-        ? (["primary"] as const)
-        : (["primary", "independent_backup"] as const);
+      subject === "parser_output" && checkpoint.parserReuse
+        ? ([] as const)
+        : subject === "original_bytes" && original.providerOriginal
+          ? (["primary"] as const)
+          : (["primary", "independent_backup"] as const);
     for (const role of roles) {
       const copy = row.copies[role];
       if (!copy.prepared) {
@@ -4044,9 +4066,9 @@ export class PipelineRunner {
     // found, which is not the same set as the parked ones, so the pass stops
     // at the number the operator stated rather than at whatever it meets.
     const refusal = this.options.operatorClear
-      ? (this.operatorClears >= (this.options.maxClears ?? 0)
+      ? ((this.operatorClears >= (this.options.maxClears ?? 0)
           ? "operator_clear_limit"
-          : undefined) ?? operatorReceiptClearRefusal(shared)
+          : undefined) ?? operatorReceiptClearRefusal(shared))
       : await automaticReceiptClearRefusal({
           ...shared,
           originals: catalog.listOriginals(),
@@ -4183,7 +4205,10 @@ export class PipelineRunner {
                 : "original_receipt_unknown_to_server",
             );
           }
-          return archivedBase(current, { step: "capture", receiptChecked: true });
+          return archivedBase(current, {
+            step: "capture",
+            receiptChecked: true,
+          });
         }
         let { original } = this.archivedRows(current);
         const provider = original.providerOriginal !== undefined;
@@ -4258,6 +4283,35 @@ export class PipelineRunner {
         return archivedBase(current, {
           step: "capture",
           expectedOriginalRevision: original.rowRevision,
+          // P2-104d. These bytes are already admitted and the receipts over
+          // them are immutable, bound to the admission that created them. A
+          // second processing generation cannot declare them again -- a fresh
+          // admission carries a fresh request digest and the stored receipt
+          // refuses it -- so it selects them. A provider original has no
+          // backup receipt to select and does not reach admission at all
+          // (P2-31b), so it is left alone.
+          ...(provider
+            ? {}
+            : {
+                originalReuse: {
+                  primaryReceiptId: text(
+                    value.originalPrimaryReceiptId,
+                    "original_primary_receipt_id",
+                  ),
+                  primaryBindingEpoch: integer(
+                    value.originalPrimaryBindingEpoch,
+                    "original_primary_binding_epoch",
+                  ),
+                  backupReceiptId: text(
+                    value.originalBackupReceiptId,
+                    "original_backup_receipt_id",
+                  ),
+                  backupBindingEpoch: integer(
+                    value.originalBackupBindingEpoch,
+                    "original_backup_binding_epoch",
+                  ),
+                },
+              }),
         });
       },
     );
@@ -4603,6 +4657,10 @@ export class PipelineRunner {
             parserOutputByteLength: output.rawArtifact.byteLength,
             parserOutputMediaType: output.rawArtifact.mediaType,
             parsedText: mapped.declaration,
+            // P2-104d. Ask for the artifact the server already holds under
+            // this parser fingerprint. Opt-in because it adds a field to the
+            // not-found answer, which older clients reject.
+            reuseParserArtifact: true,
           },
         }),
       async (current, response, pending) => {
@@ -4621,7 +4679,19 @@ export class PipelineRunner {
           throw new PipelineWorkerError("archived_lookup_mode_conflict");
         }
         if (value.found !== true) {
-          return archivedBase(current, { step: "parser_archive" });
+          // P2-104d. Not admitted under this processing configuration, but the
+          // server may already hold the parser artifact and its archived
+          // parser output: this document re-parsed to bytes it has. That is
+          // the ordinary shape of a re-parse under a changed extraction
+          // configuration, because the archived subject is the raw conversion
+          // and the extraction configuration maps it rather than changing it.
+          // Record the selection so `parser_archive` skips its copies and
+          // `admit` names these ids. Cleared when the server offers nothing,
+          // so a later pass that re-parses to different bytes archives again.
+          return archivedBase(current, {
+            step: "parser_archive",
+            parserReuse: parserArtifactReuse(value),
+          });
         }
         if (value.desiredProcessingEpoch !== identity.processingEpoch) {
           throw new PipelineWorkerError("archived_lookup_parent_conflict");
@@ -4661,9 +4731,16 @@ export class PipelineRunner {
             "parserBackupReceiptId",
           ],
         ] as const;
+        // P2-104d. A generation admitted against a parser artifact it did not
+        // archive has no published parser-output copies of its own, and that
+        // is the whole shape of a reuse, not a missing parent.
+        const reusedParserOutput =
+          !processing.copies.primary.published &&
+          !processing.copies.independent_backup.published;
         for (const [subject, row, role, field] of receipts) {
           const live = subject === "original_bytes" ? original : processing;
-          if (!live.copies[role].published) {
+          const reused = subject === "parser_output" && reusedParserOutput;
+          if (!reused && !live.copies[role].published) {
             throw new PipelineWorkerError("archived_receipt_parent_missing");
           }
           if (!live.copies[role].cloudReceipt) {
@@ -4678,6 +4755,7 @@ export class PipelineRunner {
               receiptId: text(value[field], "archive_receipt_id"),
               requestDigest: pending.requestDigest,
               recordedAt: pending.receivedAt,
+              ...(reused ? { reused: true as const } : {}),
             });
             if (subject === "original_bytes") {
               original = updated as OriginalCatalogRow;
@@ -4822,6 +4900,101 @@ export class PipelineRunner {
     }
   }
 
+  /**
+   * What an admission selects: the parser artifact and the four (or three, for
+   * a provider original) archive receipts.
+   *
+   * P2-104d. One builder, because two of them is how this broke: the admission
+   * and the replay validator each built the request and a replay is refused
+   * when they disagree. The reuse branch was added to one of them, and a
+   * resumed pass answered `journal_phase_conflict` on a document whose
+   * checkpoint was fine.
+   */
+  private admissionSelections(
+    checkpoint: ArchivedCheckpoint,
+    mapped: { original: OriginalCatalogRow; processing: ProcessingCatalogRow },
+    providerOriginal: unknown,
+  ): {
+    parserArtifact: ParserArtifactSelection;
+    archives: ArchiveReceiptSelection[];
+  } {
+    const reuse = checkpoint.parserReuse;
+    const original = checkpoint.originalReuse;
+    return {
+      // Either this document archived its own parser output, or it reused the
+      // copies already bound to the artifact it is selecting. The two go
+      // together: a reused artifact has no local copies to declare, and a
+      // created one has no receipts to reuse.
+      parserArtifact: reuse
+        ? existingParserArtifactSelection(reuse.parserArtifactId)
+        : createParserArtifactSelection(mapped.processing),
+      archives: [
+        ...(original
+          ? [
+              existingArchiveReceiptSelection({
+                subjectKind: "original_bytes",
+                copyRole: "primary",
+                receiptId: original.primaryReceiptId,
+                bindingEpoch: original.primaryBindingEpoch,
+              }),
+              ...(original.backupReceiptId === undefined
+                ? []
+                : [
+                    existingArchiveReceiptSelection({
+                      subjectKind: "original_bytes",
+                      copyRole: "independent_backup",
+                      receiptId: original.backupReceiptId,
+                      bindingEpoch: original.backupBindingEpoch!,
+                    }),
+                  ]),
+            ]
+          : [
+              createArchiveReceiptSelection(
+                "original_bytes",
+                mapped.original,
+                "primary",
+              ),
+              ...(providerOriginal === undefined
+                ? [
+                    createArchiveReceiptSelection(
+                      "original_bytes",
+                      mapped.original,
+                      "independent_backup",
+                    ),
+                  ]
+                : []),
+            ]),
+        ...(reuse
+          ? [
+              existingArchiveReceiptSelection({
+                subjectKind: "parser_output",
+                copyRole: "primary",
+                receiptId: reuse.primaryReceiptId,
+                bindingEpoch: reuse.primaryBindingEpoch,
+              }),
+              existingArchiveReceiptSelection({
+                subjectKind: "parser_output",
+                copyRole: "independent_backup",
+                receiptId: reuse.backupReceiptId,
+                bindingEpoch: reuse.backupBindingEpoch,
+              }),
+            ]
+          : [
+              createArchiveReceiptSelection(
+                "parser_output",
+                mapped.processing,
+                "primary",
+              ),
+              createArchiveReceiptSelection(
+                "parser_output",
+                mapped.processing,
+                "independent_backup",
+              ),
+            ]),
+      ],
+    };
+  }
+
   private async driveArchivedAdmit(): Promise<void> {
     const checkpoint = this.journal.checkpoint;
     if (checkpoint.phase !== "archived" || checkpoint.step !== "admit") {
@@ -4940,33 +5113,6 @@ export class PipelineRunner {
           this.journal.pending === undefined,
         )
       : undefined;
-    const archives = [
-      createArchiveReceiptSelection(
-        "original_bytes",
-        mapped.original,
-        "primary",
-      ),
-      ...(providerOriginal === undefined
-        ? [
-            createArchiveReceiptSelection(
-              "original_bytes",
-              mapped.original,
-              "independent_backup",
-            ),
-          ]
-        : []),
-      createArchiveReceiptSelection(
-        "parser_output",
-        mapped.processing,
-        "primary",
-      ),
-      createArchiveReceiptSelection(
-        "parser_output",
-        mapped.processing,
-        "independent_backup",
-      ),
-    ];
-    const parserArtifact = createParserArtifactSelection(mapped.processing);
     const result = await this.mutation(
       "discovery.admitArchived",
       () =>
@@ -4975,8 +5121,7 @@ export class PipelineRunner {
           workId: lease.workId,
           leaseEpoch: lease.leaseEpoch,
           leaseToken: lease.leaseToken,
-          parserArtifact,
-          archives,
+          ...this.admissionSelections(checkpoint, mapped, providerOriginal),
           ...(providerOriginal === undefined ? {} : { providerOriginal }),
           parsedText: mapped.declaration,
         }),
@@ -5032,6 +5177,13 @@ export class PipelineRunner {
           ["parser_output", "independent_backup", "parserBackupReceiptId"],
         ] as const) {
           const live = subject === "original_bytes" ? original : processing;
+          // P2-104d. A reused parser output was archived by the row that
+          // created the artifact, so this row has no published object to hang
+          // the receipt on. It still holds the receipt: that is what says the
+          // bytes behind this generation are durable, and the row would
+          // otherwise look never admitted.
+          const reused =
+            subject === "parser_output" && current.parserReuse !== undefined;
           if (!live.copies[role].cloudReceipt) {
             const updated = await this.requireCatalog().recordCloudReceipt({
               subject,
@@ -5044,6 +5196,7 @@ export class PipelineRunner {
               receiptId: text(value[receiptField], receiptField),
               requestDigest: pending.requestDigest,
               recordedAt: pending.receivedAt,
+              ...(reused ? { reused: true as const } : {}),
             });
             if (subject === "original_bytes")
               original = updated as OriginalCatalogRow;

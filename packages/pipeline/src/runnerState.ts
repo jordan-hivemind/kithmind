@@ -95,6 +95,29 @@ export type JobLease = {
   leaseExpiresAt: number;
 };
 
+/**
+ * P2-104d. Archive receipts this document reuses instead of declaring its own,
+ * as `discovery.lookupArchivedAdmission` reported them. The backup pair is
+ * absent for an original whose independent copy is a provider reference.
+ */
+export type ArchiveReceiptReuse = {
+  primaryReceiptId: string;
+  primaryBindingEpoch: number;
+  backupReceiptId?: string;
+  backupBindingEpoch?: number;
+};
+
+/**
+ * The same, plus the parser artifact those receipts belong to. Both copies are
+ * required here: the server offers a parser artifact for reuse only when both
+ * of its archive copies are currently bound.
+ */
+export type ParserArtifactReuse = ArchiveReceiptReuse & {
+  parserArtifactId: string;
+  backupReceiptId: string;
+  backupBindingEpoch: number;
+};
+
 export type ArchivedDiscoveryLease = Omit<
   DiscoveryLease,
   "uri" | "contentHash" | "byteLength"
@@ -167,6 +190,20 @@ type ArchivedRun = ActiveScan & {
    * admission receipt, so the question is asked at most once per cycle.
    */
   receiptChecked?: boolean;
+  /**
+   * P2-104d. Set while this document is to reuse a parser artifact the server
+   * already holds, rather than archive its parser output and create one.
+   * Re-derived from `discovery.lookupArchivedAdmission` on every pass that
+   * reaches `lookup_processing`, so it is state, not a decision to remember.
+   */
+  parserReuse?: ParserArtifactReuse;
+  /**
+   * P2-104d. Set while this document's original bytes are already admitted:
+   * the receipts over them are immutable and bound to the admission that
+   * created them, so a second processing generation has to select them rather
+   * than declare them again.
+   */
+  originalReuse?: ArchiveReceiptReuse;
   discoveryLease?: ArchivedDiscoveryLease;
   jobLease?: JobLease;
   resumeStep?:
@@ -604,6 +641,43 @@ function archivedDiscoveryLease(value: unknown): ArchivedDiscoveryLease {
   };
 }
 
+function archiveReceiptReuse(value: unknown): ArchiveReceiptReuse {
+  const row = object(value);
+  exact(
+    row,
+    ["primaryReceiptId", "primaryBindingEpoch"],
+    ["backupReceiptId", "backupBindingEpoch"],
+  );
+  if (
+    (row.backupReceiptId === undefined) !==
+    (row.backupBindingEpoch === undefined)
+  )
+    fail();
+  return {
+    primaryReceiptId: id(row.primaryReceiptId),
+    primaryBindingEpoch: integer(row.primaryBindingEpoch),
+    ...(row.backupReceiptId === undefined
+      ? {}
+      : {
+          backupReceiptId: id(row.backupReceiptId),
+          backupBindingEpoch: integer(row.backupBindingEpoch),
+        }),
+  };
+}
+
+function parserArtifactReuse(value: unknown): ParserArtifactReuse {
+  const row = object(value);
+  const { parserArtifactId, ...receipts } = row;
+  const copies = archiveReceiptReuse(receipts);
+  if (copies.backupReceiptId === undefined) fail();
+  return {
+    parserArtifactId: id(parserArtifactId),
+    ...copies,
+    backupReceiptId: copies.backupReceiptId,
+    backupBindingEpoch: copies.backupBindingEpoch!,
+  };
+}
+
 const scanBaseFields = [
   "version",
   "phase",
@@ -814,6 +888,8 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
         "expectedProcessingRevision",
         "preflightAction",
         "receiptChecked",
+        "parserReuse",
+        "originalReuse",
         "discoveryLease",
         "jobLease",
         "resumeStep",
@@ -899,6 +975,12 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       ...(input.receiptChecked === undefined
         ? {}
         : { receiptChecked: boolean(input.receiptChecked) }),
+      ...(input.parserReuse === undefined
+        ? {}
+        : { parserReuse: parserArtifactReuse(input.parserReuse) }),
+      ...(input.originalReuse === undefined
+        ? {}
+        : { originalReuse: archiveReceiptReuse(input.originalReuse) }),
       ...(input.discoveryLease === undefined
         ? {}
         : { discoveryLease: archivedDiscoveryLease(input.discoveryLease) }),
