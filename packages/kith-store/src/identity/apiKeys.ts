@@ -39,6 +39,7 @@ import {
 } from "./authorization.js";
 import { at, exec, row, rows, type IdentityCtx } from "./db.js";
 import { IdentityError, notAuthenticated } from "./errors.js";
+import type { SensitivityLevel } from "../sensitivity/model.js";
 
 export type ApiKeySummary = {
   id: string;
@@ -48,6 +49,7 @@ export type ApiKeySummary = {
   lastUsedAt: number | null;
   capabilities: readonly Capability[];
   spaceIds: readonly string[];
+  maxSensitivity: SensitivityLevel;
   sourceAccountIds: readonly string[];
 };
 
@@ -71,6 +73,7 @@ function summarize(key: ApiKeyRecord): ApiKeySummary {
     lastUsedAt: key.lastUsedAt,
     capabilities: key.capabilities,
     spaceIds: key.spaceIds,
+    maxSensitivity: key.maxSensitivity,
     sourceAccountIds: key.sourceAccountIds,
   };
 }
@@ -379,6 +382,8 @@ export async function create(
     capabilities: readonly Capability[];
     spaceIds: readonly string[];
     sourceAccountIds?: readonly string[];
+    /** SENS-1. Absent is `restricted`: the key withholds nothing. */
+    maxSensitivity?: SensitivityLevel;
   },
 ): Promise<{ id: string; rawKey: string }> {
   const { principal } = args;
@@ -397,8 +402,8 @@ export async function create(
   await exec(
     ctx,
     `INSERT INTO kith.api_keys
-       (id, user_id, key_hash, key_prefix, name, capabilities)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+       (id, user_id, key_hash, key_prefix, name, capabilities, max_sensitivity)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)`,
     [
       id,
       principal.userId,
@@ -406,6 +411,7 @@ export async function create(
       rawKey.slice(0, 11),
       args.name,
       JSON.stringify([...args.capabilities]),
+      args.maxSensitivity ?? "restricted",
     ],
   );
   await replaceGrants(ctx, id, args.spaceIds, args.sourceAccountIds ?? []);
@@ -444,6 +450,58 @@ export async function update(
     [args.id, args.name ?? null, JSON.stringify([...args.capabilities])],
   );
   await replaceGrants(ctx, args.id, args.spaceIds, args.sourceAccountIds ?? []);
+}
+
+/**
+ * Change one key's sensitivity ceiling (SENS-1).
+ *
+ * Its own function rather than a field on `update`, because `update` replaces
+ * the whole grant -- name, capabilities and spaces -- and the settings kebab
+ * wants to change this one thing without restating the rest.
+ *
+ * THE SECURITY PROPERTY, and why it is enforced here rather than at the route:
+ * a credential must never be able to raise its own ceiling, or the ceiling is
+ * decorative. `/api/kith/*` authenticates from the session cookie only and has
+ * no bearer path at all today, so the route is already safe -- but "already
+ * safe" is a property of one file that a future route could get wrong. A web
+ * session's principal has no `credentialId` (see `webPrincipal`), and every
+ * API-key and OAuth principal has one, so refusing a principal that carries one
+ * is exactly "owner session only", checked where every caller must pass.
+ */
+export async function setMaxSensitivity(
+  ctx: IdentityCtx,
+  args: {
+    principal: Principal;
+    id: string;
+    maxSensitivity: SensitivityLevel;
+  },
+): Promise<void> {
+  if (args.principal.credentialId !== undefined) {
+    throw new IdentityError("API key not found", {
+      code: "unauthorized",
+      message: "API key not found",
+    });
+  }
+  const key = await getApiKey(ctx, args.id);
+  // The same conflation `revoke` uses, and the same three cases: someone
+  // else's key, a missing key and an in-flight OAuth key are all "not found",
+  // so this cannot enumerate keys. The OAuth case is not only about
+  // enumeration. A `preparing` or `pending` row's ceiling is the consent
+  // screen's choice and is covered by `oauth_request_hash`; changing it here,
+  // in either direction, would hand the client about to exchange the code
+  // something other than the screen it was shown said it would get.
+  if (
+    !key ||
+    key.userId !== args.principal.userId ||
+    !hasNoOAuthLifecycle(key)
+  ) {
+    throw new Error("API key not found");
+  }
+  await exec(
+    ctx,
+    `UPDATE kith.api_keys SET max_sensitivity = $2 WHERE id = $1`,
+    [args.id, args.maxSensitivity],
+  );
 }
 
 /** `models/apiKeys/public.ts` `revoke`. The grant rows cascade with it. */

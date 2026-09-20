@@ -33,6 +33,11 @@
 
 import { ProofError } from "../errors.js";
 import { newKithId } from "../ids.js";
+// SENS-1: `last_error` is a diagnostic a failed handler wrote, shown on an
+// operations screen. A parser or driver that quotes the offending value is the
+// usual way an identifier reaches one, so it is scrubbed -- and still bounded,
+// because `scrubJobError` does the 2000-character truncation this did inline.
+import { scrubJobError } from "../sensitivity/sinks.js";
 import { randomBytes } from "node:crypto";
 
 import {
@@ -378,7 +383,7 @@ export async function fail(
           SET state = 'failed', attempts = $1, lease_token = NULL,
               lease_expires_at = NULL, last_error = $2, updated_at = $3
         WHERE id = $4`,
-      [attempts, args.error.slice(0, 2000), at(ctx.now), args.id],
+      [attempts, scrubJobError(args.error), at(ctx.now), args.id],
     );
     return { status: "exhausted" };
   }
@@ -393,7 +398,7 @@ export async function fail(
     [
       attempts,
       at(nextAttemptAt),
-      args.error.slice(0, 2000),
+      scrubJobError(args.error),
       at(ctx.now),
       args.id,
     ],
@@ -419,7 +424,7 @@ export async function failWithoutAttempt(
             last_error = $1, updated_at = $2
       WHERE id = $3 AND state = 'running' AND lease_token = $4
       RETURNING id`,
-    [args.error.slice(0, 2000), at(ctx.now), args.id, args.leaseToken],
+    [scrubJobError(args.error), at(ctx.now), args.id, args.leaseToken],
   );
   return { status: updated.length === 1 ? "completed" : "lease_lost" };
 }

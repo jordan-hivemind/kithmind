@@ -31,6 +31,7 @@ import { randomBytes } from "node:crypto";
 
 import { sha256 as sha256Hex } from "../hash.js";
 import { KITH_ID, newKithId } from "../ids.js";
+import type { SensitivityLevel } from "../sensitivity/model.js";
 import {
   getApiKey,
   requireSpaceAccess,
@@ -171,6 +172,8 @@ export type ConsentArgs = {
   name: string;
   capabilities: readonly Capability[];
   spaceIds: readonly string[];
+  /** SENS-1. Absent is `restricted`: the grant withholds nothing. */
+  maxSensitivity?: SensitivityLevel;
 };
 
 /**
@@ -197,7 +200,15 @@ export function canonicalConsent(args: ConsentArgs): string {
     oauthError("invalid_input");
   }
   return JSON.stringify({
-    version: "oauth-consent-v1",
+    // SENS-1 added `maxSensitivity` to the hashed bytes, so the version moves
+    // with it. Every field the user was shown must be in here: a ceiling that
+    // was displayed but unhashed could be replayed against a consent the user
+    // gave for a different one, which is exactly what this hash prevents for
+    // spaces and capabilities already. An in-flight v1 consent hashes
+    // differently under v2 and is refused rather than silently re-read, which
+    // is the correct outcome for a consent whose terms this build cannot
+    // reconstruct.
+    version: "oauth-consent-v2",
     clientId: args.clientId,
     redirectUri: args.redirectUri,
     resource: args.resource,
@@ -207,6 +218,9 @@ export function canonicalConsent(args: ConsentArgs): string {
     name: args.name,
     capabilities: [...args.capabilities].sort(),
     spaceIds: [...args.spaceIds].map(String).sort(),
+    // Normalized, never left undefined: "absent" and "restricted" are the same
+    // grant and must not hash to two different consents.
+    maxSensitivity: args.maxSensitivity ?? "restricted",
   });
 }
 
@@ -373,8 +387,9 @@ export async function beginAuthorizationGrant(
     `INSERT INTO kith.api_keys
        (id, user_id, key_hash, key_prefix, name, capabilities, oauth_lifecycle,
         oauth_request_hash, oauth_binding_seed_hash, oauth_grant_expires_at,
-        oauth_preparation_expires_at, oauth_preparation_nonce)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'preparing', $7, $8, $9, $10, $11)`,
+        oauth_preparation_expires_at, oauth_preparation_nonce, max_sensitivity)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'preparing', $7, $8, $9, $10, $11,
+               $12)`,
     [
       keyId,
       principal.userId,
@@ -388,6 +403,9 @@ export async function beginAuthorizationGrant(
       at(grantExpiresAt),
       at(now + PREPARATION_LIFETIME_MS),
       preparationNonce,
+      // SENS-1. The same value that was hashed into `requestHash` above, so
+      // the grant that gets stored is the grant the user was shown.
+      args.maxSensitivity ?? "restricted",
     ],
   );
   for (const spaceId of spaceIds) {

@@ -62,6 +62,11 @@
       "node": "./dist/extraction/index.js",
       "default": "./src/extraction/index.ts"
     },
+    "./sensitivity": {
+      "types": "./src/sensitivity/index.ts",
+      "node": "./dist/sensitivity/index.js",
+      "default": "./src/sensitivity/index.ts"
+    },
     "./deferred": {
       "types": "./src/deferred/index.ts",
       "node": "./dist/deferred/index.js",
