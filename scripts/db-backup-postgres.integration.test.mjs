@@ -376,7 +376,7 @@ test("retention is scoped to this host and the kith-db tag with the configured d
 // runs' distinct staging directories) and back-dated times, plus one
 // snapshot carrying a different tag standing in for another writer (the
 // pipeline's document archive) sharing the same host and repository.
-test("retention actually removes aged-out snapshots across distinct staging paths, and never touches an untagged snapshot", { skip: !ADMIN }, async (t) => {
+test("retention actually removes aged-out snapshots across distinct staging paths, and never touches a differently-tagged or genuinely untagged snapshot", { skip: !ADMIN }, async (t) => {
   const root = await mkdtemp(join(homedir(), ".kith-pg-retention-groupby-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const repository = join(root, "repository");
@@ -414,6 +414,22 @@ test("retention actually removes aged-out snapshots across distinct staging path
     "receipt.pdf.age",
   ], { cwd: otherDirectory });
 
+  // BAK-1 second review, "also worth doing": a snapshot with no tag at all,
+  // not merely a different one. This is what a real pre-existing snapshot
+  // actually looks like -- the "One-time retroactive retention" section of
+  // docs/database-backups.md exists precisely because backups made before
+  // this row shipped carry no `kith-db` tag, so an untagged fixture (not
+  // just a differently-tagged one) is the honest stand-in for that backlog.
+  const untaggedDirectory = join(root, "pre-existing-untagged-object");
+  await mkdir(untaggedDirectory, { mode: 0o700 });
+  await writeFile(join(untaggedDirectory, "legacy.dump.age"), "synthetic-legacy");
+  const untaggedTime = new Date(baseline - 730 * dayMs).toISOString().replace("T", " ").replace(/\.\d+Z$/, "");
+  await execute(RESTIC, [
+    "--repo", repository, "--password-command", passwordCommand.path, "--no-cache",
+    "backup", "--host", host, "--time", untaggedTime,
+    "legacy.dump.age",
+  ], { cwd: untaggedDirectory });
+
   const passwordArgument = `'${passwordCommand.path}'`;
   const result = await resticForget(
     RESTIC, repository, passwordArgument, host,
@@ -446,4 +462,19 @@ test("retention actually removes aged-out snapshots across distinct staging path
     ])).stdout,
   );
   assert.equal(untouched.length, 1);
+
+  // The genuinely untagged snapshot survives too, even though it is by far
+  // the oldest of everything created above: `--tag kith-db` excludes it from
+  // the candidate set entirely, the same way it excludes the differently
+  // tagged one above.
+  const allSnapshots = JSON.parse(
+    (await execute(RESTIC, [
+      "--repo", repository, "--password-command", passwordCommand.path,
+      "--no-cache", "--host", host, "snapshots", "--json",
+    ])).stdout,
+  );
+  const untaggedSurvivors = allSnapshots.filter(
+    (snapshot) => !Array.isArray(snapshot.tags) || snapshot.tags.length === 0,
+  );
+  assert.equal(untaggedSurvivors.length, 1);
 });

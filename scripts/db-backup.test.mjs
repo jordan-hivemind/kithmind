@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +11,11 @@ import {
   parseDbBackupArgs,
   runDbBackup,
 } from "./db-backup.mjs";
+import { runWithDatabaseBackupState } from "./run-database-backup.mjs";
+
+const SYSTEM_NODE = realpathSync(process.execPath);
+const SHELL = realpathSync("/bin/sh");
+const CLI = new URL("./db-backup.mjs", import.meta.url).pathname;
 
 test("parseDbBackupArgs requires a known engine", () => {
   assert.throws(
@@ -192,6 +199,7 @@ test("runDbBackup routes --engine postgres to the postgres adapter only, runs a 
     result: { status: "passed", snapshotId: "s1" },
     verification: { status: "passed", restore: { status: "passed" } },
     retention: { status: "passed", dryRun: false, keptCount: 7, removedCount: 2, removedTimes: [] },
+    retentionState: "ok",
   });
 });
 
@@ -328,4 +336,175 @@ test("postgres CLI cannot report success without restore verification", () => {
     () => parseDbBackupArgs(["--engine", "postgres", "--config", "/abs/pg.json"]),
     (error) => error.code === "postgres_requires_verify",
   );
+});
+
+// BAK-1 second review, row 1 and row 3: the tests above stand in for
+// runWithDatabaseBackupState with `fakeStateRunner`, which only records
+// `setStage` calls and never validates them, so all of them kept passing
+// while `setStage("retention")` (line 118 above) threw `status_invalid`
+// against the real runner -- `retention` was missing from its valid-stage
+// set. These three drive the REAL runWithDatabaseBackupState (the default
+// `stateRunner`, the same shared journal a live postgres run uses) through
+// runDbBackup's actual callback, so a stage this file learns to set that the
+// runner does not yet accept as valid fails here again, honestly, instead of
+// only in production.
+function fakePostgresModule(overrides = {}) {
+  return {
+    loadPostgresBackupConfig: async () => overrides.backupConfig ?? {},
+    loadPostgresVerifyConfig: async () =>
+      overrides.verifyConfig ?? { restoreProofEveryDays: 30 },
+    runPostgresDatabaseBackup:
+      overrides.runPostgresDatabaseBackup ??
+      (async () => ({ status: "passed", snapshotId: "s1" })),
+    verifyPostgresBackup:
+      overrides.verifyPostgresBackup ??
+      (async () => ({ status: "passed", restore: { status: "passed" } })),
+    runPostgresRetention:
+      overrides.runPostgresRetention ??
+      (async () => ({
+        status: "passed",
+        dryRun: false,
+        keptCount: 1,
+        removedCount: 0,
+        removedTimes: [],
+      })),
+  };
+}
+async function stateFixture(t) {
+  const stateDirectory = await mkdtemp(join(homedir(), ".kith-db-backup-e2e-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  return stateDirectory;
+}
+const journalOf = async (stateDirectory) =>
+  JSON.parse(
+    await readFile(join(stateDirectory, "database-backup-status.json"), "utf8"),
+  );
+const lockPathOf = (stateDirectory) =>
+  join(stateDirectory, "database-backup.lock");
+
+test("runDbBackup drives the real runWithDatabaseBackupState through every stage db-backup.mjs sets, ending at retention then complete", async (t) => {
+  const stateDirectory = await stateFixture(t);
+  const postgresModule = fakePostgresModule({ backupConfig: { stateDirectory } });
+  const output = await runDbBackup(
+    ["--engine", "postgres", "--config", "/abs/pg.json", "--verify", "--verify-config", "/abs/verify.json"],
+    { postgresModule, stateRunner: runWithDatabaseBackupState },
+  );
+  assert.equal(output.retention.status, "passed");
+  const journal = await journalOf(stateDirectory);
+  assert.equal(journal.state, "succeeded");
+  assert.equal(journal.stage, "complete");
+  assert.equal(journal.retention.state, "ok");
+  assert.equal(journal.retention.removed, 0);
+  assert.equal(journal.retention.kept, 1);
+  await assert.rejects(readFile(lockPathOf(stateDirectory)), { code: "ENOENT" });
+});
+
+test("runDbBackup's real ordering runs backup, then verify, then retention -- a verify failure records retention as skipped, fails the run, and releases the lock", async (t) => {
+  const stateDirectory = await stateFixture(t);
+  const calls = [];
+  const postgresModule = fakePostgresModule({
+    backupConfig: { stateDirectory },
+    runPostgresDatabaseBackup: async () => {
+      calls.push("backup");
+      return { status: "passed", snapshotId: "s1" };
+    },
+    verifyPostgresBackup: async () => {
+      calls.push("verify");
+      throw Object.assign(new Error("bad"), { code: "restore_proof_failed:x" });
+    },
+    runPostgresRetention: async () => {
+      calls.push("retention");
+      return { status: "passed", dryRun: false, keptCount: 1, removedCount: 0, removedTimes: [] };
+    },
+  });
+  await assert.rejects(
+    runDbBackup(
+      ["--engine", "postgres", "--config", "/abs/pg.json", "--verify", "--verify-config", "/abs/verify.json"],
+      { postgresModule, stateRunner: runWithDatabaseBackupState },
+    ),
+    (error) => error.code === "restore_proof_failed:x",
+  );
+  // Retention never ran: ordering holds even on the failure path.
+  assert.deepEqual(calls, ["backup", "verify"]);
+  const journal = await journalOf(stateDirectory);
+  assert.equal(journal.state, "failed");
+  assert.equal(journal.stage, "verify");
+  assert.equal(journal.retention.state, "skipped");
+  assert.equal(journal.retention.code, null);
+  await assert.rejects(readFile(lockPathOf(stateDirectory)), { code: "ENOENT" });
+});
+
+test("a failure during the backup step -- before retention is ever reached -- is recorded failed, releases the lock, and does not report a stale prior retention outcome as this run's own", async (t) => {
+  const stateDirectory = await stateFixture(t);
+  // A prior successful run recorded retention "ok".
+  await runWithDatabaseBackupState({ stateDirectory }, async ({ recordRetention }) => {
+    recordRetention({ state: "ok", code: null, at: 1, removed: 2, kept: 3 });
+    return {};
+  });
+  const postgresModule = fakePostgresModule({
+    backupConfig: { stateDirectory },
+    runPostgresDatabaseBackup: async () => {
+      throw Object.assign(new Error("boom"), { code: "command_failed" });
+    },
+  });
+  await assert.rejects(
+    runDbBackup(
+      ["--engine", "postgres", "--config", "/abs/pg.json", "--verify", "--verify-config", "/abs/verify.json"],
+      { postgresModule, stateRunner: runWithDatabaseBackupState },
+    ),
+    (error) => error.code === "command_failed",
+  );
+  const journal = await journalOf(stateDirectory);
+  assert.equal(journal.state, "failed");
+  assert.equal(journal.stage, "export");
+  // Not the prior run's "ok" -- this run never reached retention at all, so
+  // it must not read as though retention succeeded this run.
+  assert.equal(journal.retention.state, "skipped");
+  assert.equal(journal.retention.removed, null);
+  assert.equal(journal.retention.kept, null);
+  await assert.rejects(readFile(lockPathOf(stateDirectory)), { code: "ENOENT" });
+});
+
+// BAK-1 second review, "also worth doing": the CLI's success line now
+// reports the retention outcome, not just the engine. Run against the real
+// CLI process (the convex engine, which needs no restic/pg_dump/age
+// fixtures) so this proves the actual stdout contract, not a mock of it.
+test("the CLI success line reports retention: null for the convex engine, which has no retention step", async (t) => {
+  const root = await mkdtemp(join(homedir(), ".kith-db-backup-cli-"));
+  await chmod(root, 0o700);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDirectory = join(root, "state");
+  const stagingRoot = join(root, "staging");
+  await mkdir(stateDirectory, { mode: 0o700 });
+  await mkdir(stagingRoot, { mode: 0o700 });
+  const helper = join(root, "helper.mjs");
+  await writeFile(
+    helper,
+    `flag=$1\ndirectory=$2\nprintf '%s' "$directory" > "$directory/\${flag#--}.txt"\nprintf '{"status":"passed"}\\n'\n`,
+    { mode: 0o700 },
+  );
+  const config = {
+    version: 1,
+    stateDirectory,
+    stagingRoot,
+    cwd: root,
+    timeoutMs: 2_000,
+    exportCommand: { path: SHELL, args: [helper] },
+    backupCommand: { path: SHELL, args: [helper] },
+  };
+  const configPath = join(root, "config.json");
+  await writeFile(configPath, `${JSON.stringify(config)}\n`, { mode: 0o600 });
+  const output = await new Promise((ok, no) =>
+    execFile(
+      SYSTEM_NODE,
+      [CLI, "--engine", "convex", "--config", configPath],
+      { encoding: "utf8" },
+      (error, stdout) => (error ? no(error) : ok(stdout)),
+    ),
+  );
+  assert.deepEqual(JSON.parse(output), {
+    status: "passed",
+    engine: "convex",
+    retention: null,
+  });
 });

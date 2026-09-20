@@ -188,6 +188,45 @@ test("config requires exact fields, 0600 mode, and canonical bound paths", async
   await writeFile(f.configPath, JSON.stringify(f.config));
   await assert.rejects(loadDatabaseBackupConfig(`${f.root}/./config.json`));
 });
+// BAK-1 second review, row 2: the deployed status file (`git show
+// origin/main:scripts/run-database-backup.mjs`) has this shape -- no
+// lastProofAt, nextProofDueAt, or retention keys at all. parseStatus's exact
+// key check used to require all three, so the first run after this deploy
+// threw status_invalid out of priorStatus, before runningRecorded was ever
+// set, which left the durable lock behind and failed every later run with
+// backup_already_running_or_recovery_required.
+test("a legacy-shaped status file with no lastProofAt/nextProofDueAt/retention is accepted, a full run completes, and no lock is leaked", async (t) => {
+  const f = await fixture(t);
+  const statusPath = join(f.stateDirectory, "database-backup-status.json");
+  const legacy = {
+    version: 1,
+    state: "succeeded",
+    stage: "complete",
+    runId: "legacy-run",
+    startedAt: 1_000,
+    updatedAt: 2_000,
+    lastSuccessAt: 2_000,
+  };
+  await writeFile(statusPath, `${JSON.stringify(legacy)}\n`, {
+    mode: 0o600,
+    flag: "wx",
+  });
+  const result = await runDatabaseBackup(
+    await loadDatabaseBackupConfig(f.configPath),
+  );
+  assert.equal(result.status, "passed");
+  const journal = await status(f);
+  assert.equal(journal.state, "succeeded");
+  assert.equal(journal.lastSuccessAt, result.finishedAt);
+  assert.equal(journal.lastProofAt, null);
+  assert.equal(journal.nextProofDueAt, null);
+  assert.equal(journal.retention, null);
+  await assert.rejects(
+    readFile(join(f.stateDirectory, "database-backup.lock")),
+    { code: "ENOENT" },
+  );
+});
+
 // P2-39k follow-up (BAK-1): runWithDatabaseBackupState is the postgres
 // engine's own shared lock and journal (db-backup-postgres.mjs has no lock
 // logic of its own). These exercise the restore-proof cadence bookkeeping it
@@ -276,7 +315,7 @@ test("runWithDatabaseBackupState carries the prior retention outcome forward whe
   assert.deepEqual(journal.retention, { state: "failed", code: "command_failed", at: 100, removed: null, kept: null });
 });
 
-test("runWithDatabaseBackupState records a skipped retention outcome and preserves it across a later failure", async (t) => {
+test("runWithDatabaseBackupState records a skipped retention outcome and preserves it across a later run that also calls recordRetention", async (t) => {
   const f = await fixture(t);
   const config = await loadDatabaseBackupConfig(f.configPath);
   await runWithDatabaseBackupState(config, async ({ recordRetention }) => {
@@ -286,13 +325,44 @@ test("runWithDatabaseBackupState records a skipped retention outcome and preserv
   let journal = await status(f);
   assert.deepEqual(journal.retention, { state: "skipped", code: null, at: 55, removed: null, kept: null });
   await assert.rejects(
-    runWithDatabaseBackupState(config, async () => {
+    runWithDatabaseBackupState(config, async ({ recordRetention }) => {
+      recordRetention({ state: "skipped", code: null, at: 66, removed: null, kept: null });
       throw Object.assign(new Error("boom"), { code: "operation_failed" });
     }),
   );
   journal = await status(f);
   assert.equal(journal.state, "failed");
-  assert.deepEqual(journal.retention, { state: "skipped", code: null, at: 55, removed: null, kept: null });
+  assert.deepEqual(journal.retention, { state: "skipped", code: null, at: 66, removed: null, kept: null });
+});
+
+// BAK-1 second review, "also worth doing": a run that fails WITHOUT ever
+// calling recordRetention (a failure before the retention step -- unlike the
+// test above, which fails after explicitly recording "skipped") must not
+// leave a prior run's retention outcome looking like it applies to this
+// failed run. `lastSuccessAt`/`lastProofAt` do carry forward on a failure;
+// retention deliberately does not, because "ok" on a failed run's own record
+// reads as though retention ran fine this time, when it never ran at all.
+test("runWithDatabaseBackupState does not carry a prior 'ok' retention outcome forward onto a run that fails before ever calling recordRetention", async (t) => {
+  const f = await fixture(t);
+  const config = await loadDatabaseBackupConfig(f.configPath);
+  await runWithDatabaseBackupState(config, async ({ recordRetention }) => {
+    recordRetention({ state: "ok", code: null, at: 1, removed: 2, kept: 3 });
+    return { ok: true };
+  });
+  const before = await status(f);
+  assert.equal(before.retention.state, "ok");
+  await assert.rejects(
+    runWithDatabaseBackupState(config, async () => {
+      // Fails before ever reaching setStage/recordRetention for this run.
+      throw Object.assign(new Error("boom"), { code: "operation_failed" });
+    }),
+  );
+  const after = await status(f);
+  assert.equal(after.state, "failed");
+  assert.equal(after.retention.state, "skipped");
+  assert.equal(after.retention.code, null);
+  assert.equal(after.retention.removed, null);
+  assert.equal(after.retention.kept, null);
 });
 
 test("CLI stdout is a closed safe result without private paths", async (t) => {

@@ -117,14 +117,18 @@ export async function runDbBackup(argv, deps = {}) {
     }
     await setStage("retention");
     const retention = await postgres.runPostgresRetention(loaded);
+    const retentionState = retention.status === "passed" ? "ok" : "failed";
     recordRetention({
-      state: retention.status === "passed" ? "ok" : "failed",
+      state: retentionState,
       code: retention.code ?? null,
       at: clock(),
       removed: retention.removedCount ?? null,
       kept: retention.keptCount ?? null,
     });
-    return { engine, result, verification, retention };
+    // Exposed on the returned object (not just the durable status journal) so
+    // the CLI's own success line can report it (BAK-1 second review,
+    // "also worth doing") without recomputing the ok/failed mapping itself.
+    return { engine, result, verification, retention, retentionState };
   });
 }
 
@@ -142,7 +146,12 @@ function isMain() {
 async function main() {
   const output = await runDbBackup(process.argv.slice(2));
   process.stdout.write(
-    `${JSON.stringify({ status: "passed", engine: output.engine })}\n`,
+    `${JSON.stringify({
+      status: "passed",
+      engine: output.engine,
+      // null for the convex engine, which has no retention step at all.
+      retention: output.retentionState ?? null,
+    })}\n`,
   );
 }
 if (isMain())

@@ -11,6 +11,7 @@ import {
   exportSnapshot,
   loadPostgresBackupConfig,
   loadPostgresVerifyConfig,
+  parseForgetArgs,
   requireNoActiveWriters,
   resticForget,
 } from "./db-backup-postgres.mjs";
@@ -547,4 +548,49 @@ test("resticForget fails closed on output that is not a JSON array of groups", a
     resticForget(restic, "/abs/repo", "'/bin/true'", "kith-db-01", { keepDaily: 7, keepWeekly: 5, keepMonthly: 12 }, 5_000, true),
     (error) => error instanceof PostgresBackupError && error.code === "retention_output_invalid",
   );
+});
+
+// BAK-1 second review, "also worth doing": the `--forget` operator command
+// used to prune a real repository by default unless an operator remembered
+// `--dry-run`. It is dry-run by default now; `--apply` is required to
+// actually delete/prune, and any argument this command does not recognize is
+// rejected instead of silently ignored (a typo like `--force` used to just
+// do nothing and still prune).
+test("parseForgetArgs defaults to dry-run (apply: false) with only --config given", () => {
+  assert.deepEqual(parseForgetArgs(["--config", "/abs/backup.json"]), {
+    configPath: "/abs/backup.json",
+    apply: false,
+  });
+});
+
+test("parseForgetArgs requires --apply to opt into deleting/pruning", () => {
+  assert.deepEqual(
+    parseForgetArgs(["--config", "/abs/backup.json", "--apply"]),
+    { configPath: "/abs/backup.json", apply: true },
+  );
+});
+
+test("parseForgetArgs requires --config", () => {
+  assert.throws(
+    () => parseForgetArgs(["--apply"]),
+    (error) => error instanceof PostgresBackupError && error.code === "usage_invalid",
+  );
+  assert.throws(
+    () => parseForgetArgs([]),
+    (error) => error.code === "usage_invalid",
+  );
+});
+
+test("parseForgetArgs rejects stray arguments, including the old --dry-run flag", () => {
+  for (const argv of [
+    ["--config", "/abs/backup.json", "--dry-run"],
+    ["--config", "/abs/backup.json", "--force"],
+    ["--config", "/abs/backup.json", "--apply", "extra"],
+  ]) {
+    assert.throws(
+      () => parseForgetArgs(argv),
+      (error) => error.code === "usage_invalid",
+      `expected usage_invalid for ${JSON.stringify(argv)}`,
+    );
+  }
 });

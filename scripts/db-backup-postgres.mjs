@@ -1603,6 +1603,26 @@ export async function verifyPostgresBackup(verifyConfig, backupResult, options =
   return parsed;
 }
 
+/** Pure argv parsing for the `--forget` operator command, kept separate from
+ * dispatch so its usage rules are unit-testable without a real restic
+ * repository. Dry-run by default (BAK-1 second review): `--apply` is
+ * required to actually delete/prune, because the previous default did the
+ * opposite -- it pruned a real repository unless an operator remembered
+ * `--dry-run`. Any argument other than `--config <path>` and `--apply` is
+ * rejected instead of silently ignored. */
+export function parseForgetArgs(argv) {
+  let configPath;
+  let apply = false;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--config") configPath = argv[(i += 1)];
+    else if (arg === "--apply") apply = true;
+    else fail("usage_invalid");
+  }
+  if (typeof configPath !== "string" || configPath.length === 0)
+    fail("usage_invalid");
+  return { configPath, apply };
+}
 function isMain() {
   if (!process.argv[1]) return false;
   try {
@@ -1628,14 +1648,12 @@ async function main() {
   }
   if (process.argv[2] === "--forget") {
     // Operator command: `node db-backup-postgres.mjs --forget --config
-    // <path> [--dry-run]`. Reuses the backup config (it already carries the
+    // <path> [--apply]`. Reuses the backup config (it already carries the
     // restic binary, repository and password command this needs) but never
-    // touches Postgres, age, or the dump/publish path.
-    const configIndex = process.argv.indexOf("--config");
-    if (configIndex === -1 || process.argv[configIndex + 1] === undefined)
-      fail("usage_invalid");
-    const dryRun = process.argv.includes("--dry-run");
-    const config = await loadPostgresBackupConfig(process.argv[configIndex + 1]);
+    // touches Postgres, age, or the dump/publish path. Dry-run unless
+    // --apply is given.
+    const { configPath, apply } = parseForgetArgs(process.argv.slice(3));
+    const config = await loadPostgresBackupConfig(configPath);
     const passwordCommandArgument_ = await passwordCommandArgument(
       config.resticPasswordCommand,
     );
@@ -1646,7 +1664,7 @@ async function main() {
       config.host,
       config.resticRetention,
       config.timeoutMs,
-      dryRun,
+      !apply,
     );
     process.stdout.write(`${JSON.stringify(result)}\n`);
     return;

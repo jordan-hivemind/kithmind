@@ -13,7 +13,7 @@ const MAX_STDOUT = 4_096;
 const MAX_STDERR = 65_536;
 const KILL_GRACE = 250;
 const states = new Set(["running", "succeeded", "failed"]);
-const stages = new Set(["export", "backup", "verify", "complete"]);
+const stages = new Set(["export", "backup", "verify", "retention", "complete"]);
 
 export class DatabaseBackupRunnerError extends Error {
   constructor(code) {
@@ -275,7 +275,19 @@ function validRetention(value) {
     (value.kept === null || Number.isSafeInteger(value.kept))
   );
 }
+// The three proof/retention keys below (BAK-1 second review, row 2) did not
+// exist in the status file this repository already writes on `main` --
+// `lastProofAt`, `nextProofDueAt`, and `retention` are new. Each is optional
+// on read, independently, and defaults to null when absent, so the exact-key
+// check below still accepts the deployed shape (none of the three present)
+// without a deploy-time migration step. `atomicStatus` still always WRITES
+// the full new shape (via `status()`'s own `?? null` defaults), so every run
+// upgrades the file in place the moment it next records status.
+const OPTIONAL_STATUS_KEYS = ["lastProofAt", "nextProofDueAt", "retention"];
 function parseStatus(value) {
+  const present = OPTIONAL_STATUS_KEYS.filter((key) =>
+    Object.hasOwn(value ?? {}, key),
+  );
   const keys = [
     "version",
     "state",
@@ -284,12 +296,15 @@ function parseStatus(value) {
     "startedAt",
     "updatedAt",
     "lastSuccessAt",
-    "lastProofAt",
-    "nextProofDueAt",
-    "retention",
+    ...present,
     ...(value?.state === "failed" ? ["failureCode"] : []),
   ];
   exact(value, keys, "status_invalid");
+  const lastProofAt = present.includes("lastProofAt") ? value.lastProofAt : null;
+  const nextProofDueAt = present.includes("nextProofDueAt")
+    ? value.nextProofDueAt
+    : null;
+  const retention = present.includes("retention") ? value.retention : null;
   if (
     value.version !== 1 ||
     !states.has(value.state) ||
@@ -298,22 +313,26 @@ function parseStatus(value) {
     !Number.isSafeInteger(value.startedAt) ||
     !Number.isSafeInteger(value.updatedAt) ||
     (value.lastSuccessAt !== null && !Number.isSafeInteger(value.lastSuccessAt)) ||
-    (value.lastProofAt !== null && !Number.isSafeInteger(value.lastProofAt)) ||
-    (value.nextProofDueAt !== null && !Number.isSafeInteger(value.nextProofDueAt)) ||
-    !validRetention(value.retention)
+    (lastProofAt !== null && !Number.isSafeInteger(lastProofAt)) ||
+    (nextProofDueAt !== null && !Number.isSafeInteger(nextProofDueAt)) ||
+    !validRetention(retention)
   )
     fail("status_invalid");
   if (value.state === "failed") text(value.failureCode, 64);
-  return value;
+  return { ...value, lastProofAt, nextProofDueAt, retention };
 }
 // The isolated restore proof (unlike the backup itself) now runs on a
 // cadence, not every run (P2-39k follow-up: `restoreProofEveryDays`), so the
 // durable status journal carries its own last-success time and next-due time
 // alongside the backup's, and preserves both across a run that did not
 // attempt a proof, the same way `lastSuccessAt` already survives a failure.
-// `retention` is carried forward the same way: a run that fails before
-// reaching retention (or an engine, like convex, that has none) must not
-// erase the last known retention outcome.
+// `retention` is carried forward the same way on a SUCCESSFUL run that never
+// calls recordRetention (an engine, like convex, that has none): nothing went
+// wrong, so the last known outcome stays the best available answer. A FAILED
+// run is different (BAK-1 second review): it records `skipped` instead of
+// carrying the prior value forward, so a failed run never reads as though
+// retention succeeded this time. See the failure branch of
+// runWithDatabaseBackupState below.
 async function priorStatus(path) {
   try {
     const parsed = parseStatus(
@@ -563,7 +582,17 @@ export async function runWithDatabaseBackupState(config, operation, options = {}
         lastSuccessAt: prior.lastSuccessAt,
         lastProofAt: proof?.lastProofAt ?? prior.lastProofAt,
         nextProofDueAt: proof?.nextProofDueAt ?? prior.nextProofDueAt,
-        retention: retention ?? prior.retention,
+        // Unlike lastSuccessAt/lastProofAt, a FAILED run must not report the
+        // previous run's retention outcome as its own (BAK-1 second review):
+        // an operator reading "ok" on a failed run's status record would
+        // reasonably conclude retention ran fine this time. When the
+        // operation never called recordRetention this run -- a failure
+        // during export or backup, before retention is ever reached -- record
+        // it as not run (`skipped`) instead of carrying the stale value
+        // forward. The one call site that already reaches recordRetention on
+        // a failure (a verify failure, recorded `skipped` explicitly in
+        // db-backup.mjs) is unaffected: `retention` is already non-null there.
+        retention: retention ?? { state: "skipped", code: null, at: clock(), removed: null, kept: null },
         failureCode,
       }), runId);
       mayRelease = true;

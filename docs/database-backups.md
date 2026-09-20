@@ -249,27 +249,38 @@ status journal (`database-backup-status.json`) as
 
 so a health check reading that one file, not grepping logs, can alert on it.
 `state` is `"ok"` after a successful `forget`/`prune`, `"failed"` on the error
-case above, or `"skipped"` when verification itself failed and retention
-never ran at all (its own case, not folded into `"failed"`, so the two causes
-stay distinguishable). A run that never reaches the retention step -- the
-convex engine, or a run that fails earlier than verification -- leaves the
-prior run's recorded `retention` value in place rather than erasing it, the
-same way `lastSuccessAt` already survives a failure.
+case above, or `"skipped"` when verification itself failed (or a run failed
+even earlier, before retention was ever reached) and retention never ran at
+all (its own case, not folded into `"failed"`, so the two causes stay
+distinguishable). A SUCCESSFUL run that never reaches the retention step --
+only the convex engine today, which has none -- leaves the prior run's
+recorded `retention` value in place, the same way `lastSuccessAt` already
+survives a failure. A FAILED run does not: it never reports a stale prior
+outcome (say, a previous `"ok"`) as though retention ran fine this time: it
+is recorded `"skipped"` instead.
 
 Run retention by hand, without touching Postgres, age, or the dump/publish
 path, with the backup config's own `--forget`:
 
 ```sh
-node scripts/db-backup-postgres.mjs --forget --config /absolute/protected/backup.json [--dry-run]
+node scripts/db-backup-postgres.mjs --forget --config /absolute/protected/backup.json [--apply]
 ```
 
-`--dry-run` prints what would be forgotten -- counts and the removed
-snapshots' times only, never snapshot contents or paths -- and does not
-prune:
+This is dry-run by default -- it never prunes unless `--apply` is given. Any
+argument other than `--config <path>` and `--apply` (including the old
+`--dry-run` flag, no longer needed since it is now the default) is rejected
+as `usage_invalid` rather than silently ignored.
+
+Without `--apply`, it prints what would be forgotten -- counts and the
+removed snapshots' times only, never snapshot contents or paths -- and does
+not prune:
 
 ```json
 { "status": "passed", "dryRun": true, "keptCount": 12, "removedCount": 3, "removedTimes": ["2026-08-01T03:00:00Z", "2026-08-02T03:00:00Z", "2026-08-03T03:00:00Z"] }
 ```
+
+Review what it reports, then run the identical command with `--apply` added
+once satisfied it matches expectations.
 
 Unlike the automatic post-verification run above, this manual command's own
 failure is not swallowed: a bad config or an unreachable repository exits
@@ -527,11 +538,12 @@ exec /ABSOLUTE/PATH/TO/node /ABSOLUTE/PATH/TO/REPOSITORY/scripts/db-backup.mjs \
 3. Re-create the Keychain (or equivalent credential store) items the restic
    password command, age identity, and database connection command read from
    -- these are host-local secrets, never copied as files between machines.
-4. Run once with `--dry-run` against retention only, to prove the new host's
-   tools and credentials resolve the same repository without changing it:
+4. Run once against retention only, to prove the new host's tools and
+   credentials resolve the same repository without changing it (dry-run by
+   default -- omit `--apply`):
 
    ```sh
-   node scripts/db-backup-postgres.mjs --forget --config /ABSOLUTE/PROTECTED/backup.json --dry-run
+   node scripts/db-backup-postgres.mjs --forget --config /ABSOLUTE/PROTECTED/backup.json
    ```
 
 5. Load the new host's LaunchAgent (`launchctl bootstrap` / `launchctl load`,
