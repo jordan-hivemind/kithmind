@@ -13,6 +13,8 @@
 
 import type { FinanceAccountInventoryRecord } from "@repo/finance-contract";
 
+import { mergeFinanceAccountOverride } from "@/lib/kith/finance-account-overrides";
+
 /**
  * What a statement archive can be: holding nothing, gone quiet (closed or
  * dormant, nothing to file), live but behind on statements, or current.
@@ -207,10 +209,17 @@ export function groupInstitutions(
   for (const record of records) {
     const hasContent = record.statementCount + record.recordCount > 0;
     const override = overrides.get(record.account.accountId) ?? null;
+    const shownAccount = mergeFinanceAccountOverride(
+      record.account,
+      override === null
+        ? undefined
+        : { accountId: record.account.accountId, ...override },
+    );
     const archiveName = friendlyAccountName(record.account);
-    const shownName = override?.displayName ?? archiveName;
-    const accountLast4 =
-      override?.accountLast4 ?? record.account.accountLast4 ?? null;
+    const shownName =
+      shownAccount.ownerOverride?.displayName ??
+      friendlyAccountName(record.account);
+    const accountLast4 = shownAccount.accountLast4 ?? null;
     const child: InstitutionRow = {
       id: record.account.accountId,
       name: shownName,
@@ -231,7 +240,7 @@ export function groupInstitutions(
       currentValueCurrency: record.currentValue?.value.currency ?? null,
       currentValueAsOf: record.currentValue?.asOf ?? null,
       currentValueStale: valueIsStale(record.currentValue?.asOf ?? null, now),
-      accountType: override?.accountType ?? record.account.accountType ?? null,
+      accountType: shownAccount.accountType ?? null,
       accounts: null,
       statements: record.statementCount,
       records: record.recordCount,
@@ -244,7 +253,7 @@ export function groupInstitutions(
         hasContent,
         now,
         record.activityTo ?? null,
-        override?.closed === true,
+        shownAccount.closed === true,
       ),
     };
     const name = record.account.institutionName;

@@ -4,12 +4,13 @@
 //
 // The archive owns canonical financial identity (issue 57, boundary agreed in
 // #54/#55). Kith Mind consumes its records and retained evidence and does not
-// build a competing ledger, so nothing here reshapes, re-groups, re-decimalises
-// or merges a row. A finance response reaches the caller as the archive built
-// it: coverage, completeness, truncation, issues and evidence intact, money
-// still a decimal string. The pinned `NUMERIC` decoding in `createArchivePool`
-// is what keeps that last part true at the driver, before any of this code
-// sees a value.
+// build a competing ledger. The strict archive response is validated first;
+// then the web layer may overlay the owner's descriptive account fields while
+// retaining the archive originals in `archiveAccount`. Record rows, coverage,
+// completeness, truncation, issues and evidence remain intact, and money stays
+// a decimal string. The pinned `NUMERIC` decoding in `createArchivePool` is
+// what keeps that last part true at the driver, before any of this code sees a
+// value.
 //
 // Three values configure the provider and must be present before a single
 // row is served:
@@ -31,12 +32,19 @@ import { serveFinanceRead } from "@repo/finance-archive/read";
 import { createArchivePool } from "@repo/finance-archive/store";
 import {
   authorizeFinanceReadRequest,
+  type FinanceAccountInventoryRecord,
   FinanceContractError,
   type FinancePrincipalId,
   type FinanceReadRequest,
   type FinanceReadResponse,
   parseAuthorizedFinanceReadExchange,
 } from "@repo/finance-contract";
+
+import {
+  type FinanceAccountOverride,
+  mergeFinanceAccountOverride,
+  type WebFinanceAccountDescriptor,
+} from "@/lib/kith/finance-account-overrides";
 
 /**
  * The archive this deployment reads, and the one space it holds.
@@ -62,6 +70,85 @@ export type FinanceTrustedGatewayContext = {
   principalId: string;
   authorizedSpaceIds: readonly string[];
 };
+
+type ListAccountsResponse = Extract<
+  FinanceReadResponse,
+  { operation: "list_accounts" }
+>;
+type HoldingsSnapshotResponse = Extract<
+  FinanceReadResponse,
+  { operation: "get_holdings_snapshot" }
+>;
+type AccountInventoryResponse = Extract<
+  FinanceReadResponse,
+  { operation: "list_account_inventory" }
+>;
+
+/**
+ * The web provider's deliberate post-contract shape.
+ *
+ * Only responses that name an account differ from the archive contract. Their
+ * descriptors may carry the owner's `closed` flag and their three descriptive
+ * fields may contain owner overrides. `archiveAccount` preserves the original
+ * statement-derived values. All record, evidence, coverage and pagination
+ * fields remain the archive's validated values.
+ */
+export type WebFinanceReadResponse =
+  | Exclude<
+      FinanceReadResponse,
+      ListAccountsResponse | HoldingsSnapshotResponse | AccountInventoryResponse
+    >
+  | (Omit<ListAccountsResponse, "items"> & {
+      items: WebFinanceAccountDescriptor[];
+    })
+  | (Omit<HoldingsSnapshotResponse, "account"> & {
+      account: WebFinanceAccountDescriptor;
+    })
+  | (Omit<AccountInventoryResponse, "items"> & {
+      items: Array<
+        Omit<FinanceAccountInventoryRecord, "account"> & {
+          account: WebFinanceAccountDescriptor;
+        }
+      >;
+    });
+
+function mergeAccountOverrides(
+  response: FinanceReadResponse,
+  overrides: readonly FinanceAccountOverride[],
+): WebFinanceReadResponse {
+  if (overrides.length === 0) return response;
+  const byAccount = new Map(overrides.map((item) => [item.accountId, item]));
+  if (response.operation === "list_accounts") {
+    return {
+      ...response,
+      items: response.items.map((account) =>
+        mergeFinanceAccountOverride(account, byAccount.get(account.accountId)),
+      ),
+    };
+  }
+  if (response.operation === "get_holdings_snapshot") {
+    return {
+      ...response,
+      account: mergeFinanceAccountOverride(
+        response.account,
+        byAccount.get(response.account.accountId),
+      ),
+    };
+  }
+  if (response.operation === "list_account_inventory") {
+    return {
+      ...response,
+      items: response.items.map((item) => ({
+        ...item,
+        account: mergeFinanceAccountOverride(
+          item.account,
+          byAccount.get(item.account.accountId),
+        ),
+      })),
+    };
+  }
+  return response;
+}
 
 // ponytail: one module-scoped pool, keyed on nothing, because a serverless
 // instance reads its environment once and never changes it. Upgrade path if a
@@ -150,7 +237,8 @@ export async function readFinanceArchive(
   archive: FinanceArchiveAccess,
   request: unknown,
   trusted: FinanceTrustedGatewayContext,
-): Promise<FinanceReadResponse> {
+  overrides: readonly FinanceAccountOverride[] = [],
+): Promise<WebFinanceReadResponse> {
   if (!trusted.authorizedSpaceIds.includes(archive.spaceId)) {
     throw new FinanceContractError("not_authorized");
   }
@@ -161,7 +249,7 @@ export async function readFinanceArchive(
   const response = await archive.read(authorized.request, {
     principalId: authorized.principalId,
   });
-  return parseAuthorizedFinanceReadExchange({
+  const validated = parseAuthorizedFinanceReadExchange({
     request: authorized.request,
     response,
     trustedContext: {
@@ -169,4 +257,5 @@ export async function readFinanceArchive(
       authorizedSpaceIds: [archive.spaceId],
     },
   }).response;
+  return mergeAccountOverrides(validated, overrides);
 }

@@ -442,14 +442,21 @@ so the later Kith Mind adapter wraps this surface rather than re-deriving it.
 
 F1-10 built that adapter, and it does wrap rather than re-derive. The Kith Mind
 gateway calls the same `serveFinanceRead` these six operations run through,
-over the same reader role, and returns the archive's response unchanged. The
-standalone stdio server above is unchanged and remains the local entry point;
-the gateway is the hosted one, so the owner asks one server rather than two.
-The gateway supplies its own trusted context: the principal is the
-authenticated API key's user and the authorized space set is Convex membership,
-read live on every call. The archive's space is pinned in the gateway's
-configuration, because this database has no space column and serving it under
-whichever space a caller named would relabel one space's ledger as another's.
+over the same reader role. The standalone stdio server above is unchanged and
+remains the local entry point; the gateway is the hosted one, so the owner asks
+one server rather than two. The gateway supplies its own trusted context: the
+principal is the authenticated API key's user and the authorized space set is
+PostgreSQL membership, read live on every call. The archive's space is pinned
+in the gateway's configuration, because this database has no space column and
+serving it under whichever space a caller named would relabel one space's
+ledger as another's.
+
+The web MCP validates the strict archive exchange before applying the owner's
+account name, last four, type and closed override from Kith Mind. This is a web
+presentation overlay only; the finance protocol and standalone server do not
+change. Account-bearing web responses keep the original statement-derived
+label, last four and type in `archiveAccount` for matching statement wording.
+Record rows, evidence, money, coverage and pagination remain unchanged.
 
 ## Working on the archive without reading it
 

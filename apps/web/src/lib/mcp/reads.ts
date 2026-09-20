@@ -40,6 +40,8 @@ import {
   principalMaxSensitivity,
 } from "@repo/kith-store/identity";
 
+import type { FinanceAccountOverride } from "@/lib/kith/finance-account-overrides";
+
 import { resolveMcpEmbedder } from "./embedder";
 import type { WithMcpPrincipal } from "./principal";
 
@@ -297,7 +299,7 @@ export type McpReads = {
    * the same question. On Convex it is `undefined`: the set is a separate query
    * there, and issuing it unconditionally would add a round trip to every call
    * whether or not an archive is configured, changing that surface's behaviour.
-   * The tool falls back to `authorizedSpaceIds()` when it is absent.
+   * The tool falls back to `financeContext()` when it is absent.
    */
   listSources(
     args: ReadSpaces & { sourceAccountId?: string; limit?: number },
@@ -341,8 +343,11 @@ export type McpReads = {
   getThoughts(args: ReadSpaces & { ids: string[] }): Promise<FullThought[]>;
   timelineThoughts(args: TimelineArgs): Promise<TimelineRow[]>;
   getStats(args: ReadSpaces): Promise<unknown>;
-  /** The space set the finance provider is authorized against, per call. */
-  authorizedSpaceIds(): Promise<string[]>;
+  /** Live finance membership and that exact space's account overrides. */
+  financeContext(spaceId: string): Promise<{
+    authorizedSpaceIds: string[];
+    accountOverrides: FinanceAccountOverride[];
+  }>;
 };
 
 // ---------------------------------------------------------------------------
@@ -968,10 +973,16 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
         return stats;
       });
     },
-    async authorizedSpaceIds() {
+    async financeContext(spaceId) {
       return await read(async ({ ctx, principal }) => {
         const spaces = await listIdentitySpaces(ctx, { principal });
-        return spaces.map((space) => space.spaceId);
+        const authorizedSpaceIds = spaces.map((space) => space.spaceId);
+        return {
+          authorizedSpaceIds,
+          accountOverrides: authorizedSpaceIds.includes(spaceId)
+            ? await admin.listAccountOverrides(ctx, { spaceId })
+            : [],
+        };
       });
     },
   };
