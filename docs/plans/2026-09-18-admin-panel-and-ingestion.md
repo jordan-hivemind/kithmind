@@ -222,6 +222,25 @@ A `Summary` row with a committed amount but no `Docs Signed` date is reported
 as unimportable rather than given today's date: a fabricated date in a
 financial record is worse than a missing entry.
 
+## 13. Extraction and the parsed seal (ADM-5i)
+
+The payload manifest seals the **parsed** payload: the pages, spans, documents
+and chunks the parser produced. Typed extraction is a derived layer written on
+top of an already-activated generation, and its rows must not count against
+that seal.
+
+| Row | How the seal knows it is extraction's |
+| --- | --- |
+| Event version, observation | `event_type = 'document_statement'` |
+| Evidence span, written from ADM-5i on | `locator->>'kind' = 'extraction_v1'` |
+| Evidence span, written before that | Referenced only by a `document_statement` observation's `value_evidence` or that event version's `field_evidence` |
+
+A span the manifest lists is never excluded, whatever points at it: extraction
+reuses a parser span when one already covers the range, and excluding it would
+turn a reused span into a missing one. The seal still refuses a foreign span, a
+missing or altered parsed row, and any event version or observation on the
+generation that is not extraction's.
+
 ## 12. Extraction knobs (ADM-5d)
 
 The model reads a page as numbered lines and cites line ids rather than

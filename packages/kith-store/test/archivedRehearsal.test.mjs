@@ -374,6 +374,147 @@ test(
     }
     assert.equal(await assessment(f), "complete");
 
+    // ADM-5i. Typed extraction writes its own event version, observations and
+    // evidence spans onto the activated parsed generation. Until this branch
+    // the seal counted every one of them against the manifest, so from the
+    // first backfill the assessment reported `payload_verify_error:id_sets`
+    // for every extracted document and the watcher never ended a pass
+    // `complete` again -- with the documents themselves still perfectly
+    // readable, because reads never call the verifier.
+    const target = (await activeGenerations(f))[0];
+    assert.ok(target, "an activated generation to extract from");
+    const generationId = target.active_generation_id;
+    const targetText = (
+      await f.client.query(
+        `SELECT source_text_version_id, source_revision_id, source_item_id,
+                source_account_id, space_id
+           FROM kith.processing_generations WHERE id = $1`,
+        [generationId],
+      )
+    ).rows[0];
+    const targetPage = (
+      await f.client.query(
+        `SELECT id FROM kith.source_pages
+          WHERE source_text_version_id = $1 ORDER BY ordinal LIMIT 1`,
+        [targetText.source_text_version_id],
+      )
+    ).rows[0];
+    // Hand-written rather than run through the extraction job, because that
+    // needs a model and a seeded document type and this test is about the
+    // seal. The rows below mirror `findOrCreateSpan` and `store` in
+    // `src/extraction/model.ts` -- if the locator shape there changes, this
+    // fixture has to change with it.
+    const extractionSpan = newKithId();
+    await f.client.query(
+      `INSERT INTO kith.evidence_spans
+         (id, space_id, created_at, source_revision_id, source_text_version_id,
+          source_page_id, ordinal, "start", "end", quote_hash, locator)
+       VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,99,0,1,$6,
+               jsonb_build_object('kind', 'extraction_v1'))`,
+      [
+        extractionSpan,
+        targetText.space_id,
+        targetText.source_revision_id,
+        targetText.source_text_version_id,
+        targetPage.id,
+        "e".repeat(64),
+      ],
+    );
+    const extractionEvent = newKithId();
+    const extractionVersion = newKithId();
+    await f.client.query(
+      `INSERT INTO kith.events
+         (id, space_id, created_at, source_account_id, source_item_id,
+          event_key, created_by)
+       VALUES ($1,$2,transaction_timestamp(),$3,$4,'document_statement:v1',$5)`,
+      [
+        extractionEvent,
+        targetText.space_id,
+        targetText.source_account_id,
+        targetText.source_item_id,
+        f.userId,
+      ],
+    );
+    const extractionEntity = newKithId();
+    await f.client.query(
+      `INSERT INTO kith.entities
+         (id, space_id, created_at, user_id, key, kind, canonical_name,
+          normalized_name, aliases, normalized_aliases)
+       VALUES ($1,$2,transaction_timestamp(),$3,'other:document','other',
+               'Document','document','[]'::jsonb,'[]'::jsonb)`,
+      [extractionEntity, targetText.space_id, f.userId],
+    );
+    const chain = [
+      targetText.space_id,
+      targetText.source_account_id,
+      targetText.source_item_id,
+      targetText.source_revision_id,
+      targetText.source_text_version_id,
+      generationId,
+    ];
+    await f.client.query(
+      `INSERT INTO kith.event_versions
+         (id,space_id,created_at,source_account_id,source_item_id,
+          source_revision_id,source_text_version_id,processing_generation_id,
+          event_id,entity_id,event_type,schema_version,occurrence,
+          occurrence_date,occurrence_instant,occurrence_sort_key,
+          field_evidence,doc_type_patch,user_id)
+       VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,
+               'document_statement',1,'{"precision":"unknown"}'::jsonb,
+               NULL,NULL,NULL,$10,NULL,$11)`,
+      [
+        extractionVersion,
+        ...chain,
+        extractionEvent,
+        extractionEntity,
+        JSON.stringify({
+          occurrence: [extractionSpan],
+          entity: [extractionSpan],
+          eventType: [extractionSpan],
+        }),
+        f.userId,
+      ],
+    );
+    await f.client.query(
+      `INSERT INTO kith.observations
+         (id,space_id,created_at,source_account_id,source_item_id,
+          source_revision_id,source_text_version_id,processing_generation_id,
+          event_id,event_version_id,entity_id,event_type,occurrence,
+          occurrence_date,occurrence_instant,occurrence_sort_key,
+          observation_key,observation_type,schema_version,value,value_evidence,
+          bound_entity_id,user_id)
+       VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,$10,
+               'document_statement','{"precision":"unknown"}'::jsonb,
+               NULL,NULL,NULL,'vendor','vendor',1,
+               '{"type":"text","value":"Synthetic"}'::jsonb,$11,NULL,$12)`,
+      [
+        newKithId(),
+        ...chain,
+        extractionEvent,
+        extractionVersion,
+        extractionEntity,
+        JSON.stringify([extractionSpan]),
+        f.userId,
+      ],
+    );
+
+    // The next pass must still end complete: extraction is a derived layer
+    // and the seal is over the parsed payload.
+    await rehearsalUntilSettled(pass(profileB));
+    assert.equal(await assessment(f), "complete");
+    // And no item is held back by the seal. `notReadyReasons` lives inside
+    // the assessment's `counts` column; on the owner's machine it read
+    // `{"payload_verify_error:id_sets": 10}` for every watcher-ingested item.
+    const counts = (
+      await f.client.query(
+        `SELECT counts FROM kith.worker_processing_assessments
+          WHERE source_account_id = $1 ORDER BY created_at DESC LIMIT 1`,
+        [f.sourceAccountId],
+      )
+    ).rows[0]?.counts;
+    assert.deepEqual(counts?.notReadyReasons ?? {}, {});
+    assert.equal(counts?.unavailable ?? 0, 0);
+
     const kept = await withRehearsalCatalog(
       pass(profileB).config,
       f.credential.rawKey,

@@ -526,6 +526,250 @@ test(
     const verifiedWithCardSpan = await provenance.verifySealedParsedPayload(client, generation);
     assert.equal(verifiedWithCardSpan.actualEvidenceSpanCount, 2);
 
+    // ADM-5i: typed extraction is the same kind of derived layer, and writes
+    // its rows onto the activated parsed generation. From the first backfill
+    // every extracted document failed `id_sets`, so the watcher stopped
+    // reporting a complete pass and the health screen went red -- while the
+    // documents themselves stayed perfectly readable, because reads do not
+    // call the verifier.
+    const extractionSpanId = newKithId();
+    await client.query(
+      `INSERT INTO kith.evidence_spans
+         (id, space_id, created_at, source_revision_id, source_text_version_id,
+          source_page_id, ordinal, "start", "end", quote_hash, locator)
+       VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,9,0,2,$6,
+               jsonb_build_object('kind', 'extraction_v1'))`,
+      [
+        extractionSpanId,
+        spaceId,
+        archivedRevision.id,
+        parsedTextVersion.id,
+        (
+          await client.query(
+            "SELECT id FROM kith.source_pages WHERE source_text_version_id = $1 LIMIT 1",
+            [parsedTextVersion.id],
+          )
+        ).rows[0].id,
+        await sha256Utf8("AB"),
+      ],
+    );
+    const withExtractionSpan = await provenance.verifySealedParsedPayload(
+      client,
+      generation,
+    );
+    assert.equal(withExtractionSpan.actualEvidenceSpanCount, 2);
+
+    // The legacy rule: a span written before the marker existed, recognised
+    // by a `document_statement` observation pointing at it. The rows on the
+    // owner's machine today are all of this shape.
+    const legacySpanId = newKithId();
+    const firstPageId = (
+      await client.query(
+        "SELECT id FROM kith.source_pages WHERE source_text_version_id = $1 LIMIT 1",
+        [parsedTextVersion.id],
+      )
+    ).rows[0].id;
+    await client.query(
+      `INSERT INTO kith.evidence_spans
+         (id, space_id, created_at, source_revision_id, source_text_version_id,
+          source_page_id, ordinal, "start", "end", quote_hash)
+       VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,21,0,2,$6)`,
+      [
+        legacySpanId,
+        spaceId,
+        archivedRevision.id,
+        parsedTextVersion.id,
+        firstPageId,
+        await sha256Utf8("AB"),
+      ],
+    );
+    // Unmarked and unreferenced, it is indistinguishable from a foreign span
+    // and the seal refuses it.
+    const orphanSeen = [];
+    await assert.rejects(
+      provenance.verifySealedParsedPayload(client, generation, (named) =>
+        orphanSeen.push(named),
+      ),
+      /scan_conflict/,
+    );
+    assert.deepEqual(orphanSeen, ["id_sets"]);
+
+    // Adopted by a `document_statement` observation, it is extraction's and
+    // the seal passes. Nothing about the span itself changed.
+    // The provenance fixture never needed a `spaces` row; an entity does.
+    await client.query(
+      `INSERT INTO kith.spaces (id, kind, name, created_by)
+       VALUES ($1,'personal','Synthetic',$2)
+       ON CONFLICT (id) DO NOTHING`,
+      [spaceId, userId],
+    );
+    const legacyUser = userId;
+    const legacyEntity = newKithId();
+    const legacyEvent = newKithId();
+    const legacyVersion = newKithId();
+    await client.query(
+      `INSERT INTO kith.entities
+         (id, space_id, created_at, user_id, key, kind, canonical_name,
+          normalized_name, aliases, normalized_aliases)
+       VALUES ($1,$2,transaction_timestamp(),$3,'other:document','other',
+               'Document','document','[]'::jsonb,'[]'::jsonb)`,
+      [legacyEntity, spaceId, legacyUser],
+    );
+    await client.query(
+      `INSERT INTO kith.events
+         (id, space_id, created_at, source_account_id, source_item_id,
+          event_key, created_by)
+       VALUES ($1,$2,transaction_timestamp(),$3,$4,'document_statement:v1',$5)`,
+      [legacyEvent, spaceId, sourceAccountId, item.id, legacyUser],
+    );
+    const legacyChain = [
+      spaceId,
+      sourceAccountId,
+      item.id,
+      archivedRevision.id,
+      parsedTextVersion.id,
+      generation.id,
+    ];
+    await client.query(
+      `INSERT INTO kith.event_versions
+         (id,space_id,created_at,source_account_id,source_item_id,
+          source_revision_id,source_text_version_id,processing_generation_id,
+          event_id,entity_id,event_type,schema_version,occurrence,
+          field_evidence,user_id)
+       VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,
+               'document_statement',1,'{"precision":"unknown"}'::jsonb,$10,$11)`,
+      [
+        legacyVersion,
+        ...legacyChain,
+        legacyEvent,
+        legacyEntity,
+        JSON.stringify({ occurrence: [], entity: [], eventType: [] }),
+        legacyUser,
+      ],
+    );
+    await client.query(
+      `INSERT INTO kith.observations
+         (id,space_id,created_at,source_account_id,source_item_id,
+          source_revision_id,source_text_version_id,processing_generation_id,
+          event_id,event_version_id,entity_id,event_type,occurrence,
+          observation_key,observation_type,schema_version,value,value_evidence,
+          user_id)
+       VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,$10,
+               'document_statement','{"precision":"unknown"}'::jsonb,
+               'vendor','vendor',1,'{"type":"text","value":"X"}'::jsonb,$11,$12)`,
+      [
+        newKithId(),
+        ...legacyChain,
+        legacyEvent,
+        legacyVersion,
+        legacyEntity,
+        JSON.stringify([legacySpanId]),
+        legacyUser,
+      ],
+    );
+    assert.equal(
+      (await provenance.verifySealedParsedPayload(client, generation))
+        .actualEvidenceSpanCount,
+      2,
+      "an unmarked span adopted by a document_statement observation",
+    );
+    await client.query(
+      "DELETE FROM kith.observations WHERE event_id = $1",
+      [legacyEvent],
+    );
+    await client.query(
+      "DELETE FROM kith.event_versions WHERE event_id = $1",
+      [legacyEvent],
+    );
+    await client.query("DELETE FROM kith.events WHERE id = $1", [legacyEvent]);
+    await client.query("DELETE FROM kith.evidence_spans WHERE id = $1", [
+      legacySpanId,
+    ]);
+
+    // A span with no marker and nothing pointing at it is a foreign span, and
+    // the seal must still refuse it. This is the check the exclusion above
+    // must not have cost.
+    const foreignSpanId = newKithId();
+    await client.query(
+      `INSERT INTO kith.evidence_spans
+         (id, space_id, created_at, source_revision_id, source_text_version_id,
+          source_page_id, ordinal, "start", "end", quote_hash)
+       VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,11,0,2,$6)`,
+      [
+        foreignSpanId,
+        spaceId,
+        archivedRevision.id,
+        parsedTextVersion.id,
+        (
+          await client.query(
+            "SELECT id FROM kith.source_pages WHERE source_text_version_id = $1 LIMIT 1",
+            [parsedTextVersion.id],
+          )
+        ).rows[0].id,
+        await sha256Utf8("AB"),
+      ],
+    );
+    const foreignSeen = [];
+    await assert.rejects(
+      provenance.verifySealedParsedPayload(client, generation, (named) =>
+        foreignSeen.push(named),
+      ),
+      /scan_conflict/,
+    );
+    assert.deepEqual(foreignSeen, ["id_sets"]);
+    await client.query("DELETE FROM kith.evidence_spans WHERE id = $1", [
+      foreignSpanId,
+    ]);
+    // And a manifest span that goes missing is still a missing span, even
+    // though an extraction span now sits over the same text.
+    const manifestSpan = (
+      await client.query(
+        `SELECT evidence_span_ids
+           FROM kith.processing_generation_payload_manifests WHERE id = $1`,
+        [summary.manifestId],
+      )
+    ).rows[0].evidence_span_ids[0];
+    const removed = (
+      await client.query(
+        "DELETE FROM kith.evidence_spans WHERE id = $1 RETURNING *",
+        [manifestSpan],
+      )
+    ).rows;
+    const missingSeen = [];
+    await assert.rejects(
+      provenance.verifySealedParsedPayload(client, generation, (named) =>
+        missingSeen.push(named),
+      ),
+      /scan_conflict/,
+    );
+    assert.deepEqual(missingSeen, ["id_sets"]);
+    await client.query(
+      `INSERT INTO kith.evidence_spans
+         (id, space_id, created_at, source_revision_id, source_text_version_id,
+          source_page_id, ordinal, "start", "end", quote_hash, locator,
+          card_extraction_fingerprints)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [
+        removed[0].id,
+        removed[0].space_id,
+        removed[0].created_at,
+        removed[0].source_revision_id,
+        removed[0].source_text_version_id,
+        removed[0].source_page_id,
+        removed[0].ordinal,
+        removed[0].start,
+        removed[0].end,
+        removed[0].quote_hash,
+        removed[0].locator,
+        removed[0].card_extraction_fingerprints,
+      ],
+    );
+    assert.equal(
+      (await provenance.verifySealedParsedPayload(client, generation))
+        .actualEvidenceSpanCount,
+      2,
+    );
+
     // P2-100d. A manifest whose four byte totals were measured under a
     // different row shape -- every Convex manifest the migration carried over
     // verbatim -- still verifies, because every content proof still holds.

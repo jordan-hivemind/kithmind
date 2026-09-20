@@ -51,6 +51,7 @@ import {
 import { ProofError } from "../errors.js";
 import { KITH_ID, newKithId } from "../ids.js";
 import { locateCardQuote } from "../provenance/model.js";
+import { EXTRACTION_SPAN_LOCATOR_KIND } from "../provenance/parsedStaging.js";
 import {
   areContiguous,
   citedLines,
@@ -828,11 +829,19 @@ async function findOrCreateSpan(
   // `card_extraction_fingerprints` stays null on purpose: a null marks a span
   // that `sweepCardEvidenceSpans` must never collect, and these spans are
   // referenced by live observations rather than by a card generation.
+  //
+  // The locator carries `extraction_v1` so the parsed payload's seal can tell
+  // this span from a parser one. Without a marker the seal counted extraction
+  // spans against the manifest and every extracted document failed
+  // `payload_verify_error:id_sets`, which stopped the watcher reporting a
+  // complete pass at all. See `extractionSpanIds` in
+  // `../provenance/parsedStaging.ts`.
   await client.query(
     `INSERT INTO kith.evidence_spans
        (id, space_id, created_at, source_revision_id, source_text_version_id,
         source_page_id, ordinal, "start", "end", quote_hash, locator)
-     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,NULL)`,
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,
+             jsonb_build_object('kind', $10::text))`,
     [
       id,
       loaded.spaceId,
@@ -843,6 +852,7 @@ async function findOrCreateSpan(
       located.start,
       located.end,
       await sha256Utf8(page.text.slice(located.start, located.end)),
+      EXTRACTION_SPAN_LOCATOR_KIND,
     ],
   );
   return id;
