@@ -54,7 +54,7 @@ Investment document matching uses investment.entityId to reach that entity's ali
 
 Example replacement: {"entityId":"<entityId>","aliases":["Northstar Fund II","Northstar II"]}`,
 
-  attention: `list_attention returns a bounded page plus active mutes. Current producers mainly create extraction items and many are informational. An item targetKind of document uses targetId as a sourceItemId, not a Brain documentId.
+  attention: `list_attention returns a bounded page plus active mutes. By default it includes open items at all severity levels, matching the web queue; use severity or state to narrow it or inspect history. Current producers mainly create extraction items and many are informational. An item targetKind of document uses targetId as a sourceItemId, not a Brain documentId.
 
 manage_attention supports dismiss, undo_dismiss, snooze, bulk_dismiss, bulk_snooze, mute and unmute. Dismiss is remembered for that item. Snooze returns later. Mute suppresses future items for a detector, source_root or document_kind. Bulk filters are ids, detector, documentKind, investment or beforeDate; an investment filter may match nothing until a detector produces investment targets.
 

@@ -1,5 +1,12 @@
 # Investment document matching and the attention queue
 
+> Update, 2026-09-20: MCP management is the primary interface, with the web
+> queue supporting audit and discovery. Both show open informational items by
+> default, with explicit severity filters. This supersedes the narrower default
+> proposed below. Dismissing an item does not correct its underlying value;
+> field corrections are available through MCP. Further detectors and UI editors
+> remain proposals, not prerequisites for shipping the existing workflows.
+
 Date: 2026-09-19
 Status: adopted, in build. Slice 2 of section 8 is the last slice landed
 (ADM-8c); slices 3 to 7 are not built. Extends section 12 of

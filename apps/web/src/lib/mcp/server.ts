@@ -1919,7 +1919,7 @@ export function createMcpServer(
       severity: z
         .array(z.enum(["info", "attention", "alert"]))
         .max(3)
-        .optional(),
+        .default(["info", "attention", "alert"]),
       detector: z.string().trim().min(1).max(100).optional(),
       targetKind: z.string().trim().min(1).max(50).optional(),
       targetId: z.string().trim().min(1).max(512).optional(),
