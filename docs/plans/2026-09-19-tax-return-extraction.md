@@ -3,6 +3,15 @@
 Date: 2026-09-19
 Status: proposed. Design only.
 
+> Amended 2026-09-20: sensitivity re-scoped by the owner, see PR #319.
+> Section 8 is rewritten to match what shipped: three levels
+> (`normal`/`sensitive`/`restricted`), not the two (`low`/`high`) proposed
+> below; the never-store-identifiers gate, identifier masking, MCP and search
+> redaction, and the audit line were all removed from the design and did not
+> ship. The per-key ceiling shipped as `api_keys.max_sensitivity`, defaulting
+> to `restricted` (full access), lowered only by the owner. Section 10's
+> slice 0 row and decision 8 in section 11 are updated to match.
+
 Owner requirement, verbatim: "I'd like to be aggressive / broad about the
 information we extract from the tax return and keep in Postgres. Not every line
 item, but every total, so it's easy to run basic aggregations and calculations
@@ -310,71 +319,60 @@ different numbers is the case the owner must see.
 ## 8. Sensitivity
 
 Work item the owner approved, 2026-09-19, and its own prerequisite slice: it
-ships before any tax PDF is ingested, not after. The earlier draft of this
-design argued that space isolation
-(`packages/kith-store/src/identity/spaces.ts`, `authorization.ts`) and a "last
-four only" convention were enough and that no tier system was needed. The
-owner's answer is that a document class this sensitive needs the level held
-as data, not left to a convention engineers have to remember.
+shipped in PR #319 (migration `032_sensitivity.sql`) before any tax PDF is
+ingested, not after. The rest of this section originally proposed a
+never-store-identifiers gate, masking, redaction at the MCP read boundary and
+an audit table. The owner reviewed that draft and rejected it, in these
+words: "This is my personal data that I personally am accessing. Why
+wouldn't I be allowed to view my tax information? Or SSN for that matter? If
+I forget my wife's SSN and I need it, why shouldn't I be allowed to ask the
+agent to retrieve it for me?" What follows describes what actually shipped.
 
-**Sensitivity as data.** A `sensitivity` column, `low | high`, on
-`kith.document_types` (per kind: a W-2 or a 1099 is `high`, a preparer
-invoice is `low`), and a second `sensitivity` column on
-`document_type_fields` (per field: `filer_name_as_written` on a 1040 is
-`low` even though the 1040 itself is `high`). A field's own value wins when
-set; the document kind's level otherwise. This reuses the shape `line_refs`
-already adds to `document_type_fields` (section 4), one more per-kind,
-per-field column on a table that already holds them.
+**Sensitivity as a label.** Three levels, `normal`, `sensitive` and
+`restricted`, not the two (`low`/`high`) originally proposed here. A
+`sensitivity` column on `kith.document_types` (per kind) and on
+`document_type_fields` (per field), plus a nullable owner override on
+`source_items` and `source_roots` that can raise, never lower, a document's
+effective level. The effective level is the maximum of kind, item override
+and root override. `schedule_k1` is seeded `restricted`; the other financial
+and medical kinds so far are seeded `sensitive`. No W-2 or 1099 kind exists
+in the seed yet; when this plan's own extraction work adds one, give it a
+level the same way. A label restricts nothing by itself.
 
-**Never extracted.** Unchanged from the earlier draft, and now the enforced
-consequence of `high` sensitivity rather than a convention alone: SSN, ITIN,
-any taxpayer identifying number; bank routing and account numbers (1040
-lines 35b to 35d); dependent names and SSNs (a count is fine); street
-addresses (jurisdiction and state are fine). `containsRestrictedIdentifier(text)`,
-beside the gate, refuses a statement whose value matches one of these
-patterns and refuses a `tax_facts` row whose quote prints one.
+**Never extracted, masking and redaction at the boundary were all removed.**
+This section originally specified a `containsRestrictedIdentifier` gate
+refusing SSNs, routing and account numbers, and dependent names at capture;
+EIN and identifier masking to last four; and stripping identifiers from any
+text an MCP tool or search snippet returns. None of that shipped. Extraction
+stores an identifier exactly as the document states it. `get_document`,
+search results and every other read return values in full, whatever the
+caller's ceiling. The only place an identifier is ever altered is a scrubber
+over logs, error text, `deferred_work.last_error` and outbound alerts
+(`packages/kith-store/src/sensitivity/identifiers.ts`, `sinks.ts`). It never
+touches stored data or a tool result.
 
-**Masking.** EIN and any other identifier kept for matching rather than
-reading is last four only (`*_ein_last_four`, following `account_last_four`
-in `seed.ts` and `maskedLabel` in `apps/web/src/lib/kith/institutions.ts`).
-Filer name stays as written, as `recipient_as_written` already is. This is
-the existing convention, now the documented consequence of a field's
-sensitivity level rather than a habit.
+**A per-key ceiling that filters, not a refusal.** `api_keys.max_sensitivity`
+defaults to `restricted`, meaning everything, no withholding, for every key
+and OAuth grant including the owner's own. Only the owner can lower a
+particular credential's ceiling, and only for that one connection. A read
+whose target exceeds the ceiling is filtered out of the result and counted,
+not refused outright as this section originally proposed. The filter reaches
+`search_documents`, `get_document`, `list_inventory`, `list_review_queue`
+and the `query_records` aggregations. It does not reach thoughts, facts,
+investments, sources or stats. Whether `query_tax_facts` (section 9, not yet
+built) needs its own ceiling check, or reads through one of the functions
+above and inherits theirs, is open; confirm against
+`packages/kith-store/src/sensitivity/model.ts` when building slice 4.
 
-**Redaction at the boundary.** Page text and evidence spans stay unredacted in
-storage: the pages are the archive, and redacting them would make the
-evidence span lie about what the document says. The control is at read time:
-the same restricted-identifier patterns are stripped from any text an MCP
-tool returns and from any search snippet, whatever the caller's sensitivity
-ceiling. `get_document` keeps its existing authorization and behavior; this
-adds redaction on top, not a new permission model. `query_tax_facts` (section
-9) already returns amounts, semantic keys, form, line reference, year,
-jurisdiction, counterparty, state and an evidence span id, and no quote text,
-so it needs no separate redaction pass.
+**No audit table.** The audit line this section proposed was not built and
+none is planned. Nothing records who read a restricted document or when.
 
-**Per-key ceiling.** An API key or MCP client carries a `max_sensitivity`
-(`low | high`; default `high` for the owner's own clients). A read whose
-target exceeds the caller's ceiling is refused the way an unauthorized space
-already is, not silently filtered: a partial, unlabelled answer is its own
-failure mode. This is the one lever for "a connected assistant should not see
-W-2s," without a role or scope system built for cases that do not exist yet.
-
-**Audit line.** Every MCP read of a `high`-sensitivity document writes one row
-recording who, when, which document, and which tool. It is a log, not a queue
-item and not an alert; nothing reads it automatically. It exists so "did
-anything read my W-2s last month" has an answer.
-
-**Deliberately not built.** No per-field redaction inside a returned
-document's own text: a client is refused the whole document, not handed one
-with holes in it. No encryption at rest beyond what the database already
-provides. No approval workflow for a high-sensitivity read: the owner is the
-only principal with a `high` ceiling today, so there is no one to approve
-past. No retention or expiry policy for the audit log. These are proportionate
-omissions for a personal project with one owner and a small, named set of MCP
-clients, not oversights; each is a small addition later if a second
-owner-level principal or a third-party client needs one. Tax documents live
-in the owner's personal space: no new space, permission model, or route, only
-the sensitivity data and the boundary checks above.
+**Deliberately not built**, for reasons unchanged from the earlier draft: no
+per-field redaction inside a returned document's own text, no encryption at
+rest beyond what the database already provides, no approval workflow, no
+retention or expiry policy on anything. Tax documents live in the owner's
+personal space: no new space, permission model or route, only the label
+columns, the two sensitivity views and the ceiling above.
 
 ## 9. MCP and UI
 
@@ -412,7 +410,7 @@ already live.
 
 | Slice | Hours | Second-model review |
 | --- | --- | --- |
-| 0. Sensitivity: schema columns, `containsRestrictedIdentifier`, MCP and search redaction, per-key ceiling, audit line | 5 | Yes: gates what every later slice can read |
+| 0. Sensitivity: label columns and the two views, per-key ceiling. Shipped in PR #319, scoped down from the original proposal (section 8) | done | Yes: gates what every later slice can read |
 | 1. Catalog, seeder extension, migration 028 | 5 | Yes: schema and financial numbers |
 | 2. Page classification and segmentation, deterministic first | 5 | No |
 | 3. Raise the eight pipeline constants together, re-parse check | 4 | No |
@@ -448,4 +446,4 @@ Measuring the first real run:
 | 5 | Is a draft return worth storing? | Yes, with `authoritative = false`. The owner believes none exists, but if one is found it is surfaced as a quiet queue item, not just stored silently (section 7) |
 | 6 | Missing-document checklist noise? | Same low-noise principle as the investment-matching design: pull-only, never an alert or a queue item (section 9, "Missing checklist" and "Which K-1s") |
 | 7 | Aggregatable projections work item | Approved as a general pattern, not tax-only. `tax_facts` first, then receipts/invoices line totals, then investment-document facts, each a flat projection table rebuildable from the gated statements (section 2) |
-| 8 | Sensitivity work item | Approved as its own prerequisite slice, before any tax PDF is ingested: sensitivity levels as data, masking, MCP and search redaction, a per-key ceiling, and an audit line (section 8, build order slice 0) |
+| 8 | Sensitivity work item | Approved as its own prerequisite slice, before any tax PDF is ingested. Shipped in PR #319 as sensitivity levels as data and a per-key ceiling only; masking, MCP and search redaction, and an audit line were proposed here and were rejected by the owner and not built (section 8, build order slice 0) |
