@@ -1,12 +1,50 @@
 // Display formatting shared by the app pages' tables.
 
-/** `meeting_note` to `meeting note`. */
+/** `credit_line` to `Credit Line`, for labels shown to people. */
 export function label(value: string): string {
-  return value.replaceAll("_", " ");
+  return value
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
-/** A timestamp as `YYYY-MM-DD`, or empty for none. */
+/** A date as `9-26-2026`, or empty for none. Uses UTC so it is stable across
+ * the client and server render boundary. */
 export function shortDate(value: number | null | undefined): string {
   if (value === null || value === undefined) return "";
-  return new Date(value).toISOString().slice(0, 10);
+  const date = new Date(value);
+  return `${date.getUTCMonth() + 1}-${date.getUTCDate()}-${date.getUTCFullYear()}`;
+}
+
+/** A date-only archive value without timezone conversion. */
+export function archiveDate(value: string | null | undefined): string {
+  if (value === null || value === undefined || value === "") return "";
+  const [year, month, day] = value.slice(0, 10).split("-");
+  if (year === undefined || month === undefined || day === undefined)
+    return value;
+  return `${Number(month)}-${Number(day)}-${year}`;
+}
+
+/** A table timestamp as `9-26-2026 2:05 PM`, or empty for none. */
+export function tableDateTime(value: number | null | undefined): string {
+  if (value === null || value === undefined) return "";
+  const date = new Date(value);
+  const hour = date.getUTCHours();
+  const minute = String(date.getUTCMinutes()).padStart(2, "0");
+  return `${shortDate(value)} ${hour % 12 || 12}:${minute} ${hour >= 12 ? "PM" : "AM"}`;
+}
+
+/** Integer values in tables use separators and stable tabular figures. */
+export function tableInteger(value: number | null | undefined): string {
+  return value === null || value === undefined
+    ? ""
+    : value.toLocaleString("en-US");
+}
+
+/** Add grouping to an exact decimal string without converting it to a JS
+ * number, which would lose precision for money and account values. */
+export function tableDecimal(value: string): string {
+  const match = /^(-?)(\d+)(\.\d+)?$/.exec(value);
+  if (match === null) return value;
+  const [, sign = "", whole = "", fraction = ""] = match;
+  return `${sign}${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}${fraction}`;
 }

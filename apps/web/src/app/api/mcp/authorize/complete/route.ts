@@ -283,6 +283,11 @@ export async function POST(req: Request) {
     name: `MCP (${registration.clientName})`,
     capabilities: request.capabilities,
     spaceIds: request.spaceIds,
+    // SENS-1. Whatever the consent screen showed, carried through to the hash
+    // and the stored grant. Absent is `restricted`: no withholding.
+    ...(request.maxSensitivity === undefined
+      ? {}
+      : { maxSensitivity: request.maxSensitivity }),
   };
 
   let grant: Grant;

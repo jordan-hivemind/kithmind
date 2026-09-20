@@ -14,8 +14,10 @@
 // stopped. Every row ends up in the result list as created, already imported,
 // or failed with a reason.
 
+import type { ColumnDef } from "@tanstack/react-table";
 import { useMemo, useState } from "react";
 
+import { DataTable } from "@/components/ui/data-table";
 import {
   buttonClass,
   Drawer,
@@ -23,6 +25,12 @@ import {
   inputClass,
   primaryButtonClass,
 } from "@/components/ui/drawer";
+import {
+  archiveDate,
+  label,
+  tableDecimal,
+  tableInteger,
+} from "@/lib/kith/format";
 import {
   buildPreview,
   IMPORT_REIMPORT_NOTE,
@@ -33,6 +41,45 @@ import {
   planImport,
   roundToScale,
 } from "@/lib/kith/investment-import";
+
+type ImportSummaryRow = { id: string; metric: string; count: number };
+type TopLineRow = {
+  id: string;
+  metric: string;
+  totalRow: string | null;
+  comparison: string;
+};
+
+const IMPORT_SUMMARY_COLUMNS: ColumnDef<ImportSummaryRow, unknown>[] = [
+  { id: "metric", accessorKey: "metric", header: "Import" },
+  {
+    id: "count",
+    accessorKey: "count",
+    header: "Count",
+    meta: { nowrap: true },
+    cell: ({ row }) => (
+      <span className="tabular-nums">{tableInteger(row.original.count)}</span>
+    ),
+  },
+];
+
+const TOP_LINE_COLUMNS: ColumnDef<TopLineRow, unknown>[] = [
+  { id: "metric", accessorKey: "metric", header: "Total" },
+  {
+    id: "totalRow",
+    accessorKey: "totalRow",
+    header: "Sheet",
+    meta: { nowrap: true },
+    cell: ({ row }) => (
+      <span className="tabular-nums">
+        {row.original.totalRow === null
+          ? "—"
+          : tableDecimal(row.original.totalRow)}
+      </span>
+    ),
+  },
+  { id: "comparison", accessorKey: "comparison", header: "Comparison" },
+];
 
 export function ImportDrawer({
   open,
@@ -97,6 +144,65 @@ export function ImportDrawer({
       preview.suspectRates.length > 0 ||
       (plan?.invalid.length ?? 0) > 0);
 
+  const importSummaryRows: ImportSummaryRow[] =
+    preview === null || plan === null
+      ? []
+      : [
+          {
+            id: "investments",
+            metric: "Investments",
+            count: preview.summary.length,
+          },
+          {
+            id: "entries",
+            metric: "Entries",
+            count: plan.operations.filter((row) => row.kind === "entry").length,
+          },
+          { id: "skipped", metric: "Not read", count: preview.skipped.length },
+          {
+            id: "invalid",
+            metric: "Cannot import",
+            count: plan.invalid.length,
+          },
+          {
+            id: "differences",
+            metric: "Differences",
+            count: preview.reconciliation.length,
+          },
+          {
+            id: "rates",
+            metric: "Rate looks wrong",
+            count: preview.suspectRates.length,
+          },
+        ];
+
+  const topLineRows: TopLineRow[] =
+    preview?.topLineCheck === null || preview === null
+      ? []
+      : (["committed", "sent", "received"] as const).map((field) => {
+          const check = preview.topLineCheck![field];
+          const comparison = [
+            `Rows sum to ${tableDecimal(check.summarySum)}`,
+            check.difference === null
+              ? null
+              : `difference ${tableDecimal(check.difference)}`,
+            check.ledgerSum === null
+              ? null
+              : `Ledger sums to ${tableDecimal(check.ledgerSum)}`,
+            check.ledgerDifference === null
+              ? null
+              : `Ledger difference ${tableDecimal(check.ledgerDifference)}`,
+          ]
+            .filter((value): value is string => value !== null)
+            .join(" · ");
+          return {
+            id: field,
+            metric: label(field),
+            totalRow: check.totalRow,
+            comparison,
+          };
+        });
+
   return (
     <Drawer open={open} onOpenChange={onOpenChange} title="Import">
       <div className="flex flex-col gap-3">
@@ -135,61 +241,28 @@ export function ImportDrawer({
               {IMPORT_REIMPORT_NOTE}
             </p>
 
-            <table className="w-full text-[11px]">
-              <tbody>
-                {(
-                  [
-                    ["Investments", preview.summary.length],
-                    [
-                      "Entries",
-                      plan.operations.filter((row) => row.kind === "entry")
-                        .length,
-                    ],
-                    ["Not read", preview.skipped.length],
-                    ["Cannot import", plan.invalid.length],
-                    ["Differences", preview.reconciliation.length],
-                    ["Rate looks wrong", preview.suspectRates.length],
-                  ] as const
-                ).map(([label, count]) => (
-                  <tr key={label} className="border-b border-gray-100">
-                    <td className="h-row">{label}</td>
-                    <td className="h-row text-right tabular-nums">{count}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <DataTable
+              id="investment-import-summary"
+              data={importSummaryRows}
+              columns={IMPORT_SUMMARY_COLUMNS}
+              showSearch={false}
+              empty="No import rows"
+            />
 
             {preview.topLineCheck === null ? null : (
-              <table className="w-full text-[11px]">
-                <caption className="pb-1 text-left text-gray-500">
-                  The sheet&apos;s own Total row, line {preview.topLineCheck.line}
-                </caption>
-                <tbody>
-                  {(
-                    ["committed", "sent", "received"] as const
-                  ).map((field) => {
-                    const check = preview.topLineCheck![field];
-                    return (
-                      <tr key={field} className="border-b border-gray-100">
-                        <td className="h-row capitalize">{field}</td>
-                        <td className="h-row text-right tabular-nums">
-                          {check.totalRow ?? "—"}
-                        </td>
-                        <td className="h-row text-right tabular-nums text-gray-500">
-                          rows sum to {check.summarySum}
-                          {check.difference === null ? "" : ` (${check.difference})`}
-                          {check.ledgerSum === null
-                            ? ""
-                            : `, Ledger sums to ${check.ledgerSum}` +
-                              (check.ledgerDifference === null
-                                ? ""
-                                : ` (${check.ledgerDifference})`)}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+              <div className="flex flex-col gap-1">
+                <p className="text-[11px] text-gray-500">
+                  The sheet&apos;s own Total row, line{" "}
+                  {tableInteger(preview.topLineCheck.line)}
+                </p>
+                <DataTable
+                  id="investment-import-top-line"
+                  data={topLineRows}
+                  columns={TOP_LINE_COLUMNS}
+                  showSearch={false}
+                  empty="No totals"
+                />
+              </div>
             )}
 
             {preview.ledgerOnlyInvestments.length === 0 ? null : (
@@ -271,7 +344,7 @@ export function ImportDrawer({
                   className="flex items-center gap-1 text-[11px]"
                 >
                   <span className="w-20 shrink-0 tabular-nums text-gray-500">
-                    {row.entryDate}
+                    {archiveDate(row.entryDate)}
                   </span>
                   <span className="min-w-0 flex-1 truncate">
                     {row.investmentName}
@@ -283,13 +356,13 @@ export function ImportDrawer({
                       row.notes.length === 0 ? undefined : row.notes.join("; ")
                     }
                   >
-                    {row.amount} {row.currency}
+                    {tableDecimal(row.amount)} {row.currency}
                     {/* Converted at this row's own rate, shown at cents. The
                         reconciliation adds the unrounded values, the way the
                         store does. */}
                     {row.currency === "USD"
                       ? ""
-                      : ` → ${roundToScale(row.usdAmount, 2).value}`}
+                      : ` → ${tableDecimal(roundToScale(row.usdAmount, 2).value)}`}
                   </span>
                   <button
                     type="button"
@@ -297,7 +370,7 @@ export function ImportDrawer({
                     onClick={() => flip(index)}
                     className="rounded-tag border border-gray-200 bg-gray-50 px-1.5 py-0.5 hover:border-gray-300"
                   >
-                    {row.entryType}
+                    {label(row.entryType)}
                   </button>
                 </li>
               ))}
@@ -319,8 +392,9 @@ export function ImportDrawer({
         {outcome === null ? null : (
           <div className="flex flex-col gap-0.5 text-[11px]">
             <p className="text-gray-700">
-              {outcome.investmentsCreated} investments · {outcome.entriesCreated}{" "}
-              entries · {outcome.entriesAlreadyImported} already imported ·{" "}
+              {outcome.investmentsCreated} investments ·{" "}
+              {outcome.entriesCreated} entries ·{" "}
+              {outcome.entriesAlreadyImported} already imported ·{" "}
               {outcome.failed.length} failed
             </p>
             {outcome.failed.map((row) => (
@@ -345,7 +419,9 @@ export function ImportDrawer({
           <button
             type="button"
             disabled={
-              preview === null || busy || (needsAcknowledgement && !acknowledged)
+              preview === null ||
+              busy ||
+              (needsAcknowledgement && !acknowledged)
             }
             className={primaryButtonClass}
             onClick={async () => {

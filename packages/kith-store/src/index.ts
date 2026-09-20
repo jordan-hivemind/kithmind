@@ -394,6 +394,22 @@ export async function grantProofAppRole(
   // PUBLIC's default USAGE on `public`, so the writer is granted it by name
   // for the same reason the domains below are.
   await owner.query(`GRANT USAGE ON SCHEMA public TO "${appRole}"`);
+  // EXECUTE on a function is granted to PUBLIC by default and revoked from
+  // PUBLIC when the reader role is applied (`REVOKE ALL ON ALL ROUTINES IN
+  // SCHEMA kith FROM PUBLIC`, packages/pg/src/readerRole.ts), so the writer is
+  // granted it by name for the same reason the domains below are.
+  //
+  // `kith.sensitivity_rank` (migration 032) is the one function the
+  // application calls: `src/sensitivity/model.ts` names it directly in the
+  // ceiling predicate, and both sensitivity views call it too, so without this
+  // grant a narrowed key's every read fails with 42501 -- and only on a host
+  // where the reader role has been applied since that function was created,
+  // which is the hosted archive and nowhere else. `kith.record_change` is
+  // deliberately not granted: it is SECURITY DEFINER and reached only through
+  // triggers, whose EXECUTE is checked when the trigger is created.
+  await owner.query(
+    `GRANT EXECUTE ON FUNCTION ${KITH_SCHEMA}.sensitivity_rank(text) TO "${appRole}"`,
+  );
   // USAGE on a domain is granted to PUBLIC by default and revoked from PUBLIC
   // when the reader role is applied, so the writer is granted it by name.
   for (const domain of KITH_DOMAINS) {

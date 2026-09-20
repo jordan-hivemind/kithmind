@@ -43,6 +43,10 @@ import {
   keysetCursorColumn,
   keysetCursorPredicate,
 } from "../keyset.js";
+import {
+  applyCeiling,
+  type SensitivityLevel,
+} from "../sensitivity/model.js";
 import { spacePredicate } from "../spaces.js";
 import type { RecordEventType } from "./model.js";
 
@@ -115,6 +119,9 @@ export type ReviewQueuePage = {
   cursor: string | undefined;
   isDone: boolean;
   counts: ReviewQueueCounts;
+  /** SENS-1. How many rows this credential's ceiling hid. Always 0 on the
+   * default ceiling, which is every credential the owner has not narrowed. */
+  withheld?: number;
 };
 
 function emptyCounts(): ReviewQueueCounts {
@@ -515,6 +522,12 @@ export async function listReviewQueue(
   client: ClientBase,
   authorizedSpaceIds: readonly string[],
   args: ReviewQueueListArgs,
+  /**
+   * SENS-1. See `listInventory`: a review-queue row names a source item and a
+   * field key, which is a description of a document a narrowed client was not
+   * allowed to read. Omitted, or `restricted`, is no withholding.
+   */
+  ceiling: SensitivityLevel = "restricted",
 ): Promise<ReviewQueuePage> {
   const limit = boundedLimit(args.limit);
   if (authorizedSpaceIds.length === 0) {
@@ -575,5 +588,16 @@ export async function listReviewQueue(
     args.cursor,
     limit,
   );
-  return { ...page, counts };
+  // SENS-1. Every detail row carries `sourceItemId` except the duplicate-group
+  // and queue-status classes, which are counts rather than documents; a row
+  // without one reads as `normal` and stays, which is correct -- there is no
+  // document behind it to be sensitive.
+  const gated = await applyCeiling(
+    client,
+    page.rows,
+    (row) => (row as { sourceItemId?: string }).sourceItemId ?? null,
+    ceiling,
+    "sourceItem",
+  );
+  return { ...page, rows: gated.visible, counts, withheld: gated.withheld };
 }

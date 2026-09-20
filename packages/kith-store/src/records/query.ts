@@ -2,6 +2,7 @@ import type { ClientBase } from "pg";
 
 import { assertKithId } from "../ids.js";
 import {
+  principalMaxSensitivity,
   principalRef,
   reloadPrincipal,
   requireSpaceAccess,
@@ -9,6 +10,10 @@ import {
   type PrincipalRef,
   type SpaceMember,
 } from "../identity/index.js";
+import {
+  ceilingWhereSql,
+  type SensitivityLevel,
+} from "../sensitivity/model.js";
 import { calculateCoverage, type QueryCoverage } from "../coverage/index.js";
 import {
   createRecordHydrationCache,
@@ -164,6 +169,21 @@ type Scope = {
   membership: SpaceMember;
   sourceAccountIds: string[];
   authorizationSignature: string;
+  /**
+   * SENS-1. The reading credential's ceiling.
+   *
+   * The WHERE fragment is built per query site rather than once here, because
+   * it has to name the scanned table (`kith.observations.source_item_id`); an
+   * unqualified column binds to the subquery's own table and filters
+   * everything. See `ceilingWhereSql`.
+   *
+   * It is SQL rather than a post-filter because `sum_money` adds up what it
+   * selects: a total computed over withheld rows and then trimmed is a wrong
+   * total, so the aggregation must not see them in the first place. The other
+   * three operations use the same rule so one query cannot disagree with
+   * another about what this credential may read.
+   */
+  ceiling: SensitivityLevel;
 };
 type Candidate = {
   id: string;
@@ -477,6 +497,8 @@ async function resolveScope(
     membership,
     sourceAccountIds: ids,
     authorizationSignature,
+    // From the principal this call just reloaded, never from the query.
+    ceiling: principalMaxSensitivity(p),
   };
 }
 function normalized(query: RecordQuery, scope: Scope) {
@@ -858,11 +880,11 @@ async function latest(
     maxDate = dateAt(Math.min(MAX_QUERY_TIME, asOf + MAX_DATE_OFFSET_MS));
   const [dates, times] = await Promise.all([
     ctx.client.query(
-      `SELECT * FROM kith.${table} WHERE space_id=$1 AND entity_id=$2 AND ${typeCol}=$3 AND occurrence->>'precision'='date' AND occurrence_date<=$4 ORDER BY occurrence_date DESC,id DESC LIMIT $5`,
+      `SELECT * FROM kith.${table} WHERE space_id=$1 AND entity_id=$2 AND ${typeCol}=$3 AND occurrence->>'precision'='date' AND occurrence_date<=$4${ceilingWhereSql(state.scope.ceiling, `kith.${table}.source_item_id`)} ORDER BY occurrence_date DESC,id DESC LIMIT $5`,
       [query.spaceId, query.entityId, type, maxDate, MAX_QUERY_SCAN_ROWS + 1],
     ),
     ctx.client.query(
-      `SELECT * FROM kith.${table} WHERE space_id=$1 AND entity_id=$2 AND ${typeCol}=$3 AND occurrence_instant<=$4 ORDER BY occurrence_instant DESC,id DESC LIMIT $5`,
+      `SELECT * FROM kith.${table} WHERE space_id=$1 AND entity_id=$2 AND ${typeCol}=$3 AND occurrence_instant<=$4${ceilingWhereSql(state.scope.ceiling, `kith.${table}.source_item_id`)} ORDER BY occurrence_instant DESC,id DESC LIMIT $5`,
       [
         query.spaceId,
         query.entityId,
@@ -1024,7 +1046,7 @@ async function paged(
     op = query.order === "asc" ? ">" : "<",
     edge = query.order === "asc" ? (cursor ?? lower) : (cursor ?? upper);
   const rows = await ctx.client.query(
-    `SELECT * FROM kith.${table} WHERE space_id=$1 AND entity_id=$2 AND ${typeCol}=$3 AND occurrence_sort_key ${op} $4 AND occurrence_sort_key ${query.order === "asc" ? "<" : ">"} $5 ORDER BY occurrence_sort_key ${query.order === "asc" ? "ASC" : "DESC"} LIMIT $6`,
+    `SELECT * FROM kith.${table} WHERE space_id=$1 AND entity_id=$2 AND ${typeCol}=$3 AND occurrence_sort_key ${op} $4 AND occurrence_sort_key ${query.order === "asc" ? "<" : ">"} $5${ceilingWhereSql(state.scope.ceiling, `kith.${table}.source_item_id`)} ORDER BY occurrence_sort_key ${query.order === "asc" ? "ASC" : "DESC"} LIMIT $6`,
     [
       query.spaceId,
       query.entityId,
@@ -1193,7 +1215,7 @@ async function sumMoney(
     ? "space_id=$1 AND entity_id=$2"
     : "space_id=$1 AND source_account_id=$2";
   const rows = await ctx.client.query(
-    `SELECT * FROM kith.observations WHERE ${where} AND observation_type=$3 AND occurrence_sort_key>$4 AND occurrence_sort_key<$5 ORDER BY occurrence_sort_key ASC LIMIT $6`,
+    `SELECT * FROM kith.observations WHERE ${where} AND observation_type=$3 AND occurrence_sort_key>$4 AND occurrence_sort_key<$5${ceilingWhereSql(state.scope.ceiling, "kith.observations.source_item_id")} ORDER BY occurrence_sort_key ASC LIMIT $6`,
     [
       query.spaceId,
       query.entityId ?? query.sourceAccountId,

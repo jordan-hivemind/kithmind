@@ -21,6 +21,8 @@ import { WorkerHeartbeatStatus } from "@/components/kith-worker-heartbeat-status
 import {
   type GrantableSpace,
   type KeyCapability,
+  type SensitivityChoice,
+  SensitivityControl,
   SpaceGrantChoices,
 } from "@/components/space-grant-choices";
 import {
@@ -37,7 +39,7 @@ import { DataTable, Detail, type RowAction, Tag } from "@/components/ui/data-tab
 import { useToast } from "@/components/ui/toast";
 import { sourceAccountGrantsForCapabilities } from "@/lib/api-key-scopes";
 import { PLUGIN_COMMANDS, PROMPTS } from "@/lib/kith/connect-guide";
-import { shortDate } from "@/lib/kith/format";
+import { shortDate, tableInteger } from "@/lib/kith/format";
 import { isPendingId, mutateJson, pendingId, requestJson } from "@/lib/kith/optimistic";
 import type { SettingsData } from "@/lib/kith/settings-data";
 import { useOptimisticMutation, useServerData } from "@/lib/kith/use-server-data";
@@ -152,6 +154,7 @@ type NewKey = {
     spaceIds: string[];
     capabilities: KeyCapability[];
     sourceAccountIds: string[];
+    maxSensitivity: SensitivityChoice;
   };
 };
 
@@ -189,6 +192,30 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
       },
     }),
   });
+
+  // SENS-1. Narrowing a key that already exists, without deleting it and
+  // re-authorizing every client that uses it.
+  const setCeiling = useOptimisticMutation<
+    SettingsData,
+    { id: string; maxSensitivity: SensitivityChoice }
+  >({
+    queryKey: KEY,
+    mutationFn: ({ id, maxSensitivity }) =>
+      mutateJson(`/api/kith/api-keys/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ maxSensitivity }),
+      }),
+    apply: (current, { id, maxSensitivity }) => ({
+      ...current,
+      apiKeys: {
+        ...current.apiKeys,
+        page: current.apiKeys.page.map((key) =>
+          key.id === id ? { ...key, maxSensitivity } : key,
+        ),
+      },
+    }),
+  });
+  const [editing, setEditing] = useState<ApiKeyRow | null>(null);
 
   // ponytail: a resync from the server render collapses loaded pages back to
   // the first 25 keys. Keep extra pages across resyncs if anyone has more.
@@ -252,7 +279,11 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
         meta: { nowrap: true },
         cell: ({ row }) => (
           <Detail
-            label={<span className="tabular-nums">{row.original.spaceIds.length}</span>}
+            label={
+              <span className="tabular-nums">
+                {tableInteger(row.original.spaceIds.length)}
+              </span>
+            }
             detail={row.original.spaceIds
               .map((id) => spaceNames.get(id) ?? id)
               .join(", ")}
@@ -291,6 +322,11 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
         disabled: (key) => isPendingId(key.id),
       },
       {
+        label: "Edit",
+        onSelect: (key) => setEditing(key),
+        disabled: (key) => isPendingId(key.id),
+      },
+      {
         label: "Revoke",
         danger: true,
         onSelect: (key) => revoke.mutate(key.id),
@@ -320,6 +356,19 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
             setCreating(false);
           }}
         />
+      )}
+      {editing && (
+        <Panel>
+          <Field label="Access level" htmlFor="api-key-ceiling">
+            <SensitivityControl
+              value={editing.maxSensitivity}
+              onChange={(value) => {
+                setCeiling.mutate({ id: editing.id, maxSensitivity: value });
+                setEditing(null);
+              }}
+            />
+          </Field>
+        </Panel>
       )}
       {newRawKey && (
         <Panel tone="accent">
@@ -367,6 +416,9 @@ function NewKeyForm({
   const [spaceIds, setSpaceIds] = useState<string[]>([]);
   const [capabilities, setCapabilities] = useState<KeyCapability[]>(["read"]);
   const [sourceAccountIds, setSourceAccountIds] = useState<string[]>([]);
+  // SENS-1. Defaults to the full-access option; see the consent screen.
+  const [maxSensitivity, setMaxSensitivity] =
+    useState<SensitivityChoice>("restricted");
   const [error, setError] = useState("");
 
   const grantableSpaces: GrantableSpace[] = spaces.map((space) => ({
@@ -400,8 +452,15 @@ function NewKeyForm({
         capabilities,
         spaceIds,
         sourceAccountIds: grantedSources,
+        maxSensitivity,
       },
-      body: { name: trimmed, spaceIds, capabilities, sourceAccountIds: grantedSources },
+      body: {
+        name: trimmed,
+        spaceIds,
+        capabilities,
+        sourceAccountIds: grantedSources,
+        maxSensitivity,
+      },
     });
   }
 
@@ -425,6 +484,8 @@ function NewKeyForm({
           capabilities={capabilities}
           onCapabilitiesChange={setCapabilities}
           allowedCapabilities={settingsCapabilities}
+          maxSensitivity={maxSensitivity}
+          onMaxSensitivityChange={setMaxSensitivity}
         />
         {needsSource && (
           <fieldset className="my-3 rounded-tag border border-gray-200 p-3 text-xs">
@@ -594,7 +655,11 @@ function SourceAccountsSection({
         accessorFn: (row) => row.freshnessMs / 60_000,
         header: "Freshness (min)",
         meta: { nowrap: true },
-        cell: ({ getValue }) => <span className="tabular-nums">{getValue() as number}</span>,
+        cell: ({ getValue }) => (
+          <span className="tabular-nums">
+            {tableInteger(getValue() as number)}
+          </span>
+        ),
       },
       {
         id: "status",

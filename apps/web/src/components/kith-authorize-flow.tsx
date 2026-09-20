@@ -27,6 +27,7 @@ import {
 import {
   type GrantableSpace,
   type KeyCapability,
+  type SensitivityChoice,
   SpaceGrantChoices,
 } from "@/components/space-grant-choices";
 import {
@@ -52,6 +53,10 @@ export function KithAuthorizeFlow({
   const [mode, setMode] = useState<"signIn" | "signUp">("signIn");
   const [spaceIds, setSpaceIds] = useState<string[]>([]);
   const [capabilities, setCapabilities] = useState<KeyCapability[]>(["read"]);
+  // SENS-1. "Everything" is the default: approving a client narrows nothing
+  // unless the owner reaches for the control and says so.
+  const [maxSensitivity, setMaxSensitivity] =
+    useState<SensitivityChoice>("restricted");
 
   const request = readAuthorizeRequest(searchParams);
   if (!request) {
@@ -73,7 +78,11 @@ export function KithAuthorizeFlow({
       window.location.assign(
         await (deny
           ? submitDenial(request)
-          : submitConsent(request, { spaceIds, capabilities })),
+          : submitConsent(request, {
+              spaceIds,
+              capabilities,
+              maxSensitivity,
+            })),
       );
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Authorization failed");
@@ -203,6 +212,8 @@ export function KithAuthorizeFlow({
         capabilities={capabilities}
         onCapabilitiesChange={setCapabilities}
         allowedCapabilities={allowedCapabilities}
+        maxSensitivity={maxSensitivity}
+        onMaxSensitivityChange={setMaxSensitivity}
       />
       {error && (
         <p role="alert" className="mb-2 text-xs text-red-700">

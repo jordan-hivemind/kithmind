@@ -75,6 +75,7 @@ import {
   resolvedCorrections,
 } from "./corrections.js";
 import { seedDocumentTypes } from "./seed.js";
+import { sweepUnreferencedExtractionSpans } from "./spanSweep.js";
 import {
   candidatesFor,
   checkLineItem,
@@ -1660,6 +1661,19 @@ async function store(
       JSON.stringify(prepared.statements),
     ],
   );
+
+  // Nothing this run stranded, and nothing the *previous* run stranded, is
+  // left behind. Both cases are one query and both belong here, after the
+  // three reference sites above are written: pass two of `prepare` drops a
+  // whole field's statements after their spans exist, and the observation
+  // replace at the top of this function abandons every span the last run
+  // cited and this one did not. A stranded span used to fail the parsed
+  // payload's seal outright. See `./spanSweep.ts` for the eight places a span
+  // can be referenced from and why the check is a whitelist.
+  await sweepUnreferencedExtractionSpans(client, {
+    spaceId: loaded.spaceId,
+    sourceTextVersionId: loaded.sourceTextVersionId,
+  });
 
   // The previous run's open items go before this run's are written, so the
   // queue shows what is wrong now rather than everything that has ever been

@@ -23,6 +23,7 @@ export {
   reloadPrincipal,
   principalFromApiKey,
   principalRef,
+  principalMaxSensitivity,
   webPrincipal,
   hasNoOAuthLifecycle,
   // Personal space bootstrap and write destination.
@@ -91,6 +92,7 @@ export {
   requireMcpPrincipal,
   revoke as revokeApiKey,
   update as updateApiKey,
+  setMaxSensitivity as setApiKeyMaxSensitivity,
   validateApiKeyName,
   validateApiKeyScopes,
   type ApiKeySummary,

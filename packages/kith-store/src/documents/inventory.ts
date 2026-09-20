@@ -20,6 +20,10 @@ import {
   keysetCursorColumn,
   keysetCursorPredicate,
 } from "../keyset.js";
+import {
+  applyCeiling,
+  type SensitivityLevel,
+} from "../sensitivity/model.js";
 import { spacePredicate } from "../spaces.js";
 import { camelizeSourceInventory, type SourceInventoryExclusionReason, type SourceInventoryRow } from "../provenance/rows.js";
 import { sha256Utf8 } from "../provenance/sql.js";
@@ -378,6 +382,17 @@ export async function listInventory(
   client: ClientBase,
   authorizedSpaceIds: readonly string[],
   args: InventoryListArgs,
+  /**
+   * SENS-1. The reading credential's ceiling. Omitted, or `restricted`, is no
+   * withholding and no extra query -- the state of every credential the owner
+   * has not deliberately narrowed.
+   *
+   * An inventory row names a file: its name, its folder and its size. That is
+   * enough to tell a narrowed client that "2024 Tax Return.pdf" exists in a
+   * folder it was not allowed to search, so it is filtered on the same rule as
+   * the document itself.
+   */
+  ceiling: SensitivityLevel = "restricted",
 ) {
   const limit = boundedLimit(args.limit);
   const filterCount = [args.fileName, args.folderPath, args.exclusionReason, args.duplicateGroupId].filter(
@@ -445,11 +460,26 @@ export async function listInventory(
 
   const counts = await inventoryScopeCounts(client, account.space_id as string, account.id as string, args);
 
+  // SENS-1. Filtered on the raw rows, before projection: `source_item_id` is
+  // on the row and deliberately not on the projection, so this is the last
+  // point at which the grain the ceiling needs still exists. `counts` is left
+  // alone -- it is a total over the account, not a list of files, and
+  // recomputing it per ceiling would cost a second scan to hide a number that
+  // names nothing.
+  const gated = await applyCeiling(
+    client,
+    pageRows,
+    (row) => (row.source_item_id as string | null) ?? null,
+    ceiling,
+    "sourceItem",
+  );
+
   return {
-    rows: pageRows.map((row) => projectInventoryRow(camelizeSourceInventory(row))),
+    rows: gated.visible.map((row) => projectInventoryRow(camelizeSourceInventory(row))),
     cursor,
     isDone,
     counts,
+    withheld: gated.withheld,
   };
 }
 

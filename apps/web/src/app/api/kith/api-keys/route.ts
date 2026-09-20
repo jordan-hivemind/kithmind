@@ -22,6 +22,14 @@ import {
 
 const CAPABILITIES: readonly Capability[] = ["read", "write", "ingest"];
 
+/** SENS-1. The closed ceiling set, in the same shape as `CAPABILITIES`. */
+type SensitivityChoice = "normal" | "sensitive" | "restricted";
+const SENSITIVITY_CHOICES: readonly SensitivityChoice[] = [
+  "normal",
+  "sensitive",
+  "restricted",
+];
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -78,7 +86,23 @@ export async function POST(request: Request): Promise<Response> {
     const spaceIds = stringArray(body.spaceIds);
     const capabilities = capabilityArray(body.capabilities);
     const sourceAccountIds = stringArray(body.sourceAccountIds) ?? [];
-    if (name === null || spaceIds === null || capabilities === null) {
+    // SENS-1. Narrowed to the closed set here; absent is `restricted`, which
+    // is the store's own default and means the key withholds nothing. An
+    // unrecognised string is a bad request rather than a silent fallback:
+    // guessing which ceiling the owner meant is the one thing this must not
+    // do in either direction.
+    const maxSensitivity =
+      body.maxSensitivity === undefined
+        ? undefined
+        : SENSITIVITY_CHOICES.includes(body.maxSensitivity as SensitivityChoice)
+          ? (body.maxSensitivity as SensitivityChoice)
+          : null;
+    if (
+      name === null ||
+      spaceIds === null ||
+      capabilities === null ||
+      maxSensitivity === null
+    ) {
       return problem(400, "Invalid request");
     }
     // The service validates every capability and space against the
@@ -90,6 +114,7 @@ export async function POST(request: Request): Promise<Response> {
       capabilities,
       spaceIds,
       sourceAccountIds,
+      ...(maxSensitivity === undefined ? {} : { maxSensitivity }),
     });
     return noStoreJson(created, 201);
   });
