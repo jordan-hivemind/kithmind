@@ -732,8 +732,17 @@ export function mapLedger(
   return { drafts, skipped };
 }
 
-/** Whether the sheet's own USD figure and the converted one agree. */
-function checkRate(
+/**
+ * Whether the sheet's own USD figure and the converted one agree.
+ *
+ * Exported for `rate-tolerance-parity.test.ts`, which runs this and the
+ * store's `amountMatches` over one shared table of cases. The two are
+ * separate implementations of the same rule -- this module is loaded into the
+ * browser bundle and cannot import `@repo/kith-store` -- and a cross-currency
+ * capital call the importer accepts and the matcher rejects, or the reverse,
+ * is a disagreement about the owner's money that nothing else would catch.
+ */
+export function checkRate(
   sheetUsd: string,
   convertedUsd: string,
 ): NonNullable<LedgerDraft["rateCheck"]> {
@@ -953,6 +962,21 @@ export type EntryBody = {
   currency: string;
   exchangeRate?: string;
   note?: string;
+  /**
+   * True when `entryDate` is this import's own estimate rather than a date
+   * the sheet states (ADM-8b, slice 1b).
+   *
+   * Only rule 3's fallback sets it: a Summary row with a Committed amount and
+   * no Docs Signed date, dated at the investment's earliest Ledger entry. A
+   * Ledger row is never marked, because a Ledger row without a parsable date
+   * is skipped rather than estimated.
+   *
+   * It is what lets a matched `investment_agreement` later replace the date
+   * with the one the agreement actually states. Without it the store defaults
+   * to false and the date is treated as the owner's own, which is the safe
+   * side of the same rule.
+   */
+  dateIsEstimated?: boolean;
   importKey: string;
 };
 
@@ -1088,9 +1112,18 @@ export function planImport(preview: ImportPreview): ImportPlan {
       amount: investment.committed,
       currency: "USD",
       importKey: investment.importKey,
-      // The schema has no boolean for this; the note is where "estimated"
-      // fits without a migration.
-      ...(estimated ? { note: "date estimated from first payment" } : {}),
+      // Two things, and they say different halves of the same fact. The
+      // boolean is the marker the store reads (`date_is_estimated`, migration
+      // 033): it is what allows a matched agreement to correct this date
+      // later. The note says HOW it was estimated, which the boolean cannot
+      // carry and which the owner reads in the drawer. Neither replaces the
+      // other, so both are sent.
+      ...(estimated
+        ? {
+            dateIsEstimated: true,
+            note: "date estimated from first payment",
+          }
+        : {}),
     };
     pushEntry(operations, invalid, {
       key: body.importKey,

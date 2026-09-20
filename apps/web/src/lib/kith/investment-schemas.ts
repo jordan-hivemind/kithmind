@@ -108,6 +108,17 @@ export const createEntrySchema = z
     exchangeRate: rateSchema.nullish(),
     note: z.string().min(1).max(4_000).nullish(),
     documentId: kithIdSchema.nullish(),
+    /**
+     * True when `entryDate` is an estimate rather than a date anything
+     * states (ADM-8b, slice 1b).
+     *
+     * Absent means false, which is what makes this safe to add: every caller
+     * that does not send it -- the drawer as it stands, an older client --
+     * creates an entry whose date is the owner's own and that no document may
+     * rewrite. The import sends it for a commitment it dated from the
+     * investment's first payment.
+     */
+    dateIsEstimated: z.boolean().optional(),
     importKey: z.string().min(1).max(512).nullish(),
   })
   .refine(negativeOnlyForCommitmentChange, { message: NEGATIVE_MESSAGE });
@@ -122,6 +133,9 @@ export const patchEntrySchema = z
     exchangeRate: rateSchema.nullish(),
     note: z.string().min(1).max(4_000).nullish(),
     documentId: kithIdSchema.nullish(),
+    /** Absent beside a new `entryDate` clears the marker: typing a date is
+     * how the owner states one. See `updateInvestmentEntry`. */
+    dateIsEstimated: z.boolean().optional(),
   })
   .refine(negativeOnlyForCommitmentChange, { message: NEGATIVE_MESSAGE });
 

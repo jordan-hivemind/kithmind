@@ -45,6 +45,11 @@ export type EntryDraft = {
   exchangeRate: string;
   note: string;
   documentId: string | null;
+  /** True when `entryDate` is an estimate rather than a stated date
+   * (ADM-8b). No control renders it yet -- the pills and the tick box are
+   * slice 4 -- but it is carried so the value round trips through an edit
+   * instead of being dropped and re-defaulted to false. */
+  dateIsEstimated: boolean;
 };
 
 const ENTRY_TYPE_LABELS: Record<admin.InvestmentEntryType, string> = {
@@ -73,6 +78,7 @@ export function emptyEntry(investmentId: string): EntryDraft {
     exchangeRate: "",
     note: "",
     documentId: null,
+    dateIsEstimated: false,
   };
 }
 

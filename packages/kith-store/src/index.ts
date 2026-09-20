@@ -363,6 +363,13 @@ export async function grantProofAppRole(
   // the one new table this slice adds.
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.attention_mutes TO "${appRole}"`);
+  // Investment document matching (ADM-8b, migration 033). One new table.
+  // `investment_entries` and `corrections` are already granted above with the
+  // admin panel, and the date rule writes both of them through this same
+  // credential. No new function, so there is no EXECUTE grant to forget --
+  // the one trap `kith.sensitivity_rank` fell into below.
+  await owner.query(`GRANT INSERT, UPDATE, DELETE ON
+    kith.investment_document_links TO "${appRole}"`);
   // The change feed (migration 023) is deliberately not in the list above.
   //
   // Nothing in the application writes `kith.changes`: rows arrive only through
