@@ -13,8 +13,11 @@
 
 import type { FinanceAccountInventoryRecord } from "@repo/finance-contract";
 
-/** Fresh, stale or empty: the three things a statement archive can be. */
-export type InstitutionStatus = "fresh" | "stale" | "empty";
+/**
+ * What a statement archive can be: holding nothing, gone quiet (closed or
+ * dormant, nothing to file), live but behind on statements, or current.
+ */
+export type InstitutionStatus = "fresh" | "stale" | "inactive" | "empty";
 
 /**
  * A statement is filed monthly or quarterly, so an archive whose latest
@@ -23,7 +26,21 @@ export type InstitutionStatus = "fresh" | "stale" | "empty";
  * `attention`, and deliberately the same number in both places.
  */
 const STALE_AFTER_DAYS = 45;
+/**
+ * An account with no activity of any kind for this long is not waiting on a
+ * statement, it has stopped. A quarter plus a month's lag, and the same number
+ * the health screen uses for a statement that was never filed.
+ */
+const INACTIVE_AFTER_DAYS = 100;
 const DAY = 24 * 60 * 60 * 1000;
+
+/** The owner's own values for an account, from `kith.finance_account_overrides`. */
+export type AccountOverrideValues = {
+  displayName: string | null;
+  accountLast4: string | null;
+  accountType: string | null;
+  closed: boolean;
+};
 
 export type InstitutionRow = {
   /** Unique across the table: an institution name, or an account id. */
@@ -47,17 +64,57 @@ export type InstitutionRow = {
   activityTo: string | null;
   latestSnapshotAsOf: string | null;
   openReviews: number;
+  /** The account's latest reported value in `currentValueCurrency`, dated
+   * `currentValueAsOf`. On a group: the sum of its active accounts, and null
+   * when those span currencies, because no total crosses currencies. */
+  currentValue: number | null;
+  currentValueCurrency: string | null;
+  currentValueAsOf: string | null;
+  /** What the archive itself says, and the owner's override of it. On an
+   * account row only: the edit panel shows the first as what clearing the
+   * second returns to. */
+  archive: {
+    name: string;
+    accountLast4: string | null;
+    accountType: string | null;
+  } | null;
+  override: AccountOverrideValues | null;
+  /** Why the last four are missing, in the reader's words. Null when shown,
+   * and on a group row. */
+  last4Reason: string | null;
   status: InstitutionStatus;
   /** The age behind the status, for the tooltip. Null when there is none. */
   statusDetail: string | null;
   children?: InstitutionRow[];
 };
 
+/**
+ * Morgan Stanley's site labels accounts "<Category>: <AccountType>". Its "BDA"
+ * type code sits on every investment, trust and retirement account, so it
+ * tells one account from another no better than nothing does and is dropped.
+ */
+const BDA_SUFFIX = /:\s*BDA$/i;
+
 /** The archive's account name, without substituting an identifier for it. */
 export function friendlyAccountName(
   account: FinanceAccountInventoryRecord["account"],
 ): string {
-  return account.displayLabel?.trim() || "Unlabeled account";
+  const name = account.displayLabel?.trim().replace(BDA_SUFFIX, "");
+  return name || "Unlabeled account";
+}
+
+const LAST4_REASON = {
+  not_reported: "No statement has printed this account's number yet",
+  ambiguous_aliases: "Statements print conflicting numbers for this account",
+  unsupported_value: "A statement printed a number in a format we don't read",
+} as const;
+
+function last4Reason(
+  account: FinanceAccountInventoryRecord["account"],
+): string | null {
+  if (account.accountLast4 !== undefined) return null;
+  const found = account.disclosures.find((item) => item.field === "accountLast4");
+  return found === undefined ? null : LAST4_REASON[found.reason];
 }
 
 function ageDays(asOf: string | null, now: number): number | null {
@@ -70,8 +127,18 @@ export function freshness(
   latestSnapshotAsOf: string | null,
   hasContent: boolean,
   now: number,
+  activityTo: string | null,
+  closed = false,
 ): { status: InstitutionStatus; statusDetail: string | null } {
   if (!hasContent) return { status: "empty", statusDetail: null };
+  if (closed) return { status: "inactive", statusDetail: "marked closed" };
+  const quiet = ageDays(activityTo, now);
+  if (quiet !== null && quiet > INACTIVE_AFTER_DAYS) {
+    return {
+      status: "inactive",
+      statusDetail: `no activity since ${activityTo}, ${quiet} days ago`,
+    };
+  }
   const age = ageDays(latestSnapshotAsOf, now);
   if (age === null) {
     // Records but no snapshot: a cash account has balances and transactions
@@ -80,7 +147,7 @@ export function freshness(
   }
   return {
     status: age > STALE_AFTER_DAYS ? "stale" : "fresh",
-    statusDetail: `latest snapshot ${latestSnapshotAsOf}, ${age}d old`,
+    statusDetail: `latest holdings statement ${latestSnapshotAsOf}, ${age} days ago`,
   };
 }
 
@@ -108,17 +175,36 @@ function later(left: string | null, right: string | null): string | null {
 export function groupInstitutions(
   records: readonly FinanceAccountInventoryRecord[],
   now: number,
+  overrides: ReadonlyMap<string, AccountOverrideValues> = new Map(),
 ): InstitutionRow[] {
   const groups = new Map<string, InstitutionRow>();
   for (const record of records) {
     const hasContent = record.statementCount + record.recordCount > 0;
+    const override = overrides.get(record.account.accountId) ?? null;
+    const archiveName = friendlyAccountName(record.account);
+    const shownName = override?.displayName ?? archiveName;
+    const accountLast4 =
+      override?.accountLast4 ?? record.account.accountLast4 ?? null;
     const child: InstitutionRow = {
       id: record.account.accountId,
-      name: friendlyAccountName(record.account),
+      name: shownName,
       institutionName: record.account.institutionName,
-      accountName: friendlyAccountName(record.account),
-      accountLast4: record.account.accountLast4 ?? null,
-      accountType: record.account.accountType ?? null,
+      accountName: shownName,
+      accountLast4,
+      archive: {
+        name: archiveName,
+        accountLast4: record.account.accountLast4 ?? null,
+        accountType: record.account.accountType ?? null,
+      },
+      override,
+      last4Reason: accountLast4 === null ? last4Reason(record.account) : null,
+      currentValue:
+        record.currentValue === undefined
+          ? null
+          : Number(record.currentValue.value.decimal),
+      currentValueCurrency: record.currentValue?.value.currency ?? null,
+      currentValueAsOf: record.currentValue?.asOf ?? null,
+      accountType: override?.accountType ?? record.account.accountType ?? null,
       accounts: null,
       statements: record.statementCount,
       records: record.recordCount,
@@ -126,7 +212,13 @@ export function groupInstitutions(
       activityTo: record.activityTo ?? null,
       latestSnapshotAsOf: record.latestSnapshotAsOf ?? null,
       openReviews: record.openReviewCount,
-      ...freshness(record.latestSnapshotAsOf ?? null, hasContent, now),
+      ...freshness(
+        record.latestSnapshotAsOf ?? null,
+        hasContent,
+        now,
+        record.activityTo ?? null,
+        override?.closed === true,
+      ),
     };
     const name = record.account.institutionName;
     const group = groups.get(name) ?? {
@@ -135,6 +227,12 @@ export function groupInstitutions(
       institutionName: name,
       accountName: null,
       accountLast4: null,
+      archive: null,
+      override: null,
+      last4Reason: null,
+      currentValue: null,
+      currentValueCurrency: null,
+      currentValueAsOf: null,
       accountType: null,
       accounts: 0,
       statements: 0,
@@ -161,7 +259,11 @@ export function groupInstitutions(
     groups.set(name, group);
   }
   return [...groups.values()]
-    .map((group) => ({ ...group, ...groupFreshness(group) }))
+    .map((group) => ({
+      ...group,
+      ...groupFreshness(group),
+      ...groupValue(group),
+    }))
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
@@ -195,13 +297,16 @@ function groupFreshness(group: InstitutionRow): {
     const oldest = stale[0]!;
     return {
       status: "stale",
-      statusDetail: `${stale.length} stale, oldest ${oldest.name} ${
+      statusDetail: `${stale.length} stale, oldest ${oldest.name} (${
         oldest.statusDetail ?? ""
-      }`.trim(),
+      })`,
     };
   }
   if (children.every((child) => child.status === "empty")) {
     return { status: "empty", statusDetail: null };
+  }
+  if (children.every((child) => child.status !== "fresh")) {
+    return { status: "inactive", statusDetail: "no recent activity" };
   }
   return {
     status: "fresh",
@@ -209,5 +314,32 @@ function groupFreshness(group: InstitutionRow): {
       group.latestSnapshotAsOf === null
         ? "no snapshot"
         : `latest snapshot ${group.latestSnapshotAsOf}`,
+  };
+}
+
+/**
+ * The sum of a group's accounts' values. An inactive account is left out: its
+ * last figure is the day it went quiet, which is not what the institution is
+ * worth now. Its own row still shows that figure, dated.
+ */
+function groupValue(group: InstitutionRow): {
+  currentValue: number | null;
+  currentValueCurrency: string | null;
+  currentValueAsOf: string | null;
+} {
+  const valued = (group.children ?? []).filter(
+    (child) => child.status !== "inactive" && child.currentValue !== null,
+  );
+  const currencies = new Set(valued.map((child) => child.currentValueCurrency));
+  if (valued.length === 0 || currencies.size !== 1) {
+    return { currentValue: null, currentValueCurrency: null, currentValueAsOf: null };
+  }
+  return {
+    currentValue: valued.reduce((sum, child) => sum + child.currentValue!, 0),
+    currentValueCurrency: valued[0]!.currentValueCurrency,
+    currentValueAsOf: valued
+      .map((child) => child.currentValueAsOf!)
+      .sort()
+      .at(-1)!,
   };
 }

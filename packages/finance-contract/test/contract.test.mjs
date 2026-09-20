@@ -706,6 +706,24 @@ describe("list_account_inventory (ADM-2)", () => {
     rejects("invalid_response", () => parseExchange(exchange));
   });
 
+  it("carries a current value with its currency and date, and refuses a malformed one", () => {
+    const parsed = parseExchange(inventory());
+    assert.deepEqual(parsed.response.items[0].currentValue, {
+      value: { decimal: "1250.5", currency: "USD" },
+      asOf: "2026-07-31",
+      source: "positions",
+    });
+    assert.equal(parsed.response.items[1].currentValue, undefined);
+
+    const badSource = inventory();
+    badSource.response.items[0].currentValue.source = "estimate";
+    rejects("invalid_response", () => parseExchange(badSource));
+
+    const extra = inventory();
+    extra.response.items[0].currentValue.note = "x";
+    rejects("invalid_response", () => parseExchange(extra));
+  });
+
   it("keeps an empty account's row, with no dates rather than invented ones", () => {
     const parsed = parseExchange(inventory());
     assert.equal(parsed.response.items.length, 2);

@@ -8,7 +8,7 @@ import { describe, expect, test } from "vitest";
 
 import {
   columnChipOptions,
-  matchesChipFilter,
+  matchesFilter,
   rowMatchesSearch,
   searchableText,
 } from "@/lib/kith/table-filters";
@@ -79,11 +79,11 @@ describe("filter chips", () => {
     expect(columnChipOptions([undefined, "", null])).toEqual([]);
   });
 
-  test("no selection shows everything; a selection is a union", () => {
-    expect(matchesChipFilter("fs", [])).toBe(true);
-    expect(matchesChipFilter("fs", ["fs", "imap"])).toBe(true);
-    expect(matchesChipFilter("gdrive", ["fs", "imap"])).toBe(false);
-    // A null cell is not matched by a chip that names a value.
-    expect(matchesChipFilter(null, ["finance"])).toBe(false);
+  test("nothing unchecked shows everything; an unchecked value hides its rows", () => {
+    expect(matchesFilter("fs", [])).toBe(true);
+    expect(matchesFilter("fs", ["imap"])).toBe(true);
+    expect(matchesFilter("imap", ["imap"])).toBe(false);
+    // An empty cell has no option to uncheck, so it always shows.
+    expect(matchesFilter(null, ["imap"])).toBe(true);
   });
 });

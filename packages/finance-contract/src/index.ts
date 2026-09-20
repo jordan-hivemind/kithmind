@@ -418,6 +418,25 @@ export type FinanceAccountInventoryRecord = {
   latestSnapshotAsOf?: string;
   /** `review_items` for this account still in the `open` status. */
   openReviewCount: number;
+  /**
+   * The account's latest reported value, in the currency it was reported in;
+   * no figure ever crosses currencies. Absent when the archive holds no
+   * balance or holding value for the account, or when its latest holdings
+   * are in more than one currency.
+   */
+  currentValue?: FinanceAccountCurrentValue;
+};
+
+/**
+ * `balance` is the latest `balances.total_value` the account has. `positions`
+ * is the sum of `positions.market_value` on its latest holdings date, used
+ * only when that date is later than any balance's. `asOf` is that date, so a
+ * closed account's last value reads as last, not current.
+ */
+export type FinanceAccountCurrentValue = {
+  value: FinanceMoney;
+  asOf: string;
+  source: "balance" | "positions";
 };
 
 export type FinanceCoverageRecord = {
@@ -2465,7 +2484,7 @@ function accountInventoryRecord(
   exact(
     input,
     ["account", "statementCount", "recordCount", "openReviewCount"],
-    ["activityFrom", "activityTo", "latestSnapshotAsOf"],
+    ["activityFrom", "activityTo", "latestSnapshotAsOf", "currentValue"],
     "invalid_response",
   );
   const count = (raw: unknown) =>
@@ -2494,11 +2513,26 @@ function accountInventoryRecord(
         latestSnapshotAsOf > activityTo))
   )
     fail("invalid_response");
+  let currentValue: FinanceAccountCurrentValue | undefined;
+  if (input.currentValue !== undefined) {
+    const raw = object(input.currentValue, "invalid_response");
+    exact(raw, ["value", "asOf", "source"], [], "invalid_response");
+    currentValue = {
+      value: money(raw.value, "invalid_response"),
+      asOf: isoDate(raw.asOf, "invalid_response"),
+      source: oneOf(
+        raw.source,
+        ["balance", "positions"] as const,
+        "invalid_response",
+      ),
+    };
+  }
   return {
     account: accountDescriptor(input.account),
     statementCount: count(input.statementCount),
     recordCount: count(input.recordCount),
     openReviewCount: count(input.openReviewCount),
+    ...(currentValue === undefined ? {} : { currentValue }),
     ...(activityFrom === undefined ? {} : { activityFrom }),
     ...(activityTo === undefined ? {} : { activityTo }),
     ...(latestSnapshotAsOf === undefined ? {} : { latestSnapshotAsOf }),

@@ -91,6 +91,7 @@ const GRANTED = Object.freeze({
   // pass. Without the grant the daemon fails with 42501 on its first link and
   // only in production, because every other test here runs as the owner.
   investmentLinks: ["investment_document_links"],
+  financeOverrides: ["finance_account_overrides"],
 });
 
 /**

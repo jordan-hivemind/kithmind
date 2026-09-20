@@ -38,6 +38,7 @@ import {
   canonicalizeFinanceDecimal,
   type FinanceAccountId,
   type FinanceAccountDescriptor,
+  type FinanceAccountCurrentValue,
   type FinanceAccountInventoryRecord,
   type FinanceAggregateRecord,
   type FinanceBalanceRecord,
@@ -1145,7 +1146,57 @@ type AccountInventoryRow = AccountDescriptorRow & {
   activity_to: string | null;
   latest_snapshot_as_of: string | null;
   open_review_count: string;
+  balance_as_of: string | null;
+  balance_value: string | null;
+  balance_currency: string | null;
+  balance_count: string;
+  holdings_value: string | null;
+  holdings_currency_count: string;
+  holdings_currency: string | null;
 };
+
+function currentValueOf(
+  row: AccountInventoryRow,
+  scope: ReadScope,
+): FinanceAccountCurrentValue | null {
+  const balance =
+    row.balance_as_of === null || row.balance_count !== "1"
+      ? null
+      : {
+          asOf: row.balance_as_of,
+          amount: decimalOrNull(row.balance_value, scope),
+          currency: currencyOrNull(row.balance_currency, scope),
+          source: "balance" as const,
+        };
+  const holdings =
+    row.holdings_value === null || row.holdings_currency_count !== "1"
+      ? null
+      : {
+          asOf: row.latest_snapshot_as_of,
+          amount: decimalOrNull(row.holdings_value, scope),
+          currency: currencyOrNull(row.holdings_currency, scope),
+          source: "positions" as const,
+        };
+  // A balance wins a tie: it is the statement's own total.
+  const chosen =
+    holdings !== null &&
+    holdings.asOf !== null &&
+    (balance === null || holdings.asOf > balance.asOf)
+      ? holdings
+      : balance;
+  if (
+    chosen === null ||
+    chosen.asOf === null ||
+    chosen.amount === null ||
+    chosen.currency === null
+  )
+    return null;
+  return {
+    value: { decimal: chosen.amount, currency: chosen.currency },
+    asOf: chosen.asOf,
+    source: chosen.source,
+  };
+}
 
 /**
  * ADM-2: one page of per-account inventory counts.
@@ -1154,13 +1205,21 @@ type AccountInventoryRow = AccountDescriptorRow & {
  * unchanged, so an account is identified and disclosed here exactly as
  * `list_accounts` identifies and discloses it, and the last-four rules are not
  * reimplemented. What is added is five aggregates, and nothing else about the
- * account's contents: no amount, no instrument, no description. An inventory
- * screen asks how much is held, not what is in it.
+ * account's contents: no instrument, no description, and one figure, its
+ * current value. An inventory screen asks how much is held and worth, not what
+ * is in it.
  *
  * `activity_from`/`activity_to` span all three record kinds because a cash
  * account has balances and no positions and a brokerage account has both, and
  * an inventory row that reported only one kind's range would say an account was
  * emptier than it is.
+ *
+ * `currentValue` is the latest balance's total, or the sum of market values on
+ * the latest holdings date when that date is later; see
+ * `FinanceAccountCurrentValue`. ponytail: several balances on the latest date
+ * (say one per currency) or holdings in several currencies give no value,
+ * rather than a pick or a total that crosses currencies. Upgrade path if that
+ * turns up in real data: report a value per currency.
  *
  * ponytail: correlated subqueries, one set per account row on the page, rather
  * than five grouped joins. The page is at most 100 accounts and each subquery
@@ -1197,8 +1256,35 @@ async function listAccountInventory(
               WHERE p.account_id = d.account_id)::text AS latest_snapshot_as_of,
             (SELECT count(*) FROM review_items r
               WHERE r.account_id = d.account_id
-                AND r.status = 'open')::text AS open_review_count
+                AND r.status = 'open')::text AS open_review_count,
+            lb.as_of::text AS balance_as_of,
+            lb.total_value::text AS balance_value,
+            lb.currency::text AS balance_currency,
+            coalesce(lb.n, 0)::text AS balance_count,
+            hv.value::text AS holdings_value,
+            coalesce(hv.currency_count, 0)::text AS holdings_currency_count,
+            hv.currency::text AS holdings_currency
        FROM account_descriptors d
+       LEFT JOIN LATERAL (
+         SELECT b.as_of, count(*) AS n, min(b.total_value) AS total_value,
+                min(b.currency::text) AS currency
+           FROM balances b
+          WHERE b.account_id = d.account_id AND b.total_value IS NOT NULL
+            AND b.as_of = (SELECT max(x.as_of) FROM balances x
+                            WHERE x.account_id = d.account_id
+                              AND x.total_value IS NOT NULL)
+          GROUP BY b.as_of
+       ) lb ON true
+       LEFT JOIN LATERAL (
+         SELECT sum(p.market_value) AS value,
+                count(DISTINCT p.currency) AS currency_count,
+                min(p.currency::text) AS currency
+           FROM positions p
+          WHERE p.account_id = d.account_id
+            AND p.as_of = (SELECT max(q.as_of) FROM positions q
+                            WHERE q.account_id = d.account_id)
+            AND p.market_value IS NOT NULL
+       ) hv ON true
       WHERE ($1::text IS NULL OR d.account_id > $1)
       ORDER BY d.account_id
       LIMIT $2`,
@@ -1210,6 +1296,7 @@ async function listAccountInventory(
     // account with rows of one kind only still has both, and an account with
     // no rows at all has neither.
     const ranged = row.activity_from !== null && row.activity_to !== null;
+    const currentValue = currentValueOf(row, scope);
     return {
       account: accountDescriptorOf(row, scope),
       statementCount: Number(row.statement_count),
@@ -1221,6 +1308,7 @@ async function listAccountInventory(
       ...(ranged && row.latest_snapshot_as_of !== null
         ? { latestSnapshotAsOf: row.latest_snapshot_as_of }
         : {}),
+      ...(currentValue === null ? {} : { currentValue }),
     };
   });
   const truncated = result.rows.length > request.limit;

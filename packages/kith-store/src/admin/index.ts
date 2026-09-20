@@ -4,6 +4,7 @@
 // for the attention queue (ADM-8a), and `linkScoring.ts` with
 // `investmentLinks.ts` for investment document matching (ADM-8b).
 
+export * from "./accountOverrides.js";
 export * from "./areas.js";
 export * from "./attention.js";
 export * from "./changes.js";

@@ -12,8 +12,9 @@
 // MCP gateway -- `resolveFinanceArchive` plus `readFinanceArchive`, which
 // re-authorizes the request against the archive's own pinned space -- and
 // never by widening the kith pool's credentials. `readAccountInventory` below
-// is the only new call, and it is a read of counts: no amount, no instrument,
-// no description, and no full account number exists in the archive to return.
+// is the only new call, and it is a read of counts and one figure per account,
+// its current value: no instrument, no description, and no full account number
+// exists in the archive to return.
 
 import {
   type FinanceAccountInventoryRecord,
@@ -209,17 +210,28 @@ export async function loadInstitutions(
 ): Promise<InstitutionsPageData | null> {
   const loaded = await loadAuthenticatedPage(
     cookieHeader,
-    async ({ ctx, principal }) => ({
-      principal,
-      spaces: await administeredSpaces(ctx, principal),
-    }),
+    async ({ ctx, principal }) => {
+      const spaces = await administeredSpaces(ctx, principal);
+      // The owner's edits to account names and the like live beside the
+      // archive, in the archive's own space.
+      const archiveSpace = resolveFinanceArchive()?.spaceId;
+      const overrides =
+        archiveSpace !== undefined && spaces.includes(archiveSpace)
+          ? await admin.listAccountOverrides(ctx, { spaceId: archiveSpace })
+          : [];
+      return { principal, spaces, overrides };
+    },
   );
   if (loaded === null) return null;
   const inventory = await archiveInventory(loaded.principal, loaded.spaces);
   return {
     institutions:
       inventory.state === "read"
-        ? groupInstitutions(inventory.records, now)
+        ? groupInstitutions(
+            inventory.records,
+            now,
+            new Map(loaded.overrides.map((item) => [item.accountId, item])),
+          )
         : [],
     state: inventory.state,
     reason: inventory.state === "unavailable" ? inventory.reason : null,

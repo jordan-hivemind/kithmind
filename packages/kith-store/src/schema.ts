@@ -256,6 +256,14 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
       import.meta.url,
     ),
   },
+  {
+    version: 34,
+    name: "finance account overrides: the owner's name, last four, type and closed flag over the archive's (ADM-2b)",
+    url: new URL(
+      "../migrations/034_finance_account_overrides.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

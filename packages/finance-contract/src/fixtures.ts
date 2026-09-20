@@ -418,6 +418,11 @@ export const syntheticFinanceReadExchanges = [
           activityTo: "2026-07-31",
           latestSnapshotAsOf: "2026-07-31",
           openReviewCount: 0,
+          currentValue: {
+            value: { decimal: "1250.5", currency: "USD" },
+            asOf: "2026-07-31",
+            source: "positions",
+          },
         },
         // An account the archive has nothing for: counted, never omitted, and
         // with no dates to report rather than invented ones.

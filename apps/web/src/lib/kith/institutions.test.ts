@@ -45,23 +45,174 @@ describe("account names stay separate from identifiers", () => {
   });
 });
 
+describe("last four", () => {
+  test("Morgan Stanley's BDA type code is dropped from the name", () => {
+    expect(
+      friendlyAccountName(account({ displayLabel: "Investments: BDA" })),
+    ).toBe("Investments");
+    expect(
+      friendlyAccountName(account({ displayLabel: "Other Loans: SBL" })),
+    ).toBe("Other Loans: SBL");
+  });
+
+  test("a missing last four says why, a present one says nothing", () => {
+    const rows = groupInstitutions(
+      [
+        record({
+          account: account({
+            accountId: "a",
+            disclosures: [{ field: "accountLast4", reason: "not_reported" }],
+          }),
+        }),
+        record({ account: account({ accountId: "b", accountLast4: "1234" }) }),
+      ],
+      NOW,
+    )[0]!.children!;
+    expect(rows[0]!.last4Reason).toMatch(/No statement has printed/);
+    expect(rows[1]!.last4Reason).toBeNull();
+  });
+});
+
 describe("freshness", () => {
   test("nothing held is empty, not stale", () => {
-    expect(freshness("2020-01-01", false, NOW).status).toBe("empty");
+    expect(freshness("2020-01-01", false, NOW, null).status).toBe("empty");
   });
 
   test("records with no snapshot are fresh: a cash account has none", () => {
-    expect(freshness(null, true, NOW)).toEqual({
+    expect(freshness(null, true, NOW, "2026-08-31")).toEqual({
       status: "fresh",
       statusDetail: "no snapshot",
     });
   });
 
   test("a snapshot past the statement interval is stale, with its age", () => {
-    expect(freshness("2026-09-01", true, NOW).status).toBe("fresh");
-    const stale = freshness("2026-06-01", true, NOW);
+    expect(freshness("2026-09-01", true, NOW, "2026-09-01").status).toBe("fresh");
+    const stale = freshness("2026-06-01", true, NOW, "2026-08-31");
     expect(stale.status).toBe("stale");
-    expect(stale.statusDetail).toMatch(/latest snapshot 2026-06-01, 109d old/);
+    expect(stale.statusDetail).toMatch(/latest holdings statement 2026-06-01, 109 days ago/);
+  });
+});
+
+describe("the owner's overrides", () => {
+  const overrides = (values: Record<string, unknown>) =>
+    new Map([
+      [
+        "account-1",
+        {
+          displayName: null,
+          accountLast4: null,
+          accountType: null,
+          closed: false,
+          ...values,
+        },
+      ],
+    ]) as never;
+
+  test("a name, last four and type replace the archive's, which stay available", () => {
+    const [group] = groupInstitutions(
+      [record({ account: account({ displayLabel: "Investments: BDA" }) })],
+      NOW,
+      overrides({
+        displayName: "Joint brokerage",
+        accountLast4: "4321",
+        accountType: "trust",
+      }),
+    );
+    const child = group!.children![0]!;
+    expect(child.name).toBe("Joint brokerage");
+    expect(child.accountLast4).toBe("4321");
+    expect(child.accountType).toBe("trust");
+    expect(child.last4Reason).toBeNull();
+    expect(child.archive).toEqual({
+      name: "Investments",
+      accountLast4: null,
+      accountType: null,
+    });
+  });
+
+  test("closed makes an account inactive whatever its dates say, but never fills an empty one", () => {
+    const [group] = groupInstitutions(
+      [record(), record({ account: account({ accountId: "b" }), statementCount: 0, recordCount: 0 })],
+      NOW,
+      new Map([
+        ["account-1", { displayName: null, accountLast4: null, accountType: null, closed: true }],
+        ["b", { displayName: null, accountLast4: null, accountType: null, closed: true }],
+      ]) as never,
+    );
+    expect(group!.children![0]!.status).toBe("inactive");
+    expect(group!.children![0]!.statusDetail).toBe("marked closed");
+    expect(group!.children![1]!.status).toBe("empty");
+  });
+});
+
+describe("current value", () => {
+  const value = (decimal: string, currency = "USD", asOf = "2026-08-31") => ({
+    currentValue: { value: { decimal, currency }, asOf, source: "balance" },
+  });
+
+  test("a group sums its active accounts and leaves out the ones that went quiet", () => {
+    const [group] = groupInstitutions(
+      [
+        record(value("100.5")),
+        record({ account: account({ accountId: "b" }), ...value("50") }),
+        record({
+          account: account({ accountId: "c" }),
+          activityTo: "2022-12-31",
+          latestSnapshotAsOf: "2022-10-31",
+          ...value("7000", "USD", "2022-12-31"),
+        }),
+      ],
+      NOW,
+    );
+    expect(group!.currentValue).toBe(150.5);
+    expect(group!.currentValueCurrency).toBe("USD");
+    expect(group!.children![2]!.currentValue).toBe(7000);
+  });
+
+  test("a group across currencies has no total", () => {
+    const [group] = groupInstitutions(
+      [
+        record(value("100")),
+        record({ account: account({ accountId: "b" }), ...value("50", "EUR") }),
+      ],
+      NOW,
+    );
+    expect(group!.currentValue).toBeNull();
+  });
+});
+
+describe("inactive", () => {
+  test("an account with no activity for a quarter has stopped, not fallen behind", () => {
+    const quiet = freshness("2022-10-31", true, NOW, "2022-12-31");
+    expect(quiet.status).toBe("inactive");
+    expect(quiet.statusDetail).toMatch(/no activity since 2022-12-31/);
+  });
+
+  test("recent activity with an old snapshot is still stale", () => {
+    expect(freshness("2022-10-31", true, NOW, "2026-09-10").status).toBe(
+      "stale",
+    );
+  });
+
+  test("an institution of only inactive and empty accounts is inactive", () => {
+    const [group] = groupInstitutions(
+      [
+        record({
+          activityTo: "2022-12-31",
+          latestSnapshotAsOf: "2022-10-31",
+        }),
+        record({
+          account: account({ accountId: "account-2" }),
+          statementCount: 0,
+          recordCount: 0,
+          activityFrom: undefined,
+          activityTo: undefined,
+          latestSnapshotAsOf: undefined,
+        }),
+      ],
+      NOW,
+    );
+    expect(group!.status).toBe("inactive");
   });
 });
 
@@ -114,7 +265,7 @@ describe("grouping", () => {
         record({
           account: account({ accountId: "account-2", displayLabel: "IRA" }),
           activityFrom: "2020-01-01",
-          activityTo: "2024-06-30",
+          activityTo: "2026-08-31",
           latestSnapshotAsOf: "2024-06-30",
         }),
       ],

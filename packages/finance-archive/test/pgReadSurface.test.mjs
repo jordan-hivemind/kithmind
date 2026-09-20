@@ -2365,6 +2365,43 @@ test(
 // --- ADM-2: list_account_inventory -----------------------------------------
 
 test(
+  "list_account_inventory reports a current value from the latest balance or holdings, never across currencies (ADM-2)",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const snapshot = await citedSnapshot(owner, seeded);
+    const inventory = async () =>
+      (
+        await serve(r, { operation: "list_account_inventory", limit: 100 })
+      ).items.find((item) => item.account.accountId === snapshot.accountId);
+
+    // Two balances on the snapshot date (one per currency) and holdings in two
+    // currencies: no single figure the archive can stand behind.
+    assert.equal((await inventory()).currentValue, undefined);
+
+    // Holdings in one currency answer, summed on their latest date.
+    await owner.query("DELETE FROM positions WHERE currency = 'EUR'");
+    const held = await inventory();
+    assert.equal(held.currentValue.source, "positions");
+    assert.equal(held.currentValue.asOf, snapshot.asOf);
+    assert.equal(held.currentValue.value.currency, "USD");
+
+    // A balance dated after the holdings is the latest figure the archive has.
+    await owner.query(
+      `INSERT INTO balances (id, account_id, as_of, total_value, currency)
+       VALUES ('balance-later', $1, $2::date + 30, '999', 'USD')`,
+      [snapshot.accountId, snapshot.asOf],
+    );
+    const later = await inventory();
+    assert.equal(later.currentValue.source, "balance");
+    assert.deepEqual(later.currentValue.value, {
+      decimal: "999",
+      currency: "USD",
+    });
+  },
+);
+
+test(
   "list_account_inventory reports one row per account, with the counts and dates the archive actually holds (ADM-2)",
   { skip },
   async (t) => {
