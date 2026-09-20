@@ -51,6 +51,7 @@ const PASSWORD = "a strong enough password";
 type Fixture = {
   userId: string;
   keyA: string;
+  keyWriteA: string;
   keyBoth: string;
   readerUserId: string;
   readerKey: string;
@@ -67,7 +68,9 @@ describeWithDatabase("MCP investment read tools", () => {
   let databaseName: string;
   let fixture: Fixture;
 
-  async function onAdmin<T>(work: (client: pg.Client) => Promise<T>): Promise<T> {
+  async function onAdmin<T>(
+    work: (client: pg.Client) => Promise<T>,
+  ): Promise<T> {
     const client = new pg.Client({ connectionString: adminUrl });
     await client.connect();
     try {
@@ -77,7 +80,9 @@ describeWithDatabase("MCP investment read tools", () => {
     }
   }
 
-  function inTransaction<T>(work: (ctx: IdentityCtx) => Promise<T>): Promise<T> {
+  function inTransaction<T>(
+    work: (ctx: IdentityCtx) => Promise<T>,
+  ): Promise<T> {
     return withKithTransaction(pool, (client) => work(identityCtx(client)));
   }
 
@@ -156,6 +161,12 @@ describeWithDatabase("MCP investment read tools", () => {
         capabilities: ["read"],
         spaceIds: [spaceA, spaceB],
       });
+      const keyWriteA = await createApiKey(ctx, {
+        principal,
+        name: "Manage space A",
+        capabilities: ["read", "write"],
+        spaceIds: [spaceA],
+      });
 
       const writer = {
         userId: session.userId,
@@ -174,7 +185,11 @@ describeWithDatabase("MCP investment read tools", () => {
         name: "Other Space LP",
       });
       for (const entry of [
-        { entryType: "commitment", entryDate: "2023-01-10", amount: "100000.00" },
+        {
+          entryType: "commitment",
+          entryDate: "2023-01-10",
+          amount: "100000.00",
+        },
         {
           entryType: "capital_call_paid",
           entryDate: "2023-04-01",
@@ -188,7 +203,11 @@ describeWithDatabase("MCP investment read tools", () => {
           exchangeRate: "1.25",
         },
         { entryType: "fee", entryDate: "2024-01-01", amount: "500.01" },
-        { entryType: "distribution", entryDate: "2025-06-30", amount: "12345.67" },
+        {
+          entryType: "distribution",
+          entryDate: "2025-06-30",
+          amount: "12345.67",
+        },
       ] as const) {
         await admin.createInvestmentEntry(ctx, {
           principal: writer,
@@ -245,6 +264,7 @@ describeWithDatabase("MCP investment read tools", () => {
       return {
         userId: session.userId,
         keyA: keyA.id,
+        keyWriteA: keyWriteA.id,
         keyBoth: keyBoth.id,
         readerUserId: readerSession.userId,
         readerKey: readerKey.id,
@@ -394,16 +414,18 @@ describeWithDatabase("MCP investment read tools", () => {
         nameContains: "other",
       }),
     ) as { investments: { name: string }[] };
-    expect(byName.investments.map((row) => row.name)).toEqual(["Other Space LP"]);
+    expect(byName.investments.map((row) => row.name)).toEqual([
+      "Other Space LP",
+    ]);
   });
 
   test("a credential granted one space never sees the other's investment", async () => {
     const onlyA = payload(
       await call(credentialFor(fixture.keyA), "list_investments", {}),
     ) as { investments: { spaceId: string }[] };
-    expect(onlyA.investments.every((row) => row.spaceId === fixture.spaceA)).toBe(
-      true,
-    );
+    expect(
+      onlyA.investments.every((row) => row.spaceId === fixture.spaceA),
+    ).toBe(true);
 
     // Naming the ungranted space explicitly is refused, not narrowed to the
     // granted one: a silently narrowed answer would read as "space B holds no
@@ -460,6 +482,86 @@ describeWithDatabase("MCP investment read tools", () => {
     expect(detail.linkedDocumentIds).toEqual([]);
   });
 
+  test("management tools use live write and space grants, including real entry delete", async () => {
+    const readOnly = await call(
+      credentialFor(fixture.keyA),
+      "manage_investment",
+      {
+        request: {
+          action: "create",
+          spaceId: fixture.spaceA,
+          name: "Read-only attempt",
+        },
+      },
+    );
+    expect(readOnly.isError).toBe(true);
+    expect(errorText(readOnly)).toContain("Space not found");
+
+    const wrongSpace = await call(
+      credentialFor(fixture.keyWriteA),
+      "manage_investment",
+      {
+        request: {
+          action: "create",
+          spaceId: fixture.spaceB,
+          name: "Wrong-space attempt",
+        },
+      },
+    );
+    expect(wrongSpace.isError).toBe(true);
+    expect(errorText(wrongSpace)).toContain("Space not found");
+
+    const created = payload(
+      await call(credentialFor(fixture.keyWriteA), "manage_investment", {
+        request: {
+          action: "create",
+          spaceId: fixture.spaceA,
+          name: "Synthetic Managed LP",
+        },
+      }),
+    ) as { investmentId: string };
+    const entry = payload(
+      await call(credentialFor(fixture.keyWriteA), "manage_investment_entry", {
+        request: {
+          action: "create",
+          investmentId: created.investmentId,
+          entryType: "capital_call_paid",
+          entryDate: "2026-09-20",
+          amount: "1250.00",
+          currency: "USD",
+        },
+      }),
+    ) as { entryId: string };
+    expect(entry.entryId).toBeTruthy();
+
+    const deleted = await call(
+      credentialFor(fixture.keyWriteA),
+      "manage_investment_entry",
+      {
+        request: {
+          action: "delete",
+          investmentId: created.investmentId,
+          entryId: entry.entryId,
+        },
+      },
+    );
+    expect(deleted.isError).not.toBe(true);
+    const remaining = await pool.query(
+      "SELECT 1 FROM kith.investment_entries WHERE id = $1",
+      [entry.entryId],
+    );
+    expect(remaining.rowCount).toBe(0);
+
+    const capabilities = payload(
+      await call(credentialFor(fixture.keyWriteA), "get_kith_capabilities"),
+    ) as { canWrite: boolean; canIngest: boolean; toolProfile: string };
+    expect(capabilities).toMatchObject({
+      canWrite: true,
+      canIngest: false,
+      toolProfile: "full",
+    });
+  });
+
   test("a credential revoked between two calls denies on the second", async () => {
     const revoked = await inTransaction(async (ctx) => {
       const session = await signUp(ctx, {
@@ -479,7 +581,9 @@ describeWithDatabase("MCP investment read tools", () => {
     const first = await call(credential, "list_investments", {});
     expect(first.isError).not.toBe(true);
 
-    await pool.query("DELETE FROM kith.api_keys WHERE id = $1", [revoked.keyId]);
+    await pool.query("DELETE FROM kith.api_keys WHERE id = $1", [
+      revoked.keyId,
+    ]);
 
     const second = await call(credential, "list_investments", {});
     expect(second.isError).toBe(true);

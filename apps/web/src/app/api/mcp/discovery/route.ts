@@ -18,9 +18,9 @@ export async function GET() {
       type: "mcp/server",
       name: "open-brain",
       description:
-        "Personal knowledge and temporal memory layer for AI assistants. Automatically store durable context and preserve changed facts as linked history.",
+        "Authenticated personal knowledge, document and owner-data management for AI assistants, with on-demand domain help.",
       endpoint: `${baseUrl}/api/mcp`,
-      capabilities: ["tools"],
+      capabilities: ["tools", "resources"],
       // Advertise only what this deployment's profile actually registers.
       tools: resolveEnabledMcpToolNames(),
       authentication: {

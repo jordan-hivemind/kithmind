@@ -18,6 +18,19 @@ export const MCP_TOOL_NAMES = {
   captureThought: "capture_thought",
   listInvestments: "list_investments",
   getInvestment: "get_investment",
+  getKithHelp: "get_kith_help",
+  getKithCapabilities: "get_kith_capabilities",
+  listEntities: "list_entities",
+  manageEntityAliases: "manage_entity_aliases",
+  manageInvestment: "manage_investment",
+  manageInvestmentEntry: "manage_investment_entry",
+  listSupportingDocumentLinks: "list_supporting_document_links",
+  manageSupportingDocumentLink: "manage_supporting_document_link",
+  listAttention: "list_attention",
+  manageAttention: "manage_attention",
+  manageMemory: "manage_memory",
+  manageAccountDisplayOverride: "manage_account_display_override",
+  correctExtractedValue: "correct_extracted_value",
 } as const;
 
 export const MCP_TOOL_NAME_LIST = Object.values(MCP_TOOL_NAMES);

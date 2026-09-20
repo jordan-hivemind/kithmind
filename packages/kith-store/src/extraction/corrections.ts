@@ -25,7 +25,13 @@ import type { ClientBase } from "pg";
 
 import { isAttentionMuted } from "../admin/attention.js";
 import { ProofError } from "../errors.js";
-import { newKithId } from "../ids.js";
+import {
+  type Principal,
+  requireSpaceAccess,
+} from "../identity/authorization.js";
+import type { IdentityCtx } from "../identity/db.js";
+import { IdentityError } from "../identity/errors.js";
+import { assertKithId, newKithId } from "../ids.js";
 import { occurrenceSortKey } from "../records/model.js";
 import type { Occurrence } from "../records/values.js";
 import {
@@ -51,6 +57,23 @@ const OBSERVATION_VALUE_TYPES = new Set([
   "date",
   "entity",
 ]);
+
+/** Strict owner-input validation before a correction is stored. */
+export function validateOwnerCorrectionValue(value: unknown): ObservationValue {
+  const candidate = value as { type?: unknown } | null;
+  if (
+    !candidate ||
+    typeof candidate !== "object" ||
+    !OBSERVATION_VALUE_TYPES.has(candidate.type as string)
+  ) {
+    throw new IdentityError("Corrected value is invalid");
+  }
+  try {
+    return canonicalizeObservationValue(candidate as ObservationValue);
+  } catch {
+    throw new IdentityError("Corrected value is invalid");
+  }
+}
 
 export type CorrectionRow = {
   id: string;
@@ -221,6 +244,21 @@ export async function applyCorrection(
     now?: number;
   },
 ): Promise<string> {
+  return (await applyCorrectionDetailed(client, input)).id;
+}
+
+async function applyCorrectionDetailed(
+  client: ClientBase,
+  input: {
+    spaceId: string;
+    sourceItemId: string;
+    fieldName: string;
+    correctedValue: unknown;
+    actorUserId: string;
+    reason?: string;
+    now?: number;
+  },
+): Promise<{ id: string; observationWrite: number }> {
   const at = new Date(input.now ?? Date.now());
   await requireSingleTarget(client, input);
   const existing = (
@@ -255,8 +293,9 @@ export async function applyCorrection(
         JSON.stringify(original ?? null),
       ],
     );
-    await orphanIfUnapplied(client, input, await writeThrough(client, input));
-    return existing.id;
+    const observationWrite = await writeThrough(client, input);
+    await orphanIfUnapplied(client, input, observationWrite);
+    return { id: existing.id, observationWrite };
   }
   const id = newKithId();
   await client.query(
@@ -276,8 +315,69 @@ export async function applyCorrection(
       at,
     ],
   );
-  await orphanIfUnapplied(client, input, await writeThrough(client, input));
-  return id;
+  const observationWrite = await writeThrough(client, input);
+  await orphanIfUnapplied(client, input, observationWrite);
+  return { id, observationWrite };
+}
+
+/**
+ * Authenticated service wrapper for owner-facing transports. The correction
+ * target is a source-item id, because source items survive re-extraction;
+ * brain document ids do not.
+ */
+export async function applyAuthorizedCorrection(
+  ctx: IdentityCtx,
+  input: {
+    principal: Principal;
+    spaceId: string;
+    sourceItemId: string;
+    fieldName: string;
+    correctedValue: unknown;
+    reason?: string;
+  },
+): Promise<{
+  correctionId: string;
+  exactRecordStatus: "updated" | "pending_extraction" | "orphaned_list_item";
+}> {
+  const spaceId = assertKithId(input.spaceId, "invalid_space_id");
+  const sourceItemId = assertKithId(
+    input.sourceItemId,
+    "invalid_source_item_id",
+  );
+  await requireSpaceAccess(ctx, input.principal, spaceId, "write");
+  const found = await ctx.client.query(
+    "SELECT 1 FROM kith.source_items WHERE id = $1 AND space_id = $2",
+    [sourceItemId, spaceId],
+  );
+  if (found.rowCount !== 1) {
+    throw new IdentityError("Source item not found");
+  }
+  const correctedValue = validateOwnerCorrectionValue(input.correctedValue);
+  if (correctedValue.type === "entity") {
+    const entity = await ctx.client.query(
+      "SELECT 1 FROM kith.entities WHERE id = $1 AND space_id = $2",
+      [assertKithId(correctedValue.entityId, "invalid_entity_id"), spaceId],
+    );
+    if (entity.rowCount !== 1) throw new IdentityError("Entity not found");
+  }
+  const result = await applyCorrectionDetailed(ctx.client, {
+    spaceId,
+    sourceItemId,
+    fieldName: input.fieldName,
+    correctedValue,
+    actorUserId: input.principal.userId,
+    reason: input.reason,
+    now: ctx.now,
+  });
+  return {
+    correctionId: result.id,
+    exactRecordStatus:
+      result.observationWrite > 0
+        ? "updated"
+        : result.observationWrite < 0
+          ? "orphaned_list_item"
+          : "pending_extraction",
+  };
 }
 
 /**
@@ -619,7 +719,8 @@ export async function resolvedCorrections(
   ).rows;
   const settled = new Map<string, unknown>();
   for (const row of rows) {
-    if (row.field_name !== null) settled.set(row.field_name, row.corrected_value);
+    if (row.field_name !== null)
+      settled.set(row.field_name, row.corrected_value);
   }
   return settled;
 }
