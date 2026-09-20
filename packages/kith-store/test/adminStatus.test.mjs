@@ -166,6 +166,9 @@ test("a refused pass is a problem even while the heartbeat is current", () => {
   for (const code of [
     "root_selection_would_retire_items",
     "root_contents_collapsed",
+    // ADM-6a. The one that does not clear itself, so the least forgivable to
+    // leave off this list.
+    "journal_behind_server",
   ]) {
     const checks = deriveHealthChecks(
       facts({

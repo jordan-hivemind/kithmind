@@ -120,18 +120,23 @@ export function countsLine(
 }
 
 /**
- * ADM-9. The two client-side circuit breakers PR #313 added to the watcher.
+ * ADM-9. The client-side circuit breakers PR #313 added to the watcher.
  *
  * A pass that trips one of these ends `incomplete` and writes no scan at all,
  * on purpose: neither a config mistake nor a half-synced folder may mark
  * documents unavailable. That is the right refusal and the wrong silence --
  * the owner has to go and fix something, and until they do the watcher is
- * reading nothing. So either code is a problem on sight, without waiting for
- * a second pass to agree.
+ * reading nothing. So any of these codes is a problem on sight, without
+ * waiting for a second pass to agree.
+ *
+ * ADM-6a added the third. It is the one that cannot clear itself: the other
+ * two end when the folder comes back, this one ends when someone gives the
+ * watcher this source's own journal.
  */
 export const PASS_BREAKER_CODES: readonly string[] = [
   "root_selection_would_retire_items",
   "root_contents_collapsed",
+  "journal_behind_server",
 ];
 
 /**
