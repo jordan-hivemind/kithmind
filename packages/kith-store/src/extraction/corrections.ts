@@ -24,6 +24,7 @@
 import type { ClientBase } from "pg";
 
 import { isAttentionMuted } from "../admin/attention.js";
+import { scheduleInvestmentLinkForExtraction } from "../admin/investmentLinkWork.js";
 import { ProofError } from "../errors.js";
 import {
   type Principal,
@@ -338,6 +339,7 @@ export async function applyAuthorizedCorrection(
 ): Promise<{
   correctionId: string;
   exactRecordStatus: "updated" | "pending_extraction" | "orphaned_list_item";
+  investmentLinkRefreshQueued: boolean;
 }> {
   const spaceId = assertKithId(input.spaceId, "invalid_space_id");
   const sourceItemId = assertKithId(
@@ -345,8 +347,11 @@ export async function applyAuthorizedCorrection(
     "invalid_source_item_id",
   );
   await requireSpaceAccess(ctx, input.principal, spaceId, "write");
-  const found = await ctx.client.query(
-    "SELECT 1 FROM kith.source_items WHERE id = $1 AND space_id = $2",
+  const found = await ctx.client.query<{ kind: string | null }>(
+    `SELECT de.kind FROM kith.source_items si
+       LEFT JOIN kith.document_extractions de
+         ON de.space_id = si.space_id AND de.source_item_id = si.id
+      WHERE si.id = $1 AND si.space_id = $2`,
     [sourceItemId, spaceId],
   );
   if (found.rowCount !== 1) {
@@ -369,6 +374,14 @@ export async function applyAuthorizedCorrection(
     reason: input.reason,
     now: ctx.now,
   });
+  const investmentLinkRefresh =
+    result.observationWrite > 0
+      ? await scheduleInvestmentLinkForExtraction(ctx, {
+          spaceId,
+          sourceItemId,
+          kind: found.rows[0]?.kind ?? null,
+        })
+      : null;
   return {
     correctionId: result.id,
     exactRecordStatus:
@@ -377,6 +390,7 @@ export async function applyAuthorizedCorrection(
         : result.observationWrite < 0
           ? "orphaned_list_item"
           : "pending_extraction",
+    investmentLinkRefreshQueued: investmentLinkRefresh !== null,
   };
 }
 

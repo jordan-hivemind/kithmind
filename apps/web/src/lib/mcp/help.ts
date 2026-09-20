@@ -72,7 +72,7 @@ accountId is the finance archive's opaque account ID. It is not an entityId, inv
 
   corrections: `correct_extracted_value records an owner correction and tries to write the validated value through to exact query records. It requires spaceId, stable sourceItemId, one observation fieldName, and a typed ObservationValue. It never accepts a Brain documentId as the target.
 
-exactRecordStatus updated means query_records was updated now. pending_extraction means the correction is stored but there is no compatible current observation yet. orphaned_list_item means a list line key no longer exists; the correction is stored and an attention item is opened, so do not claim the exact data is fixed. A bare list field cannot be corrected because it names multiple observations.
+exactRecordStatus updated means query_records was updated now. pending_extraction means the correction is stored but there is no compatible current observation yet. orphaned_list_item means a list line key no longer exists; the correction is stored and an attention item is opened, so do not claim the exact data is fixed. investmentLinkRefreshQueued reports whether supporting-document matching was queued from an applied correction. A bare list field cannot be corrected because it names multiple observations.
 
 Example money correction: {"spaceId":"<spaceId>","sourceItemId":"<sourceItemId>","fieldName":"amount_due","correctedValue":{"type":"money","amount":"1250.00","currency":"USD"},"reason":"Owner correction"}. Date values use {"type":"date","value":"2026-09-20","precision":"day"}.
 
