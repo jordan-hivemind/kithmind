@@ -523,15 +523,17 @@ test("a citation outside the page is a named failure, not a wrong fact", { skip 
     }),
     ids,
   );
-  assert.equal(outcome.stored, 1);
+  assert.equal(outcome.stored, 2);
   // A page the document does not have is its own reason, so the counts can
   // tell "we number pages differently" from "that line id is off the end".
   // ADM-5f: a line id off the end of the page is still out of range; two
   // real-but-wrong lines are a value the citation does not support.
+  // ADM-5h: `subtotal` cited two real-but-wrong lines and the page prints
+  // 20.00 exactly once, so its citation is repaired. A line id off the end
+  // of the page and a page that does not exist are not repairable.
   assert.deepEqual(await f.corrections(), [
     { field_name: "total", reason: "citation_out_of_range" },
     { field_name: "tax", reason: "citation_page_unknown" },
-    { field_name: "subtotal", reason: "value_not_in_quote" },
   ]);
 });
 
@@ -778,10 +780,21 @@ test("a line between two cited lines cannot support a value", { skip }, async (t
     }),
     ids,
   );
-  assert.equal(outcome.stored, 1);
-  assert.deepEqual(await f.corrections(), [
-    { field_name: "total", reason: "value_not_in_quote" },
-  ]);
+  // ADM-5h: the value is on line 5, which was not cited -- and the page
+  // prints 8.00 exactly once, so there is one line it could mean. The
+  // citation is repaired to that line rather than to the region between the
+  // cited ones, and the stored span points at line 5.
+  assert.equal(outcome.stored, 2);
+  const span = (
+    await f.rows(
+      `SELECT s."start", s."end" FROM kith.observations o
+         JOIN kith.evidence_spans s ON s.id = (o.value_evidence->>0)
+        WHERE o.space_id = $1 AND o.observation_type = 'total'`,
+      [f.spaceId],
+    )
+  )[0];
+  assert.equal(TABLE_RECEIPT.slice(span.start, span.end), "Mallet | 8.00");
+  assert.deepEqual(await f.corrections(), []);
 });
 
 test("a model the provider refuses falls back once and says so", { skip }, async (t) => {
@@ -1174,26 +1187,51 @@ test("a column receipt stores its money fields from far-apart lines", { skip }, 
   assert.notEqual(spans[0].start, spans[1].start);
 });
 
-test("a value on neither cited line is still refused", { skip }, async (t) => {
+test("a repair needs the page to state the value exactly once", { skip }, async (t) => {
   const f = await fixture(t);
   const ids = await f.ingest(COLUMN_TOTALS_RECEIPT, "synthetic-column-wrong");
+  // 20.00 is printed once, on line 4. 12.00 is printed twice, on lines 2
+  // and 3.
+  const page = [
+    "BRACKEN TOOLS", // 1
+    "Chisel   12.00", // 2
+    "Mallet   12.00", // 3
+    "Subtotal 20.00", // 4
+    "Total    44.00", // 5
+  ].join("\n");
+  await repaginate(f, ids, [[0, page]]);
   const outcome = await f.extract(
     fakeModel({
       kind: "receipt",
       summary: "Hardware receipt.",
       statements: [
-        // Lines 9 and 14 are "Subtotal" and "21.60". Claiming the subtotal is
-        // 20.00 cites two real lines, neither of which prints it, and the
-        // 20.00 sitting on line 12 in between must not rescue it.
-        statement("subtotal", "20.00", [9, 14]),
+        // Neither cited line prints 20.00, but line 4 does and it is the
+        // only line that does, so the citation is repaired to it. The value
+        // stored is what the document says; only the line the model named
+        // was wrong.
+        statement("subtotal", "20.00", [1, 5]),
+        // 12.00 is on two lines, so there is no one line the model could
+        // have meant. Choosing between them would be a guess, and the
+        // failure stands.
+        statement("tax", "12.00", [1, 5]),
       ],
     }),
     ids,
   );
-  assert.equal(outcome.stored, 0);
+  assert.equal(outcome.stored, 1);
   assert.deepEqual(await f.corrections(), [
-    { field_name: "subtotal", reason: "value_not_in_quote" },
+    { field_name: "tax", reason: "value_not_in_quote" },
   ]);
+  // The repaired citation points at the line that states the value.
+  const span = (
+    await f.rows(
+      `SELECT s."start", s."end" FROM kith.observations o
+         JOIN kith.evidence_spans s ON s.id = (o.value_evidence->>0)
+        WHERE o.space_id = $1 AND o.observation_type = 'subtotal'`,
+      [f.spaceId],
+    )
+  )[0];
+  assert.equal(page.slice(span.start, span.end), "Subtotal 20.00");
 });
 
 test("a vendor may be folded and split, but a number may not", { skip }, async (t) => {
@@ -1277,8 +1315,9 @@ test("the diagnostic answers in numbers and never in text", { skip }, async (t) 
       summary: "Hardware receipt.",
       statements: [
         statement("vendor", "BRACKEN TOOLS LTD.", [1, 2]),
-        // Cited the label lines only: the amount is on 12, not on 9 or 11.
-        statement("subtotal", "20.00", [9, 11]),
+        // A value the page states on no line at all, so the repair has
+        // nothing to offer and the failure reaches the diagnostic.
+        statement("subtotal", "99.00", [9, 11]),
       ],
     }),
     ids,
@@ -1304,10 +1343,11 @@ test("the diagnostic answers in numbers and never in text", { skip }, async (t) 
   assert.deepEqual(failure.citedLines, [9, 11]);
   assert.equal(failure.pageLineCount, 14);
   assert.equal(failure.contiguous, false);
-  // This is the answer the live trial could not get: the value IS on the
-  // page, on line 12, and the model cited 9 and 11.
-  assert.equal(failure.onCitedPage, true);
-  assert.deepEqual(failure.onLines, [12]);
+  // The answer the live trial could not get, in the other direction: the
+  // value is on no line of the page at all, which is a different fault from
+  // citing the wrong one.
+  assert.equal(failure.onCitedPage, false);
+  assert.deepEqual(failure.onLines, []);
   assert.equal(failure.onOtherPage, false);
   assert.equal(failure.signature, "99.99");
   assert.deepEqual(summary.reasonCounts, { value_not_in_quote: 1 });
@@ -1442,16 +1482,22 @@ test("a value cut in half cannot be stored", { skip }, async (t) => {
     ],
   });
   const outcome = await f.extract(model, ids);
-  // Only the vendor: the three fabricated readings have no line that prints
-  // them, because no line was ever cut through a value.
-  assert.equal(outcome.stored, 1);
+  // The two fabricated readings have no line that prints them, because no
+  // line was ever cut through a value. `subtotal` asked for 1234.56, which
+  // the page does print, once -- so ADM-5h repairs its citation and stores
+  // it. That is the document's own number under the line that states it.
+  assert.equal(outcome.stored, 2);
   assert.deepEqual(
-    (await f.stored()).map((row) => row.observation_key),
-    ["vendor"],
+    (await f.stored()).map((row) => row.observation_key).sort(),
+    ["subtotal", "vendor"],
   );
-  for (const row of await f.corrections()) {
-    assert.equal(row.reason, "value_not_in_quote", row.field_name);
-  }
+  assert.deepEqual(
+    (await f.corrections()).map((row) => [row.field_name, row.reason]).sort(),
+    [
+      ["invoice_date", "value_not_in_quote"],
+      ["total", "value_not_in_quote"],
+    ],
+  );
   // And the page as shown never offers a partial value as a line.
   const shown = model.requests[0].prompt;
   assert.doesNotMatch(shown, /^\d+\| 234\.56$/m);

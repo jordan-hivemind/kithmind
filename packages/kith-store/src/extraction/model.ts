@@ -273,6 +273,12 @@ type LoadedType = {
   /** How this kind writes a numeric date, when it says. See
    * {@link documentTypeSetting}. */
   dateOrder: DateOrder | null;
+  /** How many pages and characters of a document of this kind the model is
+   * shown. Null means the global default. A twenty-five page K-1 read twelve
+   * pages at a time is a truncated K-1, and twenty of them came back that
+   * way; the fix is the owner's to make per kind, not this code's to guess. */
+  maxPages: number | null;
+  maxChars: number | null;
   fields: TypeField[];
 };
 
@@ -311,6 +317,29 @@ export function documentTypeSetting(
     }
   }
   return null;
+}
+
+/** The widest a kind may set its own bounds to. A setting is the owner's
+ * call; a ceiling is the daemon's, because one document must not be able to
+ * spend a whole run's budget. */
+export const MAX_KIND_PAGES = 60;
+export const MAX_KIND_CHARS = 400_000;
+
+/**
+ * A per-kind whole number from the same data home as the model override, or
+ * null. Bounded on both sides: a setting outside the ceiling is ignored
+ * rather than clamped, so a typo reads as "unset" instead of as a number
+ * nobody chose.
+ */
+export function documentTypeBound(
+  examples: unknown,
+  name: string,
+  ceiling: number,
+): number | null {
+  const raw = documentTypeSetting(examples, name);
+  if (raw === null || !/^[1-9][0-9]{0,6}$/.test(raw)) return null;
+  const value = Number(raw);
+  return value >= 1 && value <= ceiling ? value : null;
 }
 
 /** The kind's model override, or null for the configured default. */
@@ -368,6 +397,7 @@ type Loaded = {
   pages: LoadedPage[];
   pagesTotal: number;
   pagesWithText: number;
+  allWithText: LoadedPage[];
   types: LoadedType[];
   /** The kind the last extraction of this document settled on, when there was
    * one. Only used to pick the model before the reply names a kind. */
@@ -438,10 +468,24 @@ async function loadDocument(
   // invitation to cite it. Numbering is by position in the shown list, so
   // leaving one out shifts nothing: there is no hole to shift over.
   const withText = all.filter((page) => page.text.trim().length > 0);
-  const shownPages = boundPages(withText).map((page, index) => ({
-    ...page,
-    shown: index + 1,
-  }));
+  const priorKind =
+    (
+      await client.query<{ kind: string }>(
+        `SELECT kind FROM kith.document_extractions
+          WHERE space_id = $1 AND source_item_id = $2 LIMIT 1`,
+        [spaceId, sourceItemId],
+      )
+    ).rows[0]?.kind ?? null;
+  const types = await loadTypes(client, spaceId, now);
+  const priorBounds = priorKind
+    ? types.find((type) => type.kind === priorKind)
+    : undefined;
+  const shownPages = shownFrom(
+    boundPages(withText, {
+      maxPages: priorBounds?.maxPages ?? null,
+      maxChars: priorBounds?.maxChars ?? null,
+    }),
+  );
   if (shownPages.length === 0) return null;
   return {
     spaceId,
@@ -458,33 +502,36 @@ async function loadDocument(
     /** Pages with words on them, which is what "was anything dropped?" is
      * measured against. Leaving out a blank page loses nothing. */
     pagesWithText: withText.length,
-    types: await loadTypes(client, spaceId, now),
-    priorKind:
-      (
-        await client.query<{ kind: string }>(
-          `SELECT kind FROM kith.document_extractions
-            WHERE space_id = $1 AND source_item_id = $2 LIMIT 1`,
-          [spaceId, sourceItemId],
-        )
-      ).rows[0]?.kind ?? null,
+    types,
+    priorKind,
+    /** Every page with words on it, kept so a wider bound can be applied
+     * after the reply names a kind without reading the document again. */
+    allWithText: withText,
   };
 }
 
-function boundPages(pages: readonly LoadedPage[]): LoadedPage[] {
+function boundPages(
+  pages: readonly LoadedPage[],
+  bounds: { maxPages?: number | null; maxChars?: number | null } = {},
+): LoadedPage[] {
+  const maxPages = bounds.maxPages ?? MAX_EXTRACTION_PAGES;
+  const maxChars = bounds.maxChars ?? MAX_EXTRACTION_CHARS;
   const kept: LoadedPage[] = [];
   let characters = 0;
   for (const page of pages) {
-    if (kept.length >= MAX_EXTRACTION_PAGES) break;
-    if (
-      kept.length > 0 &&
-      characters + page.text.length > MAX_EXTRACTION_CHARS
-    ) {
-      break;
-    }
+    if (kept.length >= maxPages) break;
+    if (kept.length > 0 && characters + page.text.length > maxChars) break;
     characters += page.text.length;
     kept.push(page);
   }
   return kept;
+}
+
+/** Re-numbers a bounded page list. The number the model sees is a position in
+ * what it is shown, so widening the bound re-numbers nothing that was already
+ * cited -- the wider list starts with the same pages in the same order. */
+function shownFrom(pages: readonly LoadedPage[]): LoadedPage[] {
+  return pages.map((page, index) => ({ ...page, shown: index + 1 }));
 }
 
 async function loadTypes(
@@ -542,6 +589,8 @@ async function loadTypes(
       description: (row.description ?? null) as string | null,
       model: extractionModelSetting(row.examples),
       dateOrder: dateOrderSetting(row.examples),
+      maxPages: documentTypeBound(row.examples, "max_pages", MAX_KIND_PAGES),
+      maxChars: documentTypeBound(row.examples, "max_chars", MAX_KIND_CHARS),
       fields,
     });
   }
@@ -612,7 +661,8 @@ Reply with JSON only, in exactly this shape:
 Rules:
 - Every statement names a field in "field". Never leave it out, never rename it, and never use the field name as a key of its own.
 - "lines" holds one to three line numbers from the page named in "page". Cite the line that prints the value. You may also cite the line that prints its label, even if it is far away; they do not need to be next to each other.
-- Only use fields listed under the kind you chose. Omit a field the document does not state.
+- Only use fields listed under the kind you chose. Omit a field the document does not state: leave it out entirely rather than returning an empty string, a null or a blank.
+- A date may be all the document prints. If it states only a year ("2024") or only a month and a year ("March 2024"), return exactly that. Never add a month or a day the document does not print.
 - Copy a value exactly as the line prints it, including the currency symbol. Dates may be copied as printed.
 - A line_item_list field puts its lines in "line_items" and sets "value" to null. Every other field puts its value in "value" and sets "line_items" to null.
 - Each entry of "line_items" has its own "lines". Items sit on different lines; cite the line each one is printed on.
@@ -737,6 +787,45 @@ export type StatementCitation = {
    * apart, which is legitimate and worth being able to see. */
   contiguous: boolean;
 };
+
+/**
+ * The one line of a page that prints this value, or null.
+ *
+ * Null when no line does, and null when more than one does. The second is the
+ * point: a value printed twice gives no way to say which line states it, and
+ * a citation chosen by coin flip is exactly what the gate refuses everywhere
+ * else.
+ */
+function soleLineCarrying(
+  page: LoadedPage,
+  valueType: DocumentFieldValueType,
+  value: unknown,
+): Candidate | null {
+  let found: Candidate | null = null;
+  for (const line of page.lines) {
+    const candidate = { text: line.text, start: line.start, end: line.end };
+    const checked = checkValue({
+      valueType,
+      value,
+      candidates: [candidate],
+      pageText: page.text,
+      defaultCurrency: "USD",
+    });
+    if (!checked.ok) continue;
+    if (found) return null;
+    found = candidate;
+  }
+  return found;
+}
+
+/** Whether the model said "nothing here". An empty string, a null, or an
+ * empty list are all the same statement about the document. */
+function isEmptyReading(value: unknown): boolean {
+  if (value === null || value === undefined) return true;
+  if (typeof value === "string") return value.trim().length === 0;
+  if (Array.isArray(value)) return value.length === 0;
+  return false;
+}
 
 function citationOf(
   page: LoadedPage,
@@ -1102,7 +1191,24 @@ async function prepare(
       continue;
     }
     prepared.named += 1;
+    // A blank box on a form is not a failed reading. Fifteen K-1 statements
+    // came back with an empty value for a box the form leaves empty, and each
+    // opened an item the owner would have had to dismiss one at a time. An
+    // empty value for an optional field means the document does not state it,
+    // which is exactly what omitting the field would have meant. A *required*
+    // field still opens one, because a required field the document does not
+    // state is worth knowing about.
     const page = pages.get(statement.page);
+    if (isEmptyReading(statement.value)) {
+      if (!field.required) continue;
+      prepared.failures.push({
+        field: field.name,
+        reason: "malformed_statement",
+        reading: null,
+        ...(page ? { citation: citationOf(page, statement) } : {}),
+      });
+      continue;
+    }
     if (!page) {
       // Its own reason, not `citation_out_of_range`. A citation into a page
       // that does not exist is a model reading the page numbering differently
@@ -1205,21 +1311,53 @@ async function prepare(
       defaultCurrency: "USD",
       ...(type?.dateOrder ? { dateOrder: type.dateOrder } : {}),
     });
-    if (!gated.ok) {
+    let resolved = gated;
+    let candidateSet = candidates;
+    if (
+      !resolved.ok &&
+      resolved.reason === "value_not_in_quote" &&
+      (field.valueType === "money" || field.valueType === "number")
+    ) {
+      // The value is not on any line the model cited. If the page prints it
+      // on exactly one line, that line is the citation.
+      //
+      // The safety argument, and it is the whole of it: the check is still
+      // "does a line of this page state this value", unchanged. What is
+      // relaxed is only *which* line, and only when the page leaves no
+      // choice -- one occurrence means there is exactly one line that could
+      // be meant, so nothing is being picked between. Two occurrences keep
+      // the failure, because then choosing would be guessing. A K-1's dense
+      // boxes put the model one line off seven times in the backfill; none
+      // of those readings was wrong about the number.
+      const unique = soleLineCarrying(page, field.valueType, statement.value);
+      if (unique) {
+        candidateSet = [unique];
+        resolved = checkValue({
+          valueType: field.valueType,
+          value: statement.value,
+          candidates: candidateSet,
+          pageText: page.text,
+          defaultCurrency: "USD",
+          ...(type?.dateOrder ? { dateOrder: type.dateOrder } : {}),
+        });
+      }
+    }
+    if (!resolved.ok) {
       prepared.failures.push({
         field: field.name,
-        reason: gated.reason,
+        reason: resolved.reason,
         reading: statement.value,
         citation,
       });
       continue;
     }
+    const gatedOk = resolved;
     // One span per line that supported a value, so an observation cites the
     // line that prints it rather than the region it was found in.
     const spanIds: string[] = [];
     let spanFailed = false;
-    for (const index of gated.support) {
-      const candidate = candidates[index]!;
+    for (const index of gatedOk.support) {
+      const candidate = candidateSet[index]!;
       const spanId = await findOrCreateSpan(client, loaded, page, candidate);
       if (!spanId) {
         spanFailed = true;
@@ -1239,15 +1377,15 @@ async function prepare(
     accepted.push({
       field,
       page: statement.page,
-      quote: candidates[gated.support[0] ?? 0]?.text ?? "",
+      quote: candidateSet[gatedOk.support[0] ?? 0]?.text ?? "",
       lines: [...(statement.lines ?? [])],
       citation,
       spanIds,
-      values: gated.values,
-      ...(gated.itemsTotal === undefined
+      values: gatedOk.values,
+      ...(gatedOk.itemsTotal === undefined
         ? {}
-        : { itemsTotal: gated.itemsTotal }),
-      ...(gated.currencyAssumed ? { currencyAssumed: true as const } : {}),
+        : { itemsTotal: gatedOk.itemsTotal }),
+      ...(gatedOk.currencyAssumed ? { currencyAssumed: true as const } : {}),
     });
   }
 
@@ -1330,7 +1468,15 @@ async function prepare(
       if (value.type === "money" && !moneyByField.has(name)) {
         moneyByField.set(name, value.amount);
       }
-      if (value.type === "date" && prepared.occurrence.precision === "unknown") {
+      // Only a full date can date an event: `occurrence_date` holds a
+      // calendar day, and a year-precision value has none to give. A
+      // document whose only date is "2024" keeps an unknown occurrence
+      // rather than being filed under the first of January.
+      if (
+        value.type === "date" &&
+        (value.precision ?? "day") === "day" &&
+        prepared.occurrence.precision === "unknown"
+      ) {
         prepared.occurrence = { precision: "date", date: value.value };
       }
     });
@@ -1691,6 +1837,7 @@ async function store(
       reason: "input_truncated",
       reading: {
         pagesRead: loaded.pages.length,
+        pagesWithText: loaded.pagesWithText,
         pagesTotal: loaded.pagesTotal,
         linesShownPerPage: MAX_PAGE_LINES,
         longestPageLines: Math.max(
@@ -1742,13 +1889,14 @@ export async function runDocumentExtractionJob(
   if (job.spaceId !== null && job.spaceId !== spaceId) {
     throw new Error("document_extraction payload is not in the job's space");
   }
-  const loaded = await withKithTransaction(pool, (client) =>
+  const first = await withKithTransaction(pool, (client) =>
     loadDocument(client, spaceId, sourceItemId, now),
   );
   // A document that is forgotten, unavailable, still parsing or replaced since
   // the job was queued is not an error: the activation that replaces it queues
   // its own job.
-  if (!loaded || loaded.types.length === 0) return null;
+  if (!first || first.types.length === 0) return null;
+  let loaded: Loaded = first;
 
   // Which model reads this document.
   //
@@ -1787,17 +1935,42 @@ export async function runDocumentExtractionJob(
     used = model.name;
     reading = await model.read(request);
   }
-  const wanted =
-    loaded.types.find((type) => type.kind === reading.kind)?.model ?? null;
-  if (wanted && wanted !== used && refusedModel === null) {
+  const chosen = loaded.types.find((type) => type.kind === reading.kind);
+  const wanted = chosen?.model ?? null;
+
+  // The kind can also widen how much of the document is read, and until the
+  // reply names a kind there is no way to know which bound applies. So a
+  // first pass that was truncated, on a kind that asks for more, is read once
+  // more with the wider bound. Twenty of the owner's K-1s average
+  // twenty-five pages against a default of twelve; the setting is the fix and
+  // it has to reach the document that needed it, not only the next one.
+  const widened =
+    (chosen?.maxPages ?? null) !== null || (chosen?.maxChars ?? null) !== null
+      ? shownFrom(
+          boundPages(loaded.allWithText, {
+            maxPages: chosen?.maxPages ?? null,
+            maxChars: chosen?.maxChars ?? null,
+          }),
+        )
+      : null;
+  const widerRequest =
+    widened && widened.length > loaded.pages.length
+      ? buildRequest({ ...loaded, pages: widened })
+      : null;
+  if (widerRequest) loaded = { ...loaded, pages: widened! };
+
+  if (refusedModel === null && (widerRequest || (wanted && wanted !== used))) {
+    const next = widerRequest ?? request;
     try {
-      reading = await model.read({ ...request, model: wanted });
-      used = wanted;
+      reading = await model.read(
+        wanted ? { ...next, model: wanted } : next,
+      );
+      if (wanted) used = wanted;
     } catch {
-      // Keep the reading the default already produced rather than losing the
+      // Keep the reading the first pass produced rather than losing the
       // document to a string the provider will refuse again. No second try:
       // that is the loop this guard exists to prevent.
-      refusedModel = wanted;
+      if (wanted && wanted !== used) refusedModel = wanted;
     }
   }
 

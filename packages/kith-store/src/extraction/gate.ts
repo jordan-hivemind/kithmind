@@ -26,6 +26,7 @@
 import type { DocumentFieldValueType } from "../admin/model.js";
 import {
   addDecimals,
+  type DatePrecision,
   canonicalizeDecimal,
   compareDecimals,
   SUPPORTED_CURRENCIES,
@@ -356,7 +357,11 @@ export function parseAmount(raw: string): string | undefined {
  * 1075.
  */
 function readDigits(raw: string): string | undefined {
-  let text = raw;
+  // A K-1 prints whole dollars with the decimal point still there and no
+  // cents after it: "12,345.", "-9,999.". The point is typography, not a
+  // fraction, and dropping it changes nothing about the value. Only a bare
+  // trailing point; anything with digits after it reads as it always did.
+  let text = raw.replace(/(\d)\.$/, "$1");
   if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(text)) text = text.split(",").join("");
   else if (
     /^\d{1,3}(\.\d{3}){2,}$/.test(text) ||
@@ -544,7 +549,7 @@ const MONTH_FIRST_DATE =
   /([A-Za-z]{3,9})\.?[\s-]+(\d{1,2})(?:st|nd|rd|th)?,?[\s-]+'?(\d{4}|\d{2})(?!\d)/g;
 /** `1 September 2026`, `1st Sep. 2026`. */
 const DAY_FIRST_DATE =
-  /(\d{1,2})(?:st|nd|rd|th)?[\s-]+([A-Za-z]{3,9})\.?,?[\s-]+'?(\d{4}|\d{2})(?!\d)/g;
+  /(\d{1,2})(?:st|nd|rd|th)?[\s-]+(?:of[\s-]+)?([A-Za-z]{3,9})\.?,?[\s-]+'?(\d{4}|\d{2})(?!\d)/g;
 
 /**
  * Whether the quote prints this ISO date.
@@ -593,7 +598,7 @@ export type DateOrder = "MDY" | "DMY";
  * that could be read two ways, which is a different answer from "not a date"
  * and gets its own correction reason. */
 export type PrintedDate =
-  | { kind: "date"; iso: string }
+  | { kind: "date"; iso: string; precision: DatePrecision }
   | { kind: "ambiguous" }
   | { kind: "none" };
 
@@ -621,6 +626,38 @@ export function readPrintedDate(raw: string, order?: DateOrder): PrintedDate {
   const text = raw.normalize("NFKC").trim();
   if (!text) return { kind: "none" };
 
+  // A year on its own, or a month and a year, is a date. Twenty-three of the
+  // owner's letters state nothing more -- a tax letter says "2024", a K-1
+  // cover letter says "March 2024" -- and refusing them lost the only date
+  // those documents have. Padding to the first of January would invent a day
+  // the page does not print and that a reader would repeat as fact, so the
+  // precision travels with the value instead.
+  const yearOnly = /^(\d{4})$/.exec(text);
+  if (yearOnly) {
+    const year = Number(yearOnly[1]);
+    return year >= 1000 && year <= 9999
+      ? { kind: "date", iso: yearOnly[1]!, precision: "year" }
+      : { kind: "none" };
+  }
+  const monthAndYear =
+    /^([A-Za-z]{3,9})\.?,?[\s-]+(\d{4})$/.exec(text) ??
+    /^(\d{4})[-/](\d{1,2})$/.exec(text);
+  if (monthAndYear) {
+    const named = /^[A-Za-z]/.test(monthAndYear[1]!);
+    const month = named
+      ? monthNumber(monthAndYear[1]!)
+      : Number(monthAndYear[2]);
+    const year = named ? Number(monthAndYear[2]) : Number(monthAndYear[1]);
+    if (month && month >= 1 && month <= 12 && year >= 1000 && year <= 9999) {
+      return {
+        kind: "date",
+        iso: `${year}-${String(month).padStart(2, "0")}`,
+        precision: "month",
+      };
+    }
+    return { kind: "none" };
+  }
+
   // `(?!\d)` rather than `\b`, so an ISO date with a time glued to it
   // ("2026-09-18T14:32") reads: `T` is a word character, so `\b` refused the
   // very form a machine-written timestamp takes.
@@ -631,7 +668,7 @@ export function readPrintedDate(raw: string, order?: DateOrder): PrintedDate {
       Number(isoLike[2]),
       Number(isoLike[3]),
     );
-    return iso ? { kind: "date", iso } : { kind: "none" };
+    return iso ? { kind: "date", iso, precision: "day" } : { kind: "none" };
   }
 
   const numeric = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4}|\d{2})(?!\d)/.exec(
@@ -646,7 +683,7 @@ export function readPrintedDate(raw: string, order?: DateOrder): PrintedDate {
     if (resolved === "ambiguous") return { kind: "ambiguous" };
     if (!resolved) return { kind: "none" };
     const iso = isoFrom(namedYear(numeric[3]!), resolved.month, resolved.day);
-    return iso ? { kind: "date", iso } : { kind: "none" };
+    return iso ? { kind: "date", iso, precision: "day" } : { kind: "none" };
   }
 
   // Separators may be spaces or hyphens ("18-Sep-2026"), the comma is
@@ -663,19 +700,19 @@ export function readPrintedDate(raw: string, order?: DateOrder): PrintedDate {
         month,
         Number(monthFirst[2]),
       );
-      return iso ? { kind: "date", iso } : { kind: "none" };
+      return iso ? { kind: "date", iso, precision: "day" } : { kind: "none" };
     }
   }
 
   const dayFirst =
-    /^(\d{1,2})(?:st|nd|rd|th)?[\s-]+([A-Za-z]{3,9})\.?,?[\s-]+'?(\d{4}|\d{2})(?!\d)/.exec(
+    /^(\d{1,2})(?:st|nd|rd|th)?[\s-]+(?:of[\s-]+)?([A-Za-z]{3,9})\.?,?[\s-]+'?(\d{4}|\d{2})(?!\d)/.exec(
       text,
     );
   if (dayFirst) {
     const month = monthNumber(dayFirst[2]!);
     if (month) {
       const iso = isoFrom(namedYear(dayFirst[3]!), month, Number(dayFirst[1]));
-      return iso ? { kind: "date", iso } : { kind: "none" };
+      return iso ? { kind: "date", iso, precision: "day" } : { kind: "none" };
     }
   }
   return { kind: "none" };
@@ -732,10 +769,35 @@ function dateInQuote(
   iso: string,
   quote: string,
   order?: DateOrder,
+  precision: DatePrecision = "day",
 ): boolean {
-  const [year, month, day] = iso.split("-") as [string, string, string];
   const text = quote.normalize("NFKC");
   if (text.includes(iso)) return true;
+
+  // A partial date is checked for exactly the parts it claims. A year-only
+  // value asks whether the line prints that year and nothing about a month
+  // or a day it never stated.
+  if (precision === "year") {
+    const years: string[] = text.match(/\d{4}/g) ?? [];
+    return years.includes(iso);
+  }
+  if (precision === "month") {
+    const parts = iso.split("-");
+    const statedYear = parts[0] ?? "";
+    const statedMonth = parts[1] ?? "";
+    const printed = readPrintedDate(text.trim(), order);
+    if (printed.kind === "date" && printed.iso.startsWith(iso)) return true;
+    const runs: string[] = text.match(/\d+/g) ?? [];
+    if (!runs.includes(statedYear)) return false;
+    const numeric = String(Number(statedMonth));
+    return (
+      (text.toLowerCase().match(/[a-z]+/g) ?? []).some(
+        (word) => word.length >= 3 && namesMonth(Number(statedMonth), word),
+      ) || runs.some((run) => run === statedMonth || run === numeric)
+    );
+  }
+
+  const [year, month, day] = iso.split("-") as [string, string, string];
   const days = [day, String(Number(day))];
 
   // A numeric window is read positionally, by the same rules the value is
@@ -999,17 +1061,26 @@ export function checkValue(input: GateInput): GateResult {
       // is normalized here and checked against the cited lines afterwards, so
       // a date can only be stored when a cited line prints it, in the order
       // that line prints it.
-      const iso = realIsoDate(literal)
-        ? literal
-        : (() => {
-            const printed = readPrintedDate(literal, input.dateOrder);
-            return printed.kind === "date" ? printed.iso : printed.kind;
-          })();
-      if (iso === "ambiguous") return fail("date_ambiguous");
-      if (iso === "none") return fail("date_unparsable");
-      const at = firstMatch((text) => dateInQuote(iso, text, input.dateOrder));
+      const printed: PrintedDate = realIsoDate(literal)
+        ? { kind: "date", iso: literal, precision: "day" }
+        : readPrintedDate(literal, input.dateOrder);
+      if (printed.kind === "ambiguous") return fail("date_ambiguous");
+      if (printed.kind === "none") return fail("date_unparsable");
+      const at = firstMatch((text) =>
+        dateInQuote(printed.iso, text, input.dateOrder, printed.precision),
+      );
       if (at < 0) return fail("value_not_in_quote");
-      return { ok: true, values: [{ type: "date", value: iso }], support: [at] };
+      return {
+        ok: true,
+        // A day-precision value keeps the shape every stored date has had,
+        // with no `precision` key; a partial one says how much it knows.
+        values: [
+          printed.precision === "day"
+            ? { type: "date", value: printed.iso }
+            : { type: "date", value: printed.iso, precision: printed.precision },
+        ],
+        support: [at],
+      };
     }
     case "number": {
       // Through `parseAmount`, not a bare canonicalize: a percentage prints as
