@@ -65,8 +65,9 @@ export type InstitutionRow = {
   latestSnapshotAsOf: string | null;
   openReviews: number;
   /** The account's latest reported value in `currentValueCurrency`, dated
-   * `currentValueAsOf`. On a group: the sum of its active accounts, and null
-   * when those span currencies, because no total crosses currencies. */
+   * `currentValueAsOf`. On a group: the sum of its live accounts, and null
+   * unless every one of them has a value in one shared currency, dated by the
+   * oldest of them. See `groupValue`. */
   currentValue: number | null;
   currentValueCurrency: string | null;
   currentValueAsOf: string | null;
@@ -317,29 +318,59 @@ function groupFreshness(group: InstitutionRow): {
   };
 }
 
+const NO_VALUE = {
+  currentValue: null,
+  currentValueCurrency: null,
+  currentValueAsOf: null,
+} as const;
+
 /**
- * The sum of a group's accounts' values. An inactive account is left out: its
- * last figure is the day it went quiet, which is not what the institution is
- * worth now. Its own row still shows that figure, dated.
+ * The sum of a group's live accounts' values, or nothing at all.
+ *
+ * Nothing at all unless every live account has a value and they are all in
+ * one currency. Adding up the accounts that happen to have one and showing
+ * the result as the institution's value is the same partial total the archive
+ * refuses to build out of half-valued holdings, one level up: the owner reads
+ * this figure as what the institution holds, and a total quietly missing an
+ * account is worse than an empty cell that makes him open the rows.
+ *
+ * Live means `fresh` or `stale`. Two kinds of account are left out of both
+ * the sum and the requirement, because neither is a gap in what is held now:
+ *
+ *   * `inactive` -- closed, or quiet past the threshold. Its last figure is
+ *     the day it went quiet, which is not what the institution is worth now.
+ *     Its own row still shows that figure, dated.
+ *   * `empty` -- the archive holds no statement and no record for it, so
+ *     there is nothing to have failed to value. The table hides these by
+ *     default for the same reason.
+ *
+ * The date is the OLDEST component's, never the newest. A total dated by its
+ * newest part claims every other part was still true that day. The oldest is
+ * the honest answer: no part of this figure is older than this.
  */
 function groupValue(group: InstitutionRow): {
   currentValue: number | null;
   currentValueCurrency: string | null;
   currentValueAsOf: string | null;
 } {
-  const valued = (group.children ?? []).filter(
-    (child) => child.status !== "inactive" && child.currentValue !== null,
+  const live = (group.children ?? []).filter(
+    (child) => child.status === "fresh" || child.status === "stale",
   );
-  const currencies = new Set(valued.map((child) => child.currentValueCurrency));
-  if (valued.length === 0 || currencies.size !== 1) {
-    return { currentValue: null, currentValueCurrency: null, currentValueAsOf: null };
-  }
+  if (live.length === 0) return { ...NO_VALUE };
+  if (
+    live.some(
+      (child) =>
+        child.currentValue === null || child.currentValueAsOf === null,
+    )
+  )
+    return { ...NO_VALUE };
+  const currencies = new Set(live.map((child) => child.currentValueCurrency));
+  if (currencies.size !== 1) return { ...NO_VALUE };
   return {
-    currentValue: valued.reduce((sum, child) => sum + child.currentValue!, 0),
-    currentValueCurrency: valued[0]!.currentValueCurrency,
-    currentValueAsOf: valued
+    currentValue: live.reduce((sum, child) => sum + child.currentValue!, 0),
+    currentValueCurrency: live[0]!.currentValueCurrency,
+    currentValueAsOf: live
       .map((child) => child.currentValueAsOf!)
-      .sort()
-      .at(-1)!,
+      .sort()[0]!,
   };
 }
