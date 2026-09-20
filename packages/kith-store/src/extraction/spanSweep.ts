@@ -18,6 +18,12 @@
 // what it stranded in the same transaction, and `unreferencedSpanIds` is
 // re-used by `kith-extraction-span-cleanup` for the legacy residue.
 //
+// ADM-5l: both halves now select with the same rule. They did not, and the
+// difference was the whole bug -- see `SPAN_IN_SCOPE_SQL` below. A span an
+// extraction strands is swept by the extraction that stranded it, whether or
+// not the *previous* run had stamped it, so the CLI has nothing left to do
+// but the one-time residue it was written for.
+//
 // ## Every place in the schema that names an evidence span
 //
 // Read off `packages/kith-store/migrations`, and all eight are checked below.
@@ -130,36 +136,68 @@ const REFERENCED_SPAN_IDS = referencedSpanIdsSql("$1");
 export type SweepScope = {
   spaceId: string;
   sourceTextVersionId: string;
-  /**
-   * `marked` is the write path: only spans this pipeline stamped
-   * `extraction_v1`, so a parser span, a card span and anything with a
-   * foreign locator are out of scope before the reference check even runs.
-   *
-   * `legacy` is the one-time cleanup, which must also reach spans minted
-   * before the marker existed. It widens the scope to a locator with no
-   * `kind` at all -- and nothing further: a locator naming any other kind is
-   * somebody else's row.
-   */
-  include: "marked" | "legacy";
   limit?: number;
 };
 
 /**
- * The spans in scope that nothing in the table above names.
+ * What a sweep may even look at, before a single reference is checked.
+ *
+ * Two shapes, one rule, because ADM-5l proved they cannot be two rules. Until
+ * then the write path took only spans stamped `extraction_v1` and the
+ * one-time cleanup took those *and* the unmarked ones; re-extracting a
+ * document whose previous run had cited unmarked spans therefore stranded
+ * them where only a hand-run CLI could reach. Measured on the owner's data on
+ * 2026-09-20: 48 such orphans across 37 generations, each one its generation
+ * failing `payload_verify_error:id_sets` again.
+ *
+ *   * `kind = 'extraction_v1'`: a span this pipeline minted. Recognised
+ *     everywhere, on any text version, sealed or not -- inline ingestion
+ *     never seals, and the spans an extraction over inline text strands are
+ *     still its own to collect.
+ *   * no `kind` at all, over *sealed* text: a span minted before the marker
+ *     existed. The seal is the whole of the extra caution. Unmarked spans are
+ *     not exclusively extraction's -- `insertEvidenceSpans` writes a caller's
+ *     locator through, null included -- so what makes these recognisable is
+ *     not the row, it is the position: over text a manifest has sealed, a
+ *     span outside that manifest that none of the eight sites names is by
+ *     construction something a later pass wrote and then abandoned. Exactly
+ *     the condition `cleanupOrphanedExtractionSpans`'s pre-filter already
+ *     required by joining the manifests, so the cleanup's behaviour is
+ *     unchanged to the row: there, this `EXISTS` is always true.
+ *
+ * A locator naming any other kind is somebody else's row, marked or sealed or
+ * neither, and is never in scope.
+ */
+const SPAN_IN_SCOPE_SQL = `(
+       s.locator->>'kind' = $3
+       OR (
+         s.locator->>'kind' IS NULL
+         AND EXISTS (
+           SELECT 1
+             FROM kith.processing_generation_payload_manifests m
+            WHERE m.space_id = s.space_id
+              AND m.source_text_version_id = s.source_text_version_id
+         )
+       )
+     )`;
+
+/**
+ * The spans in scope ({@link SPAN_IN_SCOPE_SQL}) that nothing in the table
+ * above names.
  *
  * Never returns a manifest span: the manifest is the first reference site, so
  * a sealed span is referenced by definition. Never returns a card span:
  * `card_extraction_fingerprints` is non-null on those and
  * `sweepCardEvidenceSpans` owns them.
+ *
+ * One selection, both callers, no mode flag. The write path and the cleanup
+ * get the same answer for the same text version by construction rather than
+ * by two rules kept in step by hand.
  */
 export async function unreferencedSpanIds(
   client: ClientBase,
   scope: SweepScope,
 ): Promise<string[]> {
-  const kinds =
-    scope.include === "marked"
-      ? `s.locator->>'kind' = $3`
-      : `(s.locator->>'kind' IS NULL OR s.locator->>'kind' = $3)`;
   const found = await client.query<{ id: string }>(
     `WITH candidate AS (
        SELECT s.id
@@ -167,7 +205,7 @@ export async function unreferencedSpanIds(
         WHERE s.space_id = $1
           AND s.source_text_version_id = $2
           AND s.card_extraction_fingerprints IS NULL
-          AND ${kinds}
+          AND ${SPAN_IN_SCOPE_SQL}
         ORDER BY s.id
         LIMIT $4
      ), referenced AS (${REFERENCED_SPAN_IDS})
@@ -203,15 +241,18 @@ export async function deleteSpans(
  * the observations, the event version and `document_extractions` are written:
  * those three are reference sites, so a span this run still uses is only safe
  * once its referent exists.
+ *
+ * This run's own spans and the spans the *previous* run cited and this one
+ * abandoned, marked or not. A re-extraction is exactly where an unmarked span
+ * stops being referenced -- the observation citing it has just been replaced
+ * a few statements up this same transaction -- so the transaction that
+ * strands it is the one that must collect it (ADM-5l).
  */
 export async function sweepUnreferencedExtractionSpans(
   client: ClientBase,
   scope: { spaceId: string; sourceTextVersionId: string },
 ): Promise<number> {
-  const ids = await unreferencedSpanIds(client, {
-    ...scope,
-    include: "marked",
-  });
+  const ids = await unreferencedSpanIds(client, scope);
   return deleteSpans(client, scope.spaceId, ids);
 }
 
@@ -333,7 +374,6 @@ export async function cleanupOrphanedExtractionSpans(
         const ids = await unreferencedSpanIds(client, {
           spaceId: row.space_id,
           sourceTextVersionId: row.text_version_id,
-          include: "legacy",
         });
         if (options.apply) await deleteSpans(client, row.space_id, ids);
         return ids.length;

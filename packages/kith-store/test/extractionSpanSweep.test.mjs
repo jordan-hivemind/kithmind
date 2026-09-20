@@ -315,3 +315,70 @@ test("a re-extraction leaves no unreferenced extraction span", { skip }, async (
     "the first run's abandoned span was not removed",
   );
 });
+
+/**
+ * ADM-5l. The write path now reaches unmarked spans too, and this is the
+ * fence around that: it reaches them only over text a payload manifest has
+ * sealed.
+ *
+ * Inline ingestion never seals, and an unmarked span there is not
+ * extraction's to reason about -- `insertEvidenceSpans` writes whatever
+ * locator its caller passes, null included, so over unsealed text "no kind"
+ * says nothing about who wrote the row. Over sealed text it does: a span
+ * outside the manifest that none of the eight sites names can only be
+ * something a later pass wrote and abandoned. The seal is the whole of the
+ * difference, and it is the same condition the one-time cleanup already
+ * required by joining the manifests.
+ */
+test("an unmarked span over unsealed text is nobody's to sweep", { skip }, async (t) => {
+  const f = await fixture(t);
+  await f.seed();
+  const ingested = await f.ingest();
+  await f.extract(
+    stubModel(reading([VENDOR, TOTAL])),
+    ingested.sourceItemId,
+    ingested.generationId,
+  );
+  assert.equal(await assertNoOrphans(f, ingested.textVersionId), 2);
+  // Unreferenced, unmarked, not a card's, over this document's text -- every
+  // property of the orphan the sealed case sweeps, except the seal.
+  const unmarkedId = newKithId();
+  await f.client.query(
+    `INSERT INTO kith.evidence_spans
+       (id, space_id, created_at, source_revision_id, source_text_version_id,
+        source_page_id, ordinal, "start", "end", quote_hash)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,97,0,1,$6)`,
+    [
+      unmarkedId,
+      f.spaceId,
+      ingested.sourceRevisionId,
+      ingested.textVersionId,
+      ingested.pageId,
+      "f".repeat(64),
+    ],
+  );
+  assert.equal(
+    (
+      await f.rows("SELECT count(*)::int AS count FROM kith.processing_generation_payload_manifests WHERE space_id = $1", [
+        f.spaceId,
+      ])
+    )[0].count,
+    0,
+    "the inline fixture is unsealed, which is the whole point of this test",
+  );
+
+  // A re-extraction that strands one of its own marked spans: that one goes,
+  // and the unmarked one is left exactly where it was.
+  await f.extract(
+    stubModel(reading([{ ...VENDOR, value: "Invoice 4471", quote: "Invoice 4471" }, TOTAL])),
+    ingested.sourceItemId,
+    ingested.generationId,
+    NOW + 3_000,
+  );
+  assert.equal(await assertNoOrphans(f, ingested.textVersionId), 2);
+  assert.equal(
+    (await f.rows("SELECT count(*)::int AS count FROM kith.evidence_spans WHERE id = $1", [unmarkedId]))[0].count,
+    1,
+    "an unmarked span over unsealed text was swept",
+  );
+});
