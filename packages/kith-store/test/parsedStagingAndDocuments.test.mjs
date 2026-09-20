@@ -9,9 +9,10 @@ import test from "node:test";
 
 import { digestParsedMappingManifest } from "@repo/worker-protocol";
 
-import { applyKithSchema, newKithId } from "../dist/index.js";
+import { applyKithSchema, createKithPool, newKithId } from "../dist/index.js";
 import * as provenance from "../dist/provenance/index.js";
 import * as documents from "../dist/documents/index.js";
+import * as extraction from "../dist/extraction/index.js";
 
 import { connect, skip, throwawayDatabase } from "./helpers/pgDatabase.mjs";
 
@@ -1045,6 +1046,538 @@ test(
     // simply is not found -- `forget_epoch` is part of its identity.
     const noAck = await provenance.loadArchiveDeletionAck(client, receipt, item2, forgotten + 1);
     assert.equal(noAck, null);
+  },
+);
+
+/**
+ * ADM-5j. A sealed one-page generation, without the digest assertions the
+ * test above makes about it -- everything here cares about is that the
+ * manifest exists and the seal verifies.
+ */
+async function sealedGeneration(client) {
+  const spaceId = seedSpace();
+  const sourceAccountId = await seedSourceAccount(client, spaceId);
+  const userId = await seedUser(client);
+  const actorCredentialId = await seedApiKey(client, userId);
+  const item = await provenance.createOrGetSourceItem(client, {
+    spaceId,
+    sourceAccountId,
+    externalId: "fixture/orphans.pdf",
+  });
+  const revision = await provenance.createOrGetArchivedRevision(client, {
+    spaceId,
+    sourceItemId: item.id,
+    contentHash: await sha256Utf8("binary-bytes"),
+    byteLength: 1024,
+    mediaType: "application/pdf",
+    capturedAt: new Date(),
+    userId,
+  });
+  const parserArtifact = await provenance.createOrGetParserArtifact(client, {
+    spaceId,
+    sourceAccountId,
+    sourceItemId: item.id,
+    sourceRevisionId: revision.id,
+    clientArtifactId: cryptoRandomUuid(),
+    parserFingerprint: "parser-v1",
+    outputHash: await sha256Utf8("parsed-output"),
+    outputByteLength: 256,
+    outputMediaType: "application/x-parsed-pages",
+    userId,
+    actorCredentialId,
+    createdAt: new Date(),
+  });
+  const pageText = "AB";
+  const pageTextHash = await sha256Utf8(pageText);
+  const pageInputs = [{ ordinal: 0, start: 0, end: 2, text: pageText, textHash: pageTextHash }];
+  const evidenceInputs = [
+    {
+      ordinal: 0,
+      pageOrdinal: 0,
+      start: 0,
+      end: 1,
+      quoteHash: await sha256Utf8("A"),
+      locator: { kind: "parser_page_v1", pageNumber: 1, pageTextHash },
+    },
+    {
+      ordinal: 1,
+      pageOrdinal: 0,
+      start: 1,
+      end: 2,
+      quoteHash: await sha256Utf8("B"),
+      locator: { kind: "parser_page_v1", pageNumber: 1, pageTextHash },
+    },
+  ];
+  const mappingManifestHash = await digestParsedMappingManifest(pageInputs, evidenceInputs);
+  const textVersion = await provenance.createOrGetParsedTextVersion(client, {
+    spaceId,
+    sourceRevisionId: revision.id,
+    parserArtifactId: parserArtifact.id,
+    extractionFingerprint: "extract-v1",
+    textHash: pageTextHash,
+    byteLength: 2,
+    utf16Length: 2,
+    pageCount: 1,
+    mappingManifestHash,
+  });
+  const counts = {
+    expectedPageCount: 1,
+    expectedEvidenceSpanCount: 2,
+    expectedDocumentCount: 1,
+    expectedChunkCount: 2,
+  };
+  const generationId = await seedGeneration(client, {
+    spaceId,
+    sourceAccountId,
+    sourceItemId: item.id,
+    sourceRevisionId: revision.id,
+    sourceTextVersionId: textVersion.id,
+    parserArtifactId: parserArtifact.id,
+    mappingManifestHash,
+    desiredProcessingEpoch: 0,
+    ...counts,
+  });
+  const ingestJobId = await seedIngestJob(client, spaceId, sourceAccountId, item.id, revision.id, generationId);
+  const discoveryWorkId = await seedDiscoveryWork(client, {
+    spaceId,
+    sourceAccountId,
+    sourceItemId: item.id,
+    userId,
+    credentialId: actorCredentialId,
+  });
+  const stage = await seedWorkerParsedStage(client, {
+    spaceId,
+    sourceAccountId,
+    sourceItemId: item.id,
+    discoveryWorkId,
+    ingestJobId,
+    processingGenerationId: generationId,
+    sourceRevisionId: revision.id,
+    sourceTextVersionId: textVersion.id,
+    parserArtifactId: parserArtifact.id,
+    mappingManifestHash,
+    ...counts,
+  });
+  const pageInsert = await provenance.insertParsedPages(client, stage, pageInputs);
+  stage.pageIds = pageInsert.ids;
+  stage.pageBytes = pageInsert.bytes;
+  const evidenceInsert = await provenance.insertParsedEvidence(client, stage, evidenceInputs);
+  stage.evidenceSpanIds = evidenceInsert.ids;
+  stage.evidenceBytes = evidenceInsert.bytes;
+  const documentInsert = await provenance.insertParsedDocuments(client, stage, [
+    {
+      documentKey: "doc-1",
+      title: "Fixture document",
+      docType: "note",
+      capturedAt: capturedAtMs,
+      evidence: [
+        { pageOrdinal: 0, evidenceOrdinal: 0 },
+        { pageOrdinal: 0, evidenceOrdinal: 1 },
+      ],
+    },
+  ]);
+  stage.documentIds = documentInsert.ids;
+  stage.documentBytes = documentInsert.bytes;
+  const chunkInsert = await provenance.insertParsedChunks(client, stage, [
+    { documentKey: "doc-1", ordinal: 0, start: 0, end: 1, text: "A", evidence: [{ pageOrdinal: 0, evidenceOrdinal: 0 }] },
+    { documentKey: "doc-1", ordinal: 1, start: 1, end: 2, text: "B", evidence: [{ pageOrdinal: 0, evidenceOrdinal: 1 }] },
+  ]);
+  stage.chunkIds = chunkInsert.ids;
+  stage.chunkBytes = chunkInsert.bytes;
+  await provenance.sealParsedPayload(client, stage, new Date());
+  await client.query(
+    `INSERT INTO kith.spaces (id, kind, name, created_by)
+     VALUES ($1,'personal','Synthetic',$2) ON CONFLICT (id) DO NOTHING`,
+    [spaceId, userId],
+  );
+  const generation = provenance.camelizeProcessingGeneration(
+    (await client.query("SELECT * FROM kith.processing_generations WHERE id = $1", [generationId])).rows[0],
+  );
+  const pageId = (
+    await client.query("SELECT id FROM kith.source_pages WHERE source_text_version_id = $1 LIMIT 1", [textVersion.id])
+  ).rows[0].id;
+  return {
+    spaceId,
+    sourceAccountId,
+    userId,
+    item,
+    revision,
+    textVersion,
+    generation,
+    generationId,
+    manifestSpanIds: stage.evidenceSpanIds,
+    pageId,
+  };
+}
+
+/**
+ * One `document_statement` event version and observation, citing the spans
+ * given -- what the extraction writer leaves behind, built by hand so this
+ * test does not need a model.
+ */
+async function citeSpans(client, fixture, spanIds) {
+  const entityId = newKithId();
+  const eventId = newKithId();
+  const versionId = newKithId();
+  await client.query(
+    `INSERT INTO kith.entities
+       (id, space_id, created_at, user_id, key, kind, canonical_name,
+        normalized_name, aliases, normalized_aliases)
+     VALUES ($1,$2,transaction_timestamp(),$3,'other:document','other',
+             'Document','document','[]'::jsonb,'[]'::jsonb)`,
+    [entityId, fixture.spaceId, fixture.userId],
+  );
+  await client.query(
+    `INSERT INTO kith.events
+       (id, space_id, created_at, source_account_id, source_item_id,
+        event_key, created_by)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,'document_statement:v1',$5)`,
+    [eventId, fixture.spaceId, fixture.sourceAccountId, fixture.item.id, fixture.userId],
+  );
+  const chain = [
+    fixture.spaceId,
+    fixture.sourceAccountId,
+    fixture.item.id,
+    fixture.revision.id,
+    fixture.textVersion.id,
+    fixture.generationId,
+  ];
+  await client.query(
+    `INSERT INTO kith.event_versions
+       (id,space_id,created_at,source_account_id,source_item_id,
+        source_revision_id,source_text_version_id,processing_generation_id,
+        event_id,entity_id,event_type,schema_version,occurrence,
+        field_evidence,user_id)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,
+             'document_statement',1,'{"precision":"unknown"}'::jsonb,$10,$11)`,
+    [
+      versionId,
+      ...chain,
+      eventId,
+      entityId,
+      JSON.stringify({ occurrence: spanIds, entity: spanIds, eventType: spanIds }),
+      fixture.userId,
+    ],
+  );
+  await client.query(
+    `INSERT INTO kith.observations
+       (id,space_id,created_at,source_account_id,source_item_id,
+        source_revision_id,source_text_version_id,processing_generation_id,
+        event_id,event_version_id,entity_id,event_type,occurrence,
+        observation_key,observation_type,schema_version,value,value_evidence,
+        user_id)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,$10,
+             'document_statement','{"precision":"unknown"}'::jsonb,
+             'vendor','vendor',1,'{"type":"text","value":"X"}'::jsonb,$11,$12)`,
+    [newKithId(), ...chain, eventId, versionId, entityId, JSON.stringify(spanIds), fixture.userId],
+  );
+}
+
+test(
+  "the span cleanup removes exactly the orphan, and the seal verifies again",
+  { skip },
+  async (t) => {
+    // ADM-5j. The live residue after ADM-5i: 68 of the owner's 91 ready
+    // generations still carried an evidence span that is outside the
+    // manifest, carries no locator kind and is referenced by nothing, so the
+    // seal refused the generation and the health screen stayed red.
+    //
+    // Everything about this test is the *exactness* of the selection. Four
+    // spans that look like the orphan from one angle each have to survive.
+    const database = await throwawayDatabase(t);
+    const client = await connect(database);
+    await applyKithSchema(client);
+    const f = await sealedGeneration(client);
+    const pool = createKithPool(database.url);
+    pool.on("error", () => {});
+    t.after(() => pool.end());
+
+    const span = async (ordinal, columns = {}) => {
+      const id = newKithId();
+      await client.query(
+        `INSERT INTO kith.evidence_spans
+           (id, space_id, created_at, source_revision_id, source_text_version_id,
+            source_page_id, ordinal, "start", "end", quote_hash, locator,
+            card_extraction_fingerprints)
+         VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,0,1,$7,$8,$9)`,
+        [
+          id,
+          f.spaceId,
+          f.revision.id,
+          f.textVersion.id,
+          f.pageId,
+          ordinal,
+          await sha256Utf8("A"),
+          columns.locator ?? null,
+          columns.card ?? null,
+        ],
+      );
+      return id;
+    };
+
+    const extractionSpanId = await span(900, {
+      locator: JSON.stringify({ kind: "extraction_v1" }),
+    });
+    // A span written before the marker existed, adopted by an observation.
+    // Every one of the owner's surviving legacy spans is this shape.
+    const legacySpanId = await span(901);
+    await citeSpans(client, f, [extractionSpanId, legacySpanId]);
+    // The card runner's, which `sweepCardEvidenceSpans` owns.
+    const cardSpanId = await span(902, { card: JSON.stringify(["card-v1"]) });
+    // Somebody else's, named by its locator. Unreferenced, and still not ours.
+    const foreignSpanId = await span(903, {
+      locator: JSON.stringify({ kind: "parser_page_v1", pageNumber: 1 }),
+    });
+    // Named only by `investment_entries.evidence_span_id`, an `ON DELETE SET
+    // NULL` foreign key -- the one reference site an over-broad delete would
+    // corrupt silently instead of failing loudly.
+    const investmentSpanId = await span(905);
+    const investmentId = newKithId();
+    await client.query(
+      `INSERT INTO kith.investments (id, space_id, name) VALUES ($1,$2,'Synthetic investment')`,
+      [investmentId, f.spaceId],
+    );
+    const investmentEntryId = newKithId();
+    await client.query(
+      `INSERT INTO kith.investment_entries
+         (id, space_id, investment_id, entry_type, entry_date, amount, currency, evidence_span_id)
+       VALUES ($1,$2,$3,'commitment',CURRENT_DATE,100,'USD',$4)`,
+      [investmentEntryId, f.spaceId, investmentId, investmentSpanId],
+    );
+    // Named only by `document_extractions.statements[].evidenceSpanId`.
+    const extractionStatementSpanId = await span(906);
+    await client.query(
+      `INSERT INTO kith.document_extractions
+         (id, space_id, source_item_id, processing_generation_id, kind, model,
+          extracted_at, pages_read, pages_total, statements)
+       VALUES ($1,$2,$3,$4,'other','test-model',transaction_timestamp(),1,1,$5::jsonb)`,
+      [
+        newKithId(),
+        f.spaceId,
+        f.item.id,
+        f.generationId,
+        JSON.stringify([{ evidenceSpanId: extractionStatementSpanId }]),
+      ],
+    );
+    // Named only by `worker_parsed_stages.evidence_span_ids` -- cheap to add
+    // beside the two required legs above, and the last reference site not
+    // already covered by the manifest or `citeSpans`.
+    const workerStageSpanId = await span(907);
+    const stageRow = (
+      await client.query("SELECT id FROM kith.worker_parsed_stages WHERE processing_generation_id = $1", [
+        f.generationId,
+      ])
+    ).rows[0];
+    await client.query(
+      `UPDATE kith.worker_parsed_stages SET evidence_span_ids = evidence_span_ids || $2::jsonb WHERE id = $1`,
+      [stageRow.id, JSON.stringify([workerStageSpanId])],
+    );
+    const orphanSpanId = await span(908);
+
+    // The live symptom, first: one unmarked unadopted span and the whole
+    // generation fails to verify.
+    const refused = [];
+    await assert.rejects(
+      provenance.verifySealedParsedPayload(client, f.generation, (named) => refused.push(named)),
+      /scan_conflict/,
+    );
+    assert.deepEqual(refused, ["id_sets"]);
+
+    // Dry run is the default and deletes nothing.
+    const dry = await extraction.cleanupOrphanedExtractionSpans(pool, { apply: false });
+    assert.equal(dry.applied, false);
+    assert.equal(dry.generationsAffected, 1);
+    assert.equal(dry.spans, 1);
+    assert.equal(
+      (
+        await client.query("SELECT count(*)::int AS count FROM kith.evidence_spans WHERE source_text_version_id = $1", [
+          f.textVersion.id,
+        ])
+      ).rows[0].count,
+      f.manifestSpanIds.length + 8,
+    );
+
+    const applied = await extraction.cleanupOrphanedExtractionSpans(pool, { apply: true });
+    assert.equal(applied.applied, true);
+    assert.equal(applied.spans, 1);
+
+    const survivors = new Set(
+      (
+        await client.query("SELECT id FROM kith.evidence_spans WHERE source_text_version_id = $1", [f.textVersion.id])
+      ).rows.map((row) => row.id),
+    );
+    assert.equal(survivors.has(orphanSpanId), false, "the orphan survived");
+    for (const [name, id] of [
+      ["the marked extraction span", extractionSpanId],
+      ["the adopted legacy span", legacySpanId],
+      ["the card span", cardSpanId],
+      ["the foreign parser span", foreignSpanId],
+      ["the investment-entry-cited span", investmentSpanId],
+      ["the document-extraction-cited span", extractionStatementSpanId],
+      ["the worker-parsed-stage-cited span", workerStageSpanId],
+      ...f.manifestSpanIds.map((id, index) => [`manifest span ${index}`, id]),
+    ]) {
+      assert.ok(survivors.has(id), `${name} was deleted`);
+    }
+
+    // The point of a whitelist rather than a foreign-key sweep:
+    // `investment_entries.evidence_span_id` is `ON DELETE SET NULL`, so a
+    // wrong delete would blank it silently instead of failing. Surviving is
+    // not enough on its own -- the entry must still point at it.
+    assert.equal(
+      (
+        await client.query("SELECT evidence_span_id FROM kith.investment_entries WHERE id = $1", [investmentEntryId])
+      ).rows[0].evidence_span_id,
+      investmentSpanId,
+      "the investment entry's evidence_span_id was blanked",
+    );
+
+    // Idempotent: a second apply finds nothing, so a scheduled run is safe.
+    const again = await extraction.cleanupOrphanedExtractionSpans(pool, { apply: true });
+    assert.equal(again.spans, 0);
+    assert.equal(again.generationsAffected, 0);
+
+    // The point of the exercise: with the orphan gone the generation
+    // verifies again, so the watcher can report a complete pass.
+    //
+    // These go first, and that is not a loophole. A span with somebody
+    // else's locator kind is one the seal is *right* to refuse, and the
+    // cleanup is right to leave alone -- removing `foreignSpanId` here
+    // separates "the cleanup fixed the orphan" from "the seal stopped
+    // checking", which is the failure this whole line of work has to avoid.
+    //
+    // The investment-entry, document-extraction and worker-parsed-stage
+    // survivors are the known, called-out residue: the cleanup's reference
+    // check is wider than the seal's acceptable-span check (only a manifest
+    // member, an `extraction_v1`-marked span, or a `document_statement`
+    // adoption verifies), so a kindless span these three tables cite and
+    // nothing else adopts is correctly *not deleted* -- proved above -- but
+    // still correctly fails `id_sets` on its own, unrelated to this fix.
+    //
+    // `investment_entries.evidence_span_id, space_id` is a *composite*
+    // foreign key, so `ON DELETE SET NULL` would try to null `space_id` too
+    // and hit its `NOT NULL` constraint. Clearing the reference by hand
+    // first is this test's cleanup, not a claim about the sweep.
+    await client.query("UPDATE kith.investment_entries SET evidence_span_id = NULL WHERE id = $1", [
+      investmentEntryId,
+    ]);
+    await client.query("DELETE FROM kith.evidence_spans WHERE id = ANY($1::text[])", [
+      [foreignSpanId, investmentSpanId, extractionStatementSpanId, workerStageSpanId],
+    ]);
+    assert.equal(
+      (await provenance.verifySealedParsedPayload(client, f.generation)).actualEvidenceSpanCount,
+      f.manifestSpanIds.length,
+    );
+  },
+);
+
+/**
+ * ADM-5j second-model review, fix 1. The pre-filter used to be a cheap scan
+ * with no reference check of its own, so a sealed generation whose only
+ * candidate span was actually referenced (by an observation, here) still
+ * counted as "scanned" on every run, forever. Under a `--limit` smaller than
+ * the number of sealed generations, that false positive could occupy the
+ * whole budget and a real orphan sorted after it would never be reached
+ * without raising `--limit`.
+ *
+ * The fix reuses the exact reference-check fragment `unreferencedSpanIds`
+ * runs, inside the pre-filter itself, so a generation with nothing truly
+ * unreferenced is not a candidate at all -- not "affected: 0", absent from
+ * `generationsScanned` entirely.
+ */
+test(
+  "the cleanup's pre-filter excludes a generation whose only candidate span is referenced, so a limit-truncated run still converges",
+  { skip },
+  async (t) => {
+    const database = await throwawayDatabase(t);
+    const client = await connect(database);
+    await applyKithSchema(client);
+    const pool = createKithPool(database.url);
+    pool.on("error", () => {});
+    t.after(() => pool.end());
+
+    // Two independent sealed generations. Kith ids are random, not
+    // time-ordered (see `packages/kith-store/src/ids.ts`), so which fixture's
+    // space id sorts first is decided after both exist, not by call order.
+    // The one that sorts first gets only a referenced legacy span (no true
+    // orphan) -- the shape that used to earn a permanent, un-earned seat in
+    // `generationsScanned` ahead of the generation that actually needs work.
+    const fixtureA = await sealedGeneration(client);
+    const fixtureB = await sealedGeneration(client);
+    const [referencedOnly, hasOrphan] =
+      fixtureA.spaceId < fixtureB.spaceId ? [fixtureA, fixtureB] : [fixtureB, fixtureA];
+
+    const span = async (fixture, ordinal) => {
+      const id = newKithId();
+      await client.query(
+        `INSERT INTO kith.evidence_spans
+           (id, space_id, created_at, source_revision_id, source_text_version_id,
+            source_page_id, ordinal, "start", "end", quote_hash)
+         VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,0,1,$7)`,
+        [
+          id,
+          fixture.spaceId,
+          fixture.revision.id,
+          fixture.textVersion.id,
+          fixture.pageId,
+          ordinal,
+          await sha256Utf8("A"),
+        ],
+      );
+      return id;
+    };
+
+    const referencedSpanId = await span(referencedOnly, 900);
+    await citeSpans(client, referencedOnly, [referencedSpanId]);
+    const orphanSpanId = await span(hasOrphan, 900);
+
+    // limit: 1, with two sealed generations in the database. The old
+    // pre-filter would deterministically return `referencedOnly` here (it
+    // sorts first and always re-qualified), and the per-generation check
+    // would then find nothing to remove -- `generationsScanned: 1,
+    // generationsAffected: 0, spans: 0`, `hasOrphan` never seen. The fixed
+    // pre-filter excludes `referencedOnly` before the limit is even applied,
+    // so the one candidate a limit of 1 finds is the real one.
+    const limited = await extraction.cleanupOrphanedExtractionSpans(pool, {
+      apply: false,
+      limit: 1,
+    });
+    assert.equal(limited.generationsScanned, 1, "the referenced-only generation was not excluded");
+    assert.equal(limited.generationsAffected, 1);
+    assert.equal(limited.spans, 1);
+
+    // Applying at the same limit removes the real orphan on this first run --
+    // no need to raise `--limit` to get past the false positive.
+    const applied = await extraction.cleanupOrphanedExtractionSpans(pool, {
+      apply: true,
+      limit: 1,
+    });
+    assert.equal(applied.spans, 1);
+    const survivors = new Set(
+      (
+        await client.query("SELECT id FROM kith.evidence_spans WHERE source_text_version_id = $1", [
+          hasOrphan.textVersion.id,
+        ])
+      ).rows.map((row) => row.id),
+    );
+    assert.equal(survivors.has(orphanSpanId), false, "the orphan survived");
+
+    // A bare re-run at the same limit now reports nothing left to do: the
+    // referenced-only generation never counted against the budget, so the
+    // cleanup actually finished instead of being stuck re-selecting it.
+    const again = await extraction.cleanupOrphanedExtractionSpans(pool, {
+      apply: false,
+      limit: 1,
+    });
+    assert.equal(again.generationsScanned, 0);
+    assert.equal(again.spans, 0);
+
+    // The referenced span was never a candidate at all: it survives, still
+    // cited exactly as `citeSpans` wrote it.
+    assert.ok(
+      (await client.query("SELECT id FROM kith.evidence_spans WHERE id = $1", [referencedSpanId])).rows[0],
+      "the referenced span was removed",
+    );
   },
 );
 

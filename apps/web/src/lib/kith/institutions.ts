@@ -6,12 +6,10 @@
 // masking rule and the freshness rule are all testable without a database, an
 // archive or a DOM.
 //
-// PRIVACY: an account is labelled by its display name, or by the last four
-// digits the archive chose to disclose, and by nothing else. The contract
-// never returns a full account number (`accounts.acct_last4` is the only
-// digits the archive stores at all), and `maskedLabel` below is the only
-// place a row's label is built, so there is one line to check rather than one
-// per column.
+// PRIVACY: the account column uses the archive's friendly display name. The
+// separate identifier column receives only the four digits the archive chose
+// to disclose. The contract never returns a full account number
+// (`accounts.acct_last4` is the only account-number field it stores).
 
 import type { FinanceAccountInventoryRecord } from "@repo/finance-contract";
 
@@ -32,6 +30,13 @@ export type InstitutionRow = {
   id: string;
   /** The institution's name on a group row, the account's label on a child. */
   name: string;
+  /** The institution that owns an account. Repeated on children only so the
+   * UI can give the parent and child rows distinct, unambiguous columns. */
+  institutionName: string;
+  /** A human-friendly account label. Null for an institution parent row. */
+  accountName: string | null;
+  /** Only the archive-disclosed last four digits. Null when undisclosed. */
+  accountLast4: string | null;
   /** Null on a group row: an institution has no single type. */
   accountType: string | null;
   /** Accounts in the group. Null on a child row. */
@@ -48,28 +53,16 @@ export type InstitutionRow = {
   children?: InstitutionRow[];
 };
 
-/**
- * What an account is called on screen.
- *
- * The display label when the archive has one; otherwise the four digits it
- * disclosed, masked so the row cannot be misread as a whole number; otherwise
- * the opaque account id, which is an identifier and not an account number.
- */
-export function maskedLabel(
+/** The archive's account name, without substituting an identifier for it. */
+export function friendlyAccountName(
   account: FinanceAccountInventoryRecord["account"],
 ): string {
-  if (account.displayLabel !== undefined && account.displayLabel !== "") {
-    return account.displayLabel;
-  }
-  if (account.accountLast4 !== undefined) return `••••${account.accountLast4}`;
-  return account.accountId;
+  return account.displayLabel?.trim() || "Unlabeled account";
 }
 
 function ageDays(asOf: string | null, now: number): number | null {
   if (asOf === null) return null;
-  return Math.floor(
-    Math.max(now - Date.parse(`${asOf}T00:00:00Z`), 0) / DAY,
-  );
+  return Math.floor(Math.max(now - Date.parse(`${asOf}T00:00:00Z`), 0) / DAY);
 }
 
 /** One row's tag, plus the age the tooltip explains it with. */
@@ -121,7 +114,10 @@ export function groupInstitutions(
     const hasContent = record.statementCount + record.recordCount > 0;
     const child: InstitutionRow = {
       id: record.account.accountId,
-      name: maskedLabel(record.account),
+      name: friendlyAccountName(record.account),
+      institutionName: record.account.institutionName,
+      accountName: friendlyAccountName(record.account),
+      accountLast4: record.account.accountLast4 ?? null,
       accountType: record.account.accountType ?? null,
       accounts: null,
       statements: record.statementCount,
@@ -136,6 +132,9 @@ export function groupInstitutions(
     const group = groups.get(name) ?? {
       id: name,
       name,
+      institutionName: name,
+      accountName: null,
+      accountLast4: null,
       accountType: null,
       accounts: 0,
       statements: 0,

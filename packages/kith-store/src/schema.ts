@@ -239,6 +239,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
       import.meta.url,
     ),
   },
+  {
+    version: 32,
+    name: "sensitivity: levels on kinds, fields, items and roots, the effective-level views and the opt-in per-credential ceiling (SENS-1)",
+    url: new URL("../migrations/032_sensitivity.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

@@ -6,5 +6,6 @@ export * from "./diagnose.js";
 export * from "./gate.js";
 export * from "./provider.js";
 export * from "./model.js";
+export * from "./spanSweep.js";
 export * from "./corrections.js";
 export * from "./read.js";

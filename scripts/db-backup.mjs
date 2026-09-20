@@ -36,6 +36,7 @@ export function parseDbBackupArgs(argv) {
   let config;
   let verifyConfig;
   let verify = false;
+  let proofNow = false;
   const rest = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -43,6 +44,7 @@ export function parseDbBackupArgs(argv) {
     else if (arg === "--config") config = argv[(i += 1)];
     else if (arg === "--verify-config") verifyConfig = argv[(i += 1)];
     else if (arg === "--verify") verify = true;
+    else if (arg === "--proof-now") proofNow = true;
     else rest.push(arg);
   }
   if (rest.length > 0) fail("usage_invalid");
@@ -55,7 +57,8 @@ export function parseDbBackupArgs(argv) {
     fail("verify_config_required");
   if (engine === "postgres" && !verify) fail("postgres_requires_verify");
   if (!verify && verifyConfig !== undefined) fail("verify_config_without_verify");
-  return { engine, config, verify, verifyConfig };
+  if (proofNow && engine !== "postgres") fail("proof_now_requires_postgres_engine");
+  return { engine, config, verify, verifyConfig, proofNow };
 }
 
 /**
@@ -64,7 +67,7 @@ export function parseDbBackupArgs(argv) {
  * pass it; the dynamic imports below are the real, unchanged modules.
  */
 export async function runDbBackup(argv, deps = {}) {
-  const { engine, config, verify, verifyConfig } = parseDbBackupArgs(argv);
+  const { engine, config, verify, verifyConfig, proofNow } = parseDbBackupArgs(argv);
   if (engine === "convex") {
     const convex =
       deps.convexModule ?? (await import("./run-database-backup.mjs"));
@@ -78,11 +81,54 @@ export async function runDbBackup(argv, deps = {}) {
   const loaded = await postgres.loadPostgresBackupConfig(config);
   const loadedVerify = await postgres.loadPostgresVerifyConfig(verifyConfig);
   const stateRunner = deps.stateRunner ?? runWithDatabaseBackupState;
-  return stateRunner(loaded, async ({ setStage }) => {
+  const clock = deps.clock ?? Date.now;
+  return stateRunner(loaded, async ({ setStage, priorProof, recordProof, recordRetention }) => {
     const result = await postgres.runPostgresDatabaseBackup(loaded);
     await setStage("verify");
-    const verification = await postgres.verifyPostgresBackup(loadedVerify, result);
-    return { engine, result, verification };
+    // The isolated restore proof runs on a cadence
+    // (`restoreProofEveryDays`), not every backup: due when it has never
+    // passed, when the configured interval has elapsed since it last did, or
+    // when the operator forces it with `--proof-now`.
+    const everyMs = loadedVerify.restoreProofEveryDays * 86_400_000;
+    const runRestoreProof =
+      proofNow || priorProof.lastProofAt === null ||
+      clock() - priorProof.lastProofAt >= everyMs;
+    let verification;
+    try {
+      verification = await postgres.verifyPostgresBackup(
+        loadedVerify,
+        result,
+        { runRestoreProof },
+      );
+    } catch (error) {
+      // Retention (forget/prune) must never run against an unverified
+      // backup: pruning here could age an older, known-good snapshot out on
+      // the strength of a new one that turns out not to verify (BAK-1
+      // review). Record why retention was skipped this run rather than
+      // leaving the field silently unchanged, so a health check reading the
+      // status file can tell "skipped because verify failed" apart from
+      // "not attempted yet".
+      recordRetention({ state: "skipped", code: null, at: clock(), removed: null, kept: null });
+      throw error;
+    }
+    if (verification.restore?.status === "passed") {
+      const at = clock();
+      recordProof({ lastProofAt: at, nextProofDueAt: at + everyMs });
+    }
+    await setStage("retention");
+    const retention = await postgres.runPostgresRetention(loaded);
+    const retentionState = retention.status === "passed" ? "ok" : "failed";
+    recordRetention({
+      state: retentionState,
+      code: retention.code ?? null,
+      at: clock(),
+      removed: retention.removedCount ?? null,
+      kept: retention.keptCount ?? null,
+    });
+    // Exposed on the returned object (not just the durable status journal) so
+    // the CLI's own success line can report it (BAK-1 second review,
+    // "also worth doing") without recomputing the ok/failed mapping itself.
+    return { engine, result, verification, retention, retentionState };
   });
 }
 
@@ -100,7 +146,12 @@ function isMain() {
 async function main() {
   const output = await runDbBackup(process.argv.slice(2));
   process.stdout.write(
-    `${JSON.stringify({ status: "passed", engine: output.engine })}\n`,
+    `${JSON.stringify({
+      status: "passed",
+      engine: output.engine,
+      // null for the convex engine, which has no retention step at all.
+      retention: output.retentionState ?? null,
+    })}\n`,
   );
 }
 if (isMain())

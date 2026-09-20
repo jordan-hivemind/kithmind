@@ -10,6 +10,7 @@ import {
   FINANCE_READ_TOOL_DESCRIPTION,
   FinanceContractError,
 } from "@repo/finance-contract";
+import { scrubLogFields } from "@repo/kith-store/sensitivity";
 import { z } from "zod";
 
 import {
@@ -178,11 +179,21 @@ function guardToolErrors<Shape extends z.ZodRawShape>(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (CLIENT_SAFE_TOOL_ERRORS.has(message)) return toolErrorResult(message);
-      console.error("MCP tool error", {
-        tool,
-        name: error instanceof Error ? error.name : typeof error,
-        message,
-      });
+      // SENS-1. The result is already "Internal error", so nothing an
+      // identifier could be in reaches the client here. The log line is the
+      // exposure: a driver or parser that quotes the offending value puts it in
+      // `message`, and this line is what ships to the host's log store, which
+      // is the one place the owner's data would sit outside the archive. Note
+      // that this scrubs a LOG, not a tool result -- tool results are returned
+      // in full, by the owner's decision.
+      console.error(
+        "MCP tool error",
+        scrubLogFields({
+          tool,
+          name: error instanceof Error ? error.name : typeof error,
+          message,
+        }),
+      );
       return toolErrorResult("Internal error");
     }
   };

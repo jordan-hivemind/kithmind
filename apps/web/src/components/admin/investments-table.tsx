@@ -47,6 +47,7 @@ import {
   Tag,
 } from "@/components/ui/data-table";
 import { buttonClass, primaryButtonClass } from "@/components/ui/drawer";
+import { archiveDate, tableDecimal, tableInteger } from "@/lib/kith/format";
 import {
   type ImportPreview,
   type ImportWriter,
@@ -81,7 +82,9 @@ const STATUS_TONE: Record<string, "neutral" | "accent" | "warn"> = {
 };
 
 function Money({ value }: { value: string }) {
-  return <span className="tabular-nums text-gray-900">{value}</span>;
+  return (
+    <span className="tabular-nums text-gray-900">{tableDecimal(value)}</span>
+  );
 }
 
 async function send(
@@ -384,7 +387,7 @@ export function InvestmentsTable({
             <Detail label={row.original.name} detail={row.original.notes} />
           ) : (
             <span className="tabular-nums text-gray-500">
-              {row.original.entryDate}
+              {archiveDate(row.original.entryDate)}
             </span>
           ),
       },
@@ -411,11 +414,11 @@ export function InvestmentsTable({
         cell: ({ row }) =>
           row.original.kind === "investment" ? (
             <span className="tabular-nums text-gray-600">
-              {row.original.signedOn ?? ""}
+              {archiveDate(row.original.signedOn)}
             </span>
           ) : (
             <span className="tabular-nums">
-              {row.original.amount} {row.original.currency}
+              {tableDecimal(row.original.amount)} {row.original.currency}
             </span>
           ),
       },
@@ -432,7 +435,9 @@ export function InvestmentsTable({
             <Detail
               label={
                 <span className="tabular-nums text-gray-500">
-                  x {row.original.exchangeRate}
+                  {row.original.exchangeRate === null
+                    ? ""
+                    : `x ${tableDecimal(row.original.exchangeRate)}`}
                 </span>
               }
               detail="Converted at the rate recorded with this entry"
@@ -449,7 +454,7 @@ export function InvestmentsTable({
           row.original.kind === "investment" ? (
             <Detail
               label={<Money value={row.original.totals.usd.sent} />}
-              detail={`Capital calls only. Fees ${row.original.totals.usd.fees}.`}
+              detail={`Capital calls only. Fees ${tableDecimal(row.original.totals.usd.fees)}.`}
             />
           ) : (
             <span className="truncate text-gray-600">
@@ -471,7 +476,9 @@ export function InvestmentsTable({
           if (overCalled !== "0.00") {
             return (
               <Detail
-                label={<Tag tone="warn">over-called {overCalled}</Tag>}
+                label={
+                  <Tag tone="warn">over-called {tableDecimal(overCalled)}</Tag>
+                }
                 detail="Computed: sent exceeds committed by this much"
               />
             );
@@ -508,13 +515,13 @@ export function InvestmentsTable({
             <Detail
               label={
                 <span className="tabular-nums">
-                  {row.original.documentCount}
+                  {tableInteger(row.original.documentCount)}
                 </span>
               }
               detail={
                 row.original.unlinkedDocumentCount === 0
                   ? null
-                  : `${row.original.unlinkedDocumentCount} unlinked`
+                  : `${tableInteger(row.original.unlinkedDocumentCount)} unlinked`
               }
             />
           ) : row.original.documentId === null ? null : (
