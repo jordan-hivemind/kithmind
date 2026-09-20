@@ -1,128 +1,102 @@
 "use client";
 
-// Quick Capture, posting to `POST /api/kith/thoughts/capture`
-// (`lib/kith/capture.ts`'s `captureThoughtFromWeb`).
-//
-// Not optimistic, deliberately: the route runs a classifier and an admission
-// gate, and may store, merge, supersede or refuse the text. Guessing the
-// outcome would show a thought that then vanishes. A stored capture clears the
-// box and shows its classification; the recent list picks it up from the change
-// feed. Every other disposition keeps the text and shows `operationSummary` so
-// it can be edited and resent.
-
+import * as Dialog from "@radix-ui/react-dialog";
+import { Plus } from "lucide-react";
 import { useState } from "react";
 
 import { Button, inputClass } from "@/components/ui/controls";
+import type { CaptureResponse } from "@/lib/kith/capture-client";
 
-type CaptureResponse = {
-  thoughtId?: string;
-  metadata: { type: string; summary: string };
-  disposition:
-    | "stored"
-    | "duplicate"
-    | "superseded"
-    | "corrected"
-    | "needs_confirmation"
-    | "skipped";
-  operationSummary?: string;
-};
-
-export function KithQuickCapture() {
+export function KithQuickCapture({
+  onCapture,
+}: {
+  onCapture: (content: string) => Promise<CaptureResponse>;
+}) {
+  const [open, setOpen] = useState(false);
   const [content, setContent] = useState("");
   const [loading, setLoading] = useState(false);
-  const [status, setStatus] = useState<{
-    text: string;
-    failed: boolean;
-  } | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
     const trimmed = content.trim();
     if (!trimmed) return;
-
     setLoading(true);
     setStatus(null);
     try {
-      const response = await fetch("/api/kith/thoughts/capture", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: trimmed }),
-      });
-      if (response.status === 401) {
-        setStatus({
-          text: "Sign in again to capture a thought.",
-          failed: true,
-        });
-        return;
-      }
-      if (!response.ok) {
-        setStatus({
-          text: "Failed to capture thought. Please try again.",
-          failed: true,
-        });
-        return;
-      }
-      const result = (await response.json()) as CaptureResponse;
-      if (result.disposition === "stored") {
-        setStatus({
-          text: `Saved as ${result.metadata.type.replaceAll("_", " ")}: ${result.metadata.summary}`,
-          failed: false,
-        });
-        setContent("");
-      } else {
-        setStatus({
-          text:
-            result.operationSummary ??
-            "This was not stored. Try one coherent durable narrative, or use a structured fact.",
-          failed: true,
-        });
-      }
-    } catch {
-      setStatus({
-        text: "Failed to capture thought. Please try again.",
-        failed: true,
-      });
+      await onCapture(trimmed);
+      setContent("");
+      setOpen(false);
+    } catch (error) {
+      setStatus(
+        error instanceof Error
+          ? error.message
+          : "Failed to capture thought. Please try again.",
+      );
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <form
-      onSubmit={(event) => void handleSubmit(event)}
-      className="flex flex-col gap-1.5"
+    <Dialog.Root
+      open={open}
+      onOpenChange={(nextOpen) => {
+        setOpen(nextOpen);
+        if (nextOpen) setStatus(null);
+      }}
     >
-      <label
-        htmlFor="quick-capture"
-        className="text-sm font-medium text-gray-600"
-      >
-        Capture
-      </label>
-      <div className="flex items-start gap-2">
-        <textarea
-          id="quick-capture"
-          value={content}
-          onChange={(event) => setContent(event.target.value)}
-          placeholder="Thought, decision, note or idea"
-          rows={2}
-          className={`${inputClass} h-auto min-h-14 flex-1 resize-y py-1.5`}
-        />
-        <Button
-          type="submit"
-          variant="primary"
-          disabled={loading || !content.trim()}
-        >
-          {loading ? "Saving..." : "Capture"}
+      <Dialog.Trigger asChild>
+        <Button variant="primary" className="gap-1.5">
+          <Plus className="size-4" aria-hidden="true" />
+          New Thought
         </Button>
-      </div>
-      {status && (
-        <p
-          role={status.failed ? "alert" : "status"}
-          className={`text-xs ${status.failed ? "text-red-700" : "text-gray-600"}`}
-        >
-          {status.text}
-        </p>
-      )}
-    </form>
+      </Dialog.Trigger>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-40 bg-[rgb(20_32_30_/_48%)]" />
+        <Dialog.Content className="fixed top-1/2 left-1/2 z-50 w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
+          <Dialog.Title className="kith-section-title">
+            New thought
+          </Dialog.Title>
+          <Dialog.Description className="sr-only">
+            Capture a thought, decision, note, or idea.
+          </Dialog.Description>
+          <form
+            onSubmit={(event) => void handleSubmit(event)}
+            className="mt-4 space-y-3"
+          >
+            <label htmlFor="quick-capture" className="sr-only">
+              Thought
+            </label>
+            <textarea
+              id="quick-capture"
+              autoFocus
+              value={content}
+              onChange={(event) => setContent(event.target.value)}
+              placeholder="Thought, decision, note or idea"
+              rows={5}
+              className={`${inputClass} h-auto min-h-32 w-full resize-y py-2`}
+            />
+            {status ? (
+              <p role="alert" className="text-sm text-kith-danger">
+                {status}
+              </p>
+            ) : null}
+            <div className="flex justify-end gap-2">
+              <Dialog.Close asChild>
+                <Button disabled={loading}>Cancel</Button>
+              </Dialog.Close>
+              <Button
+                type="submit"
+                variant="primary"
+                disabled={loading || !content.trim()}
+              >
+                {loading ? "Saving..." : "Save thought"}
+              </Button>
+            </div>
+          </form>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }

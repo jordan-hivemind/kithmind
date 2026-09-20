@@ -33,6 +33,7 @@ import {
   type SortingState,
   useReactTable,
 } from "@tanstack/react-table";
+import { Check, Filter } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { buttonClass } from "@/components/ui/drawer";
@@ -489,17 +490,8 @@ export function DataTable<T>({
             {chipOptions.length > 0 ? (
               <DropdownMenu.Root>
                 <DropdownMenu.Trigger className="flex h-8 items-center gap-1.5 rounded-control border border-kith-border-subtle bg-kith-surface px-2.5 text-sm text-kith-text-secondary hover:bg-kith-surface-muted data-[state=open]:bg-kith-surface-muted">
-                  <svg
-                    aria-hidden
-                    viewBox="0 0 16 16"
-                    className="h-3.5 w-3.5"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.5"
-                  >
-                    <path d="M2 3h12L9.5 8.5V13l-3-1.5V8.5L2 3Z" strokeLinejoin="round" />
-                  </svg>
-                  Filters
+                  <Filter className="size-3.5" aria-hidden="true" />
+                  Filter
                   {activeFilterCount > 0 ? (
                     <span className="rounded-tag bg-accent-600 px-1.5 py-0.5 text-xs leading-none text-white">
                       {activeFilterCount}
@@ -562,7 +554,7 @@ export function DataTable<T>({
                                 aria-hidden
                                 className="flex h-3.5 w-3.5 items-center justify-center rounded-[3px] border border-gray-300 bg-white text-[10px] leading-none text-white group-data-[state=checked]:border-accent-600 group-data-[state=checked]:bg-accent-600"
                               >
-                                <span className="hidden group-data-[state=checked]:block">✓</span>
+                                <Check className="hidden size-3 group-data-[state=checked]:block" />
                               </span>
                               <span className="flex-1">{label(option.value)}</span>
                               <span className="text-xs text-kith-text-muted tabular-nums">
@@ -629,7 +621,7 @@ export function DataTable<T>({
                   className="border-b border-kith-border-subtle bg-kith-surface-muted"
                 >
                   {selectable ? (
-                    <th className="h-row w-7 px-1 align-middle">
+                    <th className="h-row w-7 bg-kith-surface-muted px-1 align-middle">
                       <SelectionCheckbox
                         label="Select all"
                         checked={selectionState === "all"}
@@ -648,7 +640,7 @@ export function DataTable<T>({
                         key={header.id}
                         scope="col"
                         style={{ width: header.getSize() }}
-                        className="relative h-row border-r border-kith-border px-2 text-left align-middle text-xs font-medium text-kith-text-secondary last:border-r-0"
+                        className="relative h-row border-r border-kith-border bg-kith-surface-muted px-2 text-left align-middle font-medium text-kith-text-secondary last:border-r-0"
                       >
                         {header.isPlaceholder ? null : header.column.getCanSort() ? (
                           <button
@@ -690,7 +682,9 @@ export function DataTable<T>({
                       </th>
                     );
                   })}
-                  {actions.length > 0 ? <th className="h-row w-8" /> : null}
+                  {actions.length > 0 ? (
+                    <th className="h-row w-8 bg-kith-surface-muted" />
+                  ) : null}
                 </tr>
               ))}
             </thead>
