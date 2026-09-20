@@ -31,8 +31,12 @@ import {
   type RowAction,
   Tag,
 } from "@/components/ui/data-table";
+import {
+  type CaptureResponse,
+  captureThought,
+} from "@/lib/kith/capture-client";
 import { label, shortDate } from "@/lib/kith/format";
-import { mutateJson } from "@/lib/kith/optimistic";
+import { isPendingId, mutateJson, pendingId } from "@/lib/kith/optimistic";
 import {
   useOptimisticMutation,
   useServerData,
@@ -64,6 +68,7 @@ type DashboardData = {
 
 type Row = {
   id: string;
+  pending: boolean;
   content: string;
   type: string;
   topics: string;
@@ -80,6 +85,8 @@ type EditVars = {
   people: string[];
 };
 
+type CaptureVars = { id: string; content: string; createdAt: number };
+
 const LIVE_TABLES = ["thoughts", "facts"] as const;
 const DASHBOARD_KEY = ["dashboard"];
 
@@ -95,9 +102,10 @@ function Stat({ value, name }: { value: number; name: string }) {
 }
 
 export function KithDashboard({ stats, recent }: DashboardData) {
+  const serverData = useMemo(() => ({ stats, recent }), [stats, recent]);
   const data = useServerData<DashboardData>(
     DASHBOARD_KEY,
-    { stats, recent },
+    serverData,
     LIVE_TABLES,
   );
   const [editing, setEditing] = useState<{
@@ -146,10 +154,47 @@ export function KithDashboard({ stats, recent }: DashboardData) {
     }),
   });
 
+  const capture = useOptimisticMutation<DashboardData, CaptureVars>({
+    queryKey: DASHBOARD_KEY,
+    mutationFn: async ({ content }) => {
+      const result = await captureThought(content);
+      if (result.disposition !== "stored") {
+        throw new Error(
+          result.operationSummary ??
+            "This was not stored. Try one coherent durable narrative, or use a structured fact.",
+        );
+      }
+      return result;
+    },
+    apply: (current, values) => ({
+      ...current,
+      stats: {
+        ...current.stats,
+        totalThoughts: current.stats.totalThoughts + 1,
+      },
+      recent: [
+        {
+          id: values.id,
+          content: values.content,
+          createdAt: values.createdAt,
+          metadata: {
+            type: "pending",
+            topics: [],
+            people: [],
+            actionItems: [],
+            summary: values.content,
+          },
+        },
+        ...current.recent,
+      ],
+    }),
+  });
+
   const rows = useMemo<Row[]>(
     () =>
       data.recent.map((thought) => ({
         id: thought.id,
+        pending: isPendingId(thought.id),
         content: thought.content,
         type: label(thought.metadata.type),
         topics: thought.metadata.topics.join(", "),
@@ -181,7 +226,9 @@ export function KithDashboard({ stats, recent }: DashboardData) {
         id: "type",
         accessorKey: "type",
         header: "Type",
-        cell: ({ row }) => <Tag>{row.original.type}</Tag>,
+        cell: ({ row }) => (
+          <Tag>{row.original.pending ? "Saving" : row.original.type}</Tag>
+        ),
       },
       { id: "topics", accessorKey: "topics", header: "Topics" },
       { id: "people", accessorKey: "people", header: "People" },
@@ -203,6 +250,7 @@ export function KithDashboard({ stats, recent }: DashboardData) {
   // Shared by the kebab's Edit item and clicking the row.
   const openEdit = useCallback(
     (row: Row) => {
+      if (row.pending) return;
       const thought = data.recent.find((item) => item.id === row.id);
       if (!thought) return;
       setEditing({
@@ -220,14 +268,16 @@ export function KithDashboard({ stats, recent }: DashboardData) {
 
   const actions = useMemo<RowAction<Row>[]>(
     () => [
-      { label: "Edit", onSelect: openEdit },
+      { label: "Edit", hidden: (row) => row.pending, onSelect: openEdit },
       {
         label: "Delete",
         danger: true,
+        hidden: (row) => row.pending,
         onSelect: (row) => void remove.mutateAsync(row.id),
       },
       {
         label: "Copy id",
+        hidden: (row) => row.pending,
         onSelect: (row) => void navigator.clipboard.writeText(row.id),
       },
     ],
@@ -236,7 +286,17 @@ export function KithDashboard({ stats, recent }: DashboardData) {
 
   return (
     <div>
-      <PageHeader title="Dashboard" />
+      <PageHeader title="Dashboard">
+        <KithQuickCapture
+          onCapture={async (content): Promise<CaptureResponse> =>
+            (await capture.mutateAsync({
+              id: pendingId(),
+              content,
+              createdAt: Date.now(),
+            })) as CaptureResponse
+          }
+        />
+      </PageHeader>
       <div className="mb-4 flex flex-wrap gap-2">
         <Stat value={data.stats.totalFacts} name="facts" />
         <Stat value={data.stats.totalThoughts} name="thoughts" />
@@ -244,7 +304,6 @@ export function KithDashboard({ stats, recent }: DashboardData) {
           <Stat key={entry.type} value={entry.count} name={label(entry.type)} />
         ))}
       </div>
-      <KithQuickCapture />
       <section className="kith-tile mt-6 overflow-hidden">
         <div className="kith-tile-header px-4 py-2">
           <h2 className="kith-section-title">Recent thoughts</h2>
