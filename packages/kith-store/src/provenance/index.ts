@@ -11,6 +11,7 @@ export * from "./archiveBindings.js";
 export * from "./archiveDeletion.js";
 export * from "./providerOriginals.js";
 export {
+  EXTRACTION_SPAN_LOCATOR_KIND,
   insertParsedPages,
   insertParsedEvidence,
   insertParsedDocuments,

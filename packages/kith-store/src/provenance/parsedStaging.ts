@@ -310,10 +310,66 @@ async function limited<T>(
  * than through a ported service, exactly as this package's other modules
  * read a table another row owns when they only need to assert its shape.
  */
+/**
+ * The locator kind an extraction span carries.
+ *
+ * Written by `src/extraction/model.ts` on every span it mints. A marker, not
+ * a shape: `requireLocator` passes an unknown kind through, and nothing reads
+ * it but the seal.
+ */
+export const EXTRACTION_SPAN_LOCATOR_KIND = "extraction_v1";
+
+/**
+ * The span ids typed extraction owns on one sealed text version.
+ *
+ * Two rules, because there are two generations of these rows. Every span
+ * extraction writes from now on carries the locator marker. Spans written
+ * before that marker existed -- the ones on the owner's machine today -- are
+ * recognised by what points at them: a `document_statement` observation's
+ * `value_evidence`, or that event version's own `field_evidence`.
+ *
+ * Deliberately *not* "anything the manifest does not list". That would make
+ * the seal blind to a foreign span appearing over sealed text, which is the
+ * one thing it is for.
+ */
+async function extractionSpanIds(
+  client: ClientBase,
+  sourceTextVersionId: string,
+): Promise<Set<string>> {
+  const marked = await client.query<{ id: string }>(
+    `SELECT id FROM kith.evidence_spans
+      WHERE source_text_version_id = $1 AND locator->>'kind' = $2
+      LIMIT $3`,
+    [sourceTextVersionId, EXTRACTION_SPAN_LOCATOR_KIND, MAX_EVIDENCE_SPANS + 1],
+  );
+  const referenced = await client.query<{ span_id: string }>(
+    `SELECT DISTINCT span_id FROM (
+       SELECT jsonb_array_elements_text(o.value_evidence) AS span_id
+         FROM kith.observations o
+        WHERE o.source_text_version_id = $1
+          AND o.event_type = 'document_statement'
+          AND jsonb_typeof(o.value_evidence) = 'array'
+       UNION ALL
+       SELECT jsonb_array_elements_text(
+                COALESCE(v.field_evidence->'occurrence', '[]'::jsonb))
+         FROM kith.event_versions v
+        WHERE v.source_text_version_id = $1
+          AND v.event_type = 'document_statement'
+     ) AS referenced
+     LIMIT $2`,
+    [sourceTextVersionId, MAX_EVIDENCE_SPANS + 1],
+  );
+  return new Set([
+    ...marked.rows.map((row) => row.id),
+    ...referenced.rows.map((row) => row.span_id),
+  ]);
+}
+
 async function collectPayloadRows(
   client: ClientBase,
   sourceTextVersionId: string,
   processingGenerationId: string,
+  sealedSpanIds: readonly string[],
 ): Promise<{
   pages: SourcePageRow[];
   spans: EvidenceSpanRow[];
@@ -340,7 +396,22 @@ async function collectPayloadRows(
   // (the only kind carrying `cardExtractionFingerprints`) is allowed to sit
   // over sealed text -- sealing protects the text and its pages, not
   // pointers into them -- so it must not count against this manifest.
-  const spans = allSpans.filter((span) => span.cardExtractionFingerprints === null);
+  //
+  // ADM-5i extends the same rule to typed extraction, for the same reason and
+  // because it had to: extraction writes its spans onto the activated parsed
+  // generation, so from the first backfill every extracted document failed
+  // `id_sets` and the watcher never reported a complete pass again.
+  //
+  // A span the manifest *does* list is never excluded, whatever points at it.
+  // Extraction reuses a parser span when one already covers the same range,
+  // and dropping that span here would turn a reused span into a missing one.
+  const owned = await extractionSpanIds(client, sourceTextVersionId);
+  const sealed = new Set(sealedSpanIds);
+  const spans = allSpans.filter(
+    (span) =>
+      span.cardExtractionFingerprints === null &&
+      (sealed.has(span.id) || !owned.has(span.id)),
+  );
   const documents = await limited(
     client,
     `SELECT * FROM kith.documents WHERE processing_generation_id = $1 LIMIT $2`,
@@ -355,10 +426,17 @@ async function collectPayloadRows(
     MAX_PARSED_CHUNKS,
     camelizeChunk,
   );
+  // The seal is over the *parsed* payload. Typed extraction is a derived
+  // layer written on top of an already-activated generation, so its event
+  // version and observations are excluded by type -- while any other record
+  // appearing on this generation still fails the seal, which is what the zero
+  // was there to catch.
   const eventVersionCount = Number(
     (
       await client.query<{ count: string }>(
-        `SELECT count(*)::text AS count FROM kith.event_versions WHERE processing_generation_id = $1`,
+        `SELECT count(*)::text AS count FROM kith.event_versions
+          WHERE processing_generation_id = $1
+            AND event_type IS DISTINCT FROM 'document_statement'`,
         [processingGenerationId],
       )
     ).rows[0]!.count,
@@ -366,7 +444,9 @@ async function collectPayloadRows(
   const observationCount = Number(
     (
       await client.query<{ count: string }>(
-        `SELECT count(*)::text AS count FROM kith.observations WHERE processing_generation_id = $1`,
+        `SELECT count(*)::text AS count FROM kith.observations
+          WHERE processing_generation_id = $1
+            AND event_type IS DISTINCT FROM 'document_statement'`,
         [processingGenerationId],
       )
     ).rows[0]!.count,
@@ -742,7 +822,12 @@ export async function sealParsedPayload(
   stage: WorkerParsedStageRow,
   now: Date,
 ): Promise<SealedPayloadSummary> {
-  const collected = await collectPayloadRows(client, stage.sourceTextVersionId, stage.processingGenerationId);
+  const collected = await collectPayloadRows(
+    client,
+    stage.sourceTextVersionId,
+    stage.processingGenerationId,
+    stage.evidenceSpanIds,
+  );
   if (
     collected.eventVersionCount !== 0 ||
     collected.observationCount !== 0 ||
@@ -1074,7 +1159,12 @@ export async function verifySealedParsedPayload(
     text.textHashAuthority !== "server_verified_retained_text"
   )
     no("manifest_identity");
-  const collected = await collectPayloadRows(client, text.id, generation.id);
+  const collected = await collectPayloadRows(
+    client,
+    text.id,
+    generation.id,
+    manifest.evidenceSpanIds,
+  );
   // Split from the counts below only so a failure can be named. The order of
   // the conditions, and so the answer, is what it was.
   if (
