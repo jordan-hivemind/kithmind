@@ -24,7 +24,7 @@ import {
 // perform, which i7b left as the PostgreSQL one. Only that read and
 // `query_records`' own Kith Mind leg are stubbed here.
 const mocks = vi.hoisted(() => ({
-  authorizedSpaceIds: vi.fn(),
+  financeContext: vi.fn(),
   queryRecords: vi.fn(),
   listSources: vi.fn(),
 }));
@@ -125,6 +125,93 @@ describe("finance provider authorization", () => {
         : undefined;
     expect(amount).toEqual({ decimal: "-12.34", currency: "USD" });
     expect(typeof amount!.decimal).toBe("string");
+  });
+
+  test("owner account fields merge only after strict archive validation", async () => {
+    const exchange = exchangeFor("list_accounts");
+    const override = {
+      accountId: "account-synthetic-001",
+      displayName: "Household Reserve: BDA",
+      accountLast4: "9876",
+      accountType: "trust",
+      closed: true,
+    };
+    const response = await readFinanceArchive(
+      fakeArchive(() => exchange.response),
+      exchange.request,
+      { principalId: PRINCIPAL, authorizedSpaceIds: [ARCHIVE_SPACE] },
+      [override],
+    );
+    expect(response.operation).toBe("list_accounts");
+    if (response.operation !== "list_accounts") return;
+    expect(response.items[0]).toMatchObject({
+      institutionName: "Example Broker",
+      displayLabel: "Household Reserve: BDA",
+      accountLast4: "9876",
+      accountType: "trust",
+      closed: true,
+      archiveAccount: {
+        displayLabel: "Income",
+        accountLast4: "1234",
+        accountType: "brokerage",
+      },
+    });
+    expect(exchange.response.items[0]).toMatchObject({
+      displayLabel: "Income",
+      accountLast4: "1234",
+    });
+
+    await expect(
+      readFinanceArchive(
+        fakeArchive(() => ({
+          ...exchange.response,
+          items: [{ ...exchange.response.items[0], institutionName: 42 }],
+        })),
+        exchange.request,
+        { principalId: PRINCIPAL, authorizedSpaceIds: [ARCHIVE_SPACE] },
+        [override],
+      ),
+    ).rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  test("every account-bearing response receives the same owner overlay", async () => {
+    const override = {
+      accountId: "account-synthetic-001",
+      displayName: "Household Reserve",
+      accountLast4: null,
+      accountType: null,
+      closed: true,
+    };
+    for (const operation of [
+      "list_accounts",
+      "get_holdings_snapshot",
+      "list_account_inventory",
+    ]) {
+      const exchange = exchangeFor(operation);
+      const response = await readFinanceArchive(
+        fakeArchive(() => exchange.response),
+        exchange.request,
+        { principalId: PRINCIPAL, authorizedSpaceIds: [ARCHIVE_SPACE] },
+        [override],
+      );
+      const accounts =
+        response.operation === "get_holdings_snapshot"
+          ? [response.account]
+          : response.operation === "list_accounts"
+            ? response.items
+            : response.operation === "list_account_inventory"
+              ? response.items.map((item) => item.account)
+              : [];
+      expect(
+        accounts.find(
+          (account) => account.accountId === "account-synthetic-001",
+        ),
+      ).toMatchObject({
+        institutionName: "Example Broker",
+        displayLabel: "Household Reserve",
+        closed: true,
+      });
+    }
   });
 
   test("a principal outside the archive space gets nothing", async () => {
@@ -250,7 +337,10 @@ function textOf(result: Awaited<ReturnType<typeof call>>): string {
 describe("query_records finance provider", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    mocks.authorizedSpaceIds.mockResolvedValue([ARCHIVE_SPACE]);
+    mocks.financeContext.mockResolvedValue({
+      authorizedSpaceIds: [ARCHIVE_SPACE],
+      accountOverrides: [],
+    });
     mocks.queryRecords.mockResolvedValue({ items: [] });
   });
 
@@ -296,7 +386,10 @@ describe("query_records finance provider", () => {
         ).toEqual(exchange.response);
       }
       // A later call in the same MCP session must reload live membership.
-      mocks.authorizedSpaceIds.mockResolvedValue([]);
+      mocks.financeContext.mockResolvedValue({
+        authorizedSpaceIds: [],
+        accountOverrides: [],
+      });
       const denied = await client.callTool({
         name: "query_records",
         arguments: {
@@ -326,6 +419,41 @@ describe("query_records finance provider", () => {
     expect(JSON.parse(textOf(result))).toEqual(exchange.response);
     // Nothing went to Kith Mind's own record store.
     expect(mocks.queryRecords).not.toHaveBeenCalled();
+  });
+
+  test("MCP returns owner account fields while retaining institution wording", async () => {
+    mocks.financeContext.mockResolvedValue({
+      authorizedSpaceIds: [ARCHIVE_SPACE],
+      accountOverrides: [
+        {
+          accountId: "account-synthetic-001",
+          displayName: "Household Reserve: BDA",
+          accountLast4: "9876",
+          accountType: "trust",
+          closed: true,
+        },
+      ],
+    });
+    const exchange = exchangeFor("get_holdings_snapshot");
+    const result = await call(
+      fakeArchive(() => exchange.response),
+      "query_records",
+      { query: { provider: "finance_archive", request: exchange.request } },
+    );
+    expect(result.isError).not.toBe(true);
+    expect(JSON.parse(textOf(result)).account).toMatchObject({
+      institutionName: "Example Broker",
+      displayLabel: "Household Reserve: BDA",
+      accountLast4: "9876",
+      accountType: "trust",
+      closed: true,
+      archiveAccount: {
+        displayLabel: "Income",
+        accountLast4: "1234",
+        accountType: "brokerage",
+      },
+    });
+    expect(mocks.financeContext).toHaveBeenCalledWith(ARCHIVE_SPACE);
   });
 
   test("a partial archive response stays partial", async () => {
@@ -373,7 +501,20 @@ describe("query_records finance provider", () => {
   });
 
   test("a principal with no membership in the archive space is refused", async () => {
-    mocks.authorizedSpaceIds.mockResolvedValue([OTHER_SPACE]);
+    mocks.financeContext.mockResolvedValue({
+      authorizedSpaceIds: [OTHER_SPACE],
+      // Even a faulty caller cannot use an override to turn a denial into a
+      // response. `readFinanceArchive` checks membership before archive I/O.
+      accountOverrides: [
+        {
+          accountId: "account-synthetic-001",
+          displayName: "Must not leak",
+          accountLast4: null,
+          accountType: null,
+          closed: false,
+        },
+      ],
+    });
     const archive = fakeArchive(
       () => exchangeFor("list_transactions").response,
     );
@@ -411,7 +552,10 @@ describe("query_records finance provider", () => {
 describe("list_sources finance archive block", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    mocks.authorizedSpaceIds.mockResolvedValue([ARCHIVE_SPACE]);
+    mocks.financeContext.mockResolvedValue({
+      authorizedSpaceIds: [ARCHIVE_SPACE],
+      accountOverrides: [],
+    });
     mocks.listSources.mockResolvedValue({
       sources: {
         sources: [{ sourceAccountId: "account-1" }],

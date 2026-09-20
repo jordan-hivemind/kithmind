@@ -114,13 +114,15 @@ describe("the owner's overrides", () => {
       [record({ account: account({ displayLabel: "Investments: BDA" }) })],
       NOW,
       overrides({
-        displayName: "Joint brokerage",
+        displayName: "Joint brokerage: BDA",
         accountLast4: "4321",
         accountType: "trust",
       }),
     );
     const child = group!.children![0]!;
-    expect(child.name).toBe("Joint brokerage");
+    // BDA cleanup applies to the institution's generic label, never to the
+    // owner's literal choice of name.
+    expect(child.name).toBe("Joint brokerage: BDA");
     expect(child.accountLast4).toBe("4321");
     expect(child.accountType).toBe("trust");
     expect(child.last4Reason).toBeNull();
