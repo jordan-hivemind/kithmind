@@ -55,13 +55,16 @@ reason is in the table below.
 | --- | --- | --- |
 | Extraction stored or re-stored | `{ spaceId, sourceItemId }` | `investment_link:item:<sourceItemId>` |
 | Entry or investment created or edited | one job per affected document | `investment_link:item:<sourceItemId>` |
+| An entity alias the scorer reads is added | one job per affected document | `investment_link:item:<sourceItemId>` |
 | An owner rejection frees an entry | one job per affected document | `investment_link:item:<sourceItemId>` |
+| Any of the above while that document's job is already RUNNING | the same payload again | `investment_link:item:<sourceItemId>:after:<runningJobId>` |
 
 Scheduled from `store` in `packages/kith-store/src/extraction/model.ts`, from
 `createInvestment`, `updateInvestment`, `archiveInvestment`,
 `createInvestmentEntry`, `updateInvestmentEntry` and `deleteInvestmentEntry`
-in `packages/kith-store/src/admin/investments.ts`, and from
-`rejectInvestmentDocumentLink` in
+in `packages/kith-store/src/admin/investments.ts`, from `resolveEntity` in
+`packages/kith-store/src/memory/entities.ts` when an alias merge actually
+adds one, and from `rejectInvestmentDocumentLink` in
 `packages/kith-store/src/admin/investmentLinks.ts` -- each in the transaction
 of the write that caused it, so the job commits with that write or not at all.
 
@@ -86,7 +89,9 @@ it prints counts only.
 | Archiving and deleting | Both wake the documents involved. An archived investment leaves the matcher's view (`loadInvestmentNames` excludes it) and a deleted entry takes its link rows with it, so in both cases a live link would otherwise stand behind a decision nothing can still justify. |
 | What the handler does with a bound it cannot score past | `candidate_limit` and `investment_limit` from the scorer are TERMINAL: `failed` on the first run, with the reason in the scrubbed `last_error`, and no attempt consumed. `drain` learned one new outcome for this (`TerminalDeferredWorkError`, `status: "terminal"`). Five identical attempts over fifteen minutes reach the same state and bury the reason under four copies of itself. |
 | What a job that links nothing does | Nothing, silently. No attention row, no correction, no log line. Most of the owner's 142 entries will never have paper behind them; a job per document announcing that it found none is the noise this design treats as a defect. |
-| A document whose kind stops being matchable | Still not swept, and not made worse: `evaluateDocumentLinks` returns `kind_not_matchable` before it sweeps anything, so gating the extraction trigger on the kind costs nothing the scorer does not already cost. It belongs with slice 3's nightly sweep. |
+| A document whose kind stops being matchable | Swept. A re-extraction that re-reads a capital call notice as something else still enqueues the document when it holds ANY link row, and `evaluateDocumentLinks` no longer returns before its sweep: rule-made rows go and give their dates back, owner-decided rows are untouched, and nothing is remembered as a rejection. A document with no link and a kind the scorer cannot read is still no job at all. |
+| A change that lands while that document's job is already RUNNING | A second job, keyed `…:after:<runningJobId>`. `schedule` de-duplicates against `running` as well as `queued`, which is right for a job that has not started reading and wrong for one that already has: the reviewer reproduced an owner's amount edit being absorbed by a running job that had read the old amount, leaving a wrong `auto_linked` row with nothing queued. `scheduleInvestmentLink` reads the pending row `FOR UPDATE` instead -- which also turns "my snapshot says queued but it was claimed since" into a 40001 the write retries -- and `schedule` itself is unchanged for every other kind. |
+| What may never fail because of this feature | An extraction, and a captured fact. Those two enqueues sit in a SAVEPOINT (`withLinkEnqueueSavepoint`): 40001 and 40P01 propagate so the transaction retries as it does today, anything else is recorded once through the scrubbed log path and the write commits, and `kith-investment-link-backfill` is the repair. The owner's own entry, investment and link writes deliberately do NOT get this: those are the writes that invalidate a link, so committing one while silently failing to queue its re-evaluation is the silent wrong data this slice exists to prevent. A failed save is visible and can be retried. |
 
 ### Candidates
 
