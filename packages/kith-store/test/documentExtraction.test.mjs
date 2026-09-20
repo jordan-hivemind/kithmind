@@ -53,6 +53,42 @@ const RECEIPT = [
   "Total due $15.50",
 ].join("\n");
 
+/** A capital call notice, for the ADM-8c trigger below. Synthetic fund,
+ * synthetic amount, synthetic date. */
+const CALL_NOTICE = [
+  "Synthetic Meridian Partners IV",
+  "Capital call notice",
+  "Amount called: $25,000.00",
+  "Due: 2026-04-02",
+].join("\n");
+
+function callNoticeReading() {
+  return {
+    kind: "capital_call_notice",
+    summary: "A capital call from Synthetic Meridian Partners IV.",
+    statements: [
+      {
+        field: "fund",
+        value: "Synthetic Meridian Partners IV",
+        page: 1,
+        quote: "Synthetic Meridian Partners IV",
+      },
+      {
+        field: "amount_called",
+        value: "$25,000.00",
+        page: 1,
+        quote: "Amount called: $25,000.00",
+      },
+      {
+        field: "due_date",
+        value: "2026-04-02",
+        page: 1,
+        quote: "Due: 2026-04-02",
+      },
+    ],
+  };
+}
+
 /** What a well-behaved model returns for {@link RECEIPT}. */
 function goodReading(overrides = {}) {
   return {
@@ -282,6 +318,62 @@ test("activation schedules extraction in the publication's own transaction", { s
   );
   assert.equal(
     (await f.rows("SELECT id FROM kith.deferred_work WHERE kind = 'document_extraction'")).length,
+    1,
+  );
+});
+
+test("storing an investment kind's extraction enqueues its link job", { skip }, async (t) => {
+  // ADM-8c, trigger one, through the path it lives on. `store` enqueues in
+  // the transaction that replaced the document's statements, so what the
+  // matcher will score is what has just been written.
+  const f = await fixture(t);
+  await f.seed();
+
+  const receipt = await f.ingest();
+  await f.extract(stubModel(goodReading()), receipt.sourceItemId, receipt.generationId);
+  assert.deepEqual(
+    await f.rows(
+      "SELECT id FROM kith.deferred_work WHERE kind = 'investment_link'",
+    ),
+    [],
+    "a receipt is not an investment document, so no job is made for it",
+  );
+
+  const notice = await f.ingest(CALL_NOTICE, "synthetic-call-1");
+  const outcome = await f.extract(
+    stubModel(callNoticeReading()),
+    notice.sourceItemId,
+    notice.generationId,
+  );
+  assert.equal(outcome.kind, "capital_call_notice");
+  assert.equal(outcome.failed, 0);
+  const queued = await f.rows(
+    `SELECT payload, dedupe_key, space_id, state FROM kith.deferred_work
+      WHERE kind = 'investment_link'`,
+  );
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].payload.spaceId, f.spaceId);
+  assert.equal(queued[0].payload.sourceItemId, notice.sourceItemId);
+  assert.equal(queued[0].space_id, f.spaceId);
+  assert.equal(queued[0].state, "queued");
+  assert.equal(
+    queued[0].dedupe_key,
+    `investment_link:item:${notice.sourceItemId}`,
+  );
+
+  // A re-extraction of the same document collapses onto the queued job.
+  await f.extract(
+    stubModel(callNoticeReading()),
+    notice.sourceItemId,
+    notice.generationId,
+    NOW + 3_000,
+  );
+  assert.equal(
+    (
+      await f.rows(
+        "SELECT id FROM kith.deferred_work WHERE kind = 'investment_link'",
+      )
+    ).length,
     1,
   );
 });
