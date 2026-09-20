@@ -2206,6 +2206,13 @@ async function store(
   // cited and this one did not. A stranded span used to fail the parsed
   // payload's seal outright. See `./spanSweep.ts` for the eight places a span
   // can be referenced from and why the check is a whitelist.
+  //
+  // ADM-5l: "what the previous run stranded" includes the spans that run
+  // wrote before the `extraction_v1` marker existed. They are unmarked, the
+  // observations that adopted them were replaced at the top of this function,
+  // and until this sweep matched the cleanup's selection they were left for a
+  // hand-run CLI -- 48 of them across 37 of the owner's generations, each one
+  // failing `payload_verify_error:id_sets` all over again.
   await sweepUnreferencedExtractionSpans(client, {
     spaceId: loaded.spaceId,
     sourceTextVersionId: loaded.sourceTextVersionId,
