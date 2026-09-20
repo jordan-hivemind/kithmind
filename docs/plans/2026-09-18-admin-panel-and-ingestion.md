@@ -275,12 +275,27 @@ their exact reading.
 The amount grammar is one explicit rule, written out in
 `packages/kith-store/src/extraction/gate.ts` and pinned by a table in
 `test/extractionGate.test.mjs` that holds every adversarial input the reviews
-have found. A magnitude suffix is **applied**, not dropped and not refused:
-`k` is a thousand, `M`, `MM` and `mn` a million, `B` and `bn` a billion, and
-the words with them. The scaling is exact, by moving the decimal point. A
-token carrying a suffix has exactly one value, the scaled one, on both the
-value side and the quote side, so `2.5` can never borrow a citation that says
-`$2.5M`. **Known ambiguity:** some banking conventions read a bare `M` as the
+have found. A magnitude suffix is **applied**, not dropped and not refused, under two
+rules that together keep it from inventing a number.
+
+An **abbreviation** (`k`, `m`, `b`, `mm`, `mn`, `bn`) scales only when it is
+pressed against the digits with no space **and** a currency marker sits beside
+the same token, on either side: `$2.5M`, `USD 2.5M`, `2.5M USD`, `£1.2k`,
+`($2.5M)`. Without a currency marker, digits followed by a magnitude letter
+are not an amount at all and the whole token is refused — not read as the bare
+number, or `401K` would quietly become 401. This is why: `401K` is a plan,
+`1099-K` is a form, `12.99 mm` is a unit and `Room 12 B` is a room, and each
+of them read as money before the rule existed. A **word** (`thousand`,
+`million`, `billion`) is unambiguous and scales with or without a currency
+marker, separated by at most one space.
+
+The scaling is exact, by moving the decimal point. A token carrying a suffix
+has exactly one value, the scaled one, on both the value side and the quote
+side, so `2.5` can never borrow a citation that says `$2.5M`.
+
+Letters glued to digits are never ignored: they are a currency this grammar
+knows (validated against the supported ISO list, not "any three letters"), a
+magnitude, or a tax flag — or the token is not an amount. **Known ambiguity:** some banking conventions read a bare `M` as the
 Roman thousand and `MM` as the million; this reads `M` as a million, because
 the documents are venture and personal finance. If a kind ever needs the
 other reading it becomes a setting beside `date_order`.
@@ -294,10 +309,17 @@ Each entry of a `line_item_list` carries its own citation and is gated on its
 own: its amount must occur within one cited line, its description folds like
 any name and may span two adjacent cited lines, and its evidence span is the
 line that prints the amount. An entry's observation key is derived from its own evidence -- the cited line
-its amount sits on, and a fold of its description -- so a correction made on
-one line does not move onto another when the model reorders the list between
-runs. Two entries with the same description on the same line still collide,
-and a key moves if the page is re-parsed into different lines.
+its amount sits on, a fold of its description, and its position within that
+line -- so a correction made on one line does not move onto another when the
+model reorders the list between runs, and two identical items on one line stay
+apart. A list always keys this way, even with one entry, or the key would
+change the week a second line appears.
+
+A key still moves when a re-extraction cites a different but equally valid
+line for the same item. The correction is then **not** applied and **not**
+inserted under the old key -- that would put the item in the list twice and
+make every sum double count -- and one `correction_orphaned` item tells the
+owner their fix no longer lands.
 
 An entry that fails is one entry, not the list:
 the rest store and a single `line_items_partial` correction says how many are

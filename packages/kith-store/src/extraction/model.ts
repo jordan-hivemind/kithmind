@@ -886,13 +886,21 @@ async function findOrCreateSpan(
  * if the page is re-parsed into different lines. Upgrade path if either
  * matters: carry the item's own span id into the key.
  */
-function lineItemKey(lineId: number, description: string): string {
+function lineItemKey(
+  lineId: number,
+  description: string,
+  withinLine: number,
+): string {
   let hash = 0x811c9dc5;
   for (const unit of foldTextForMatch(description)) {
     hash ^= unit.codePointAt(0)!;
     hash = Math.imul(hash, 0x01000193) >>> 0;
   }
-  return `${lineId}-${hash.toString(36).padStart(7, "0").slice(-7)}`;
+  // The ordinal within its own line separates two entries that are genuinely
+  // the same words and the same amount on the same line -- a receipt listing
+  // one item twice. Without it they share a key, and correcting one corrects
+  // both.
+  return `${lineId}-${hash.toString(36).padStart(7, "0").slice(-7)}-${withinLine}`;
 }
 
 type GatedLineItems = {
@@ -969,6 +977,7 @@ async function gateLineItems(
   const values: ObservationValue[] = [];
   const spanIds: string[] = [];
   const valueKeys: string[] = [];
+  const perLine = new Map<number, number>();
   let itemsTotal = "0";
   let currencyAssumed: true | undefined;
   let quote = "";
@@ -1027,7 +1036,11 @@ async function gateLineItems(
     }
     values.push(checked.value);
     spanIds.push(spanId);
-    valueKeys.push(lineItemKey(checked.lineId, entry.item.description));
+    const seenOnLine = perLine.get(checked.lineId) ?? 0;
+    perLine.set(checked.lineId, seenOnLine + 1);
+    valueKeys.push(
+      lineItemKey(checked.lineId, entry.item.description, seenOnLine),
+    );
     itemsTotal = addDecimals(itemsTotal, checked.amount);
     if (checked.currencyAssumed) currencyAssumed = true;
     if (!quote) quote = checked.span.text;
@@ -1326,8 +1339,11 @@ async function prepare(
     const name = entry.field.name;
     const keys: string[] = [];
     entry.values.forEach((value, index) => {
+      // A list always keys by evidence, even when it has one entry today: a
+      // one-item list keyed `line_items` orphans the owner's correction the
+      // moment next week's receipt has two.
       const key =
-        entry.values.length > 1
+        entry.field.valueType === "line_item_list" || entry.values.length > 1
           ? `${name}:${entry.valueKeys?.[index] ?? index}`
           : name;
       keys.push(key);
@@ -1645,6 +1661,19 @@ async function store(
     ],
   );
 
+  // The previous run's open items go before this run's are written, so the
+  // queue shows what is wrong now rather than everything that has ever been
+  // wrong. A failure that recurs is re-opened a line below; one that no longer
+  // applies simply is not.
+  //
+  // Before the re-apply below, not after: re-applying can itself open an item
+  // (a correction whose line this run no longer cites), and clearing after
+  // would delete the one row telling the owner their fix no longer lands.
+  await supersedeOpenCorrections(client, {
+    spaceId: loaded.spaceId,
+    sourceItemId: loaded.sourceItemId,
+  });
+
   // A human fix outlives this replace. The observations above are the model's
   // newest reading of every field, including fields the owner has already
   // corrected, so without this line a re-extraction silently reverts a
@@ -1653,15 +1682,6 @@ async function store(
   // showing the owner's. Re-applied inside the same transaction as the
   // replace, so no reader ever sees the reverted state.
   await reapplyCorrections(client, {
-    spaceId: loaded.spaceId,
-    sourceItemId: loaded.sourceItemId,
-  });
-
-  // The previous run's open items go before this run's are written, so the
-  // queue shows what is wrong now rather than everything that has ever been
-  // wrong. A failure that recurs is re-opened a line below; one that no longer
-  // applies simply is not.
-  await supersedeOpenCorrections(client, {
     spaceId: loaded.spaceId,
     sourceItemId: loaded.sourceItemId,
   });

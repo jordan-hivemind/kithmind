@@ -71,6 +71,11 @@ export const CORRECTION_REASONS = [
    * own reason, because "the model forgot to cite" and "the quote is not on
    * the page" are different faults and the counts have to separate them. */
   "citation_missing",
+  /** A correction the owner made on one line of a list no longer matches any
+   * stored line: the newest run cited a different, equally valid line for it.
+   * The correction stands and is not applied, because inserting it would make
+   * the item appear twice and every sum double count. */
+  "correction_orphaned",
   /** Some lines of a list failed while others stored. One row for the list,
    * carrying how many. */
   "line_items_partial",
@@ -202,43 +207,36 @@ const MAGNITUDES: Readonly<Record<string, number>> = {
 
 /** Longest alternative first, so `mm` is not read as `m` with an `m` left
  * over and `million` is not read as `m` followed by `illion`. */
-const MAGNITUDE_WORDS =
-  "millions|million|thousands|thousand|billions|billion|mm|mn|bn|k|m|b";
+const MAGNITUDE_WORD_LIST = [
+  "millions",
+  "million",
+  "thousands",
+  "thousand",
+  "billions",
+  "billion",
+  "mm",
+  "mn",
+  "bn",
+  "k",
+  "m",
+  "b",
+] as const;
 
-/** The same suffixes, as they appear on a page directly after the digits. At
- * most one space, and the suffix must end the word: `2.5 M` and `2.5 million`
- * are magnitudes, `2.5Meters` is a span. */
-const MAGNITUDE_AFTER_TOKEN = new RegExp(
-  `^[ \\u00a0]?(?:${MAGNITUDE_WORDS})(?![A-Za-z])`,
-  "i",
-);
+const CURRENCY_SYMBOL_CHARS = new Set([
+  "$",
+  "\u20ac",
+  "\u00a3",
+  "\u00a5",
+  "\u20b9",
+  "\u20a9",
+]);
 
-/**
- * One amount, as one grammar.
- *
- * Written out rather than accumulated as special cases, because it had become
- * six of them across four reviews and each new one risked contradicting the
- * last. Read left to right: an optional sign, an optional currency mark, a
- * second optional sign (a document prints `$-42.00` as readily as `-$42.00`),
- * the digits with their grouping, an optional magnitude, an optional trailing
- * currency mark, an optional status flag, and an optional trailing minus.
- * Anchored at both ends, so anything the grammar does not name is a refusal
- * rather than something quietly ignored -- which is what kept `12.99Total`,
- * `1E5` and `2.5Meters` out.
- */
-const AMOUNT_GRAMMAR = new RegExp(
-  "^" +
-    "(?<lead>[-+])?" +
-    "(?<currency>[$\u20ac\u00a3\u00a5\u20b9\u20a9]|[A-Z]{3})?" +
-    "(?<inner>[-+])?" +
-    "(?<digits>[\\d.,]+?)" +
-    `(?<magnitude>${MAGNITUDE_WORDS})?` +
-    "(?<trailingCurrency>[$\u20ac\u00a3\u00a5\u20b9\u20a9]|[A-Z]{3})?" +
-    `(?<flag>[${PRICE_FLAGS}])?` +
-    "(?<trail>-)?" +
-    "$",
-  "i",
-);
+/** The ISO codes this store supports, as a set. A currency marker is
+ * validated against this, never against "three letters". */
+const SUPPORTED_CURRENCY_SET = new Set<string>(SUPPORTED_CURRENCIES);
+
+const PRICE_FLAG_SET = new Set(PRICE_FLAGS.split(""));
+
 
 const CURRENCY_SYMBOLS: ReadonlyArray<readonly [string, string]> = [
   ["$", "USD"],
@@ -296,6 +294,60 @@ export function currencyOnPage(pageText: string): string | undefined {
  * separator pattern it has to guess at, because `numeric` is exact and every
  * amount here is one the owner will later reconcile against a bank.
  */
+/** A currency symbol this grammar knows. */
+function currencySymbolAt(text: string, at: number): number {
+  return CURRENCY_SYMBOL_CHARS.has(text[at] ?? "") ? 1 : 0;
+}
+
+/** A validated ISO 4217 code, not merely three letters. `[A-Z]{3}` under an
+ * `i` flag matched `qty`, `abc` and `Tax`, and each of those read as an
+ * amount. */
+function currencyCodeAt(text: string, at: number): number {
+  const code = text.slice(at, at + 3).toUpperCase();
+  if (code.length < 3 || !SUPPORTED_CURRENCY_SET.has(code)) return 0;
+  return /[A-Za-z]/.test(text[at + 3] ?? "") ? 0 : 3;
+}
+
+function currencyAt(text: string, at: number): number {
+  return currencySymbolAt(text, at) || currencyCodeAt(text, at);
+}
+
+/** How many characters of a magnitude sit at this position, and how much it
+ * multiplies by. */
+function magnitudeAt(
+  text: string,
+  at: number,
+): { length: number; places: number; abbreviation: boolean } | undefined {
+  const rest = text.slice(at);
+  for (const word of MAGNITUDE_WORD_LIST) {
+    if (rest.toLowerCase().startsWith(word)) {
+      const after = rest[word.length] ?? "";
+      if (/[A-Za-z0-9]/.test(after)) continue;
+      return {
+        length: word.length,
+        places: MAGNITUDES[word]!,
+        abbreviation: word.length <= 2,
+      };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * One printed amount, read.
+ *
+ * Written as a scanner rather than a regex because each piece has its own
+ * rule about the space before it, and a single pattern could not say so: a
+ * magnitude *abbreviation* has to be pressed against the digits while a
+ * magnitude *word* may be a space away, and that distinction is the whole
+ * difference between `$2.5M` and `Room 12 B`.
+ *
+ * The governing rule, learned the hard way: **letters glued to digits are
+ * never ignored.** They are a currency this grammar knows, a magnitude, or a
+ * tax flag -- or the token is not an amount and is refused whole. An earlier
+ * version let unknown letters fall away and read `qty3` as 3, `abc12.00` as
+ * 12 and `1099-K` as -1099.
+ */
 export function parseAmount(raw: string): string | undefined {
   let text = raw.normalize("NFKC").trim();
   if (!text) return undefined;
@@ -312,29 +364,117 @@ export function parseAmount(raw: string): string | undefined {
     if (/[-+]/.test(text)) return undefined;
   }
 
-  // Whitespace inside the number is a rendering artifact of the column it sat
-  // in ("$ 165 .00"), never a separator between two numbers -- by the time a
+  let at = 0;
+  const space = (): void => {
+    while (/[\s\u00a0]/.test(text[at] ?? "")) at += 1;
+  };
+  let currency = false;
+
+  if (text[at] === "-" || text[at] === "+") {
+    if (text[at] === "-") negative = !negative;
+    at += 1;
+    space();
+  }
+  const leading = currencyAt(text, at);
+  if (leading) {
+    currency = true;
+    at += leading;
+    space();
+  }
+  if (text[at] === "-" || text[at] === "+") {
+    if (text[at] === "-") negative = !negative;
+    at += 1;
+    space();
+  }
+
+  // The digit core. Whitespace inside it is a rendering artifact of the
+  // column the amount sat in ("$ 165 .00"), never a separator: by the time a
   // value reaches here it is one value. The quote side keeps its own, much
   // stricter rule; see `amountsInText`.
-  text = text.replace(/[\s\u00a0]/g, "");
-
-  const parts = AMOUNT_GRAMMAR.exec(text)?.groups;
-  if (!parts) return undefined;
-  if (parts.lead === "-" || parts.inner === "-") negative = !negative;
-  if (parts.trail === "-") negative = !negative;
-
-  const digits = readDigits(parts.digits!);
+  const coreStart = at;
+  let core = "";
+  while (at < text.length) {
+    const unit = text[at]!;
+    if (/[\d.,]/.test(unit)) {
+      core += unit;
+      at += 1;
+      continue;
+    }
+    if (/[\s\u00a0]/.test(unit) && /[\d.,]/.test(text[at + 1] ?? "")) {
+      at += 1;
+      continue;
+    }
+    break;
+  }
+  if (at === coreStart || !/\d/.test(core)) return undefined;
+  const digits = readDigits(core);
   if (digits === undefined) return undefined;
+
+  let magnitude: { places: number; abbreviation: boolean } | undefined;
+  let flag = false;
+  let trailingMinus = false;
+  while (at < text.length) {
+    const spaced = /[\s\u00a0]/.test(text[at] ?? "");
+    const probe = spaced ? at + 1 : at;
+    if (spaced && /[\s\u00a0]/.test(text[probe] ?? "")) return undefined;
+
+    const found = magnitudeAt(text, probe);
+    if (found && magnitude === undefined) {
+      // An abbreviation must be pressed against the digits. With a space
+      // allowed, "Room 12 B" read as twelve billion and "2 m cable" as two
+      // million -- a number the page never states, which is worse than any
+      // amount this rule was meant to rescue. A word is unambiguous and may
+      // be a space away.
+      if (found.abbreviation && spaced) return undefined;
+      magnitude = found;
+      at = probe + found.length;
+      continue;
+    }
+    const nextCurrency = currencyAt(text, probe);
+    if (nextCurrency && !currency) {
+      currency = true;
+      at = probe + nextCurrency;
+      continue;
+    }
+    if (!flag && PRICE_FLAG_SET.has(text[probe] ?? "")) {
+      // A flag is one letter and ends the token.
+      const after = text[probe + 1] ?? "";
+      if (after === "" || /[\s\u00a0]/.test(after)) {
+        flag = true;
+        at = probe + 1;
+        continue;
+      }
+    }
+    if (!spaced && !trailingMinus && text[at] === "-") {
+      trailingMinus = true;
+      at += 1;
+      continue;
+    }
+    if (spaced && at + 1 >= text.length) {
+      at += 1;
+      continue;
+    }
+    return undefined;
+  }
+  if (trailingMinus) negative = !negative;
 
   // A tax or status flag is a separate rule from a magnitude and shares
   // nothing with it. A flagged price has exactly two decimal places, which is
   // what tells `12.99T` from `12.5T` and from `2.5M`.
-  if (parts.flag !== undefined && !/\.\d{2}$/.test(digits)) return undefined;
+  if (flag && !/\.\d{2}$/.test(digits)) return undefined;
+
+  // A magnitude abbreviation scales only beside a currency marker.
+  //
+  // The owner asked for "$2.5M" to be understood, and it is. He did not ask
+  // for "401K" to be money, and it is not: a plan name, an SEC form, a unit
+  // and a room number all look like this, and reading one as an amount puts a
+  // number on a document that never stated it. Without a currency marker a
+  // magnitude letter means the token is not an amount at all -- not that it
+  // is the bare number, or "401K" would quietly become 401.
+  if (magnitude?.abbreviation && !currency) return undefined;
 
   const scaled =
-    parts.magnitude === undefined
-      ? digits
-      : shiftDecimal(digits, MAGNITUDES[parts.magnitude.toLowerCase()]!);
+    magnitude === undefined ? digits : shiftDecimal(digits, magnitude.places);
 
   try {
     return canonicalizeDecimal(`${negative ? "-" : ""}${scaled}`);
@@ -428,65 +568,83 @@ function realIsoDate(value: string): boolean {
 export function amountsInText(text: string): string[] {
   // A parsed receipt prints "$ 165 .00" as readily as "$165.00": the space is
   // a rendering artifact of the column the amount sat in, not a separator.
-  // Closing it up before tokenizing is what lets such an amount be found.
-  //
-  // Only ever next to a currency symbol or an ISO code, and only around a
-  // decimal point. A bare gap between two numbers is two numbers, and joining
-  // them invents an amount the page does not state: "APPLES 12 .99" is a
-  // quantity beside a price, "3. 12 Pack Soda 5.99" is a list position beside
-  // an item, "Milk 2. 5L" is a size, and "refs 1, 234, 567" is three
-  // references. Every one of those was read as a single amount by the first
-  // version of this repair, which is a fabricated value with a citation --
-  // the one outcome this gate exists to prevent. A comma is never closed at
-  // all, because a comma between numbers is a list far more often than it is
-  // a decimal point.
-  //
-  // The cost of the narrow rule is a column-rendered amount with no symbol
-  // beside it, which becomes a correction. An extra correction is cheap; a
-  // wrong stored number is not.
+  // Closed up only next to a currency mark, because a bare gap between two
+  // numbers is two numbers -- "APPLES 12 .99" is a quantity beside a price.
   const normalized = text
     .normalize("NFKC")
     .replace(
-      new RegExp(`(${CURRENCY_MARK})([ \u00a0]*)(\\d+)[ \u00a0]+\\.(?=\\d)`, "g"),
+      new RegExp(`(${CURRENCY_MARK})([ \\u00a0]*)(\\d+)[ \\u00a0]+\\.(?=\\d)`, "g"),
       "$1$2$3.",
     )
     .replace(
-      new RegExp(`(${CURRENCY_MARK})([ \u00a0]*)(\\d+\\.)[ \u00a0]+(?=\\d)`, "g"),
+      new RegExp(`(${CURRENCY_MARK})([ \\u00a0]*)(\\d+\\.)[ \\u00a0]+(?=\\d)`, "g"),
       "$1$2$3",
     );
-  const symbols = new Set(["$", "\u20ac", "\u00a3", "\u00a5", "\u20b9", "\u20a9"]);
   const found: string[] = [];
   const runs = /\d[\d.,]*/g;
   let match: RegExpExecArray | null;
   while ((match = runs.exec(normalized)) !== null) {
     const start = match.index;
     let end = start + match[0].length;
-    let signAt = start - 1;
-    if (signAt >= 0 && symbols.has(normalized[signAt]!)) signAt -= 1;
+
+    // Everything glued to the digits belongs to the token and is validated
+    // with it. A magnitude abbreviation, a currency code, a tax flag, a
+    // hyphen-letter form like `1099-K`: each is read by `parseAmount` or the
+    // token is not an amount. Letting unglued letters fall away is what read
+    // `qty3` as 3 and `1099-K` as minus one thousand and ninety-nine.
+    while (/[A-Za-z$\u20ac\u00a3\u00a5\u20b9\u20a9-]/.test(normalized[end] ?? "")) {
+      end += 1;
+    }
+    // A magnitude *word* may be one space away; an abbreviation may not.
+    const worded = /^[ \u00a0](millions?|thousands?|billions?)(?![A-Za-z0-9])/i.exec(
+      normalized.slice(end),
+    );
+    if (worded) end += worded[0].length;
+
+    // And a currency marker immediately before the digits is part of the
+    // token too, which is what makes `$2.5M` scale and `2.5M` refuse.
+    let from = start;
+    while (
+      from > 0 &&
+      /[A-Za-z$\u20ac\u00a3\u00a5\u20b9\u20a9]/.test(normalized[from - 1] ?? "")
+    ) {
+      from -= 1;
+    }
+    const spacedCurrency = /([A-Z]{3}|[$\u20ac\u00a3\u00a5\u20b9\u20a9])[ \u00a0]$/.exec(
+      normalized.slice(Math.max(0, from - 4), from),
+    );
+    const literalStart = spacedCurrency
+      ? from - spacedCurrency[0].length
+      : from;
+
+    // A trailing separator belongs to the prose, not the number: "refs 1, 234"
+    // is three references, and the comma is punctuation.
+    const literal = normalized
+      .slice(literalStart, end)
+      .replace(/[.,]+(?=[A-Za-z]*$)/, "");
+    const amount = parseAmount(literal);
+    if (amount === undefined) continue;
+
+    const signAt = literalStart;
+    let signIndex = signAt - 1;
+    if (signIndex >= 0 && CURRENCY_SYMBOL_CHARS.has(normalized[signIndex]!)) {
+      signIndex -= 1;
+    }
     const leadingMinus =
-      signAt >= 0 &&
-      normalized[signAt] === "-" &&
-      (signAt === 0 || !/[A-Za-z0-9]/.test(normalized[signAt - 1]!));
+      signIndex >= 0 &&
+      normalized[signIndex] === "-" &&
+      (signIndex === 0 || !/[A-Za-z0-9]/.test(normalized[signIndex - 1]!));
     const trailingMinus =
       normalized[end] === "-" && !/\d/.test(normalized[end + 1] ?? "");
-    // A magnitude suffix belongs to the token, and the token has exactly one
-    // value: the scaled one. The digit regex stops at the first letter, so
-    // without this a line reading "Fund size 2.5M" would offer 2.5 -- an
-    // amount the page does not state, a million times too small.
-    const suffix = MAGNITUDE_AFTER_TOKEN.exec(normalized.slice(end));
-    let literal = match[0];
-    if (suffix) {
-      literal += suffix[0];
-      end += suffix[0].length;
-    }
-    const amount = parseAmount(literal.replace(/[.,]+(?=[A-Za-z]*$)/, ""));
-    if (amount === undefined) continue;
-    const after = normalized.slice(end, end + 12);
+    // `CR` is a credit marker on the amount, not a column somewhere to the
+    // right of it. A twelve-character window let "Item 12.00      CR 45.00"
+    // flip the sign of a number that had nothing to do with it.
+    const credit = /^[ \u00a0]?CR(?![A-Za-z0-9])/i.test(normalized.slice(end));
     const negative =
       leadingMinus ||
       trailingMinus ||
-      /^\s*\)/.test(after) ||
-      /^\s*CR\b/i.test(after);
+      /^[ \u00a0]?\)/.test(normalized.slice(end)) ||
+      credit;
     found.push(negative ? negate(amount) : amount);
   }
   return found;

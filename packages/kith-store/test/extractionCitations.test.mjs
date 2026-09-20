@@ -32,6 +32,7 @@ import {
 } from "../dist/index.js";
 import {
   amountsInText,
+  applyCorrection,
   checkValue,
   diagnoseExtractions,
   valueSignature,
@@ -288,7 +289,9 @@ test("a rendering space closes only next to a currency mark", () => {
     "567",
   ]);
   assert.deepEqual(amountsInText("3. 12 Pack Soda   5.99"), ["3", "12", "5.99"]);
-  assert.deepEqual(amountsInText("Milk 2. 5L"), ["2", "5"]);
+  // ADM-5g: `5L` is digits with a letter glued to them that is neither a
+  // currency, a magnitude nor a flag, so the token is not an amount at all.
+  assert.deepEqual(amountsInText("Milk 2. 5L"), ["2"]);
   // A bare column gap is two numbers, and becomes a correction rather than
   // a guess.
   assert.deepEqual(amountsInText("Total 10. 80"), ["10", "80"]);
@@ -1897,4 +1900,103 @@ test("an item's key follows its evidence, not its position", { skip }, async (t)
     assert.ok(before, `${key} kept its key across a reorder`);
     assert.equal(before[1], amount);
   }
+});
+
+test("a one-item list still keys by evidence", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-one-item");
+  await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("line_items", null, [3, 4], {
+          line_items: [
+            { description: "Chisel", amount: "12.99 T", lines: [3, 4] },
+          ],
+        }),
+      ],
+    }),
+    ids,
+  );
+  const [only] = await f.stored();
+  // Not the bare field name: a list keyed `line_items` today orphans the
+  // owner's correction the moment next week's receipt has two lines.
+  assert.match(only.observation_key, /^line_items:\d+-[a-z0-9]+-\d+$/);
+});
+
+test("two identical items on one line get their own keys", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(TABLE_RECEIPT, "synthetic-twin-items");
+  const page = ["BRACKEN TOOLS", "Chisel 5.00   Chisel 5.00"].join("\n");
+  await repaginate(f, ids, [[0, page]]);
+  await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("line_items", null, [2], {
+          line_items: [
+            { description: "Chisel", amount: "5.00", lines: [2] },
+            { description: "Chisel", amount: "5.00", lines: [2] },
+          ],
+        }),
+      ],
+    }),
+    ids,
+  );
+  const stored = await f.stored();
+  assert.equal(stored.length, 2);
+  // Same line, same words, same amount -- and still two keys, or correcting
+  // one would correct both.
+  assert.notEqual(stored[0].observation_key, stored[1].observation_key);
+});
+
+test("a correction with no line left to land on is not duplicated", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-orphan-correction");
+  // The same item is printed twice on this receipt -- once in the body and
+  // once in a summary block -- so two different lines are an equally correct
+  // citation for it.
+  const page = [
+    "BRACKEN TOOLS", // 1
+    "Chisel 12.99", // 2
+    "SUMMARY", // 3
+    "Chisel 12.99", // 4
+  ].join("\n");
+  await repaginate(f, ids, [[0, page]]);
+  const reading = (line) => ({
+    kind: "receipt",
+    summary: "Hardware receipt.",
+    statements: [
+      statement("line_items", null, [line], {
+        line_items: [{ description: "Chisel", amount: "12.99", lines: [line] }],
+      }),
+    ],
+  });
+  await f.extract(fakeModel(reading(2)), ids);
+  const [item] = await f.stored();
+  await withKithTransaction(f.pool, (client) =>
+    applyCorrection(client, {
+      spaceId: f.spaceId,
+      sourceItemId: ids.sourceItemId,
+      fieldName: item.observation_key,
+      correctedValue: { type: "money", amount: "13.99", currency: "USD" },
+      actorUserId: f.userId,
+      now: NOW + 3_000,
+    }),
+  );
+  assert.equal((await f.stored())[0].value.amount, "13.99");
+
+  // The next run cites the summary line instead, so the old key matches
+  // nothing. Inserting the corrected value under it would put the item in the
+  // list twice and make every sum over it double count, silently.
+  await f.extract(fakeModel(reading(4)), ids, NOW + 4_000);
+  const after = await f.stored();
+  assert.equal(after.length, 1, "one line item, not two");
+  const orphan = (await f.corrections()).find(
+    (row) => row.reason === "correction_orphaned",
+  );
+  assert.ok(orphan, "the owner is told the correction no longer lands");
+  assert.equal(orphan.field_name, item.observation_key);
 });

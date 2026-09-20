@@ -520,13 +520,16 @@ const AMOUNT_SPEC = [
   ["USD 42", "42"],
   ["USD13.20", "13.2"],
   ["13.20 USD", "13.2"],
+  ["15.50 CHF", "15.5"],
   ["42", "42"],
+  ["-0.00", "0"],
 
   // Signs, in every shape a ledger prints one.
   ["-12.00", "-12"],
   ["-$42.00", "-42"],
   ["$-42.00", "-42"],
   ["250.00-", "-250"],
+  ["5USD-", "-5"],
   ["(250.00)", "-250"],
   ["(1,234.56)", "-1234.56"],
   ["(-5)", undefined],
@@ -541,29 +544,56 @@ const AMOUNT_SPEC = [
   ["1.234.567", "1234567"],
   ["1.234.567,89", "1234567.89"],
   ["178,20", "178.2"],
+  // Grouping this grammar does not claim to read, refused rather than guessed.
+  ["1,23,456.00", undefined],
+  [".5", undefined],
+  ["5.", undefined],
+  ["12,345.", undefined],
+  ["١٫٥", undefined],
+  ["１２．９９", "12.99"],
+  ["1" + "0".repeat(40), undefined],
 
   // Whitespace inside one value is a rendering artifact of its column.
   ["$ 165 .00", "165"],
   ["$ 10 .80", "10.8"],
   ["USD 13 .20", "13.2"],
 
-  // Magnitudes are applied, never dropped and never refused.
-  ["2.5M", "2500000"],
-  ["2.5 M", "2500000"],
+  // A magnitude abbreviation scales only beside a currency marker, and only
+  // pressed against the digits.
+  ["$2.5M", "2500000"],
+  ["USD 2.5M", "2500000"],
+  ["2.5M USD", "2500000"],
+  ["£1.2k", "1200"],
+  ["($2.5M)", "-2500000"],
   ["$2.5MM", "2500000"],
-  ["1.2K", "1200"],
-  ["3.4B", "3400000000"],
-  ["1,250K", "1250000"],
-  ["0.75bn", "750000000"],
-  ["1.2345M", "1234500"],
+  ["$1,250K", "1250000"],
+  ["$0.75bn", "750000000"],
+  ["$1.2345M", "1234500"],
+  ["$3.4B", "3400000000"],
+  ["$2.5mn", "2500000"],
+  // Without a currency marker it is a plan name, a form name, a unit or a
+  // room. Not an amount at all -- and not the bare number either, or "401K"
+  // would quietly become 401.
+  ["2.5M", undefined],
+  ["401K", undefined],
+  ["10K", undefined],
+  ["5K run", undefined],
+  ["12.99 mm", undefined],
+  ["2024 M", undefined],
+  ["1.5Kg", undefined],
+  ["2.5Mbps", undefined],
+  ["1.2345678M", undefined],
+  ["-2.5M-", undefined],
+  // An abbreviation a space away is not a magnitude even with a currency.
+  ["$2.5 M", undefined],
+  // Words are unambiguous and scale with or without a currency marker.
   ["2.5 million", "2500000"],
+  ["3 billion", "3000000000"],
   ["40 thousand", "40000"],
   ["1.5 billions", "1500000000"],
-  ["($2.5M)", "-2500000"],
-  ["2.5mn", "2500000"],
 
   // A tax or status flag: an allowed letter, exactly two decimals, and
-  // nothing after it. All three conditions, every time.
+  // nothing after it.
   ["12.99T", "12.99"],
   ["12.99 A", "12.99"],
   ["1,234.56F", "1234.56"],
@@ -573,17 +603,21 @@ const AMOUNT_SPEC = [
   ["1299T", undefined],
   ["12.99TX", undefined],
   ["12.99 T 3.00", undefined],
-  // A lone C is a credit marker. Dropping it would lose a sign, so it
-  // refuses rather than storing a charge where the page states a credit.
+  ["2024A", undefined],
+  // A lone C is a credit marker. Dropping it would lose a sign.
   ["45.00 C", undefined],
 
-  // Exponents are not magnitudes and not flags.
+  // Letters glued to digits are a currency this grammar knows, a magnitude,
+  // or a flag -- or the token is not an amount. `[A-Z]{3}` under an `i` flag
+  // matched any three letters, and each of these read as a number.
+  ["qty3", undefined],
+  ["abc12.00", undefined],
+  ["Tax12.99", undefined],
+  ["xyz2.5M", undefined],
+  ["1099-K", undefined],
   ["1E5", undefined],
   ["12.99E5", undefined],
-
-  // Words and units that merely start with a magnitude letter.
   ["12.99Total", undefined],
-  ["2.5Meters", undefined],
   ["12.99kg", undefined],
   ["12.99x2", undefined],
   ["12.99%", undefined],
@@ -598,26 +632,48 @@ test("the amount grammar reads exactly what the table says", () => {
     assert.equal(
       parseAmount(input),
       expected,
-      `${JSON.stringify(input)} must ${
-        expected === undefined ? "refuse" : `read as ${expected}`
-      }`,
+      JSON.stringify(input) +
+        " must " +
+        (expected === undefined ? "refuse" : "read as " + expected),
     );
   }
 });
 
-test("a magnitude token has one value, and it is the scaled one", () => {
-  // The safety property. A suffix understood is only safe if it is understood
-  // everywhere: a quote that offered both 2.5 and 2500000 would let a model
-  // store either under the same citation.
-  assert.deepEqual(amountsInText("Fund size 2.5M"), ["2500000"]);
-  assert.deepEqual(amountsInText("$2.5M"), ["2500000"]);
-  assert.deepEqual(amountsInText("Committed 1.2K total"), ["1200"]);
-  assert.deepEqual(amountsInText("Raised 40 million"), ["40000000"]);
-  // Not a magnitude, so not scaled.
-  assert.deepEqual(amountsInText("Span 2.5Meters"), ["2.5"]);
-  assert.deepEqual(amountsInText("Total 12.99"), ["12.99"]);
-  // And the sign still composes.
-  assert.deepEqual(amountsInText("Loss (2.5M)"), ["-2500000"]);
+/** What a page line must offer, and must not. */
+const QUOTE_SPEC = [
+  // A magnitude token has exactly one value, the scaled one.
+  ["Fund size $2.5M", ["2500000"]],
+  ["$2.5M", ["2500000"]],
+  ["Committed $1.2K total", ["1200"]],
+  ["Raised 40 million", ["40000000"]],
+  ["Loss ($2.5M)", ["-2500000"]],
+  // Without a currency marker a magnitude letter is a room, a plan, a unit.
+  ["Room 12 B suite", ["12"]],
+  ["Apt 4 B rent 1,200.00", ["4", "1200"]],
+  ["Suite 3 K", ["3"]],
+  ["2 m cable $19.99", ["2", "19.99"]],
+  ["Serving 250 m l", ["250"]],
+  ["401K plan balance $12,345.67", ["12345.67"]],
+  ["1099-K box 1a 12,345.67", ["12345.67"]],
+  ["Line qty3 total 3.00", ["3"]],
+  // A credit marker belongs to the amount beside it, not to a column to its
+  // right.
+  ["Balance 21.60 CR", ["-21.6"]],
+  ["Item 12.00          CR 45.00", ["12", "45"]],
+  // The column artifacts ADM-5f closed, unchanged.
+  ["Subtotal $ 165 .00", ["165"]],
+  ["APPLES   12    .99", ["12", "99"]],
+  ["Invoice refs 1, 234, 567", ["1", "234", "567"]],
+  ["3. 12 Pack Soda   5.99", ["3", "12", "5.99"]],
+  ["Total 10. 80", ["10", "80"]],
+  ["20.00      1.60   21.60", ["20", "1.6", "21.6"]],
+  ["Total 12.99", ["12.99"]],
+];
+
+test("a page line offers exactly the amounts the table says", () => {
+  for (const [line, expected] of QUOTE_SPEC) {
+    assert.deepEqual(amountsInText(line), expected, JSON.stringify(line));
+  }
 });
 
 test("the scaled value is the only one a citation supports", () => {
