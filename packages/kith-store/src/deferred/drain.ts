@@ -25,6 +25,7 @@ import {
   fail,
   failWithoutAttempt,
   deferredCtx,
+  TerminalDeferredWorkError,
   type DeferredWorkRow,
 } from "./core.js";
 import { isPooledHandler, type DeferredWorkRegistry } from "./registry.js";
@@ -33,6 +34,7 @@ export type DrainOutcome =
   | { id: string; kind: string; status: "completed" }
   | { id: string; kind: string; status: "retrying"; nextAttemptAt: number }
   | { id: string; kind: string; status: "exhausted" }
+  | { id: string; kind: string; status: "terminal" }
   | { id: string; kind: string; status: "unregistered_kind" };
 
 export type DrainSummary = {
@@ -40,6 +42,9 @@ export type DrainSummary = {
   completed: number;
   retrying: number;
   exhausted: number;
+  /** Handlers that answered `TerminalDeferredWorkError`: failed on the first
+   * run, on purpose, without spending the retry budget. */
+  terminal: number;
   unregisteredKind: number;
   outcomes: DrainOutcome[];
 };
@@ -67,6 +72,7 @@ export async function drain(
     completed: 0,
     retrying: 0,
     exhausted: 0,
+    terminal: 0,
     unregisteredKind: 0,
     outcomes: [],
   };
@@ -82,6 +88,7 @@ export async function drain(
     if (outcome.status === "completed") summary.completed += 1;
     else if (outcome.status === "retrying") summary.retrying += 1;
     else if (outcome.status === "exhausted") summary.exhausted += 1;
+    else if (outcome.status === "terminal") summary.terminal += 1;
     else summary.unregisteredKind += 1;
   }
   return summary;
@@ -122,6 +129,21 @@ async function runOne(
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    // A handler that says "this will fail the same way every time" is taken at
+    // its word: `failed` now, with the message recorded, and the attempt
+    // budget untouched because the work was tried exactly once. See
+    // `TerminalDeferredWorkError` in `core.ts` for why a bounded retry is the
+    // wrong shape for this class of failure.
+    if (error instanceof TerminalDeferredWorkError) {
+      await withKithQueueTransaction(pool, (client) =>
+        failWithoutAttempt(deferredCtx(client, fixedNow ?? Date.now()), {
+          id: job.id,
+          leaseToken: job.leaseToken,
+          error: message,
+        }),
+      );
+      return { id: job.id, kind: job.kind, status: "terminal" };
+    }
     const result = await withKithQueueTransaction(pool, (client) =>
       fail(deferredCtx(client, fixedNow ?? Date.now()), {
         id: job.id,

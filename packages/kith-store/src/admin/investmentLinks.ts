@@ -45,6 +45,10 @@ import { assertKithId, newKithId } from "../ids.js";
 import type { ObservationValue } from "../records/values.js";
 import { spacePredicate } from "../spaces.js";
 import {
+  scheduleInvestmentLinksFor,
+  scheduleInvestmentLinksForEntry,
+} from "./investmentLinkWork.js";
+import {
   dateInWindow,
   decideLinks,
   type LinkEvidence,
@@ -1630,6 +1634,35 @@ export async function rejectInvestmentDocumentLink(
       WHERE id = $1 AND space_id = $2`,
     [link.id, link.space_id, args.principal.userId, reason],
   );
+  // ADM-8c, trigger three: the owner's no frees something.
+  //
+  // For an entry-level rejection the entry is free again, and the other
+  // documents that score against it -- the ones that lost to this one, or
+  // that never got a hearing because it was already spoken for -- deserve
+  // another pass. For an investment-level one the investment is. The
+  // rejected pair itself is never re-proposed: `evaluateDocumentLinks` skips
+  // a settled pair, and the row stays `rejected` forever. The rejected
+  // DOCUMENT is still enqueued, because it may belong on a different entry of
+  // the same investment.
+  //
+  // Enqueued here, in the rejection's own transaction, before the promotion
+  // below: the job is drained later and reads the state this transaction
+  // commits, whichever order the two statements ran in.
+  if (link.entry_id === null) {
+    await scheduleInvestmentLinksFor(ctx, {
+      spaceId: link.space_id,
+      investmentId: link.investment_id,
+    });
+  } else {
+    // Through the ENTRY, so the freed entry's own amount is one of the
+    // signals that finds the documents worth waking: a wire confirmation
+    // that names no fund the owner has recorded still matches the payment it
+    // paid, and that is the whole case a rejection opens up.
+    await scheduleInvestmentLinksForEntry(ctx, {
+      spaceId: link.space_id,
+      entryId: link.entry_id,
+    });
+  }
   if (link.entry_id === null) return { dateReverted, dateReplaced: false };
   await syncEntryDocument(ctx, link.space_id, link.entry_id);
   const promoted = await primaryLink(ctx, link.space_id, link.entry_id);

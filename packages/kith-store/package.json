@@ -79,6 +79,7 @@
     "kith-extraction-backfill": "./dist/extraction/cli.js",
     "kith-extraction-diagnose": "./dist/extraction/diagnoseCli.js",
     "kith-extraction-span-cleanup": "./dist/extraction/spanCleanupCli.js",
+    "kith-investment-link-backfill": "./dist/admin/investmentLinkCli.js",
     "kith-reembed": "./dist/embeddings/cli.js"
   },
   "scripts": {
