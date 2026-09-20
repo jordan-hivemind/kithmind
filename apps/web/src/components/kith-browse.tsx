@@ -77,7 +77,9 @@ function factValueBody(
       ? { value: value.value, unit: value.unit }
       : { value: value.value }),
     changeKind: options.changeKind,
-    ...(options.validFrom === undefined ? {} : { validFrom: options.validFrom }),
+    ...(options.validFrom === undefined
+      ? {}
+      : { validFrom: options.validFrom }),
   };
 }
 
@@ -144,7 +146,7 @@ function HistoryToggle({ on, to }: { on: boolean; to: string }) {
     <Link
       href={to}
       aria-label={on ? "Hide history" : "Show history"}
-      className={`rounded-tag border px-1.5 py-0.5 text-[11px] leading-none focus-visible:outline-2 focus-visible:outline-accent-600 ${
+      className={`rounded-tag border px-1.5 py-0.5 text-meta leading-none focus-visible:outline-2 focus-visible:outline-accent-600 ${
         on
           ? "border-accent-600 bg-accent-600 text-white"
           : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"

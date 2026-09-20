@@ -127,7 +127,9 @@ export function EntryDrawer({
           ...(draft.entryDate === "" ? {} : { entryDate: draft.entryDate }),
         }),
       })
-        .then((response) => (response.ok ? response.json() : { suggestions: [] }))
+        .then((response) =>
+          response.ok ? response.json() : { suggestions: [] },
+        )
         .then((body: { suggestions: Suggestion[] }) =>
           setSuggestions(body.suggestions ?? []),
         )
@@ -184,8 +186,8 @@ export function EntryDrawer({
             list="investment-options"
             className={inputClass}
             value={
-              investments.find((item) => item.id === draft.investmentId)?.name ??
-              ""
+              investments.find((item) => item.id === draft.investmentId)
+                ?.name ?? ""
             }
             onChange={(event) => {
               const match = investments.find(
@@ -276,7 +278,9 @@ export function EntryDrawer({
           <input
             className={inputClass}
             value={draft.note}
-            onChange={(event) => setDraft({ ...draft, note: event.target.value })}
+            onChange={(event) =>
+              setDraft({ ...draft, note: event.target.value })
+            }
           />
         </Field>
 
@@ -304,7 +308,7 @@ export function EntryDrawer({
                         : suggestion.documentId,
                   })
                 }
-                className={`w-full truncate rounded-tag border px-1.5 py-0.5 text-left text-[11px] ${
+                className={`w-full truncate rounded-tag border px-1.5 py-0.5 text-left text-meta ${
                   draft.documentId === suggestion.documentId
                     ? "border-accent-600 bg-accent-50 text-accent-700"
                     : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"
@@ -346,7 +350,11 @@ export function EntryDrawer({
               Save and add another
             </button>
           ) : null}
-          <button type="submit" disabled={!valid} className={primaryButtonClass}>
+          <button
+            type="submit"
+            disabled={!valid}
+            className={primaryButtonClass}
+          >
             Save
           </button>
         </div>
@@ -412,7 +420,9 @@ export function InvestmentDrawer({
           <input
             className={inputClass}
             value={draft.name}
-            onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+            onChange={(event) =>
+              setDraft({ ...draft, name: event.target.value })
+            }
           />
         </Field>
         <Field label="Category">
@@ -460,7 +470,9 @@ export function InvestmentDrawer({
           <input
             className={inputClass}
             value={draft.notes}
-            onChange={(event) => setDraft({ ...draft, notes: event.target.value })}
+            onChange={(event) =>
+              setDraft({ ...draft, notes: event.target.value })
+            }
           />
         </Field>
         <div className="flex items-center justify-end gap-2 pt-1">

@@ -53,7 +53,7 @@ export function Drawer({
         }}
       >
         <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 z-40 bg-gray-900/20" />
+          <Dialog.Overlay className="fixed inset-0 z-40 bg-[rgb(20_32_30_/_48%)]" />
           <Dialog.Content
             onEscapeKeyDown={(event) => {
               if (dirty) {
@@ -67,17 +67,17 @@ export function Drawer({
                 requestClose();
               }
             }}
-            className="fixed inset-y-0 right-0 z-50 flex w-full max-w-md flex-col gap-3 overflow-y-auto border-l border-gray-200 bg-white p-4 shadow-xl"
+            className="fixed inset-y-0 right-0 z-50 flex w-full max-w-lg flex-col gap-4 overflow-y-auto border-l border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]"
           >
             <div className="flex items-center justify-between">
-              <Dialog.Title className="text-sm font-medium text-gray-900">
+              <Dialog.Title className="kith-section-title">
                 {title}
               </Dialog.Title>
               <button
                 type="button"
                 aria-label="Close"
                 onClick={requestClose}
-                className="rounded-tag px-1.5 py-0.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
+                className="rounded-control px-2 py-1 text-kith-text-muted hover:bg-kith-surface-muted hover:text-kith-text"
               >
                 ✕
               </button>
@@ -87,24 +87,29 @@ export function Drawer({
         </Dialog.Portal>
       </Dialog.Root>
 
-      <AlertDialog.Root open={confirmingClose} onOpenChange={setConfirmingClose}>
+      <AlertDialog.Root
+        open={confirmingClose}
+        onOpenChange={setConfirmingClose}
+      >
         <AlertDialog.Portal>
-          <AlertDialog.Overlay className="fixed inset-0 z-[60] bg-gray-900/20" />
-          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-[60] w-full max-w-xs -translate-x-1/2 -translate-y-1/2 rounded-tag border border-gray-200 bg-white p-4 shadow-xl">
-            <AlertDialog.Title className="text-sm font-medium text-gray-900">
+          <AlertDialog.Overlay className="fixed inset-0 z-[60] bg-[rgb(20_32_30_/_48%)]" />
+          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-[60] w-full max-w-xs -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
+            <AlertDialog.Title className="kith-section-title">
               Discard changes?
             </AlertDialog.Title>
-            <AlertDialog.Description className="mt-1 text-xs text-gray-600">
+            <AlertDialog.Description className="mt-1 text-sm text-kith-text-secondary">
               Unsaved edits will be lost.
             </AlertDialog.Description>
             <div className="mt-3 flex justify-end gap-2">
-              <AlertDialog.Cancel className={buttonClass}>Keep editing</AlertDialog.Cancel>
+              <AlertDialog.Cancel className={buttonClass}>
+                Keep editing
+              </AlertDialog.Cancel>
               <AlertDialog.Action
                 onClick={() => {
                   setConfirmingClose(false);
                   onOpenChange(false);
                 }}
-                className="h-7 rounded-tag border border-red-600 bg-red-600 px-2 text-xs text-white hover:bg-red-700"
+                className="h-8 rounded-control border border-red-600 bg-red-600 px-3 text-sm text-white hover:bg-red-700"
               >
                 Discard
               </AlertDialog.Action>
@@ -125,7 +130,7 @@ export function Field({
   children: React.ReactNode;
 }) {
   return (
-    <label className="flex flex-col gap-1 text-xs text-gray-600">
+    <label className="flex flex-col gap-1 text-sm text-kith-text-secondary">
       <span>{label}</span>
       {children}
     </label>
@@ -133,10 +138,10 @@ export function Field({
 }
 
 export const inputClass =
-  "h-7 w-full rounded-tag border border-gray-300 px-2 text-xs text-gray-900 outline-none focus:border-accent-500";
+  "h-8 w-full rounded-control border border-kith-border-subtle px-2.5 text-sm text-kith-text outline-none focus:border-kith-action focus:ring-1 focus:ring-kith-action";
 
 export const buttonClass =
-  "h-7 rounded-tag border border-gray-300 px-2 text-xs text-gray-700 hover:border-gray-400 disabled:text-gray-300";
+  "h-8 rounded-control border border-kith-border-subtle px-3 text-sm text-kith-text-secondary hover:bg-kith-surface-muted disabled:text-kith-text-muted";
 
 export const primaryButtonClass =
-  "h-7 rounded-tag border border-accent-600 bg-accent-600 px-2 text-xs text-white hover:bg-accent-700 disabled:border-gray-200 disabled:bg-gray-200";
+  "h-8 rounded-control border border-kith-action bg-kith-action px-3 text-sm text-white hover:bg-kith-action-hover disabled:border-gray-200 disabled:bg-gray-200";

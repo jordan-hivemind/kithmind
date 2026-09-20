@@ -38,9 +38,7 @@ export default async function AuthenticatedLayout({
     <QueryProvider>
       <ToastProvider>
         <KithSignOutNav canAdmin={canAdmin} />
-        <main className="mx-auto w-full max-w-7xl px-6 py-5 text-sm text-gray-900">
-          {children}
-        </main>
+        <main className="kith-page py-6 text-kith-text">{children}</main>
       </ToastProvider>
     </QueryProvider>
   );

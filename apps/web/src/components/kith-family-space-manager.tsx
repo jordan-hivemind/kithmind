@@ -31,11 +31,24 @@ import {
   Section,
 } from "@/components/ui/controls";
 import { CopyButton } from "@/components/ui/copy-button";
-import { DataTable, Detail, type RowAction, Tag } from "@/components/ui/data-table";
+import {
+  DataTable,
+  Detail,
+  type RowAction,
+  Tag,
+} from "@/components/ui/data-table";
 import type { FamilyOverview } from "@/lib/kith/family-data";
 import { shortDate } from "@/lib/kith/format";
-import { isPendingId, mutateJson, pendingId, requestJson } from "@/lib/kith/optimistic";
-import { useOptimisticMutation, useServerData } from "@/lib/kith/use-server-data";
+import {
+  isPendingId,
+  mutateJson,
+  pendingId,
+  requestJson,
+} from "@/lib/kith/optimistic";
+import {
+  useOptimisticMutation,
+  useServerData,
+} from "@/lib/kith/use-server-data";
 
 type Role = "editor" | "reader";
 type SpaceView = NonNullable<FamilyOverview["selected"]>;
@@ -57,7 +70,11 @@ function withSelected(
     : { ...current, selected: change(current.selected) };
 }
 
-export function KithFamilySpaceManager({ overview: server }: { overview: FamilyOverview }) {
+export function KithFamilySpaceManager({
+  overview: server,
+}: {
+  overview: FamilyOverview;
+}) {
   const router = useRouter();
   const selectedSpaceId = server.selected?.space.spaceId ?? null;
   const queryKey = ["spaces", selectedSpaceId];
@@ -85,7 +102,12 @@ export function KithFamilySpaceManager({ overview: server }: { overview: FamilyO
     event.preventDefault();
     const trimmed = name.trim();
     if (!trimmed) return;
-    create.mutate({ spaceId: pendingId(), name: trimmed, kind: "shared", role: "owner" });
+    create.mutate({
+      spaceId: pendingId(),
+      name: trimmed,
+      kind: "shared",
+      role: "owner",
+    });
     setName("");
     setCreating(false);
   }
@@ -97,12 +119,15 @@ export function KithFamilySpaceManager({ overview: server }: { overview: FamilyO
         accessorKey: "name",
         header: "Space",
         cell: ({ row }) =>
-          isPendingId(row.original.spaceId) || row.original.kind === "personal" ? (
+          isPendingId(row.original.spaceId) ||
+          row.original.kind === "personal" ? (
             <span>{row.original.name}</span>
           ) : (
             <Link
               href={`/spaces?space=${encodeURIComponent(row.original.spaceId)}`}
-              aria-current={row.original.spaceId === selectedSpaceId ? "page" : undefined}
+              aria-current={
+                row.original.spaceId === selectedSpaceId ? "page" : undefined
+              }
               className={`${linkClass} ${row.original.spaceId === selectedSpaceId ? "font-semibold" : ""}`}
             >
               {row.original.name}
@@ -134,7 +159,8 @@ export function KithFamilySpaceManager({ overview: server }: { overview: FamilyO
       {
         label: "Open",
         disabled: (row) => isPendingId(row.spaceId) || row.kind === "personal",
-        onSelect: (row) => router.push(`/spaces?space=${encodeURIComponent(row.spaceId)}`),
+        onSelect: (row) =>
+          router.push(`/spaces?space=${encodeURIComponent(row.spaceId)}`),
       },
     ],
     [router],
@@ -150,7 +176,10 @@ export function KithFamilySpaceManager({ overview: server }: { overview: FamilyO
 
       {creating && (
         <Panel>
-          <form onSubmit={submitCreate} className="flex flex-wrap items-end gap-2">
+          <form
+            onSubmit={submitCreate}
+            className="flex flex-wrap items-end gap-2"
+          >
             <Field label="Space name" htmlFor="space-name">
               <input
                 id="space-name"
@@ -216,7 +245,10 @@ function SpaceDetail({
   const [inviteError, setInviteError] = useState("");
   const [sending, setSending] = useState(false);
 
-  const setRole = useOptimisticMutation<FamilyOverview, { membershipId: string; role: Role }>({
+  const setRole = useOptimisticMutation<
+    FamilyOverview,
+    { membershipId: string; role: Role }
+  >({
     queryKey,
     mutationFn: ({ membershipId, role }) =>
       mutateJson(
@@ -236,11 +268,17 @@ function SpaceDetail({
   const remove = useOptimisticMutation<FamilyOverview, string>({
     queryKey,
     mutationFn: (membershipId) =>
-      mutateJson(`/api/kith/family/members/${membershipId}`, { method: "DELETE" }, FAILED),
+      mutateJson(
+        `/api/kith/family/members/${membershipId}`,
+        { method: "DELETE" },
+        FAILED,
+      ),
     apply: (current, membershipId) =>
       withSelected(current, (space) => ({
         ...space,
-        members: space.members.filter((member) => member.membershipId !== membershipId),
+        members: space.members.filter(
+          (member) => member.membershipId !== membershipId,
+        ),
       })),
   });
 
@@ -252,7 +290,10 @@ function SpaceDetail({
         `/api/kith/family/spaces/${spaceId}`,
         {
           method: "POST",
-          body: JSON.stringify({ action: "transferOwnership", toMembershipId: membershipId }),
+          body: JSON.stringify({
+            action: "transferOwnership",
+            toMembershipId: membershipId,
+          }),
         },
         FAILED,
       ),
@@ -275,7 +316,11 @@ function SpaceDetail({
   const approve = useOptimisticMutation<FamilyOverview, string>({
     queryKey,
     mutationFn: (invitationId) =>
-      mutateJson(`/api/kith/family/invitations/${invitationId}`, { method: "POST" }, FAILED),
+      mutateJson(
+        `/api/kith/family/invitations/${invitationId}`,
+        { method: "POST" },
+        FAILED,
+      ),
     apply: (current, invitationId) =>
       withSelected(current, (space) => ({
         ...space,
@@ -288,7 +333,11 @@ function SpaceDetail({
   const revoke = useOptimisticMutation<FamilyOverview, string>({
     queryKey,
     mutationFn: (invitationId) =>
-      mutateJson(`/api/kith/family/invitations/${invitationId}`, { method: "DELETE" }, FAILED),
+      mutateJson(
+        `/api/kith/family/invitations/${invitationId}`,
+        { method: "DELETE" },
+        FAILED,
+      ),
     apply: (current, invitationId) =>
       withSelected(current, (space) => ({
         ...space,
@@ -323,7 +372,11 @@ function SpaceDetail({
       "/api/kith/family/invitations",
       {
         method: "POST",
-        body: JSON.stringify({ spaceId, email: inviteEmail.trim(), role: inviteRole }),
+        body: JSON.stringify({
+          spaceId,
+          email: inviteEmail.trim(),
+          role: inviteRole,
+        }),
       },
       FAILED,
     );
@@ -424,8 +477,16 @@ function SpaceDetail({
         accessorKey: "status",
         header: "Status",
         cell: ({ row }) => (
-          <Tag tone={row.original.status === "pending_owner_approval" ? "warn" : "neutral"}>
-            {row.original.status === "pending_owner_approval" ? "needs approval" : "open"}
+          <Tag
+            tone={
+              row.original.status === "pending_owner_approval"
+                ? "warn"
+                : "neutral"
+            }
+          >
+            {row.original.status === "pending_owner_approval"
+              ? "needs approval"
+              : "open"}
           </Tag>
         ),
       },
@@ -437,7 +498,11 @@ function SpaceDetail({
           row.original.acceptedBy ? (
             <Detail
               label={row.original.acceptedBy}
-              detail={row.original.acceptedAt ? `Accepted ${shortDate(row.original.acceptedAt)}` : null}
+              detail={
+                row.original.acceptedAt
+                  ? `Accepted ${shortDate(row.original.acceptedAt)}`
+                  : null
+              }
             />
           ) : null,
       },
@@ -447,7 +512,9 @@ function SpaceDetail({
         header: "Expires",
         meta: { nowrap: true },
         cell: ({ row }) => (
-          <span className="text-gray-600 tabular-nums">{shortDate(row.original.expiresAt)}</span>
+          <span className="text-gray-600 tabular-nums">
+            {shortDate(row.original.expiresAt)}
+          </span>
         ),
       },
     ],
@@ -458,7 +525,8 @@ function SpaceDetail({
     () => [
       {
         label: "Approve account",
-        disabled: (invitation) => invitation.status !== "pending_owner_approval",
+        disabled: (invitation) =>
+          invitation.status !== "pending_owner_approval",
         onSelect: (invitation) => approve.mutate(invitation.invitationId),
       },
       {
@@ -483,7 +551,10 @@ function SpaceDetail({
         actions={
           <>
             {isOwner && (
-              <Button variant="primary" onClick={() => setInviting((open) => !open)}>
+              <Button
+                variant="primary"
+                onClick={() => setInviting((open) => !open)}
+              >
                 {inviting ? "Close" : "Invite"}
               </Button>
             )}
@@ -513,14 +584,20 @@ function SpaceDetail({
                 <select
                   id="invite-role"
                   value={inviteRole}
-                  onChange={(event) => setInviteRole(event.target.value as Role)}
+                  onChange={(event) =>
+                    setInviteRole(event.target.value as Role)
+                  }
                   className={inputClass}
                 >
                   <option value="reader">Reader</option>
                   <option value="editor">Editor</option>
                 </select>
               </Field>
-              <Button type="submit" variant="primary" disabled={sending || !inviteEmail.trim()}>
+              <Button
+                type="submit"
+                variant="primary"
+                disabled={sending || !inviteEmail.trim()}
+              >
                 {sending ? "Creating..." : "Create invite"}
               </Button>
             </form>
@@ -529,9 +606,11 @@ function SpaceDetail({
         )}
         {inviteLink && (
           <Panel tone="accent">
-            <div className="mb-2 text-xs font-medium">Secret invite link. Share it now.</div>
+            <div className="mb-2 text-xs font-medium">
+              Secret invite link. Share it now.
+            </div>
             <div className="flex items-center gap-2">
-              <code className="flex-1 rounded-tag border border-accent-200 bg-white px-2 py-1 font-mono text-[11px] break-all">
+              <code className="flex-1 rounded-tag border border-accent-200 bg-white px-2 py-1 font-mono text-data break-all">
                 {inviteLink}
               </code>
               <CopyButton text={inviteLink} label="Copy link" />
@@ -552,7 +631,9 @@ function SpaceDetail({
         />
         {isOwner && (
           <>
-            <h3 className="mt-6 mb-1 text-xs font-semibold text-gray-700">Invitations</h3>
+            <h3 className="mt-6 mb-1 text-xs font-semibold text-gray-700">
+              Invitations
+            </h3>
             <DataTable
               id="spaces-invitations"
               data={invitations}

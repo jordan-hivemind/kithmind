@@ -30,7 +30,10 @@ type CaptureResponse = {
 export function KithQuickCapture() {
   const [content, setContent] = useState("");
   const [loading, setLoading] = useState(false);
-  const [status, setStatus] = useState<{ text: string; failed: boolean } | null>(null);
+  const [status, setStatus] = useState<{
+    text: string;
+    failed: boolean;
+  } | null>(null);
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -46,11 +49,17 @@ export function KithQuickCapture() {
         body: JSON.stringify({ content: trimmed }),
       });
       if (response.status === 401) {
-        setStatus({ text: "Sign in again to capture a thought.", failed: true });
+        setStatus({
+          text: "Sign in again to capture a thought.",
+          failed: true,
+        });
         return;
       }
       if (!response.ok) {
-        setStatus({ text: "Failed to capture thought. Please try again.", failed: true });
+        setStatus({
+          text: "Failed to capture thought. Please try again.",
+          failed: true,
+        });
         return;
       }
       const result = (await response.json()) as CaptureResponse;
@@ -69,15 +78,24 @@ export function KithQuickCapture() {
         });
       }
     } catch {
-      setStatus({ text: "Failed to capture thought. Please try again.", failed: true });
+      setStatus({
+        text: "Failed to capture thought. Please try again.",
+        failed: true,
+      });
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <form onSubmit={(event) => void handleSubmit(event)} className="flex flex-col gap-1.5">
-      <label htmlFor="quick-capture" className="text-[11px] font-medium text-gray-600">
+    <form
+      onSubmit={(event) => void handleSubmit(event)}
+      className="flex flex-col gap-1.5"
+    >
+      <label
+        htmlFor="quick-capture"
+        className="text-sm font-medium text-gray-600"
+      >
         Capture
       </label>
       <div className="flex items-start gap-2">
@@ -89,7 +107,11 @@ export function KithQuickCapture() {
           rows={2}
           className={`${inputClass} h-auto min-h-14 flex-1 resize-y py-1.5`}
         />
-        <Button type="submit" variant="primary" disabled={loading || !content.trim()}>
+        <Button
+          type="submit"
+          variant="primary"
+          disabled={loading || !content.trim()}
+        >
           {loading ? "Saving..." : "Capture"}
         </Button>
       </div>

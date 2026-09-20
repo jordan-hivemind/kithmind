@@ -70,7 +70,7 @@ export function SpaceGrantChoices({
 
   return (
     <fieldset className="my-3 rounded-tag border border-gray-200 p-3 text-xs">
-      <legend className="px-1 text-[11px] font-medium text-gray-600">
+      <legend className="px-1 text-sm font-medium text-gray-600">
         Client access
       </legend>
       <p className="mb-2 text-gray-700">
@@ -98,7 +98,8 @@ export function SpaceGrantChoices({
               }
             />
             <span>
-              {space.name} ({space.kind === "personal" ? "Personal" : space.role})
+              {space.name} (
+              {space.kind === "personal" ? "Personal" : space.role})
               {space.role === "reader" && " · read only"}
             </span>
           </label>
@@ -123,7 +124,7 @@ export function SpaceGrantChoices({
           </label>
         ))}
       </div>
-      <p className="mt-3 text-[11px] text-gray-600">
+      <p className="mt-3 text-sm text-gray-600">
         Access follows your current membership. Removing access to a space also
         removes this client’s access. Narrative memory capture needs both read
         and write access to check existing memories.

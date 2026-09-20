@@ -22,7 +22,11 @@ const LINKS: readonly NavLink[] = [
   { href: "/settings", label: "Settings", section: "/settings" },
 ];
 
-const ADMIN: NavLink = { href: "/admin/sources", label: "Admin", section: "/admin" };
+const ADMIN: NavLink = {
+  href: "/admin/sources",
+  label: "Admin",
+  section: "/admin",
+};
 
 function isActive(pathname: string, section: string): boolean {
   return section === "/" ? pathname === "/" : pathname.startsWith(section);
@@ -41,12 +45,15 @@ export function AuthenticatedNav({
   const links = canAdmin ? [...LINKS, ADMIN] : LINKS;
 
   return (
-    <header className="border-b border-gray-200 bg-white">
+    <header className="border-b border-kith-border-subtle bg-kith-surface shadow-[var(--kith-shadow-xs)]">
       <nav
         aria-label="Main"
-        className="mx-auto flex h-11 max-w-7xl items-center gap-6 px-6 text-xs"
+        className="kith-page flex h-12 items-center gap-6 text-sm"
       >
-        <Link href="/" className="text-sm font-semibold text-gray-900">
+        <Link
+          href="/"
+          className="font-display text-[15px] font-semibold tracking-[-0.01em] text-kith-text"
+        >
           Kith Mind
         </Link>
         <ul className="flex h-full items-stretch gap-4">
@@ -60,7 +67,7 @@ export function AuthenticatedNav({
                   className={`flex items-center border-b-2 px-0.5 focus-visible:outline-2 focus-visible:outline-accent-600 ${
                     active
                       ? "border-accent-600 font-medium text-accent-700"
-                      : "border-transparent text-gray-600 hover:text-gray-900"
+                      : "border-transparent text-kith-text-secondary hover:text-kith-text"
                   }`}
                 >
                   {link.label}

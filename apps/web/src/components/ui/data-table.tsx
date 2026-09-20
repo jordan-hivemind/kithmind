@@ -183,7 +183,7 @@ export function Tag({
   return (
     <span
       title={title}
-      className={`inline-flex items-center rounded-tag border px-1.5 py-0.5 text-[11px] leading-none ${tones[tone]}`}
+      className={`inline-flex items-center rounded-tag border px-2 py-1 text-sm leading-none ${tones[tone]}`}
     >
       {children}
     </span>
@@ -209,7 +209,7 @@ export function Detail({
       <Tooltip.Portal>
         <Tooltip.Content
           sideOffset={4}
-          className="z-50 max-w-sm rounded-tag border border-gray-200 bg-white px-2 py-1 text-xs text-gray-700 shadow-md"
+          className="z-50 max-w-sm rounded-control border border-kith-border-subtle bg-kith-surface px-3 py-2 text-sm text-kith-text-secondary shadow-[var(--kith-shadow-md)]"
         >
           {detail}
         </Tooltip.Content>
@@ -304,9 +304,10 @@ export function DataTable<T>({
   const [columnSizing, setColumnSizing] = useState<ColumnSizingState>(() =>
     loadColumnSizing(id),
   );
-  const [confirming, setConfirming] = useState<{ action: RowAction<T>; row: T } | null>(
-    null,
-  );
+  const [confirming, setConfirming] = useState<{
+    action: RowAction<T>;
+    row: T;
+  } | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmingBulk, setConfirmingBulk] = useState<{
     action: RowAction<T[]>;
@@ -328,7 +329,10 @@ export function DataTable<T>({
   useEffect(() => {
     if (id === undefined || typeof window === "undefined") return;
     try {
-      window.localStorage.setItem(WIDTHS_KEY_PREFIX + id, JSON.stringify(columnSizing));
+      window.localStorage.setItem(
+        WIDTHS_KEY_PREFIX + id,
+        JSON.stringify(columnSizing),
+      );
     } catch {
       // Private browsing, a full quota, or a disabled store. Widths just
       // don't persist this session.
@@ -454,7 +458,7 @@ export function DataTable<T>({
             }}
             placeholder={searchPlaceholder}
             aria-label={searchPlaceholder}
-            className="h-7 w-56 rounded-tag border border-gray-300 px-2 text-xs outline-none focus:border-accent-500"
+            className="h-8 w-56 rounded-control border border-kith-border-subtle bg-kith-surface px-2.5 text-sm outline-none focus:border-kith-action focus:ring-1 focus:ring-kith-action"
           />
           {chipOptions.map(({ columnId, options }) =>
             options.map((option) => {
@@ -465,7 +469,7 @@ export function DataTable<T>({
                   type="button"
                   aria-pressed={selected}
                   onClick={() => toggleChip(columnId, option.value)}
-                  className={`rounded-tag border px-1.5 py-0.5 text-[11px] leading-none ${
+                  className={`rounded-tag border px-2 py-1 text-sm leading-none ${
                     selected
                       ? "border-accent-600 bg-accent-600 text-white"
                       : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"
@@ -483,7 +487,7 @@ export function DataTable<T>({
               <button
                 type="button"
                 onClick={() => setSelected(new Set())}
-                className="text-[11px] text-gray-500 hover:text-gray-700"
+                className="text-sm text-kith-text-muted hover:text-kith-text-secondary"
               >
                 Clear
               </button>
@@ -497,11 +501,12 @@ export function DataTable<T>({
                     onClick={() =>
                       action.danger
                         ? setConfirmingBulk({ action, rows: selectedRows })
-                        : (action.onSelect(selectedRows), setSelected(new Set()))
+                        : (action.onSelect(selectedRows),
+                          setSelected(new Set()))
                     }
                     className={
                       action.danger
-                        ? "h-7 rounded-tag border border-red-200 px-2 text-xs text-red-600 hover:border-red-400 disabled:text-gray-300"
+                        ? "h-8 rounded-control border border-red-200 px-3 text-sm text-red-600 hover:border-red-400 disabled:text-gray-300"
                         : buttonClass
                     }
                   >
@@ -516,7 +521,7 @@ export function DataTable<T>({
         <div className="overflow-x-auto">
           <table
             style={{ width: table.getTotalSize() + kebabWidth + selectWidth }}
-            className="table-fixed border-collapse text-xs"
+            className="kith-table-text table-fixed border-collapse text-kith-text"
           >
             <thead>
               {table.getHeaderGroups().map((headerGroup) => (
@@ -529,7 +534,9 @@ export function DataTable<T>({
                         indeterminate={selectionState === "some"}
                         onChange={(event) => {
                           event.stopPropagation();
-                          setSelected((current) => toggleSelectAll(rowIdList, current));
+                          setSelected((current) =>
+                            toggleSelectAll(rowIdList, current),
+                          );
                         }}
                       />
                     </th>
@@ -541,7 +548,7 @@ export function DataTable<T>({
                         key={header.id}
                         scope="col"
                         style={{ width: header.getSize() }}
-                        className="relative h-row px-2 text-left align-middle font-medium text-gray-500"
+                        className="relative h-row bg-kith-surface-muted px-3 text-left align-middle text-xs font-medium text-kith-text-secondary"
                       >
                         {header.isPlaceholder ? null : header.column.getCanSort() ? (
                           <button
@@ -561,11 +568,18 @@ export function DataTable<T>({
                               header.getContext(),
                             )}
                             <span aria-hidden className="text-gray-400">
-                              {sorted === "asc" ? "↑" : sorted === "desc" ? "↓" : ""}
+                              {sorted === "asc"
+                                ? "↑"
+                                : sorted === "desc"
+                                  ? "↓"
+                                  : ""}
                             </span>
                           </button>
                         ) : (
-                          flexRender(header.column.columnDef.header, header.getContext())
+                          flexRender(
+                            header.column.columnDef.header,
+                            header.getContext(),
+                          )
                         )}
                         {header.column.getCanResize() ? (
                           <div
@@ -627,19 +641,27 @@ export function DataTable<T>({
                       onKeyDown={
                         focusable
                           ? (event) => {
-                              if (event.key !== "Enter" && event.key !== " ") return;
+                              if (event.key !== "Enter" && event.key !== " ")
+                                return;
                               if (isInteractiveTarget(event.target)) return;
                               event.preventDefault();
-                              if (shouldToggleSelectionOnKey(event.key, selectable)) {
+                              if (
+                                shouldToggleSelectionOnKey(
+                                  event.key,
+                                  selectable,
+                                )
+                              ) {
                                 anchorRef.current = rowIndex;
-                                setSelected((current) => toggleSelection(current, rowId));
+                                setSelected((current) =>
+                                  toggleSelection(current, rowId),
+                                );
                                 return;
                               }
                               trigger(event);
                             }
                           : undefined
                       }
-                      className={`border-b border-gray-100 hover:bg-accent-50/40 ${
+                      className={`border-b border-kith-border-subtle hover:bg-accent-50/40 ${
                         row.depth > 0 ? "bg-gray-50/60 text-gray-600" : ""
                       } ${
                         intent === "none"
@@ -657,7 +679,10 @@ export function DataTable<T>({
                             checked={selected.has(rowId)}
                             onChange={(event) => {
                               event.stopPropagation();
-                              if (event.shiftKey && anchorRef.current !== null) {
+                              if (
+                                event.shiftKey &&
+                                anchorRef.current !== null
+                              ) {
                                 setSelected((current) =>
                                   applyRangeSelection(
                                     rowIdList,
@@ -668,7 +693,9 @@ export function DataTable<T>({
                                 );
                               } else {
                                 anchorRef.current = rowIndex;
-                                setSelected((current) => toggleSelection(current, rowId));
+                                setSelected((current) =>
+                                  toggleSelection(current, rowId),
+                                );
                               }
                             }}
                           />
@@ -693,17 +720,25 @@ export function DataTable<T>({
                                 type="button"
                                 onClick={(event) => {
                                   event.stopPropagation();
-                                  onExpandChange?.(row.original, !row.getIsExpanded());
+                                  onExpandChange?.(
+                                    row.original,
+                                    !row.getIsExpanded(),
+                                  );
                                   row.toggleExpanded();
                                 }}
                                 aria-expanded={row.getIsExpanded()}
-                                aria-label={row.getIsExpanded() ? "Collapse" : "Expand"}
+                                aria-label={
+                                  row.getIsExpanded() ? "Collapse" : "Expand"
+                                }
                                 className="mr-1 text-gray-400 hover:text-gray-700"
                               >
                                 {row.getIsExpanded() ? "▾" : "▸"}
                               </button>
                             ) : (
-                              <span aria-hidden className="mr-1 inline-block w-3" />
+                              <span
+                                aria-hidden
+                                className="mr-1 inline-block w-3"
+                              />
                             )
                           ) : null}
                           {cell.getIsGrouped() ? (
@@ -716,18 +751,29 @@ export function DataTable<T>({
                               aria-expanded={row.getIsExpanded()}
                               className="flex items-center gap-1 font-medium"
                             >
-                              <span aria-hidden>{row.getIsExpanded() ? "▾" : "▸"}</span>
-                              {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                              <span className="text-gray-400">({row.subRows.length})</span>
+                              <span aria-hidden>
+                                {row.getIsExpanded() ? "▾" : "▸"}
+                              </span>
+                              {flexRender(
+                                cell.column.columnDef.cell,
+                                cell.getContext(),
+                              )}
+                              <span className="text-gray-400">
+                                ({row.subRows.length})
+                              </span>
                             </button>
-                          ) : (groupBy !== undefined && cell.getIsAggregated()) ||
+                          ) : (groupBy !== undefined &&
+                              cell.getIsAggregated()) ||
                             cell.getIsPlaceholder() ? null : (
                             // `getIsAggregated` is true for any row that has
                             // sub-rows, whether or not the table is grouping, so a
                             // `getSubRows` parent would render nothing at all if
                             // this were not gated on `groupBy`. A grouped table
                             // behaves exactly as it did.
-                            flexRender(cell.column.columnDef.cell, cell.getContext())
+                            flexRender(
+                              cell.column.columnDef.cell,
+                              cell.getContext(),
+                            )
                           )}
                         </td>
                       ))}
@@ -739,7 +785,7 @@ export function DataTable<T>({
                                 aria-label="Row actions"
                                 data-row-click-ignore
                                 onClick={(event) => event.stopPropagation()}
-                                className="rounded-tag px-1.5 py-0.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
+                                className="rounded-control px-2 py-1 text-kith-text-muted hover:bg-kith-surface-muted hover:text-kith-text"
                               >
                                 &#8942;
                               </DropdownMenu.Trigger>
@@ -747,20 +793,28 @@ export function DataTable<T>({
                                 <DropdownMenu.Content
                                   align="end"
                                   sideOffset={2}
-                                  className="z-50 min-w-36 rounded-tag border border-gray-200 bg-white py-1 text-xs shadow-md"
+                                  className="z-50 min-w-36 rounded-control border border-kith-border-subtle bg-kith-surface py-1 text-sm shadow-[var(--kith-shadow-md)]"
                                 >
                                   {actions
                                     .filter(
                                       (action) =>
-                                        !(action.hidden?.(row.original) ?? false),
+                                        !(
+                                          action.hidden?.(row.original) ?? false
+                                        ),
                                     )
                                     .map((action) => (
                                       <DropdownMenu.Item
                                         key={action.label}
-                                        disabled={action.disabled?.(row.original) ?? false}
+                                        disabled={
+                                          action.disabled?.(row.original) ??
+                                          false
+                                        }
                                         onSelect={() =>
                                           action.danger
-                                            ? setConfirming({ action, row: row.original })
+                                            ? setConfirming({
+                                                action,
+                                                row: row.original,
+                                              })
                                             : action.onSelect(row.original)
                                         }
                                         className={`cursor-default px-2 py-1 outline-none data-[disabled]:text-gray-300 data-[highlighted]:bg-accent-50 ${
@@ -792,22 +846,24 @@ export function DataTable<T>({
         }}
       >
         <AlertDialog.Portal>
-          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-gray-900/20" />
-          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-tag border border-gray-200 bg-white p-4 shadow-xl">
-            <AlertDialog.Title className="text-sm font-medium text-gray-900">
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-[rgb(20_32_30_/_48%)]" />
+          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
+            <AlertDialog.Title className="kith-section-title">
               {confirming?.action.label}?
             </AlertDialog.Title>
-            <AlertDialog.Description className="mt-1 text-xs text-gray-600">
+            <AlertDialog.Description className="mt-1 text-sm text-kith-text-secondary">
               This can&apos;t be undone.
             </AlertDialog.Description>
             <div className="mt-3 flex justify-end gap-2">
-              <AlertDialog.Cancel className={buttonClass}>Cancel</AlertDialog.Cancel>
+              <AlertDialog.Cancel className={buttonClass}>
+                Cancel
+              </AlertDialog.Cancel>
               <AlertDialog.Action
                 onClick={() => {
                   if (confirming) confirming.action.onSelect(confirming.row);
                   setConfirming(null);
                 }}
-                className="h-7 rounded-tag border border-red-600 bg-red-600 px-2 text-xs text-white hover:bg-red-700"
+                className="h-8 rounded-control border border-red-600 bg-red-600 px-3 text-sm text-white hover:bg-red-700"
               >
                 {confirming?.action.label}
               </AlertDialog.Action>
@@ -823,24 +879,28 @@ export function DataTable<T>({
         }}
       >
         <AlertDialog.Portal>
-          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-gray-900/20" />
-          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-tag border border-gray-200 bg-white p-4 shadow-xl">
-            <AlertDialog.Title className="text-sm font-medium text-gray-900">
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-[rgb(20_32_30_/_48%)]" />
+          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
+            <AlertDialog.Title className="kith-section-title">
               {confirmingBulk?.action.label}?
             </AlertDialog.Title>
-            <AlertDialog.Description className="mt-1 text-xs text-gray-600">
-              This can&apos;t be undone. Affects {confirmingBulk?.rows.length ?? 0}{" "}
-              item{confirmingBulk?.rows.length === 1 ? "" : "s"}.
+            <AlertDialog.Description className="mt-1 text-sm text-kith-text-secondary">
+              This can&apos;t be undone. Affects{" "}
+              {confirmingBulk?.rows.length ?? 0} item
+              {confirmingBulk?.rows.length === 1 ? "" : "s"}.
             </AlertDialog.Description>
             <div className="mt-3 flex justify-end gap-2">
-              <AlertDialog.Cancel className={buttonClass}>Cancel</AlertDialog.Cancel>
+              <AlertDialog.Cancel className={buttonClass}>
+                Cancel
+              </AlertDialog.Cancel>
               <AlertDialog.Action
                 onClick={() => {
-                  if (confirmingBulk) confirmingBulk.action.onSelect(confirmingBulk.rows);
+                  if (confirmingBulk)
+                    confirmingBulk.action.onSelect(confirmingBulk.rows);
                   setConfirmingBulk(null);
                   setSelected(new Set());
                 }}
-                className="h-7 rounded-tag border border-red-600 bg-red-600 px-2 text-xs text-white hover:bg-red-700"
+                className="h-8 rounded-control border border-red-600 bg-red-600 px-3 text-sm text-white hover:bg-red-700"
               >
                 {confirmingBulk?.action.label}
               </AlertDialog.Action>

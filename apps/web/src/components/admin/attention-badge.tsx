@@ -38,7 +38,7 @@ export function AttentionBadge({
   if (total === 0) return null;
   return (
     <span
-      className={`ml-1 inline-flex min-w-4 items-center justify-center rounded-tag border px-1 text-[10px] leading-none ${
+      className={`ml-1 inline-flex min-w-4 items-center justify-center rounded-tag border px-1 text-meta leading-none ${
         data.alert > 0
           ? "border-amber-200 bg-amber-50 text-amber-800"
           : "border-accent-200 bg-accent-50 text-accent-700"

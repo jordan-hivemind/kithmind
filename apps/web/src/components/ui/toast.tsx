@@ -15,7 +15,8 @@ let nextId = 0;
 export function ToastProvider({ children }: { children: React.ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const dismiss = useCallback(
-    (id: number) => setToasts((current) => current.filter((toast) => toast.id !== id)),
+    (id: number) =>
+      setToasts((current) => current.filter((toast) => toast.id !== id)),
     [],
   );
   const push = useCallback(
@@ -40,7 +41,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
             key={toast.id}
             type="button"
             onClick={() => dismiss(toast.id)}
-            className="max-w-sm rounded-tag border border-red-200 bg-white px-3 py-2 text-left text-xs text-red-800 shadow-md"
+            className="max-w-sm rounded-panel border border-red-200 bg-white px-4 py-3 text-left text-sm text-red-800 shadow-[var(--kith-shadow-md)]"
           >
             {toast.message}
           </button>

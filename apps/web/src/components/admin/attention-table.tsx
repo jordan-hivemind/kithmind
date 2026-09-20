@@ -22,9 +22,22 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ColumnDef } from "@tanstack/react-table";
 import { useCallback, useMemo, useState } from "react";
 
-import { DataTable, Detail, type RowAction, Tag } from "@/components/ui/data-table";
-import { buttonClass, Drawer, inputClass, primaryButtonClass } from "@/components/ui/drawer";
-import type { AttentionFilter, DismissReason } from "@/lib/kith/attention-schemas";
+import {
+  DataTable,
+  Detail,
+  type RowAction,
+  Tag,
+} from "@/components/ui/data-table";
+import {
+  buttonClass,
+  Drawer,
+  inputClass,
+  primaryButtonClass,
+} from "@/components/ui/drawer";
+import type {
+  AttentionFilter,
+  DismissReason,
+} from "@/lib/kith/attention-schemas";
 import { SNOOZE_PRESETS_DAYS } from "@/lib/kith/attention-schemas";
 import { useLiveChanges } from "@/lib/kith/use-live-changes";
 
@@ -57,14 +70,20 @@ function ageLabel(createdAt: number, now: number): string {
   return days === 0 ? "today" : `${days}d`;
 }
 
-async function send(url: string, method: string, body?: unknown): Promise<Response> {
+async function send(
+  url: string,
+  method: string,
+  body?: unknown,
+): Promise<Response> {
   const response = await fetch(url, {
     method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body ?? {}),
   });
   if (!response.ok) {
-    const problem = (await response.json().catch(() => ({}))) as { error?: string };
+    const problem = (await response.json().catch(() => ({}))) as {
+      error?: string;
+    };
     throw new Error(problem.error ?? "Request failed");
   }
   return response;
@@ -102,7 +121,8 @@ function AttentionDrawer({
         </div>
         {item.reason === null ? null : (
           <div>
-            <span className="text-gray-400">Reason</span> {item.reason.replaceAll("_", " ")}
+            <span className="text-gray-400">Reason</span>{" "}
+            {item.reason.replaceAll("_", " ")}
           </div>
         )}
         {item.document === null ? null : (
@@ -114,7 +134,9 @@ function AttentionDrawer({
         {item.originalValue === null ? null : (
           <div>
             <span className="text-gray-400">Reading</span>{" "}
-            <span className="break-all">{JSON.stringify(item.originalValue)}</span>
+            <span className="break-all">
+              {JSON.stringify(item.originalValue)}
+            </span>
           </div>
         )}
       </div>
@@ -199,7 +221,10 @@ export function AttentionTable({
       // The store defaults severity to attention/alert when the param is
       // absent, so "show info too" has to name every severity explicitly
       // rather than omitting the filter.
-      params.set("severity", showInfo ? "info,attention,alert" : "attention,alert");
+      params.set(
+        "severity",
+        showInfo ? "info,attention,alert" : "attention,alert",
+      );
       if (showEverything) params.set("state", "open,snoozed,dismissed");
       const response = await fetch(`/api/kith/attention?${params.toString()}`, {
         headers: { "Content-Type": "application/json" },
@@ -224,7 +249,11 @@ export function AttentionTable({
   const dismissOne = useCallback(
     async (id: string, reason: DismissReason) => {
       try {
-        await send("/api/kith/attention", "DELETE", { action: "dismiss", id, reason });
+        await send("/api/kith/attention", "DELETE", {
+          action: "dismiss",
+          id,
+          reason,
+        });
         await refresh();
       } catch (error) {
         fail(error);
@@ -235,7 +264,11 @@ export function AttentionTable({
   const snoozeOne = useCallback(
     async (id: string, until: string) => {
       try {
-        await send("/api/kith/attention", "PATCH", { action: "snooze", id, until });
+        await send("/api/kith/attention", "PATCH", {
+          action: "snooze",
+          id,
+          until,
+        });
         await refresh();
       } catch (error) {
         fail(error);
@@ -258,7 +291,11 @@ export function AttentionTable({
     async (scopeKind: "detector" | "document_kind", scopeValue: string) => {
       if (spaceId === null) return;
       try {
-        await send("/api/kith/attention/mutes", "POST", { spaceId, scopeKind, scopeValue });
+        await send("/api/kith/attention/mutes", "POST", {
+          spaceId,
+          scopeKind,
+          scopeValue,
+        });
         await refresh();
       } catch (error) {
         fail(error);
@@ -311,7 +348,9 @@ export function AttentionTable({
         header: "Severity",
         accessorFn: (row) => row.severity,
         cell: ({ row }) => (
-          <Tag tone={SEVERITY_TONE[row.original.severity]}>{row.original.severity}</Tag>
+          <Tag tone={SEVERITY_TONE[row.original.severity]}>
+            {row.original.severity}
+          </Tag>
         ),
       },
       {
@@ -324,7 +363,9 @@ export function AttentionTable({
             label={
               <span>
                 {row.original.document?.kind ?? row.original.targetKind}
-                {row.original.fieldName === null ? "" : ` · ${row.original.fieldName}`}
+                {row.original.fieldName === null
+                  ? ""
+                  : ` · ${row.original.fieldName}`}
               </span>
             }
             detail={row.original.targetId}
@@ -335,7 +376,9 @@ export function AttentionTable({
         id: "reason",
         header: "Reason",
         accessorFn: (row) => row.reason ?? "",
-        cell: ({ row }) => <span>{row.original.reason?.replaceAll("_", " ") ?? ""}</span>,
+        cell: ({ row }) => (
+          <span>{row.original.reason?.replaceAll("_", " ") ?? ""}</span>
+        ),
       },
       {
         id: "document",
@@ -346,7 +389,8 @@ export function AttentionTable({
             <Detail
               label={
                 <span className="truncate">
-                  {row.original.document.title ?? row.original.document.sourceItemId}
+                  {row.original.document.title ??
+                    row.original.document.sourceItemId}
                 </span>
               }
               detail={row.original.document.uri}
@@ -450,7 +494,7 @@ export function AttentionTable({
           type="button"
           aria-pressed={showInfo}
           onClick={() => setShowInfo((current) => !current)}
-          className={`rounded-tag border px-1.5 py-0.5 text-[11px] leading-none ${
+          className={`rounded-tag border px-1.5 py-0.5 text-meta leading-none ${
             showInfo
               ? "border-accent-600 bg-accent-600 text-white"
               : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"
@@ -462,7 +506,7 @@ export function AttentionTable({
           type="button"
           aria-pressed={showEverything}
           onClick={() => setShowEverything((current) => !current)}
-          className={`rounded-tag border px-1.5 py-0.5 text-[11px] leading-none ${
+          className={`rounded-tag border px-1.5 py-0.5 text-meta leading-none ${
             showEverything
               ? "border-accent-600 bg-accent-600 text-white"
               : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"
@@ -473,7 +517,7 @@ export function AttentionTable({
         {toast === null ? null : (
           <span
             role="status"
-            className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] text-amber-800"
+            className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-meta text-amber-800"
           >
             {toast}
           </span>
@@ -534,21 +578,28 @@ export function AttentionTable({
         />
       )}
 
-      <AlertDialog.Root open={confirmBeforeDate} onOpenChange={setConfirmBeforeDate}>
+      <AlertDialog.Root
+        open={confirmBeforeDate}
+        onOpenChange={setConfirmBeforeDate}
+      >
         <AlertDialog.Portal>
           <AlertDialog.Overlay className="fixed inset-0 z-50 bg-gray-900/20" />
           <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-tag border border-gray-200 bg-white p-4 shadow-xl">
             <AlertDialog.Title className="text-sm font-medium text-gray-900">
               Dismiss {beforeDateCount ?? "…"} item
-              {beforeDateCount === 1 ? "" : "s"} for documents dated before {beforeDate}?
+              {beforeDateCount === 1 ? "" : "s"} for documents dated before{" "}
+              {beforeDate}?
             </AlertDialog.Title>
             <AlertDialog.Description className="mt-1 text-xs text-gray-600">
-              This can&apos;t be undone. Every open item for a document dated before
-              this date -- by its own extracted date, or its file's modified date
-              when the document states none -- is marked not worth backfilling.
+              This can&apos;t be undone. Every open item for a document dated
+              before this date -- by its own extracted date, or its file's
+              modified date when the document states none -- is marked not worth
+              backfilling.
             </AlertDialog.Description>
             <div className="mt-3 flex justify-end gap-2">
-              <AlertDialog.Cancel className={buttonClass}>Cancel</AlertDialog.Cancel>
+              <AlertDialog.Cancel className={buttonClass}>
+                Cancel
+              </AlertDialog.Cancel>
               <AlertDialog.Action
                 onClick={() => {
                   void dismissByFilter(
