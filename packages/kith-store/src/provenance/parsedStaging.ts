@@ -320,49 +320,50 @@ async function limited<T>(
 export const EXTRACTION_SPAN_LOCATOR_KIND = "extraction_v1";
 
 /**
- * The span ids typed extraction owns on one sealed text version.
+ * The span ids typed extraction has adopted on this generation, for spans
+ * written before the marker existed.
  *
- * Two rules, because there are two generations of these rows. Every span
- * extraction writes from now on carries the locator marker. Spans written
- * before that marker existed -- the ones on the owner's machine today -- are
- * recognised by what points at them: a `document_statement` observation's
- * `value_evidence`, or that event version's own `field_evidence`.
+ * Every span extraction writes from now on carries the locator marker and is
+ * recognised without a query. The rows already on the owner's machine -- two
+ * days of runs -- have no marker, so they are recognised by what points at
+ * them: a `document_statement` observation's `value_evidence`, or that event
+ * version's own `field_evidence`.
  *
  * Deliberately *not* "anything the manifest does not list". That would make
  * the seal blind to a foreign span appearing over sealed text, which is the
  * one thing it is for.
+ *
+ * Filtered on `processing_generation_id`, which both call sites already hold:
+ * it is the column migration 011 indexed, and this runs once per item per
+ * watcher pass over a corpus heading for several hundred. The text version is
+ * kept as a second predicate so the scope is still the one the caller asked
+ * about, not merely the one the generation happens to point at.
  */
-async function extractionSpanIds(
+async function adoptedSpanIds(
   client: ClientBase,
+  processingGenerationId: string,
   sourceTextVersionId: string,
 ): Promise<Set<string>> {
-  const marked = await client.query<{ id: string }>(
-    `SELECT id FROM kith.evidence_spans
-      WHERE source_text_version_id = $1 AND locator->>'kind' = $2
-      LIMIT $3`,
-    [sourceTextVersionId, EXTRACTION_SPAN_LOCATOR_KIND, MAX_EVIDENCE_SPANS + 1],
-  );
   const referenced = await client.query<{ span_id: string }>(
     `SELECT DISTINCT span_id FROM (
        SELECT jsonb_array_elements_text(o.value_evidence) AS span_id
          FROM kith.observations o
-        WHERE o.source_text_version_id = $1
+        WHERE o.processing_generation_id = $1
+          AND o.source_text_version_id = $2
           AND o.event_type = 'document_statement'
           AND jsonb_typeof(o.value_evidence) = 'array'
        UNION ALL
        SELECT jsonb_array_elements_text(
                 COALESCE(v.field_evidence->'occurrence', '[]'::jsonb))
          FROM kith.event_versions v
-        WHERE v.source_text_version_id = $1
+        WHERE v.processing_generation_id = $1
+          AND v.source_text_version_id = $2
           AND v.event_type = 'document_statement'
      ) AS referenced
-     LIMIT $2`,
-    [sourceTextVersionId, MAX_EVIDENCE_SPANS + 1],
+     LIMIT $3`,
+    [processingGenerationId, sourceTextVersionId, MAX_EVIDENCE_SPANS + 1],
   );
-  return new Set([
-    ...marked.rows.map((row) => row.id),
-    ...referenced.rows.map((row) => row.span_id),
-  ]);
+  return new Set(referenced.rows.map((row) => row.span_id));
 }
 
 async function collectPayloadRows(
@@ -405,13 +406,30 @@ async function collectPayloadRows(
   // A span the manifest *does* list is never excluded, whatever points at it.
   // Extraction reuses a parser span when one already covers the same range,
   // and dropping that span here would turn a reused span into a missing one.
-  const owned = await extractionSpanIds(client, sourceTextVersionId);
   const sealed = new Set(sealedSpanIds);
-  const spans = allSpans.filter(
+  // The marker is already on every row `allSpans` holds, so recognising a
+  // marked span costs nothing; only the unmarked legacy ones need a query.
+  const marked = (span: EvidenceSpanRow): boolean =>
+    (span.locator as { kind?: unknown } | null)?.kind ===
+    EXTRACTION_SPAN_LOCATOR_KIND;
+  // The query is only for spans that are neither marked nor in the manifest,
+  // which after this release means only the rows written before the marker
+  // existed. In steady state there are none and it is not run at all.
+  const needsLookup = allSpans.some(
     (span) =>
       span.cardExtractionFingerprints === null &&
-      (sealed.has(span.id) || !owned.has(span.id)),
+      !sealed.has(span.id) &&
+      !marked(span),
   );
+  const adopted = needsLookup
+    ? await adoptedSpanIds(client, processingGenerationId, sourceTextVersionId)
+    : new Set<string>();
+  const spans = allSpans.filter((span) => {
+    if (span.cardExtractionFingerprints !== null) return false;
+    if (sealed.has(span.id)) return true;
+    if (marked(span)) return false;
+    return !adopted.has(span.id);
+  });
   const documents = await limited(
     client,
     `SELECT * FROM kith.documents WHERE processing_generation_id = $1 LIMIT $2`,

@@ -399,6 +399,11 @@ test(
         [targetText.source_text_version_id],
       )
     ).rows[0];
+    // Hand-written rather than run through the extraction job, because that
+    // needs a model and a seeded document type and this test is about the
+    // seal. The rows below mirror `findOrCreateSpan` and `store` in
+    // `src/extraction/model.ts` -- if the locator shape there changes, this
+    // fixture has to change with it.
     const extractionSpan = newKithId();
     await f.client.query(
       `INSERT INTO kith.evidence_spans
