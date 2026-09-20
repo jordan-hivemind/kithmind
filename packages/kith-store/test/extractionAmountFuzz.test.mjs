@@ -285,6 +285,11 @@ const WORDS = [
  * is forty-two to any reader and `Cost basis 1,234.56` is a money line with a
  * label on it. {@link SPOILING_BEFORE} holds the few that do.
  *
+ * `per`, `each`, `ea` and `apiece` are not here either. A rate is still the
+ * printed dollars: `Rent $2,000.00 per month` prints two thousand dollars,
+ * and what the number is a rate *of* is a question about the field rather
+ * than about the characters.
+ *
  * An ISO currency code is not here at all. A code names the money and never
  * changes the number, on either side: `Tax 13.20 USD` is thirteen twenty.
  *
@@ -293,7 +298,9 @@ const WORDS = [
  * makes an offer a counterexample.
  */
 const SPOILING_AFTER = [
-  // Scale, spelled a way no page settles.
+  // Scale, spelled a way no page settles. Lower case, and last on the line:
+  // a Capitalized one followed by another Capitalized word is a place, which
+  // {@link makeName} prints instead.
   "mil",
   "mill",
   "mills",
@@ -333,15 +340,18 @@ const SPOILING_AFTER = [
   "bps",
   "bp",
   "basis",
-  "shares",
-  "share",
-  "units",
-  "unit",
-  "per",
-  "each",
-  "ea",
-  "apiece",
 ];
+
+/**
+ * Nouns that make a **bare** number a count rather than a sum.
+ *
+ * `100 shares` is a holding and forty-five dollars is not what it says. A
+ * currency mark settles it the other way -- `$50,000.00 Shares issued` is
+ * fifty thousand dollars however the sentence goes on -- so these spoil only
+ * an amount that prints no marker, and {@link makeCountedUnit} is the shape
+ * that prints one.
+ */
+const COUNT_UNITS = ["shares", "share", "units", "unit"];
 
 /**
  * Words that make the amount **after** them unpriceable.
@@ -974,6 +984,169 @@ function makeMarked(random) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Recall. A gate that refuses everything offers no wrong number, so the
+// invariants above pass a grammar that is useless. These shapes are the
+// owner's ordinary documents -- a pipe-rendered table, a column of amounts, a
+// form's lettered rows, a place name beside a figure, a labelled total -- and
+// on them the finder must offer **every** printed amount with its exact
+// value. The first round of ADM-5k lost about a third of the correct offers
+// on some of them and no invariant here noticed, which is what these are for.
+// ---------------------------------------------------------------------------
+
+/**
+ * One amount with nothing ambiguous about it.
+ *
+ * Deliberately narrower than {@link makeAmount}: no magnitude, no flag, no
+ * space grouping, no zero-width character, no damage. Every shape here is one
+ * this grammar is documented to read, so "the finder offered it" is a fair
+ * demand rather than a guess about what the page meant.
+ */
+function makePlainAmount(random) {
+  const whole = random.digits(1 + random.int(7));
+  const fraction = random.chance(0.6) ? random.digits(2, true) : "";
+  const grouped =
+    whole.length > 3 && random.chance(0.6) ? groupFrom(whole, ",") : whole;
+  const digits = fraction ? `${grouped}.${fraction}` : grouped;
+  // No euro sign. A euro amount refuses a single comma group outright --
+  // `12,345 €` is twelve thousand to most of the people who print it and
+  // twelve and a bit to the rest -- and that locale rule is documented
+  // behaviour rather than a shape this grammar is meant to read.
+  const marker = random.pick(["", "", "$", "$ ", "\u00a3", "\u00a3 "]);
+  const trailing = marker === "" && random.chance(0.25) ? " USD" : "";
+  const body = `${marker}${digits}${trailing}`;
+  const sign = random.pick(["none", "none", "none", "minus", "parens", "cr"]);
+  let text = body;
+  let negative = false;
+  if (sign === "minus") {
+    negative = true;
+    text = `-${body}`;
+  } else if (sign === "parens") {
+    negative = true;
+    text = `(${body})`;
+  } else if (sign === "cr") {
+    negative = true;
+    text = `${body} CR`;
+  }
+  return { text, value: truthOf({ whole, fraction, magnitude: 0, negative }) };
+}
+
+/** Place names and company names, which are two Capitalized words and never a
+ * scale however they are spelled. */
+const NAMES_AFTER = [
+  "Mill Creek",
+  "Grand Rapids",
+  "Bill Jenkins",
+  "Mill Lane",
+  "Grand Avenue",
+  "Bill Smith",
+];
+
+/** The same, opening with a word this grammar reads as a magnitude. These may
+ * only stand in *front* of an amount: after one, a Capitalized magnitude is a
+ * place to one reader and a scale to another, and the finder refuses both. */
+const NAMES_BEFORE = [
+  "Thousand Oaks",
+  "Lakh Street",
+  "Million Dollar Way",
+  "Crore Road",
+];
+
+/** A form's row letters. A K-1 prints K and M, a W-2 prints D. */
+const ROW_LETTERS = ["A", "B", "C", "D", "K", "L", "M", "N", "V", "Z"];
+
+/** One recall case: the text, the values it prints, and the family it belongs
+ * to. `lines` means the text is a page and each of its lines is scanned with
+ * the wrap tokens `pageLines` gives it. */
+function makeRecallCase(random) {
+  const family = random.int(5);
+  if (family === 0) return makePipeRecall(random);
+  if (family === 1) return makeColumnRecall(random);
+  if (family === 2) return makeLetteredRecall(random);
+  if (family === 3) return makeNameRecall(random);
+  return makeLabelRecall(random);
+}
+
+/** `| Total | 1,234.56 | (5.00) | $150.00 |`: two to six amount cells, with
+ * label cells among them. */
+function makePipeRecall(random) {
+  const count = 2 + random.int(5);
+  const cells = [];
+  const values = [];
+  if (random.chance(0.8)) cells.push(word(random));
+  for (let at = 0; at < count; at += 1) {
+    const amount = makePlainAmount(random);
+    cells.push(amount.text);
+    values.push(amount.value);
+    if (random.chance(0.2)) cells.push(word(random));
+  }
+  const bar = random.pick(["|", "\u00a6", "\u2502", "\u2551"]);
+  const pad = random.pick([" ", " ", "  "]);
+  return {
+    family: "pipe row",
+    text: `${bar}${pad}${cells.join(`${pad}${bar}${pad}`)}${pad}${bar}`,
+    values,
+  };
+}
+
+/** A column of amounts, one to a line, the shape a till receipt parses to. */
+function makeColumnRecall(random) {
+  const count = 2 + random.int(4);
+  const lines = [];
+  const values = [];
+  if (random.chance(0.5)) lines.push(word(random));
+  for (let at = 0; at < count; at += 1) {
+    const amount = makePlainAmount(random);
+    lines.push(
+      random.chance(0.4) ? `${word(random)} ${amount.text}` : amount.text,
+    );
+    values.push(amount.value);
+  }
+  if (random.chance(0.4)) lines.push(`${word(random)} ${word(random)}`);
+  return { family: "amount column", lines: lines.join("\n"), values };
+}
+
+/** `K Net rental real estate income 12,345.56`: a form's lettered rows, one
+ * under the next, which is what a K-1 and a W-2 both print. */
+function makeLetteredRecall(random) {
+  const count = 2 + random.int(3);
+  const lines = [];
+  const values = [];
+  for (let at = 0; at < count; at += 1) {
+    const amount = makePlainAmount(random);
+    const letter = random.pick(ROW_LETTERS);
+    lines.push(
+      `${letter} ${word(random)} ${word(random)} ${word(random)} ${amount.text}`,
+    );
+    values.push(amount.value);
+  }
+  return { family: "lettered row", lines: lines.join("\n"), values };
+}
+
+/** A place or a company beside a figure, on either side of it. */
+function makeNameRecall(random) {
+  const amount = makePlainAmount(random);
+  const text = random.chance(0.5)
+    ? `${amount.text} ${random.pick(NAMES_AFTER)}`
+    : `${random.pick([...NAMES_AFTER, ...NAMES_BEFORE])} ${amount.text}`;
+  return { family: "name neighbour", text, values: [amount.value] };
+}
+
+/** `Subtotal 1,234.56`: the plainest line a receipt prints. */
+function makeLabelRecall(random) {
+  const amount = makePlainAmount(random);
+  const shape = random.int(4);
+  const text =
+    shape === 0
+      ? `${word(random)} ${amount.text}`
+      : shape === 1
+        ? `${word(random)}: ${amount.text}`
+        : shape === 2
+          ? `${word(random)} ${word(random)}${columnGap(random)}${amount.text}`
+          : `${amount.text} ${word(random)}`;
+  return { family: "plain label", text, values: [amount.value] };
+}
+
 /**
  * The gap between two cells of a column, which is never one space wide.
  *
@@ -1119,6 +1292,67 @@ function check(report, label, text, tokens, options) {
   }
 }
 
+/**
+ * The recall invariant: every printed value is offered, with its exact sign
+ * and scale.
+ *
+ * The mirror of `check`, and the half the four wrong-number invariants cannot
+ * see. A missing value is recorded against its family so a report says which
+ * shape the round cost, not merely that something moved.
+ */
+function checkRecall(report, label, shaped, tally) {
+  const seen = [];
+  const texts = shaped.lines === undefined ? [shaped.text] : undefined;
+  let offered = [];
+  try {
+    if (texts) {
+      offered = amountsInText(shaped.text);
+    } else {
+      for (const line of pageLines(shaped.lines)) {
+        offered = offered.concat(
+          amountsInText(line.text, {
+            cutStart: line.cutStart,
+            cutEnd: line.cutEnd,
+            ...(line.previousToken === undefined
+              ? {}
+              : { previousToken: line.previousToken }),
+            ...(line.nextToken === undefined
+              ? {}
+              : { nextToken: line.nextToken }),
+          }),
+        );
+      }
+    }
+  } catch (error) {
+    report.push({ label, text: shaped.text ?? shaped.lines, failure: `threw ${String(error)}` });
+    return;
+  }
+  const pool = [...offered];
+  const missing = [];
+  for (const value of shaped.values) {
+    const at = pool.indexOf(value);
+    if (at < 0) missing.push(value);
+    else {
+      pool.splice(at, 1);
+      seen.push(value);
+    }
+  }
+  const stat = tally.get(shaped.family) ?? { printed: 0, offered: 0, cases: 0 };
+  stat.printed += shaped.values.length;
+  stat.offered += seen.length;
+  stat.cases += 1;
+  tally.set(shaped.family, stat);
+  if (missing.length > 0) {
+    report.push({
+      label,
+      family: shaped.family,
+      text: shaped.text ?? shaped.lines,
+      offered,
+      failure: `did not offer ${missing.join(", ")}`,
+    });
+  }
+}
+
 /** The long-line context. A cut edge is unknown, so no piece may offer a
  * value the whole line does not print either. */
 function checkSplit(report, random, tokens) {
@@ -1163,10 +1397,21 @@ function checkWrapped(report, random, seed, at) {
   const token = makeAmount(random);
   const spoiled = random.chance(0.55);
   const tailWord = spoiled
-    ? random.pick([...SPOILING_AFTER, ...MAGNITUDE_WORDS.map(([one]) => one)])
+    ? random.pick([
+        ...SPOILING_AFTER,
+        ...MAGNITUDE_WORDS.map(([one]) => one),
+      ])
     : word(random);
   const head = `${word(random)} ${word(random)} ${token.text}`;
-  const rest = `${tailWord} ${word(random)} ${word(random)}`;
+  // A single letter is a marker only where it stands alone. A form labels its
+  // rows with exactly these letters -- a K-1 prints `K Net rental real estate
+  // income`, a W-2 prints code `D` -- and a letter with a word after it is a
+  // row label rather than a wrapped magnitude, which is what
+  // `makeLetteredRecall` asserts from the other side.
+  const alone = spoiled && tailWord.length === 1;
+  const rest = alone
+    ? tailWord
+    : `${tailWord} ${word(random)} ${word(random)}`;
   const page = `${head}\n${rest}`;
   const truths = spoiled ? [] : [token];
   for (const line of pageLines(page)) {
@@ -1195,10 +1440,18 @@ function checkWrapped(report, random, seed, at) {
   }
 }
 
-function run(seed, cases) {
+function run(seed, cases, tally = new Map()) {
   const random = makeRandom(seed);
   const report = [];
   for (let at = 0; at < cases && report.length < 8; at += 1) {
+    if (at % 3 === 0) {
+      checkRecall(
+        report,
+        `seed ${seed} case ${at} recall`,
+        makeRecallCase(random),
+        tally,
+      );
+    }
     const shaped = makeCase(random);
     check(report, `seed ${seed} case ${at}`, shaped.text, shaped.tokens);
     if (shaped.single && shaped.tokens[0].signKind !== "credit" &&
@@ -1238,7 +1491,7 @@ function run(seed, cases) {
       checkWrapped(report, random, seed, at);
     }
   }
-  return report;
+  return { report, tally };
 }
 
 const CASES = Number(process.env.KITH_AMOUNT_FUZZ_CASES ?? 50000);
@@ -1248,14 +1501,43 @@ const SEEDS = (process.env.KITH_AMOUNT_FUZZ_SEEDS ?? "20260920")
   .filter((seed) => Number.isFinite(seed));
 
 test("no generated line ever offers a number it does not print", () => {
+  const tally = new Map();
   for (const seed of SEEDS) {
-    const report = run(seed, CASES);
+    const { report } = run(seed, CASES, tally);
     assert.deepEqual(
       report,
       [],
-      `seed ${seed}: ${report.length} counterexample(s)\n` +
+      `seed ${seed}: ${report.length} wrong number(s) or missing offer(s)\n` +
         report.map((entry) => JSON.stringify(entry)).join("\n"),
     );
+  }
+  // And the other half of the claim. A gate that refuses everything offers no
+  // wrong number, so recall is asserted here rather than measured elsewhere:
+  // on these plain shapes every printed amount has to come back. The families
+  // are listed so a failure names the document shape that broke.
+  const families = [
+    "pipe row",
+    "amount column",
+    "lettered row",
+    "name neighbour",
+    "plain label",
+  ];
+  for (const family of families) {
+    const stat = tally.get(family);
+    assert.ok(stat && stat.cases > 0, `${family}: nothing was generated`);
+    assert.equal(
+      stat.offered,
+      stat.printed,
+      `${family}: offered ${stat.offered} of ${stat.printed} printed amounts`,
+    );
+  }
+  if (process.env.KITH_AMOUNT_FUZZ_RECALL === "1") {
+    for (const [family, stat] of tally) {
+      const rate = ((100 * stat.offered) / stat.printed).toFixed(2);
+      console.log(
+        `recall ${family}: ${stat.offered}/${stat.printed} (${rate}%) over ${stat.cases} cases`,
+      );
+    }
   }
 });
 
