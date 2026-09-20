@@ -54,15 +54,17 @@ export { workerCtx as deferredCtx, at, exec, row, rows };
 
 /**
  * The closed set of job kinds `kith.deferred_work`'s CHECK constraint allows.
- * Keep this in step with `migrations/017_deferred_work.sql`: the two are one
- * convention written twice, the same relationship `KITH_ID` has with its own
- * domain CHECK.
+ * Keep this in step with `migrations/017_deferred_work.sql` and every
+ * migration that has widened it since (027, 034): the two are one convention
+ * written twice, the same relationship `KITH_ID` has with its own domain
+ * CHECK.
  */
 export const DEFERRED_WORK_KINDS = [
   "inline_ingestion",
   "embedding_fill",
   "card_queue_tick",
   "document_extraction",
+  "investment_link",
 ] as const;
 
 export type DeferredWorkKind = (typeof DEFERRED_WORK_KINDS)[number];
@@ -75,6 +77,31 @@ export function isDeferredWorkKind(value: unknown): value is DeferredWorkKind {
 }
 
 export type DeferredWorkState = "queued" | "running" | "done" | "failed";
+
+/**
+ * A failure a retry cannot fix, thrown by a handler that knows its job would
+ * fail the same way every time.
+ *
+ * `fail`'s backoff is the right answer for a provider that is down or a row
+ * another transaction is holding: try again in a moment. It is the wrong
+ * answer for a payload naming an id of the wrong shape, or for a bound the
+ * work has genuinely exceeded -- `candidate_limit` from the link scorer
+ * (ADM-8c) is the first of these. Those spend four more attempts and fifteen
+ * minutes of queue time reaching the state they were already in, and arrive
+ * there with `last_error` saying the same sentence five times.
+ *
+ * `drain` turns this into `failed` at once, with the scrubbed message in
+ * `last_error` and WITHOUT consuming an attempt (`failWithoutAttempt`): the
+ * attempt budget counts how many times work was TRIED, and this job was tried
+ * once and answered once. The row is terminal and visible, which is what an
+ * operator needs to see and what a retry loop would hide.
+ */
+export class TerminalDeferredWorkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TerminalDeferredWorkError";
+  }
+}
 
 export type DeferredWorkRow = {
   id: string;

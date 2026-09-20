@@ -1,14 +1,15 @@
 # Investment document matching and the attention queue
 
 Date: 2026-09-19
-Status: adopted, in build. Slice 1b of section 8 is the last slice landed
-(ADM-8b); slices 2 to 7 are not built. Extends section 12 of
+Status: adopted, in build. Slice 2 of section 8 is the last slice landed
+(ADM-8c); slices 3 to 7 are not built. Extends section 12 of
 [`2026-09-18-admin-panel-and-ingestion.md`](2026-09-18-admin-panel-and-ingestion.md),
 which fixed the auto-link rule but not the pipeline, the queue or the alerts.
 
 Where the implementation has settled a question this plan left open, it says
 so in place: see "Migrations", "Which one is the source of truth" and "What
-slice 1 settled that this plan did not" in section 3.
+slice 1 settled that this plan did not" in section 3, and "What slice 2
+settled that this plan did not" in section 2.
 
 The owner enters the dollars. The system finds the paper, says nothing when it
 succeeds, and reaches him when it cannot. Silent wrong data is the one
@@ -42,19 +43,55 @@ notice safe to compare with a GBP entry.
 
 One new deferred kind, `investment_link`, registered in
 `packages/kith-store/src/deferred/registry.ts`. Transaction scoped: it is all
-database work, so it needs no pooled handler.
+database work, so it needs no pooled handler. Migration 034 widens the queue's
+`kind` CHECK, and `packages/kith-store/src/admin/investmentLinkWork.ts` holds
+the kind, the triggers and the backfill (ADM-8c).
+
+ONE JOB PER DOCUMENT, whatever woke it. The plan's table gave the entry
+trigger its own payload and its own key; the implementation does not, and the
+reason is in the table below.
 
 | Trigger | Payload | Dedupe key |
 | --- | --- | --- |
-| Extraction finished | `{ spaceId, sourceItemId }` | `investment_link:item:<sourceItemId>` |
-| Entry created or edited | `{ spaceId, entryId }` | `investment_link:entry:<entryId>` |
-| Nightly sweep | `{ spaceId }` | `investment_sweep:<spaceId>:<yyyy-mm-dd>` |
+| Extraction stored or re-stored | `{ spaceId, sourceItemId }` | `investment_link:item:<sourceItemId>` |
+| Entry or investment created or edited | one job per affected document | `investment_link:item:<sourceItemId>` |
+| An entity alias the scorer reads is added | one job per affected document | `investment_link:item:<sourceItemId>` |
+| An owner rejection frees an entry | one job per affected document | `investment_link:item:<sourceItemId>` |
+| Any of the above while that document's job is already RUNNING | the same payload again | `investment_link:item:<sourceItemId>:after:<runningJobId>` |
 
 Scheduled from `store` in `packages/kith-store/src/extraction/model.ts`, from
-`createInvestmentEntry` and `updateInvestmentEntry` in
-`packages/kith-store/src/admin/investments.ts`, and from a sweep in
-`packages/kith-store/src/deferred/sweeps.ts` that `tick` runs on the owner
-machine's daemon.
+`createInvestment`, `updateInvestment`, `archiveInvestment`,
+`createInvestmentEntry`, `updateInvestmentEntry` and `deleteInvestmentEntry`
+in `packages/kith-store/src/admin/investments.ts`, from `resolveEntity` in
+`packages/kith-store/src/memory/entities.ts` when an alias merge actually
+adds one, and from `rejectInvestmentDocumentLink` in
+`packages/kith-store/src/admin/investmentLinks.ts` -- each in the transaction
+of the write that caused it, so the job commits with that write or not at all.
+
+The nightly sweep the plan lists as a third trigger is slice 3's, with the
+detectors it exists to run, and `investment_sweep` is therefore not a kind
+yet: a CHECK widened for a writer that does not exist is a CHECK nothing
+tests, which is the same reasoning migration 033 applied to this one.
+
+The operator route for the documents that were extracted before any of this
+existed is `kith-investment-link-backfill` (dry run by default, `--apply`,
+`--space`, `--kind`, `--limit`). It enqueues and never evaluates inline, and
+it prints counts only.
+
+### What slice 2 settled that this plan did not (ADM-8c)
+
+| Question the plan left open | What was built, and why |
+| --- | --- |
+| The entry trigger's payload and key | One job per DOCUMENT, keyed `investment_link:item:<sourceItemId>`, for every trigger. An entry-keyed job would have to re-derive the documents anyway, and two key shapes over the same work do not de-duplicate against each other: a save and a re-extraction landing together would have produced two jobs that reached the same conclusion, and the second would have rewritten the rows the first had just written. |
+| Which documents an edit wakes | Two halves. Every document already holding a link row for the investment is enqueued, always and unbounded: a live link left standing behind an amount that has moved is silent wrong data. Every other document matching on party, path or the entry's amount is enqueued too, bounded, because missing one costs a suggestion rather than a fact. |
+| How those documents are found | A bounded read of the space's extractions of matchable kinds, filtered in JavaScript with the scorer's own `normalizeMatchName`, `pathNamesFromUri` and `amountMatches`. Not in SQL: re-expressing the rule that decides where the owner's money is filed would be a second implementation of it, and the two would drift. |
+| Which edits count as match-affecting | For an entry, whether `entry_type`, `entry_date`, `amount`, `currency`, `exchange_rate` or `date_is_estimated` is a DIFFERENT STORED VALUE, asked in SQL with `IS DISTINCT FROM` over `numeric`. The drawer sends the whole entry on every save, so "he touched the amount field" is not the question, and a string compare would have enqueued a document every time he edited a note. For an investment, `name` and `signed_on` only. |
+| Archiving and deleting | Both wake the documents involved. An archived investment leaves the matcher's view (`loadInvestmentNames` excludes it) and a deleted entry takes its link rows with it, so in both cases a live link would otherwise stand behind a decision nothing can still justify. |
+| What the handler does with a bound it cannot score past | `candidate_limit` and `investment_limit` from the scorer are TERMINAL: `failed` on the first run, with the reason in the scrubbed `last_error`, and no attempt consumed. `drain` learned one new outcome for this (`TerminalDeferredWorkError`, `status: "terminal"`). Five identical attempts over fifteen minutes reach the same state and bury the reason under four copies of itself. |
+| What a job that links nothing does | Nothing, silently. No attention row, no correction, no log line. Most of the owner's 142 entries will never have paper behind them; a job per document announcing that it found none is the noise this design treats as a defect. |
+| A document whose kind stops being matchable | Swept. A re-extraction that re-reads a capital call notice as something else still enqueues the document when it holds ANY link row, and `evaluateDocumentLinks` no longer returns before its sweep: rule-made rows go and give their dates back, owner-decided rows are untouched, and nothing is remembered as a rejection. A document with no link and a kind the scorer cannot read is still no job at all. |
+| A change that lands while that document's job is already RUNNING | A second job, keyed `…:after:<runningJobId>`. `schedule` de-duplicates against `running` as well as `queued`, which is right for a job that has not started reading and wrong for one that already has: the reviewer reproduced an owner's amount edit being absorbed by a running job that had read the old amount, leaving a wrong `auto_linked` row with nothing queued. `scheduleInvestmentLink` reads the pending row `FOR UPDATE` instead -- which also turns "my snapshot says queued but it was claimed since" into a 40001 the write retries -- and `schedule` itself is unchanged for every other kind. |
+| What may never fail because of this feature | An extraction, and a captured fact. Those two enqueues sit in a SAVEPOINT (`withLinkEnqueueSavepoint`): 40001 and 40P01 propagate so the transaction retries as it does today, anything else is recorded once through the scrubbed log path and the write commits, and `kith-investment-link-backfill` is the repair. The owner's own entry, investment and link writes deliberately do NOT get this: those are the writes that invalidate a link, so committing one while silently failing to queue its re-evaluation is the silent wrong data this slice exists to prevent. A failed save is visible and can be retried. |
 
 ### Candidates
 
@@ -265,8 +302,10 @@ Migration 033 (ADM-8b, slices 1 and 1b) delivers:
    row reads as owner-entered and none can be rewritten by this feature.
 
 The `kith.deferred_work` kind check is NOT extended here. `investment_link`
-and `investment_sweep` belong to slice 2, with the handler and the triggers
-that use them.
+belongs to slice 2, with the handler and the triggers that use it, and it
+landed there as migration **034**
+(`034_investment_link_deferred_kind.sql`, ADM-8c). `investment_sweep` still
+has no migration: it waits for slice 3, which is the row that writes it.
 
 Every query in `extraction/corrections.ts` filters `target_kind = 'document'`,
 so the widened check disturbs no existing path.
@@ -528,7 +567,7 @@ Both questions are then one call each, with exact decimal amounts.
 | --- | --- | --- | --- |
 | 1 | Migration 033, link table, deterministic scorer | Synthetic fixtures produce the right auto, suggest and none decisions | Yes, it writes `investment_entries.document_id` |
 | 1b | Estimated-date marker, import change, date replacement rule | An estimated date moves and is recorded; a non-estimated one never does | Yes, it changes a financial date |
-| 2 | `investment_link` kind, three triggers, backfill command | Fixture documents link themselves through one drain | No |
+| 2 (landed, ADM-8c) | `investment_link` kind, three triggers, backfill command | Fixture documents link themselves through one drain | No |
 | 3 | Attention items, the six detectors, bulk dismiss and do-not-track suppressions | Fixtures open items and clear them next sweep; a suppressed key never opens one | No |
 | 4 | Investments pills and actions, Needs attention screen, K-1 checklist tab | Confirm and reject round trip, live with no refresh; checklist matches fixtures on request | No |
 | 5 | Digest, immediate alerts, weekly summary, heartbeat | A dry run prints each payload without posting | No |

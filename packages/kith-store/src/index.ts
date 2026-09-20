@@ -371,7 +371,7 @@ export async function grantProofAppRole(
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.investment_document_links TO "${appRole}"`);
   // The owner's overrides of a finance account's name, last four, type and
-  // closed flag (ADM-2b, migration 034).
+  // closed flag (ADM-2b, migration 035).
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.finance_account_overrides TO "${appRole}"`);
   // The change feed (migration 023) is deliberately not in the list above.

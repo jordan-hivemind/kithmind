@@ -25,6 +25,7 @@
 
 import type { Pool } from "pg";
 
+import { runInvestmentLinkJob } from "../admin/investmentLinkWork.js";
 import { runEmbeddingFillJob } from "../embeddings/fillWork.js";
 import type { FillEmbedder } from "../embeddings/fill.js";
 import {
@@ -156,6 +157,17 @@ export function defaultRegistry(
     run: (pool, payload, job) =>
       runDocumentExtractionJob(pool, payload, job, extract).then(() => undefined),
   });
+  // `investment_link` is registered by ADM-8c. Its schedulers are the three
+  // triggers in `../admin/investmentLinkWork.ts` -- a stored extraction, an
+  // edited entry or investment, and a rejected link -- each calling
+  // `schedule` in the transaction of the write that caused it, and its
+  // payload is `{ spaceId, sourceItemId }`, keyed per source item.
+  //
+  // Transaction scoped, not pooled: every statement it runs is database work
+  // in one space, it makes no outbound call, and slice 2 uses no model. So it
+  // takes the `DeferredCtx` `drain` opens and needs none of the pooled
+  // scope's machinery.
+  registry.set("investment_link", runInvestmentLinkJob);
   // `card_queue_tick` waits on a PostgreSQL port of `cardQueue.ts`: the
   // extraction queue state, cursor and budget tables of `cardQueueTables.ts`,
   // which `packages/kith-store/src/records/` does not have.
