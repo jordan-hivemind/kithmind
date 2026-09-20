@@ -19,6 +19,7 @@ import {
   type RowAction,
   Tag,
 } from "@/components/ui/data-table";
+import { tableDateTime } from "@/lib/kith/format";
 
 type Check = admin.HealthCheck;
 
@@ -51,8 +52,7 @@ const LABEL: Record<Check["status"], string> = {
 };
 
 function when(value: number | null): string {
-  if (value === null) return "";
-  return new Date(value).toISOString().slice(0, 16).replace("T", " ");
+  return tableDateTime(value);
 }
 
 export function HealthTable({ initial }: { initial: { checks: Check[] } }) {

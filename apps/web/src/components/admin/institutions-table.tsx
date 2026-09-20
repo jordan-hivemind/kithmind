@@ -21,6 +21,7 @@ import { useMemo } from "react";
 
 import { DataTable, Detail, Tag } from "@/components/ui/data-table";
 import type { InstitutionsPageData } from "@/lib/kith/admin-data";
+import { archiveDate, label, tableInteger } from "@/lib/kith/format";
 import type { InstitutionRow } from "@/lib/kith/institutions";
 
 const TONE: Record<InstitutionRow["status"], "neutral" | "accent" | "warn"> = {
@@ -41,12 +42,14 @@ export const TRUNCATED_DETAIL =
 
 function number(value: number | null) {
   return value === null ? null : (
-    <span className="tabular-nums">{value}</span>
+    <span className="tabular-nums">{tableInteger(value)}</span>
   );
 }
 
 function date(value: string | null) {
-  return <span className="tabular-nums text-gray-600">{value ?? ""}</span>;
+  return (
+    <span className="tabular-nums text-gray-600">{archiveDate(value)}</span>
+  );
 }
 
 export function InstitutionsTable({
@@ -69,12 +72,41 @@ export function InstitutionsTable({
 
   const columns = useMemo<ColumnDef<InstitutionRow, unknown>[]>(
     () => [
-      { id: "name", accessorKey: "name", header: "Institution" },
+      {
+        id: "institutionName",
+        accessorKey: "institutionName",
+        header: "Institution",
+        cell: ({ row }) =>
+          row.depth === 0 ? row.original.institutionName : "",
+      },
+      {
+        id: "accountName",
+        accessorKey: "accountName",
+        header: "Account",
+        cell: ({ row }) => row.original.accountName ?? "",
+      },
+      {
+        id: "accountLast4",
+        accessorKey: "accountLast4",
+        header: "Last 4",
+        meta: { nowrap: true },
+        cell: ({ row }) =>
+          row.original.accountLast4 === null ? (
+            ""
+          ) : (
+            <span className="tabular-nums">
+              ••••{row.original.accountLast4}
+            </span>
+          ),
+      },
       {
         id: "accountType",
         accessorKey: "accountType",
         header: "Type",
-        cell: ({ row }) => row.original.accountType ?? "",
+        cell: ({ row }) =>
+          row.original.accountType === null
+            ? ""
+            : label(row.original.accountType),
       },
       {
         id: "accounts",
@@ -159,7 +191,7 @@ export function InstitutionsTable({
         columns={columns}
         getSubRows={(row) => row.children}
         filterColumns={["status"]}
-        initialSorting={[{ id: "name", desc: false }]}
+        initialSorting={[{ id: "institutionName", desc: false }]}
         searchPlaceholder="Search institutions"
         empty={
           data.state === "unavailable" && data.reason !== null
