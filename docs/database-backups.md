@@ -20,10 +20,13 @@ and fails closed if another run holds its lock.
 A daily schedule runs only when the owner machine is logged in and awake. A missed time is handled by the next available scheduled run; this guide
 does not promise provider behavior or an exact catch-up time.
 
-Automatic prune and forget are not part of this workflow. Retention changes
-require a separately reviewed action. Recovery identities and keys are managed
-separately from this guide and are never included in commands, logs, or public
-configuration.
+The postgres engine runs restic's own `forget`/`prune` after every successful
+backup, scoped to this recipe's snapshots only (see
+[Retention](#retention) below). The generic public runner
+(`scripts/run-database-backup.mjs`) still does not prune staging directories
+or remote backups itself; that is the postgres engine's own responsibility,
+not the runner's. Recovery identities and keys are managed separately from
+this guide and are never included in commands, logs, or public configuration.
 
 ## Public runner contract
 
@@ -64,10 +67,14 @@ exact stdout JSON `{ "status": "passed" }`. Only after export succeeds does it a
 must emit a exact stdout JSON `{ "status": "passed" }`. Commands run without a shell.
 
 The state directory records bounded `running`, `failed`, or `succeeded` status
-and preserves the last successful time across a failure. A lock conflict fails
+and preserves the last successful time across a failure, plus the last
+successful isolated-restore-proof time and when the next one is due (see
+[Restore-proof cadence](#restore-proof-cadence)). A lock conflict fails
 closed. Before manual lock recovery, verify no runner or child process remains
-active and preserve failed status evidence. The runner does not automatically
-prune staging directories, prune remote backups, or forget snapshots.
+active and preserve failed status evidence. The generic runner itself does not
+automatically prune staging directories, prune remote backups, or forget
+snapshots; the postgres engine does its own retention after publishing (see
+[Retention](#retention)).
 
 Owner export and backup adapters remain private. The public setup does not
 install a schedule. Operators must configure and verify their own scheduler and
@@ -85,11 +92,18 @@ configuration names.
 
 The engine, in order:
 
-1. **Preflight.** Connects with the configured connection command, confirms
-   `current_database()` matches the expected name, and reads `finance.
-   schema_version` and `kith.schema_version` against the versions the
-   configuration expects. A mismatch on either fails closed before anything is
-   dumped.
+1. **Preflight.** Connects with the configured connection command and
+   confirms `current_database()` matches the expected name; a mismatch fails
+   closed before anything is dumped. It also reads `finance.schema_version`
+   and `kith.schema_version` and records them as-is into the manifest (step
+   5) rather than checking them against a configured expectation: a schema
+   version is expected to move as migrations ship, and requiring an operator
+   to edit `expectedFinanceSchemaVersion`/`expectedKithSchemaVersion` after
+   every one is exactly the pinning this recipe removed (owner decision,
+   2026-09-20). Both keys are still accepted in the backup and restore-proof
+   configs for backward compatibility, but are optional; when present and the
+   live value differs, the run logs a `schema_version_recorded_not_pinned`
+   notice on stderr and continues rather than failing.
 2. **Writer quiescence.** Refuses to start if `kith.deferred_work` has a row in
    `running`, or if any of `kith.worker_jobs`, `kith.ingest_jobs`,
    `kith.worker_discovery_work`, or `kith.worker_reservation_targets` has an
@@ -134,10 +148,12 @@ The engine, in order:
    length. Parity covers every `finance` and `kith` table's row count and a
    canonical content hash of its rows. It covers no sequence value and no
    planner statistic, so nothing in it can drift inside one snapshot.
-6. **Encryption and publication.** Unchanged from the Convex-era recipe: `age`
-   encryption of the dump and manifest, a restic repository identity check
-   before publication, and `restic backup` tagged with the host and operation
-   id.
+6. **Encryption and publication.** Mostly unchanged from the Convex-era
+   recipe: `age` encryption of the dump and manifest, a restic repository
+   identity check before publication, and `restic backup` with `--host` set
+   to the configured host and two `--tag` values: the configured
+   `operationId` (unchanged) and, new in this row, the fixed tag `kith-db` on
+   every snapshot this recipe creates (see [Retention](#retention)).
    `resticRepositoryPath` is either a local absolute path or restic's rclone
    backend spec, `rclone:<remote>:<path>`, which is how the
    [Dropbox-independent repository](plans/2026-09-08-dropbox-independent-backup.md)
@@ -147,12 +163,110 @@ The engine, in order:
    the `PATH` the engine runs under. A wrong or hostile rclone only ever sees
    ciphertext, and the repository identity check plus the separate-process
    readback below still fail closed.
+
+   A dropped connection during the snapshot-export-and-dump sequence (steps
+   3-4) -- the failure mode that hit the laptop LaunchAgent mid-export -- is
+   retried up to 3 times with backoff (2s, then 5s) before the run is marked
+   failed. Each attempt exports a fresh snapshot; a lost connection can kill
+   the snapshot-holding session as easily as it can kill `pg_dump`, so a bare
+   `pg_dump` retry against a dead holder would only fail again with
+   `snapshot_holder_lost`. If every attempt fails, the staging directory is
+   removed before the error is reported, so a partial dump never lingers.
 7. **Separate-process verification.** A freshly spawned process, holding only
    the verify-only age identity (never the encryption recipient's public key
    path used to publish), re-downloads the ciphertext with a fresh `--no-cache`
    restic invocation, decrypts, and compares bytes against what the backup
    process itself hashed. It then drives an isolated restore (below) and
    requires its exact `{status:"passed"}` result.
+
+## Retention
+
+After a successful backup, the engine runs restic's own retention policy,
+scoped so it can only ever touch snapshots this recipe created:
+
+```
+restic forget --host <host> --tag kith-db \
+  --keep-daily <keepDaily> --keep-weekly <keepWeekly> --keep-monthly <keepMonthly> \
+  --prune
+```
+
+A restic repository is not necessarily dedicated to database backups. The
+pipeline's independent document-archive backup
+(`pdfDocQa.archive.independentBackup.repositoryPath`/`.repository` in
+`packages/pipeline/src/config.ts`) is a separately configured
+`resticRepositoryPath`/rclone spec with no code linkage to this engine's own
+`resticRepositoryPath`; nothing stops an operator pointing both at the same
+repository, and the archive docs describe its repository as "dedicated" only
+as an operational convention, not an enforced one. Scoping `forget` to the
+`kith-db` tag (added to every snapshot in step 6, above) and this engine's own
+`--host` is what keeps a shared repository's other snapshot kinds out of the
+candidate set entirely, regardless of what the operator does with the
+repository path.
+
+Retention is config, not hard-coded, under `resticRetention` in the backup
+config (all three keys optional, independently):
+
+| Key           | Default | Meaning                              |
+| ------------- | ------- | ------------------------------------- |
+| `keepDaily`   | 7       | Most recent daily snapshots to keep   |
+| `keepWeekly`  | 5       | Most recent weekly snapshots to keep  |
+| `keepMonthly` | 12      | Most recent monthly snapshots to keep |
+
+```json
+{
+  "resticRetention": { "keepDaily": 7, "keepWeekly": 5, "keepMonthly": 12 }
+}
+```
+
+A `forget` or `prune` failure is reported in the backup's own result as
+`retention: { "status": "failed", "code": "<code>" }` and logged, but it never
+fails the backup run itself: the new snapshot the run just published already
+exists and is independently readable, which is what makes the run a success
+regardless of what retention does afterward. A successful retention run
+reports `{ "status": "passed", "dryRun": false, "keptCount": <n>,
+"removedCount": <n>, "removedTimes": [...] }`.
+
+Run retention by hand, without touching Postgres, age, or the dump/publish
+path, with the backup config's own `--forget`:
+
+```sh
+node scripts/db-backup-postgres.mjs --forget --config /absolute/protected/backup.json [--dry-run]
+```
+
+`--dry-run` prints what would be forgotten -- counts and the removed
+snapshots' times only, never snapshot contents or paths -- and does not
+prune:
+
+```json
+{ "status": "passed", "dryRun": true, "keptCount": 12, "removedCount": 3, "removedTimes": ["2026-08-01T03:00:00Z", "2026-08-02T03:00:00Z", "2026-08-03T03:00:00Z"] }
+```
+
+## Restore-proof cadence
+
+The isolated restore proof (documented in full below -- a full `pg_restore`
+into a scratch database plus a parity recapture) is the expensive part of
+verification. It now runs on a cadence, not on every backup:
+`restoreProofEveryDays` in the verify config, default 30. The daily
+ciphertext/plaintext readback and manifest checks (step 7, above) are
+unaffected and still run every time; only the isolated restore itself moves
+off "every run".
+
+The state directory's durable status journal (`database-backup-status.json`)
+carries `lastProofAt` and `nextProofDueAt` alongside the existing
+`lastSuccessAt`, so a health check can read all three from one file: last
+backup success, last proof success, and when the next proof is due. Alert if
+`nextProofDueAt` is more than twice `restoreProofEveryDays` in the past --
+that is a proof that has silently stopped running, not a due-soon warning.
+
+A run that does not attempt a proof (because it is not due) carries the prior
+`lastProofAt`/`nextProofDueAt` forward unchanged, on both success and
+failure, exactly like `lastSuccessAt` already does. Force a proof regardless
+of cadence with `--proof-now`:
+
+```sh
+node scripts/db-backup.mjs --engine postgres --config /absolute/protected/backup.json \
+  --verify --verify-config /absolute/protected/verify.json --proof-now
+```
 
 ## Isolated restore proof
 
@@ -165,8 +279,13 @@ a downloaded dump and manifest. It:
 - refuses an alias of the source (same database identity) or a non-empty
   target, so the restore can only ever land in a genuinely isolated database;
 - checks, against the live source, only what stays true while that source is
-  being written to: it is reachable, it is the database named in the manifest,
-  and both schema versions match the manifest and the configuration;
+  being written to: it is reachable and it is the database named in the
+  manifest. Its schema versions are read and, when a config still carries an
+  `expected*SchemaVersion`, a drift is logged as a notice, never checked
+  against the manifest -- a migration can land on the live source at any
+  point between the dump and this proof running, and that is expected, not
+  corruption (schema versions are recorded, not pinned; see the preflight
+  step above);
 - restores the dump, recaptures parity against the restored database, and
   requires it to equal the manifest's parity exactly;
 - reads one active document back through `@repo/kith-store`'s own
@@ -217,15 +336,22 @@ instead of a generic command failure:
 
 | Where                          | Code                              |
 | ------------------------------ | --------------------------------- |
-| Isolated restore proof child   | `restore_proof_failed:<code>`, where `<code>` is one of the proof's own codes, such as `restore_parity_failed`, `restore_target_not_empty`, `source_schema_mismatch`, `scratch_database_name_invalid` |
+| Isolated restore proof child   | `restore_proof_failed:<code>`, where `<code>` is one of the proof's own codes, such as `restore_parity_failed`, `restore_target_not_empty`, `source_database_mismatch`, `scratch_database_name_invalid` |
 | Ciphertext or plaintext readback | `verify_readback_mismatch`      |
 | Unreadable child answer        | `restore_proof_failed:unknown`    |
 | Pooled source connection       | `snapshot_not_importable`         |
 | Holding session cut off        | `snapshot_holder_lost`            |
+| Retention (`forget`/`prune`), never fails the backup | `retention_output_invalid`, or any other closed-enum code, carried in the result's own `retention.code` |
 
 Codes are closed enums on both sides, and the child's own output is never
 echoed. The code reaches the runner's result, the state directory's
 `failureCode`, and the CLI's stderr line.
+
+`source_database_mismatch` (renamed from `source_schema_mismatch`) now checks
+only that the dump's manifest names the same database identity as the live
+source; it no longer compares schema versions, since a schema version is
+recorded from the manifest, not pinned against the live source (see the
+preflight step above).
 
 ### Private restore-proof configuration
 
@@ -238,6 +364,14 @@ a configuration without the key keeps the previous behaviour.
   "scratchDatabase": true
 }
 ```
+
+`expectedFinanceSchemaVersion` and `expectedKithSchemaVersion` are now
+optional in this file too (and in the backup config's own copies of the same
+keys). A configuration written before this change, with both keys present,
+still loads and behaves the same way it always did except that a drift no
+longer fails the run -- it logs a `schema_version_recorded_not_pinned`
+notice instead. A configuration written after this change can omit both keys
+entirely.
 
 The database the `destinationConnectionCommand` points at must be renamed, or
 recreated, with a name starting `kith_restore_proof`. Point that command's
@@ -252,6 +386,112 @@ because a routine restore has no Convex export to check against once the
 database is the only store. This restore proof's own full-table content-hash
 parity (above) is the check that runs on every restore, source database
 versus restored database, not migration export versus destination.
+
+## Moving the backup to a new host
+
+This recipe has no code-level assumption tied to one host: nothing in
+`scripts/db-backup-postgres.mjs`, `scripts/db-restore-proof.mjs`, or
+`scripts/run-database-backup.mjs` reads `os.hostname()` or hard-codes a host
+name. The backup config's `host` field is the restic `--host` label used to
+tag every snapshot (step 6, above) and to scope retention (`--host` in
+[Retention](#retention)). That field is what needs to stay portable, and it
+already is: an operator carries it forward unchanged in the config file
+across a host move, which keeps retention's `--host`/`--tag kith-db` scope
+matching every snapshot this recipe has ever created, old and new. The
+alternative -- deriving `host` from the machine instead of the config -- was
+not implemented, because it would silently split one recipe's snapshot
+history into two retention scopes the moment the host label changed.
+
+### LaunchAgent template for the new host
+
+Same per-user LaunchAgent shape as
+[`docs/kithmind-deferred-work.launchd.plist.txt`](kithmind-deferred-work.launchd.plist.txt):
+a private wrapper script loads secrets (the restic password command, the age
+identity, the database connection command) from the new host's own Keychain
+or credential store, then execs the runner. Replace every ALL-CAPS
+placeholder with an absolute path; no personal path, account name, or
+credential value belongs in this file or its copy.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.kithmind.database-backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/database-backup-run.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/ABSOLUTE/PATH/TO/REPOSITORY</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/ABSOLUTE/PATH/TO/PRIVATE-LOG-DIRECTORY/database-backup.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/ABSOLUTE/PATH/TO/PRIVATE-LOG-DIRECTORY/database-backup.stderr.log</string>
+</dict>
+</plist>
+```
+
+`StartCalendarInterval` (once daily), not `KeepAlive`: unlike the deferred-work
+daemon this plist starts, a backup run is meant to finish and exit, not run
+forever. The wrapper script it names loads the restic password command, age
+identity path, and connection command from the new host's credential store
+and execs:
+
+```sh
+exec /ABSOLUTE/PATH/TO/node /ABSOLUTE/PATH/TO/REPOSITORY/scripts/db-backup.mjs \
+  --engine postgres --config /ABSOLUTE/PROTECTED/backup.json \
+  --verify --verify-config /ABSOLUTE/PROTECTED/verify.json
+```
+
+### Operator steps to move
+
+1. Install the pinned tools (`psql`/`pg_dump` matching `POSTGRES_MAJOR` in
+   `db-backup-postgres.mjs`, `age` v1.3.2, restic v0.19.1) in a protected
+   directory on the new host, and put a protected `rclone` wrapper on `PATH`
+   if the repository is reached through `rclone:<remote>:<path>`.
+2. Place the backup and verify config files (mode `0600`, in a protected
+   directory) on the new host, unchanged except for any path that pointed at
+   the old host's filesystem layout. Keep `host` and `operationId` exactly as
+   they were: `host` is the retention scope (above), and both are what
+   already-published snapshots are tagged with.
+3. Re-create the Keychain (or equivalent credential store) items the restic
+   password command, age identity, and database connection command read from
+   -- these are host-local secrets, never copied as files between machines.
+4. Run once with `--dry-run` against retention only, to prove the new host's
+   tools and credentials resolve the same repository without changing it:
+
+   ```sh
+   node scripts/db-backup-postgres.mjs --forget --config /ABSOLUTE/PROTECTED/backup.json --dry-run
+   ```
+
+5. Load the new host's LaunchAgent (`launchctl bootstrap` / `launchctl load`,
+   per the platform's current convention).
+6. Unload the old host's LaunchAgent (`launchctl bootout` / `launchctl
+   unload`) once the new host's first real run has published and verified
+   successfully. Never run both hosts' schedules against one repository at
+   the same time.
+
+### Concurrent hosts and restic's own locking
+
+restic itself is the backstop if step 6 is missed and both hosts' schedules
+overlap: every `backup`, `forget`, and `prune` takes a lock object in the
+repository first (an exclusive lock for `forget --prune`, a shared one for
+`backup`), and a second process that cannot acquire the lock it needs fails
+closed with a "repository is already locked" error rather than corrupting
+anything. That failure surfaces as this run's own `command_failed`/ retention
+failure, not a silent skip and not partial repository corruption -- but it is
+still a failed or degraded run, so treat "never run both hosts concurrently"
+as the operating rule and restic's locking as the safety net under it, not a
+substitute for step 6.
 
 ## Archive changes
 

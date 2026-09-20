@@ -31,10 +31,18 @@ export const RESTORE_PROOF_CODES = new Set([
   "scratch_reset_failed",
   "secret_command_empty",
   "snapshot_id_invalid",
-  "source_schema_mismatch",
+  "source_database_mismatch",
   "table_inventory_invalid",
   "usage_invalid",
 ]);
+
+/** A named, non-fatal notice on stderr, exactly like db-backup-postgres.mjs's
+ * own `notice`: a configured `expected*SchemaVersion` that no longer matches
+ * is logged, never a failure, since a migration moving the source's schema
+ * version between the dump and this proof is expected, not corruption. */
+function notice(code, detail) {
+  process.stderr.write(`${JSON.stringify({ notice: code, ...detail })}\n`);
+}
 
 // A restore target this proof is allowed to empty by itself. The operator opts
 // in with `scratchDatabase: true` and a database named with this prefix; any
@@ -84,14 +92,31 @@ function command(value) {
   return { path: absolute(row.path), args: row.args };
 }
 function parseConfig(value) {
-  // `scratchDatabase` is optional, so a configuration written before this key
-  // existed still parses and still behaves exactly as it did: an empty target
-  // is required and is left populated.
-  const optional = value && typeof value === "object" && "scratchDatabase" in value ? ["scratchDatabase"] : [];
-  const row = exact(value, ["version", "pgRestorePath", "psqlPath", "sourceConnectionCommand", "destinationConnectionCommand", "expectedFinanceSchemaVersion", "expectedKithSchemaVersion", "timeoutMs", ...optional]);
-  if (row.version !== 1 || !Number.isSafeInteger(row.expectedFinanceSchemaVersion) || !Number.isSafeInteger(row.expectedKithSchemaVersion) || row.expectedFinanceSchemaVersion < 1 || row.expectedKithSchemaVersion < 1 || !Number.isSafeInteger(row.timeoutMs) || row.timeoutMs < 1000 || row.timeoutMs > 3_600_000) fail("config_invalid");
-  if (optional.length && typeof row.scratchDatabase !== "boolean") fail("config_invalid");
-  return { version: 1, pgRestorePath: absolute(row.pgRestorePath), psqlPath: absolute(row.psqlPath), sourceConnectionCommand: command(row.sourceConnectionCommand), destinationConnectionCommand: command(row.destinationConnectionCommand), expectedFinanceSchemaVersion: row.expectedFinanceSchemaVersion, expectedKithSchemaVersion: row.expectedKithSchemaVersion, timeoutMs: row.timeoutMs, scratchDatabase: row.scratchDatabase === true };
+  // `scratchDatabase` and the two `expected*SchemaVersion` keys are optional,
+  // so a configuration written before any of them existed still parses and
+  // still behaves exactly as it did. `expected*SchemaVersion` used to be a
+  // required hard gate against the live source; kept only as an optional
+  // sanity value now (logged as a notice on drift), per the "recorded, not
+  // pinned" change -- see `beforeVersions` below for what it used to gate.
+  const optionalKeys = ["scratchDatabase", "expectedFinanceSchemaVersion", "expectedKithSchemaVersion"];
+  const optional = optionalKeys.filter((key) => value && typeof value === "object" && key in value);
+  const row = exact(value, ["version", "pgRestorePath", "psqlPath", "sourceConnectionCommand", "destinationConnectionCommand", "timeoutMs", ...optional]);
+  if (row.version !== 1 || !Number.isSafeInteger(row.timeoutMs) || row.timeoutMs < 1000 || row.timeoutMs > 3_600_000) fail("config_invalid");
+  if (optional.includes("scratchDatabase") && typeof row.scratchDatabase !== "boolean") fail("config_invalid");
+  for (const key of ["expectedFinanceSchemaVersion", "expectedKithSchemaVersion"]) {
+    if (row[key] !== undefined && (!Number.isSafeInteger(row[key]) || row[key] < 1)) fail("config_invalid");
+  }
+  return {
+    version: 1,
+    pgRestorePath: absolute(row.pgRestorePath),
+    psqlPath: absolute(row.psqlPath),
+    sourceConnectionCommand: command(row.sourceConnectionCommand),
+    destinationConnectionCommand: command(row.destinationConnectionCommand),
+    expectedFinanceSchemaVersion: row.expectedFinanceSchemaVersion ?? null,
+    expectedKithSchemaVersion: row.expectedKithSchemaVersion ?? null,
+    timeoutMs: row.timeoutMs,
+    scratchDatabase: row.scratchDatabase === true,
+  };
 }
 function run(path, args, timeoutMs) {
   return new Promise((resolve, reject) => {
@@ -294,19 +319,25 @@ export async function restorePostgresProof(config, dumpPath, manifestPath) {
     await resetScratchTarget(config, destination);
   }
   await assertEmptyTarget(config, destination);
-  // Source-side checks that still hold on a database being written to: it is
-  // reachable, it is the database the dump came from, and its migrations are
-  // where this recipe expects them. Its row contents are deliberately not
-  // compared with the manifest: the source has moved on since the dump, and
-  // the manifest's parity was captured inside the dump's own exported
-  // snapshot, so the restored-versus-manifest comparison below is what proves
-  // the published dump restores to what was dumped.
+  // Source-side check that still holds on a database being written to: it is
+  // reachable and it is the database the dump came from. Its schema version
+  // and row contents are deliberately not compared with the manifest here: a
+  // migration can move the source's schema version at any time between the
+  // dump and this proof running (schema versions are recorded, not pinned),
+  // and the manifest's parity was captured inside the dump's own exported
+  // snapshot, so the restored-versus-manifest comparison below -- not a
+  // source-versus-manifest one -- is what proves the published dump restores
+  // to what was dumped.
   const beforeVersions = await schemaVersions(config, source);
-  if (manifest.database !== sourceIdentity.database ||
-    beforeVersions.financeVersion !== config.expectedFinanceSchemaVersion ||
-    beforeVersions.kithVersion !== config.expectedKithSchemaVersion ||
-    manifest.financeSchemaVersion !== beforeVersions.financeVersion ||
-    manifest.kithSchemaVersion !== beforeVersions.kithVersion) fail("source_schema_mismatch");
+  if (manifest.database !== sourceIdentity.database) fail("source_database_mismatch");
+  for (const [schema, expected, actual] of [
+    ["finance", config.expectedFinanceSchemaVersion, beforeVersions.financeVersion],
+    ["kith", config.expectedKithSchemaVersion, beforeVersions.kithVersion],
+  ]) {
+    if (expected !== null && expected !== actual) {
+      notice("schema_version_recorded_not_pinned", { schema, expected, actual, source: "live" });
+    }
+  }
   await run(config.pgRestorePath, ["--exit-on-error", "--no-owner", "--no-acl", "--dbname", destination, dumpPath], config.timeoutMs);
   const afterVersions = await schemaVersions(config, destination);
   const restoredParity = await capturePostgresParity(config.psqlPath, destination, config.timeoutMs);

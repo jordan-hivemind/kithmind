@@ -17,6 +17,7 @@ import {
   DatabaseBackupRunnerError,
   loadDatabaseBackupConfig,
   runDatabaseBackup,
+  runWithDatabaseBackupState,
 } from "./run-database-backup.mjs";
 
 const SYSTEM_NODE = realpathSync(process.execPath);
@@ -94,6 +95,11 @@ test("one fresh exact staging path passes from export to backup", async (t) => {
     startedAt: result.startedAt,
     updatedAt: result.finishedAt,
     lastSuccessAt: result.finishedAt,
+    // This convex-engine path never runs a restore proof; the postgres
+    // engine's own runWithDatabaseBackupState suite below covers proof
+    // cadence tracking.
+    lastProofAt: null,
+    nextProofDueAt: null,
   });
 });
 test("export failure stops backup and preserves staging", async (t) => {
@@ -181,6 +187,64 @@ test("config requires exact fields, 0600 mode, and canonical bound paths", async
   await writeFile(f.configPath, JSON.stringify(f.config));
   await assert.rejects(loadDatabaseBackupConfig(`${f.root}/./config.json`));
 });
+// P2-39k follow-up (BAK-1): runWithDatabaseBackupState is the postgres
+// engine's own shared lock and journal (db-backup-postgres.mjs has no lock
+// logic of its own). These exercise the restore-proof cadence bookkeeping it
+// now carries, independent of any real pg_dump/restic/age process.
+test("runWithDatabaseBackupState hands the operation a null priorProof on the first run and persists what recordProof reports", async (t) => {
+  const f = await fixture(t);
+  const config = await loadDatabaseBackupConfig(f.configPath);
+  const seen = [];
+  const result = await runWithDatabaseBackupState(config, async ({ priorProof, recordProof }) => {
+    seen.push(priorProof);
+    recordProof({ lastProofAt: 555, nextProofDueAt: 999 });
+    return { ok: true };
+  });
+  assert.deepEqual(seen, [{ lastProofAt: null, nextProofDueAt: null }]);
+  const journal = await status(f);
+  assert.equal(journal.state, "succeeded");
+  assert.equal(journal.lastProofAt, 555);
+  assert.equal(journal.nextProofDueAt, 999);
+  assert.equal(result.ok, true);
+});
+
+test("runWithDatabaseBackupState carries the prior proof forward when the operation never calls recordProof", async (t) => {
+  const f = await fixture(t);
+  const config = await loadDatabaseBackupConfig(f.configPath);
+  await runWithDatabaseBackupState(config, async ({ recordProof }) => {
+    recordProof({ lastProofAt: 111, nextProofDueAt: 222 });
+    return { ok: true };
+  });
+  const seen = [];
+  await runWithDatabaseBackupState(config, async ({ priorProof }) => {
+    seen.push(priorProof);
+    return { ok: true };
+  });
+  assert.deepEqual(seen, [{ lastProofAt: 111, nextProofDueAt: 222 }]);
+  const journal = await status(f);
+  // Unchanged: a run that did not attempt a proof must not erase the last one.
+  assert.equal(journal.lastProofAt, 111);
+  assert.equal(journal.nextProofDueAt, 222);
+});
+
+test("runWithDatabaseBackupState preserves the prior proof across a failed run, like lastSuccessAt", async (t) => {
+  const f = await fixture(t);
+  const config = await loadDatabaseBackupConfig(f.configPath);
+  await runWithDatabaseBackupState(config, async ({ recordProof }) => {
+    recordProof({ lastProofAt: 111, nextProofDueAt: 222 });
+    return { ok: true };
+  });
+  await assert.rejects(
+    runWithDatabaseBackupState(config, async () => {
+      throw Object.assign(new Error("boom"), { code: "operation_failed" });
+    }),
+  );
+  const journal = await status(f);
+  assert.equal(journal.state, "failed");
+  assert.equal(journal.lastProofAt, 111);
+  assert.equal(journal.nextProofDueAt, 222);
+});
+
 test("CLI stdout is a closed safe result without private paths", async (t) => {
   const f = await fixture(t);
   const output = await new Promise((ok, no) =>

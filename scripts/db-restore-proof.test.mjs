@@ -9,10 +9,59 @@ import test from "node:test";
 
 import { buildManifest } from "./db-backup-postgres.mjs";
 import { capturePostgresParity, hashFileSha256 } from "./db-postgres-parity.mjs";
-import { restorePostgresProof } from "./db-restore-proof.mjs";
+import { RestoreProofError, loadRestoreProofConfig, restorePostgresProof } from "./db-restore-proof.mjs";
 
 const execute = promisify(execFile);
 const ADMIN = process.env.KITH_MIGRATE_TEST_DATABASE_URL;
+
+// BAK-1: schema versions are recorded, not pinned -- `expected*SchemaVersion`
+// is kept only for backward compatibility and is now optional. A config
+// written before this change (both keys present) and one written after (both
+// keys absent) must both still load.
+async function writeConfigFixture(t, overrides = {}) {
+  const root = await mkdtemp(join(homedir(), ".kith-restore-proof-config-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const tool = join(root, "tool.sh");
+  await writeFile(tool, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  const configPath = join(root, "restore.json");
+  const base = {
+    version: 1,
+    pgRestorePath: tool,
+    psqlPath: tool,
+    sourceConnectionCommand: { path: tool, args: [] },
+    destinationConnectionCommand: { path: tool, args: [] },
+    timeoutMs: 60_000,
+    ...overrides,
+  };
+  await writeFile(configPath, JSON.stringify(base), { mode: 0o600 });
+  return configPath;
+}
+
+test("loadRestoreProofConfig accepts a config with no expected schema versions", async (t) => {
+  const configPath = await writeConfigFixture(t);
+  const loaded = await loadRestoreProofConfig(configPath);
+  assert.equal(loaded.expectedFinanceSchemaVersion, null);
+  assert.equal(loaded.expectedKithSchemaVersion, null);
+  assert.equal(loaded.scratchDatabase, false);
+});
+
+test("loadRestoreProofConfig still accepts a config carrying the old required expected schema versions", async (t) => {
+  const configPath = await writeConfigFixture(t, {
+    expectedFinanceSchemaVersion: 3,
+    expectedKithSchemaVersion: 9,
+  });
+  const loaded = await loadRestoreProofConfig(configPath);
+  assert.equal(loaded.expectedFinanceSchemaVersion, 3);
+  assert.equal(loaded.expectedKithSchemaVersion, 9);
+});
+
+test("loadRestoreProofConfig rejects a non-integer expected schema version when the key is present", async (t) => {
+  const configPath = await writeConfigFixture(t, { expectedFinanceSchemaVersion: 0 });
+  await assert.rejects(
+    loadRestoreProofConfig(configPath),
+    (error) => error instanceof RestoreProofError && error.code === "config_invalid",
+  );
+});
 const PG = ADMIN
   ? realpathSync(process.env.KITH_POSTGRES_17_BIN ?? "/opt/homebrew/opt/postgresql@17/bin")
   : "";
@@ -167,4 +216,61 @@ test("published dump restores every row exactly while the source keeps moving, a
   );
   const { stdout: survivors } = await execute(join(PG, "psql"), [changed, "-X", "-tAc", "select count(*) from pg_namespace where nspname='existing'"]);
   assert.equal(survivors.trim(), "1");
+});
+
+// BAK-1: schema versions are recorded, not pinned. A migration landing on the
+// live source between the dump and the restore proof running must not fail
+// the proof -- that pinned-expectation gate (`source_schema_mismatch`, an
+// operator having to edit config after every migration) is exactly what this
+// row removes. The only version comparison left is restored-versus-manifest.
+test("a schema version bump on the live source after the dump does not fail the restore proof", { skip: !ADMIN }, async (t) => {
+  const root = await mkdtemp(join(homedir(), ".kith-restore-proof-drift-test-"));
+  const suffix = Math.random().toString(16).slice(2, 12);
+  const sourceName = `kith_restore_drift_src_${suffix}`;
+  const destinationName = `kith_restore_drift_dst_${suffix}`;
+  const source = databaseUrl(ADMIN, sourceName);
+  const destination = databaseUrl(ADMIN, destinationName);
+  t.after(async () => {
+    for (const name of [sourceName, destinationName]) {
+      await execute(join(PG, "dropdb"), ["--if-exists", "--force", "--maintenance-db", ADMIN, name]).catch(() => {});
+    }
+    await rm(root, { recursive: true, force: true });
+  });
+  for (const name of [sourceName, destinationName]) {
+    await execute(join(PG, "createdb"), ["--maintenance-db", ADMIN, name]);
+  }
+  await sql(source, "create schema finance; create schema kith; create table finance.schema_version(version integer primary key, name text not null); create table kith.schema_version(version integer primary key, name text not null); insert into finance.schema_version values (3,'finance'); insert into kith.schema_version values (9,'kith');");
+  const dumpPath = join(root, "kithmind.dump");
+  await execute(join(PG, "pg_dump"), ["--format=custom", "--no-owner", "--no-acl", "--schema=finance", "--schema=kith", source, "-f", dumpPath]);
+  await chmod(dumpPath, 0o600);
+  const parity = await capturePostgresParity(join(PG, "psql"), source, 60_000);
+  const dumpDigest = await hashFileSha256(dumpPath);
+  const manifest = buildManifest({
+    createdAt: "2026-09-20T00:00:00.000Z", host: "synthetic", operationId: "proof",
+    database: sourceName, financeSchemaVersion: 3, kithSchemaVersion: 9, parity,
+    gitRevision: "b".repeat(40),
+    files: [{ name: "kithmind.dump", ...dumpDigest }],
+  });
+  const manifestPath = join(root, "manifest.json");
+  await writeFile(manifestPath, JSON.stringify(manifest), { mode: 0o600 });
+  // A migration lands on the live source after the dump was taken, and it
+  // still carries a stale `expected*SchemaVersion` from before the change
+  // (kept only for backward compatibility): neither should fail the proof.
+  await sql(source, "insert into kith.schema_version values (10,'kith-migration');");
+  const config = {
+    version: 1,
+    pgRestorePath: join(PG, "pg_restore"),
+    psqlPath: join(PG, "psql"),
+    sourceConnectionCommand: await commandFile(root, "source.sh", source),
+    destinationConnectionCommand: await commandFile(root, "destination.sh", destination),
+    expectedFinanceSchemaVersion: 3,
+    expectedKithSchemaVersion: 9,
+    timeoutMs: 60_000,
+  };
+  const passed = await restorePostgresProof(config, dumpPath, manifestPath);
+  assert.equal(passed.status, "passed");
+  // The restored database matches what was dumped (the manifest), not the
+  // source's current, migrated-past-it version.
+  assert.equal(passed.restored.kithVersion, 9);
+  assert.equal(passed.source.kithVersion, 10);
 });

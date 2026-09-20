@@ -233,3 +233,121 @@ test("postgres runner publishes, independently reads back, decrypts, and restore
   assert.equal(journal.state, "succeeded");
   await assert.rejects(readFile(join(stateDirectory, "database-backup.lock")), { code: "ENOENT" });
 });
+
+// BAK-1: a compact fixture shared by the retry, retention and non-fatal
+// forget-failure tests below -- just enough schema for preflight and writer
+// quiescence to run, without the full Convex-migration corpus the test above
+// builds (this row's tests are about the export/retention machinery, not
+// migration parity).
+async function minimalBackupFixture(t) {
+  const root = await mkdtemp(join(homedir(), ".kith-pg-retry-retention-test-"));
+  await chmod(root, 0o700);
+  const suffix = Math.random().toString(16).slice(2, 12);
+  const sourceName = `kith_retry_src_${suffix}`;
+  const source = databaseUrl(ADMIN, sourceName);
+  t.after(async () => {
+    await execute(join(PG, "dropdb"), ["--if-exists", "--force", "--maintenance-db", ADMIN, sourceName]).catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  });
+  await execute(join(PG, "createdb"), ["--maintenance-db", ADMIN, sourceName]);
+  const client = new pg.Client({ connectionString: source });
+  await client.connect();
+  try {
+    await applyPgSchema(client, "finance");
+    await applyKithSchema(client);
+  } finally {
+    await client.end();
+  }
+  const stateDirectory = join(root, "state");
+  const stagingRoot = join(root, "staging");
+  const repository = join(root, "repository");
+  await mkdir(stateDirectory, { mode: 0o700 });
+  await mkdir(stagingRoot, { mode: 0o700 });
+  const passwordCommand = await helper(root, "password.sh", "synthetic-password");
+  const connectionCommand = await helper(root, "source.sh", source);
+  const psqlPath = await proxy(root, "psql.sh", join(PG, "psql"));
+  const identity = join(root, "identity.txt");
+  await execute(AGE_KEYGEN, ["-o", identity]);
+  await chmod(identity, 0o600);
+  const recipient = (await execute(AGE_KEYGEN, ["-y", identity])).stdout.trim();
+  const agePath = await proxy(root, "age.sh", AGE);
+  await execute(RESTIC, ["--repo", repository, "--password-command", passwordCommand.path, "init"]);
+  const repositoryId = JSON.parse((await execute(RESTIC, ["--repo", repository, "--password-command", passwordCommand.path, "--no-cache", "cat", "config"])).stdout).id;
+  const backupConfig = {
+    version: 1, stateDirectory, stagingRoot, connectionCommand,
+    psqlPath, pgDumpPath: await proxy(root, "pg-dump.sh", join(PG, "pg_dump")),
+    ageBinary: agePath, ageRecipient: recipient, resticBinary: await proxy(root, "restic.sh", RESTIC),
+    resticRepositoryPath: repository, resticPasswordCommand: passwordCommand,
+    expectedResticRepositoryId: repositoryId, host: "synthetic-host",
+    operationId: `synthetic-${suffix}`, expectedDatabaseName: sourceName,
+    timeoutMs: 60_000,
+    gitRevision: "b".repeat(40),
+  };
+  return { root, backupConfig, agePath, identity };
+}
+
+test("a transient export failure is retried with backoff, and the backup still publishes", { skip: !ADMIN }, async (t) => {
+  const { root, backupConfig } = await minimalBackupFixture(t);
+  // Fails the first two actual `pg_dump` invocations (a dropped connection
+  // mid export), then delegates to the real binary. The plain `--version`
+  // preflight check (runPostgresDatabaseBackup's own, before the retry loop
+  // even starts) always passes through untouched, so only the dump itself is
+  // flaky. The snapshot-holding session is a separate `psql` process per
+  // attempt, so this also proves a fresh holder is exported on each retry
+  // rather than reusing a dead one.
+  const counter = join(root, "pg-dump-attempts");
+  await writeFile(counter, "0");
+  const flaky = join(root, "pg-dump-flaky.sh");
+  await writeFile(
+    flaky,
+    `#!/bin/sh\ncase "$*" in\n  *--format=custom*)\n    n=$(cat '${counter}')\n    n=$((n+1))\n    printf '%s' "$n" > '${counter}'\n    if [ "$n" -le 2 ]; then echo "synthetic dropped connection" >&2; exit 1; fi\n    ;;\nesac\nexec '${join(PG, "pg_dump")}' "$@"\n`,
+    { mode: 0o700 },
+  );
+  backupConfig.pgDumpPath = flaky;
+  const startedAt = Date.now();
+  const result = await runPostgresDatabaseBackup(backupConfig);
+  const elapsedMs = Date.now() - startedAt;
+  assert.equal(result.status, "passed");
+  assert.equal(await readFile(counter, "utf8"), "3");
+  // Two backoffs (2s, 5s) must have elapsed between the three attempts.
+  assert.ok(elapsedMs >= 6_500, `expected at least ~7s of backoff, took ${elapsedMs}ms`);
+});
+
+test("a forget failure is reported but does not fail the backup", { skip: !ADMIN }, async (t) => {
+  const { root, backupConfig } = await minimalBackupFixture(t);
+  // Delegates every restic subcommand to the real binary except `forget`,
+  // which always fails -- the new snapshot this run publishes must still be
+  // a success regardless.
+  const flakyRestic = join(root, "restic-forget-fails.sh");
+  await writeFile(
+    flakyRestic,
+    `#!/bin/sh\nfor a in "$@"; do if [ "$a" = "forget" ]; then echo "synthetic forget failure" >&2; exit 1; fi; done\nexec '${RESTIC}' "$@"\n`,
+    { mode: 0o700 },
+  );
+  backupConfig.resticBinary = flakyRestic;
+  const result = await runPostgresDatabaseBackup(backupConfig);
+  assert.equal(result.status, "passed");
+  assert.equal(result.retention.status, "failed");
+  assert.equal(typeof result.retention.code, "string");
+});
+
+test("retention is scoped to this host and the kith-db tag with the configured defaults", { skip: !ADMIN }, async (t) => {
+  const { backupConfig } = await minimalBackupFixture(t);
+  const result = await runPostgresDatabaseBackup(backupConfig);
+  assert.equal(result.status, "passed");
+  assert.equal(result.retention.status, "passed");
+  // Nothing was old enough to remove yet, but the snapshot this run just
+  // published must itself already carry the retention tag going forward.
+  assert.equal(result.retention.removedCount, 0);
+  const snapshots = JSON.parse(
+    (await execute(RESTIC, [
+      "--repo", backupConfig.resticRepositoryPath,
+      "--password-command", backupConfig.resticPasswordCommand.path,
+      "--no-cache", "--host", backupConfig.host, "--tag", "kith-db",
+      "snapshots", "--json",
+    ])).stdout,
+  );
+  assert.equal(snapshots.length, 1);
+  assert.deepEqual(snapshots[0].tags.sort(), ["kith-db", backupConfig.operationId].sort());
+  assert.equal(snapshots[0].hostname, backupConfig.host);
+});

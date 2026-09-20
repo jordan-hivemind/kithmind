@@ -232,6 +232,8 @@ async function atomicStatus(path, value, runId) {
     "startedAt",
     "updatedAt",
     "lastSuccessAt",
+    "lastProofAt",
+    "nextProofDueAt",
     ...(value.state === "failed" ? ["failureCode"] : []),
   ];
   exact(value, keys, "status_invalid");
@@ -264,6 +266,8 @@ function parseStatus(value) {
     "startedAt",
     "updatedAt",
     "lastSuccessAt",
+    "lastProofAt",
+    "nextProofDueAt",
     ...(value?.state === "failed" ? ["failureCode"] : []),
   ];
   exact(value, keys, "status_invalid");
@@ -274,19 +278,32 @@ function parseStatus(value) {
     typeof value.runId !== "string" ||
     !Number.isSafeInteger(value.startedAt) ||
     !Number.isSafeInteger(value.updatedAt) ||
-    (value.lastSuccessAt !== null && !Number.isSafeInteger(value.lastSuccessAt))
+    (value.lastSuccessAt !== null && !Number.isSafeInteger(value.lastSuccessAt)) ||
+    (value.lastProofAt !== null && !Number.isSafeInteger(value.lastProofAt)) ||
+    (value.nextProofDueAt !== null && !Number.isSafeInteger(value.nextProofDueAt))
   )
     fail("status_invalid");
   if (value.state === "failed") text(value.failureCode, 64);
   return value;
 }
-async function lastSuccess(path) {
+// The isolated restore proof (unlike the backup itself) now runs on a
+// cadence, not every run (P2-39k follow-up: `restoreProofEveryDays`), so the
+// durable status journal carries its own last-success time and next-due time
+// alongside the backup's, and preserves both across a run that did not
+// attempt a proof, the same way `lastSuccessAt` already survives a failure.
+async function priorStatus(path) {
   try {
-    return parseStatus(
+    const parsed = parseStatus(
       JSON.parse((await readProtected(path, MAX_CONFIG)).toString("utf8")),
-    ).lastSuccessAt;
+    );
+    return {
+      lastSuccessAt: parsed.lastSuccessAt,
+      lastProofAt: parsed.lastProofAt,
+      nextProofDueAt: parsed.nextProofDueAt,
+    };
   } catch (error) {
-    if (error?.code === "ENOENT") return null;
+    if (error?.code === "ENOENT")
+      return { lastSuccessAt: null, lastProofAt: null, nextProofDueAt: null };
     if (error instanceof DatabaseBackupRunnerError) throw error;
     fail("status_invalid");
   }
@@ -423,6 +440,8 @@ function status({
   startedAt,
   updatedAt,
   lastSuccessAt,
+  lastProofAt,
+  nextProofDueAt,
   failureCode,
 }) {
   return {
@@ -433,6 +452,8 @@ function status({
     startedAt,
     updatedAt,
     lastSuccessAt,
+    lastProofAt: lastProofAt ?? null,
+    nextProofDueAt: nextProofDueAt ?? null,
     ...(failureCode ? { failureCode } : {}),
   };
 }
@@ -448,24 +469,40 @@ export async function runWithDatabaseBackupState(config, operation, options = {}
   const lock = await acquireLock(lockPath, runId, startedAt);
   let mayRelease = false;
   let stage = "export";
-  let prior = null;
+  let prior = { lastSuccessAt: null, lastProofAt: null, nextProofDueAt: null };
   let runningRecorded = false;
+  // The operation callback (the postgres engine's own cadence decision, in
+  // db-backup.mjs) calls this when a restore proof actually ran and passed;
+  // omitted, the prior proof time carries forward unchanged, on both success
+  // and failure, exactly like `lastSuccessAt` already does.
+  let proof = null;
   const record = async () => atomicStatus(statusPath, status({
-    state: "running", stage, runId, startedAt, updatedAt: clock(), lastSuccessAt: prior,
+    state: "running", stage, runId, startedAt, updatedAt: clock(),
+    lastSuccessAt: prior.lastSuccessAt,
+    lastProofAt: prior.lastProofAt, nextProofDueAt: prior.nextProofDueAt,
   }), runId);
   try {
-    prior = await lastSuccess(statusPath);
+    prior = await priorStatus(statusPath);
     await record();
     runningRecorded = true;
     const result = await operation({
       runId,
       startedAt,
       setStage: async (nextStage) => { stage = text(nextStage, 64); await record(); },
+      priorProof: { lastProofAt: prior.lastProofAt, nextProofDueAt: prior.nextProofDueAt },
+      recordProof: (next) => {
+        proof = {
+          lastProofAt: Number.isSafeInteger(next?.lastProofAt) ? next.lastProofAt : null,
+          nextProofDueAt: Number.isSafeInteger(next?.nextProofDueAt) ? next.nextProofDueAt : null,
+        };
+      },
     });
     const finishedAt = clock();
     await atomicStatus(statusPath, status({
       state: "succeeded", stage: "complete", runId, startedAt,
       updatedAt: finishedAt, lastSuccessAt: finishedAt,
+      lastProofAt: proof?.lastProofAt ?? prior.lastProofAt,
+      nextProofDueAt: proof?.nextProofDueAt ?? prior.nextProofDueAt,
     }), runId);
     mayRelease = true;
     return { ...result, runId, startedAt, finishedAt };
@@ -478,7 +515,10 @@ export async function runWithDatabaseBackupState(config, operation, options = {}
       if (!runningRecorded) throw new DatabaseBackupRunnerError("status_unusable");
       await atomicStatus(statusPath, status({
         state: "failed", stage, runId, startedAt, updatedAt: clock(),
-        lastSuccessAt: prior, failureCode,
+        lastSuccessAt: prior.lastSuccessAt,
+        lastProofAt: proof?.lastProofAt ?? prior.lastProofAt,
+        nextProofDueAt: proof?.nextProofDueAt ?? prior.nextProofDueAt,
+        failureCode,
       }), runId);
       mayRelease = true;
     } catch {
@@ -505,7 +545,7 @@ export async function runDatabaseBackup(config, options = {}) {
   let prior = null;
   let runningRecorded = false;
   try {
-    prior = await lastSuccess(statusPath);
+    prior = (await priorStatus(statusPath)).lastSuccessAt;
     await atomicStatus(
       statusPath,
       status({

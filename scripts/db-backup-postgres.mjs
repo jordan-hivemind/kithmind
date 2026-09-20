@@ -132,14 +132,13 @@ export const POSTGRES_BACKUP_CODES = new Set([
   "postgres_client_version_mismatch",
   "preflight_constraints_invalid",
   "preflight_database_mismatch",
-  "preflight_finance_schema_mismatch",
-  "preflight_kith_schema_mismatch",
   "preflight_query_failed",
   "published_manifest_invalid",
   "restic_backup_summary_missing",
   "restic_repository_identity_mismatch",
   "restic_repository_unreadable",
   "restic_version_mismatch",
+  "retention_output_invalid",
   "restore_worker_output_invalid",
   "row_count_invalid",
   "runner_failed",
@@ -158,6 +157,14 @@ export const POSTGRES_BACKUP_CODES = new Set([
   "writer_check_failed",
   ...[...RESTORE_PROOF_CODES, "unknown"].map((code) => `restore_proof_failed:${code}`),
 ]);
+
+/** A named, non-fatal notice on stderr: used where a value that used to be a
+ * hard gate (a pinned expected schema version) is now recorded instead, so an
+ * operator watching logs still sees a mismatch without the run failing over
+ * it. Never the mechanism for an actual failure code. */
+function notice(code, detail) {
+  process.stderr.write(`${JSON.stringify({ notice: code, ...detail })}\n`);
+}
 
 /** Reads a failed child's own `{"status":"failed","code":...}` line and
  * returns that code, accepting only codes the child is known to emit. An
@@ -205,7 +212,34 @@ function parseSecretCommand(value) {
   };
 }
 
+// Retention defaults (owner decision, 2026-09-20): a week of dailies, a
+// month and a bit of weeklies, a year of monthlies. Config can override any
+// of the three; restic's own `forget` computes the buckets.
+const DEFAULT_RETENTION = { keepDaily: 7, keepWeekly: 5, keepMonthly: 12 };
+function parseRetention(value) {
+  if (value === undefined) return DEFAULT_RETENTION;
+  const row = exact(value, ["keepDaily", "keepWeekly", "keepMonthly"]);
+  for (const key of ["keepDaily", "keepWeekly", "keepMonthly"]) {
+    if (!Number.isSafeInteger(row[key]) || row[key] < 0) fail("config_invalid");
+  }
+  return { keepDaily: row.keepDaily, keepWeekly: row.keepWeekly, keepMonthly: row.keepMonthly };
+}
+
+// Present-if-given keys: a config written before these existed still parses
+// unchanged. `expected*SchemaVersion` used to be a required hard gate (an
+// operator had to edit two JSON files after every migration or the backup
+// failed); kept only as an optional sanity value now, logged as a notice on
+// drift rather than enforced, per the "recorded, not pinned" change.
+function optionalKeysPresent(value, keys) {
+  return keys.filter((key) => value && typeof value === "object" && key in value);
+}
+
 function parseBackupConfig(value) {
+  const optional = optionalKeysPresent(value, [
+    "expectedFinanceSchemaVersion",
+    "expectedKithSchemaVersion",
+    "resticRetention",
+  ]);
   const row = exact(value, [
     "version",
     "stateDirectory",
@@ -222,10 +256,9 @@ function parseBackupConfig(value) {
     "host",
     "operationId",
     "expectedDatabaseName",
-    "expectedFinanceSchemaVersion",
-    "expectedKithSchemaVersion",
     "gitRevision",
     "timeoutMs",
+    ...optional,
   ]);
   if (row.version !== 1) fail("config_invalid");
   if (
@@ -239,13 +272,10 @@ function parseBackupConfig(value) {
     fail("config_invalid");
   if (typeof row.gitRevision !== "string" || !/^[a-f0-9]{40}$/.test(row.gitRevision))
     fail("config_invalid");
-  if (
-    !Number.isSafeInteger(row.expectedFinanceSchemaVersion) ||
-    row.expectedFinanceSchemaVersion < 1 ||
-    !Number.isSafeInteger(row.expectedKithSchemaVersion) ||
-    row.expectedKithSchemaVersion < 1
-  )
-    fail("config_invalid");
+  for (const key of ["expectedFinanceSchemaVersion", "expectedKithSchemaVersion"]) {
+    if (row[key] !== undefined && (!Number.isSafeInteger(row[key]) || row[key] < 1))
+      fail("config_invalid");
+  }
   return {
     version: 1,
     stateDirectory: absolute(row.stateDirectory),
@@ -262,8 +292,12 @@ function parseBackupConfig(value) {
     host: row.host,
     operationId: row.operationId,
     expectedDatabaseName: text(row.expectedDatabaseName, 200),
-    expectedFinanceSchemaVersion: row.expectedFinanceSchemaVersion,
-    expectedKithSchemaVersion: row.expectedKithSchemaVersion,
+    // Recorded, not pinned (owner decision, 2026-09-20): `null` when the
+    // config omits them, so a run never fails only because a migration
+    // moved a schema version since the config was last edited.
+    expectedFinanceSchemaVersion: row.expectedFinanceSchemaVersion ?? null,
+    expectedKithSchemaVersion: row.expectedKithSchemaVersion ?? null,
+    resticRetention: parseRetention(row.resticRetention),
     gitRevision: row.gitRevision,
     timeoutMs: row.timeoutMs,
   };
@@ -302,7 +336,15 @@ export async function loadPostgresBackupConfig(path) {
 
 // The verify-only identity never travels with the backup config: the
 // exporter that can publish a dump must not also be able to decrypt one.
+// Restore-proof cadence default (owner decision, 2026-09-20): the isolated
+// restore -- a full pg_restore into a scratch database -- runs every 30 days
+// unless the config says otherwise or `--proof-now` forces it. The daily
+// ciphertext/plaintext readback checks are unaffected; only this heavier
+// check moves off "every run".
+const DEFAULT_RESTORE_PROOF_EVERY_DAYS = 30;
+
 function parseVerifyConfig(value) {
+  const optional = optionalKeysPresent(value, ["restoreProofEveryDays"]);
   const row = exact(value, [
     "version",
     "ageBinary",
@@ -315,6 +357,7 @@ function parseVerifyConfig(value) {
     "host",
     "operationId",
     "timeoutMs",
+    ...optional,
   ]);
   if (row.version !== 1) fail("config_invalid");
   if (!HEX_64.test(row.expectedResticRepositoryId)) fail("config_invalid");
@@ -324,6 +367,11 @@ function parseVerifyConfig(value) {
     !Number.isSafeInteger(row.timeoutMs) ||
     row.timeoutMs < 1_000 ||
     row.timeoutMs > 3_600_000
+  )
+    fail("config_invalid");
+  if (
+    row.restoreProofEveryDays !== undefined &&
+    (!Number.isSafeInteger(row.restoreProofEveryDays) || row.restoreProofEveryDays < 1)
   )
     fail("config_invalid");
   return {
@@ -338,6 +386,7 @@ function parseVerifyConfig(value) {
     host: row.host,
     operationId: row.operationId,
     timeoutMs: row.timeoutMs,
+    restoreProofEveryDays: row.restoreProofEveryDays ?? DEFAULT_RESTORE_PROOF_EVERY_DAYS,
   };
 }
 
@@ -580,9 +629,15 @@ async function psqlScalar(config, connectionString, sql) {
   return value;
 }
 
-/** Explicit deployment preflight: the connected database and both schemas'
- * recorded versions must match what the recipe was told to expect, in the
- * same credential context used for the dump. */
+/** Explicit deployment preflight: the connected database must be the one
+ * the recipe was told to expect, in the same credential context used for the
+ * dump. Both schemas' versions are read here and recorded into the manifest
+ * as-is (`buildManifest` below) rather than checked against a configured
+ * expectation: a schema version is expected to move as migrations ship, and
+ * requiring an operator to edit `expected*SchemaVersion` after every one is
+ * exactly the pinning this recipe no longer does. When the config still
+ * carries an expected value (kept for backward compatibility), a drift is
+ * logged as a notice, never a failure. */
 async function preflight(config, connectionString) {
   const database = await psqlScalar(
     config,
@@ -598,8 +653,16 @@ async function preflight(config, connectionString) {
       "select max(version) from finance.schema_version",
     ),
   );
-  if (financeVersion !== config.expectedFinanceSchemaVersion)
-    fail("preflight_finance_schema_mismatch");
+  if (
+    config.expectedFinanceSchemaVersion !== null &&
+    financeVersion !== config.expectedFinanceSchemaVersion
+  ) {
+    notice("schema_version_recorded_not_pinned", {
+      schema: "finance",
+      expected: config.expectedFinanceSchemaVersion,
+      actual: financeVersion,
+    });
+  }
   const kithVersion = Number(
     await psqlScalar(
       config,
@@ -607,8 +670,16 @@ async function preflight(config, connectionString) {
       "select max(version) from kith.schema_version",
     ),
   );
-  if (kithVersion !== config.expectedKithSchemaVersion)
-    fail("preflight_kith_schema_mismatch");
+  if (
+    config.expectedKithSchemaVersion !== null &&
+    kithVersion !== config.expectedKithSchemaVersion
+  ) {
+    notice("schema_version_recorded_not_pinned", {
+      schema: "kith",
+      expected: config.expectedKithSchemaVersion,
+      actual: kithVersion,
+    });
+  }
   return { database, financeVersion, kithVersion };
 }
 
@@ -947,6 +1018,19 @@ async function requireResticRepositoryIdentity(
   return parsed.id;
 }
 
+// Every snapshot this recipe creates carries this tag, in addition to its
+// operationId tag, so retention (`resticForget` below) can scope `forget
+// --prune` to exactly the snapshots this recipe owns. A restic repository is
+// not necessarily dedicated to database backups: the pipeline's independent
+// archive backup (`pdfDocQa.archive.independentBackup.repositoryPath` /
+// `.repository`, packages/pipeline/src/config.ts) is a completely separate,
+// independently configured `resticRepositoryPath`/rclone spec, and nothing in
+// either config ties the two together or stops an operator pointing both at
+// the same repository. Filtering `forget` by this tag is what keeps a
+// database-backup retention policy from ever touching a document-archive
+// snapshot that happens to share the repository.
+const RETENTION_TAG = "kith-db";
+
 async function resticBackup(
   resticBinary,
   repositoryPath,
@@ -967,6 +1051,8 @@ async function resticBackup(
       host,
       "--tag",
       operationId,
+      "--tag",
+      RETENTION_TAG,
       ...objectNames,
     ],
     { timeoutMs, cwd: stagingDirectory, maxOutputBytes: MAX_COMMAND_OUTPUT_BYTES },
@@ -981,6 +1067,84 @@ async function resticBackup(
   if (!summary || typeof summary.snapshot_id !== "string")
     fail("restic_backup_summary_missing");
   return summary.snapshot_id;
+}
+
+/** Ages out old database-backup snapshots with restic's own retention policy,
+ * scoped to this host and the `kith-db` tag so a shared repository's other
+ * snapshot kinds (e.g. the pipeline's document archive) are never in the
+ * candidate set. `--prune` reclaims space from a real run; a dry run only
+ * reports counts and snapshot times, matching the CLI's `--dry-run` flag.
+ * A caller failure here must never fail the backup itself: the new snapshot
+ * this run just published already exists and is independently readable,
+ * which is the whole point this row (BAK-1) exists to keep true. */
+export async function resticForget(
+  resticBinary,
+  repositoryPath,
+  passwordCommandArgument_,
+  host,
+  retention,
+  timeoutMs,
+  dryRun = false,
+) {
+  const result = await runCapture(
+    resticBinary,
+    [
+      ...resticBaseArgs(repositoryPath, passwordCommandArgument_),
+      "forget",
+      "--json",
+      "--host",
+      host,
+      "--tag",
+      RETENTION_TAG,
+      "--keep-daily",
+      String(retention.keepDaily),
+      "--keep-weekly",
+      String(retention.keepWeekly),
+      "--keep-monthly",
+      String(retention.keepMonthly),
+      ...(dryRun ? ["--dry-run"] : ["--prune"]),
+    ],
+    { timeoutMs, maxOutputBytes: MAX_COMMAND_OUTPUT_BYTES },
+  );
+  let groups;
+  try {
+    groups = JSON.parse(result.stdout.toString("utf8"));
+  } catch {
+    fail("retention_output_invalid");
+  }
+  if (!Array.isArray(groups)) fail("retention_output_invalid");
+  const removed = groups.flatMap((group) => group?.remove ?? []);
+  const kept = groups.flatMap((group) => group?.keep ?? []);
+  return {
+    status: "passed",
+    dryRun,
+    keptCount: kept.length,
+    removedCount: removed.length,
+    // Counts and snapshot times only -- never the snapshots' own content or
+    // paths -- so a `--dry-run` report stays safe to print or log.
+    removedTimes: removed
+      .map((snapshot) => snapshot?.time)
+      .filter((time) => typeof time === "string"),
+  };
+}
+
+// ponytail: a fixed 3-attempt count and fixed backoff, not a configurable
+// retry policy; raise it (or make it config) once a real dropped-connection
+// rate shows 3 is not enough.
+const EXPORT_RETRY_BACKOFF_MS = [2_000, 5_000];
+async function withExportRetry(attempt) {
+  let lastError;
+  for (let index = 0; index < 1 + EXPORT_RETRY_BACKOFF_MS.length; index += 1) {
+    try {
+      return await attempt();
+    } catch (error) {
+      lastError = error;
+      const backoff = EXPORT_RETRY_BACKOFF_MS[index];
+      if (backoff === undefined) break;
+      await new Promise((wake) => setTimeout(wake, backoff));
+    }
+  }
+  throw lastError;
 }
 
 /** Steps 1-6 of the recipe for the postgres engine: preflight, protected
@@ -1017,38 +1181,57 @@ export async function runPostgresDatabaseBackup(config) {
     config,
     "postgres-backup",
   );
-  // One exported snapshot covers both the parity capture and pg_dump, so the
-  // manifest describes exactly the database state the dump contains even
-  // though a watcher, the deferred-work daemon or an MCP write may commit at
-  // any moment. Everything that can fail cheaply has already run, so the
-  // holding transaction stays open only for the capture and the dump.
-  const snapshot = await exportSnapshot(
-    config.psqlPath,
-    connectionString,
-    config.timeoutMs,
-  );
+  // Resilience to a dropped connection (the laptop LaunchAgent's original
+  // failure mode): retry the snapshot-export-and-dump sequence up to 3 times
+  // with backoff before the run is marked failed. It has to retry the whole
+  // sequence, not just `pg_dump`, because a lost connection can just as
+  // easily kill the snapshot-holding session; a bare `pg_dump` retry against
+  // a dead holder would only fail again with `snapshot_holder_lost`. Whatever
+  // partial `kithmind.dump` bytes an aborted attempt left behind are
+  // overwritten by the next attempt's `pg_dump -f`, and the whole staging
+  // directory is removed below if every attempt fails.
   let parity;
   let dumpPath;
   try {
-    await requireImportableSnapshot(config, connectionString, snapshot.id);
-    parity = await capturePostgresParity(
-      config.psqlPath,
-      connectionString,
-      config.timeoutMs,
-      snapshot.id,
-    );
-    if (parity.invalidConstraints !== 0) fail("preflight_constraints_invalid");
-    dumpPath = await dumpBothSchemas(
-      config,
-      connectionString,
-      stagingDirectory,
-      snapshot.id,
-    );
+    ({ parity, dumpPath } = await withExportRetry(async () => {
+      // One exported snapshot covers both the parity capture and pg_dump, so
+      // the manifest describes exactly the database state the dump contains
+      // even though a watcher, the deferred-work daemon or an MCP write may
+      // commit at any moment. Everything that can fail cheaply has already
+      // run, so the holding transaction stays open only for the capture and
+      // the dump.
+      const snapshot = await exportSnapshot(
+        config.psqlPath,
+        connectionString,
+        config.timeoutMs,
+      );
+      try {
+        await requireImportableSnapshot(config, connectionString, snapshot.id);
+        const attemptParity = await capturePostgresParity(
+          config.psqlPath,
+          connectionString,
+          config.timeoutMs,
+          snapshot.id,
+        );
+        if (attemptParity.invalidConstraints !== 0)
+          fail("preflight_constraints_invalid");
+        const attemptDumpPath = await dumpBothSchemas(
+          config,
+          connectionString,
+          stagingDirectory,
+          snapshot.id,
+        );
+        await snapshot.release();
+        return { parity: attemptParity, dumpPath: attemptDumpPath };
+      } catch (error) {
+        snapshot.abort();
+        throw error;
+      }
+    }));
   } catch (error) {
-    snapshot.abort();
+    await rm(stagingDirectory, { recursive: true, force: true }).catch(() => {});
     throw error;
   }
-  await snapshot.release();
   const dumpDigest = await requireBoundedFile(dumpPath);
   const manifest = buildManifest({
     createdAt: new Date().toISOString(),
@@ -1094,12 +1277,32 @@ export async function runPostgresDatabaseBackup(config) {
     ["kithmind.dump.age", "manifest.json.age"],
     config.timeoutMs,
   );
+  // Retention runs after publication and must never fail the backup: the new
+  // snapshot above already exists and is independently readable, which is
+  // what makes today's run a success regardless of what `forget`/`prune` do.
+  let retention;
+  try {
+    retention = await resticForget(
+      config.resticBinary,
+      config.resticRepositoryPath,
+      passwordCommandArgument_,
+      config.host,
+      config.resticRetention,
+      config.timeoutMs,
+    );
+  } catch (error) {
+    retention = {
+      status: "failed",
+      code: error instanceof PostgresBackupError ? error.code : "unknown",
+    };
+  }
   return {
     status: "passed",
     stagingDirectory,
     snapshotId,
     repositoryId: config.expectedResticRepositoryId,
     manifest,
+    retention,
     ciphertexts: {
       "kithmind.dump.age": dumpCiphertext,
       "manifest.json.age": manifestCiphertext,
@@ -1121,9 +1324,10 @@ export async function runPostgresDatabaseBackup(config) {
 // backup config) prove the *published* ciphertext independently.
 
 async function runVerifyWorker(payload) {
-  const envelope = exact(payload, ["config", "backupResult"]);
+  const envelope = exact(payload, ["config", "backupResult", "runRestoreProof"]);
   const config = parseVerifyConfig(envelope.config);
   const { backupResult } = envelope;
+  if (typeof envelope.runRestoreProof !== "boolean") fail("verify_payload_invalid");
   await protectedDirectory(dirname(config.ageIdentityPath));
   protectedFile(config.ageIdentityPath);
   protectedFile(config.restoreProofConfigPath);
@@ -1131,7 +1335,7 @@ async function runVerifyWorker(payload) {
   if (
     !backupResult ||
     JSON.stringify(Object.keys(backupResult).sort()) !==
-      JSON.stringify(["status", "stagingDirectory", "snapshotId", "repositoryId", "manifest", "ciphertexts", "plaintexts"].sort()) ||
+      JSON.stringify(["status", "stagingDirectory", "snapshotId", "repositoryId", "manifest", "retention", "ciphertexts", "plaintexts"].sort()) ||
     backupResult.status !== "passed" ||
     backupResult.repositoryId !== config.expectedResticRepositoryId ||
     typeof backupResult.stagingDirectory !== "string" ||
@@ -1227,48 +1431,62 @@ async function runVerifyWorker(payload) {
       dumpFile.sha256 !== backupResult.plaintexts["kithmind.dump.age"].sha256 ||
       dumpFile.byteLength !== backupResult.plaintexts["kithmind.dump.age"].byteLength
     ) fail("published_manifest_invalid");
-    let restoreResult;
-    try {
-      restoreResult = await runCapture(
-        process.execPath,
-        [
-          fileURLToPath(new URL("./db-restore-proof.mjs", import.meta.url)),
-          "--isolated",
-          "--config",
-          config.restoreProofConfigPath,
-          "--dump",
-          join(workDirectory, "kithmind.dump.age.plain"),
-          "--manifest",
-          join(workDirectory, "manifest.json.age.plain"),
-        ],
-        { timeoutMs: config.timeoutMs, maxOutputBytes: MAX_COMMAND_OUTPUT_BYTES },
-      );
-    } catch (error) {
-      if (error?.code !== "command_failed") throw error;
-      fail(childFailureCode(error, RESTORE_PROOF_CODES, "restore_proof_failed:"));
-    }
+    // The isolated restore proof (a full pg_restore into a scratch database
+    // plus parity recapture) is the expensive part of verification and now
+    // runs on a cadence (`restoreProofEveryDays`, decided by the caller in
+    // db-backup.mjs from the durable status journal), not every day. The
+    // ciphertext/plaintext readback and manifest checks above still run every
+    // time regardless: those are the "recovery record" checks docs/
+    // database-backups.md distinguishes from the isolated restore itself.
     let restore;
-    try {
-      restore = JSON.parse(restoreResult.stdout.toString("utf8"));
-    } catch {
-      fail("restore_worker_output_invalid");
+    if (!envelope.runRestoreProof) {
+      restore = { status: "skipped" };
+    } else {
+      let restoreResult;
+      try {
+        restoreResult = await runCapture(
+          process.execPath,
+          [
+            fileURLToPath(new URL("./db-restore-proof.mjs", import.meta.url)),
+            "--isolated",
+            "--config",
+            config.restoreProofConfigPath,
+            "--dump",
+            join(workDirectory, "kithmind.dump.age.plain"),
+            "--manifest",
+            join(workDirectory, "manifest.json.age.plain"),
+          ],
+          { timeoutMs: config.timeoutMs, maxOutputBytes: MAX_COMMAND_OUTPUT_BYTES },
+        );
+      } catch (error) {
+        if (error?.code !== "command_failed") throw error;
+        fail(childFailureCode(error, RESTORE_PROOF_CODES, "restore_proof_failed:"));
+      }
+      try {
+        restore = JSON.parse(restoreResult.stdout.toString("utf8"));
+      } catch {
+        fail("restore_worker_output_invalid");
+      }
+      if (
+        !restore ||
+        Object.keys(restore).sort().join() !==
+          ["status", "source", "restored", "tablesVerified", "citationSample"].sort().join() ||
+        restore.status !== "passed" ||
+        !Number.isSafeInteger(restore.tablesVerified) ||
+        restore.tablesVerified < 2 ||
+        JSON.stringify(Object.keys(restore.source ?? {}).sort()) !==
+          JSON.stringify(["financeVersion", "kithVersion"]) ||
+        JSON.stringify(Object.keys(restore.restored ?? {}).sort()) !==
+          JSON.stringify(["financeVersion", "kithVersion"]) ||
+        // Compared against the *restored* database, not the live source: the
+        // source may have since migrated (schema versions are recorded, not
+        // pinned), so only the restored-versus-manifest equality proves the
+        // published dump restores to what was dumped.
+        restore.restored.financeVersion !== publishedManifest.financeSchemaVersion ||
+        restore.restored.kithVersion !== publishedManifest.kithSchemaVersion ||
+        !validCitationSample(restore.citationSample)
+      ) fail("restore_worker_output_invalid");
     }
-    if (
-      !restore ||
-      Object.keys(restore).sort().join() !==
-        ["status", "source", "restored", "tablesVerified", "citationSample"].sort().join() ||
-      restore.status !== "passed" ||
-      !Number.isSafeInteger(restore.tablesVerified) ||
-      restore.tablesVerified < 2 ||
-      JSON.stringify(Object.keys(restore.source ?? {}).sort()) !==
-        JSON.stringify(["financeVersion", "kithVersion"]) ||
-      JSON.stringify(Object.keys(restore.restored ?? {}).sort()) !==
-        JSON.stringify(["financeVersion", "kithVersion"]) ||
-      restore.source.financeVersion !== publishedManifest.financeSchemaVersion ||
-      restore.source.kithVersion !== publishedManifest.kithSchemaVersion ||
-      JSON.stringify(restore.source) !== JSON.stringify(restore.restored) ||
-      !validCitationSample(restore.citationSample)
-    ) fail("restore_worker_output_invalid");
     return { status: "passed", repositoryId, mismatches: [], restore };
   } finally {
     await rm(workDirectory, { recursive: true, force: true });
@@ -1277,15 +1495,19 @@ async function runVerifyWorker(payload) {
 
 /** Spawns the separate-process verify worker and requires its exact
  * `{status:"passed"}` result, matching the generic command-output contract
- * the rest of this recipe already uses. */
-export async function verifyPostgresBackup(verifyConfig, backupResult) {
+ * the rest of this recipe already uses. `options.runRestoreProof` defaults to
+ * true (every direct caller, including both integration tests, keeps getting
+ * a full proof unless it explicitly opts out); db-backup.mjs's cadence
+ * decision is the only caller that passes `false`. */
+export async function verifyPostgresBackup(verifyConfig, backupResult, options = {}) {
   const config = parseVerifyConfig(verifyConfig);
   await protectedDirectory(dirname(config.ageIdentityPath));
   protectedFile(config.ageIdentityPath);
   protectedFile(config.restoreProofConfigPath);
+  const runRestoreProof = options.runRestoreProof !== false;
   const workerPath = fileURLToPath(import.meta.url);
   const payload = Buffer.from(
-    JSON.stringify({ config, backupResult }),
+    JSON.stringify({ config, backupResult, runRestoreProof }),
     "utf8",
   );
   let result;
@@ -1320,7 +1542,8 @@ export async function verifyPostgresBackup(verifyConfig, backupResult) {
     parsed.repositoryId !== config.expectedResticRepositoryId ||
     !Array.isArray(parsed.mismatches) ||
     parsed.mismatches.length !== 0 ||
-    parsed.restore?.status !== "passed"
+    (parsed.restore?.status !== "passed" && parsed.restore?.status !== "skipped") ||
+    (runRestoreProof && parsed.restore?.status !== "passed")
   ) fail("verify_worker_output_invalid");
   return parsed;
 }
@@ -1346,6 +1569,31 @@ async function main() {
     const result = await runVerifyWorker(payload);
     process.stdout.write(`${JSON.stringify(result)}\n`);
     if (result.status !== "passed") process.exitCode = 1;
+    return;
+  }
+  if (process.argv[2] === "--forget") {
+    // Operator command: `node db-backup-postgres.mjs --forget --config
+    // <path> [--dry-run]`. Reuses the backup config (it already carries the
+    // restic binary, repository and password command this needs) but never
+    // touches Postgres, age, or the dump/publish path.
+    const configIndex = process.argv.indexOf("--config");
+    if (configIndex === -1 || process.argv[configIndex + 1] === undefined)
+      fail("usage_invalid");
+    const dryRun = process.argv.includes("--dry-run");
+    const config = await loadPostgresBackupConfig(process.argv[configIndex + 1]);
+    const passwordCommandArgument_ = await passwordCommandArgument(
+      config.resticPasswordCommand,
+    );
+    const result = await resticForget(
+      config.resticBinary,
+      config.resticRepositoryPath,
+      passwordCommandArgument_,
+      config.host,
+      config.resticRetention,
+      config.timeoutMs,
+      dryRun,
+    );
+    process.stdout.write(`${JSON.stringify(result)}\n`);
     return;
   }
   if (process.argv.length !== 4 || process.argv[2] !== "--config")

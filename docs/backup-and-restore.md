@@ -227,9 +227,25 @@ consolidation plan (step 10 of
 replaces it with a `pg_dump` of both the `finance` and `kith` schemas from the
 one consolidated database, carrying the same preflight, protected staging,
 manifest, encryption, restic identity, and separate-process byte-equality
-steps this drill already required, plus one isolated restore. That engine and
-its own parity/citation checks are documented in
+steps this drill already required, plus an isolated restore proof (on a
+cadence, not every run -- see below). That engine and its own parity/citation
+checks are documented in
 [`docs/database-backups.md`](database-backups.md#postgresql-engine-both-schemas-in-one-dump).
+
+Owner decision (2026-09-20, BAK-1): the recipe was simplified for one
+independent off-provider copy rather than an enterprise-class backup system.
+Schema versions are recorded from the database into the manifest rather than
+pinned against a configured expectation, so a migration never fails a
+scheduled run. Retention uses restic's own `forget`/`prune`, scoped to a
+`kith-db` tag so it can never reach another snapshot kind sharing the
+repository, with age-out defaults of 7 daily / 5 weekly / 12 monthly
+snapshots. The isolated restore proof -- the expensive full `pg_restore` into
+a scratch database -- runs every `restoreProofEveryDays` (default 30) rather
+than on every backup; the daily ciphertext/plaintext readback checks are
+unaffected. See
+[`docs/database-backups.md`](database-backups.md#retention) for the full
+retention and cadence contract, and its "Moving the backup to a new host"
+section for the laptop-to-always-on-host migration.
 
 This is still a synthetic-fixture proof, not a production baseline. The
 production age recipient design, and the restic repository identity checks

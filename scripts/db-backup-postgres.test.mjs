@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -12,6 +12,7 @@ import {
   loadPostgresBackupConfig,
   loadPostgresVerifyConfig,
   requireNoActiveWriters,
+  resticForget,
 } from "./db-backup-postgres.mjs";
 
 const HEX_64 = "a".repeat(64);
@@ -402,4 +403,139 @@ test("a holder that survives the dump releases cleanly", async (t) => {
   const psql = await fakePsql(root, "holds.sh", "printf '00000003-0000001B-1\\n'\nexec cat >/dev/null");
   const snapshot = await exportSnapshot(psql, "postgres://fake/db", 5_000);
   await snapshot.release();
+});
+
+// BAK-1: schema versions are recorded (read from the database and written
+// into the manifest by `preflight`/`buildManifest`), not pinned. Both configs
+// still accept `expected*SchemaVersion` for backward compatibility, but the
+// keys are now optional, and loading a config that omits them must not fail.
+
+test("loadPostgresBackupConfig accepts a config with no expected schema versions", async (t) => {
+  const fixtureState = await fixture(t);
+  const configPath = join(fixtureState.root, "config.json");
+  const config = backupConfig(fixtureState);
+  delete config.expectedFinanceSchemaVersion;
+  delete config.expectedKithSchemaVersion;
+  await writeFile(configPath, JSON.stringify(config), { mode: 0o600 });
+  const loaded = await loadPostgresBackupConfig(configPath);
+  assert.equal(loaded.expectedFinanceSchemaVersion, null);
+  assert.equal(loaded.expectedKithSchemaVersion, null);
+});
+
+test("loadPostgresBackupConfig defaults retention to 7 daily / 5 weekly / 12 monthly", async (t) => {
+  const fixtureState = await fixture(t);
+  const configPath = join(fixtureState.root, "config.json");
+  await writeFile(configPath, JSON.stringify(backupConfig(fixtureState)), { mode: 0o600 });
+  const loaded = await loadPostgresBackupConfig(configPath);
+  assert.deepEqual(loaded.resticRetention, { keepDaily: 7, keepWeekly: 5, keepMonthly: 12 });
+});
+
+test("loadPostgresBackupConfig accepts an overridden retention policy and rejects a malformed one", async (t) => {
+  const fixtureState = await fixture(t);
+  const configPath = join(fixtureState.root, "config.json");
+  await writeFile(
+    configPath,
+    JSON.stringify(backupConfig(fixtureState, { resticRetention: { keepDaily: 3, keepWeekly: 1, keepMonthly: 6 } })),
+    { mode: 0o600 },
+  );
+  const loaded = await loadPostgresBackupConfig(configPath);
+  assert.deepEqual(loaded.resticRetention, { keepDaily: 3, keepWeekly: 1, keepMonthly: 6 });
+  await writeFile(
+    configPath,
+    JSON.stringify(backupConfig(fixtureState, { resticRetention: { keepDaily: -1, keepWeekly: 1, keepMonthly: 6 } })),
+    { mode: 0o600 },
+  );
+  await assert.rejects(
+    loadPostgresBackupConfig(configPath),
+    (error) => error.code === "config_invalid",
+  );
+});
+
+test("loadPostgresVerifyConfig defaults restoreProofEveryDays to 30 and accepts an override", async (t) => {
+  const fixtureState = await fixture(t);
+  const identityPath = join(fixtureState.root, "identity.txt");
+  await writeFile(identityPath, "AGE-SECRET-KEY-1FAKE\n", { mode: 0o600 });
+  const configPath = join(fixtureState.root, "verify.json");
+  await writeFile(
+    configPath,
+    JSON.stringify(verifyConfig(fixtureState, { ageIdentityPath: identityPath })),
+    { mode: 0o600 },
+  );
+  assert.equal((await loadPostgresVerifyConfig(configPath)).restoreProofEveryDays, 30);
+  await writeFile(
+    configPath,
+    JSON.stringify(verifyConfig(fixtureState, { ageIdentityPath: identityPath, restoreProofEveryDays: 7 })),
+    { mode: 0o600 },
+  );
+  assert.equal((await loadPostgresVerifyConfig(configPath)).restoreProofEveryDays, 7);
+});
+
+// BAK-1: retention scoping (`--host`, `--tag kith-db`, the three keep counts)
+// and the --dry-run/--prune split, exercised against a fake restic that just
+// echoes its own argv back as the "forget" JSON report, and separately fails
+// closed so a caller can prove the failure never reaches past resticForget's
+// own boundary (runPostgresDatabaseBackup catches it and marks retention
+// failed instead of failing the backup -- proven end to end in the postgres
+// integration test, which has a real restic binary to fail against).
+
+async function fakeResticForget(root, body) {
+  const path = join(root, "restic-forget.sh");
+  await writeFile(path, `#!/bin/sh\n${body}\n`, { mode: 0o700 });
+  return path;
+}
+
+test("resticForget scopes forget to the host and the kith-db tag, with the configured retention counts", async (t) => {
+  const { root } = await fixture(t);
+  const captured = join(root, "argv.txt");
+  const restic = await fakeResticForget(
+    root,
+    `printf '%s\\n' "$@" > '${captured}'\nprintf '[{"keep":[],"remove":[]}]'`,
+  );
+  const result = await resticForget(
+    restic, "/abs/repo", "'/bin/true'", "kith-db-01",
+    { keepDaily: 7, keepWeekly: 5, keepMonthly: 12 }, 5_000, false,
+  );
+  assert.equal(result.status, "passed");
+  assert.equal(result.dryRun, false);
+  assert.equal(result.keptCount, 0);
+  assert.equal(result.removedCount, 0);
+  const argv = (await readFile(captured, "utf8")).split("\n");
+  assert.ok(argv.includes("--host"));
+  assert.equal(argv[argv.indexOf("--host") + 1], "kith-db-01");
+  assert.ok(argv.includes("--tag"));
+  assert.equal(argv[argv.indexOf("--tag") + 1], "kith-db");
+  assert.equal(argv[argv.indexOf("--keep-daily") + 1], "7");
+  assert.equal(argv[argv.indexOf("--keep-weekly") + 1], "5");
+  assert.equal(argv[argv.indexOf("--keep-monthly") + 1], "12");
+  assert.ok(argv.includes("--prune"));
+  assert.ok(!argv.includes("--dry-run"));
+});
+
+test("resticForget's --dry-run reports counts and snapshot times, with --prune omitted", async (t) => {
+  const { root } = await fixture(t);
+  const captured = join(root, "argv.txt");
+  const restic = await fakeResticForget(
+    root,
+    `printf '%s\\n' "$@" > '${captured}'\nprintf '[{"keep":[{"time":"2026-01-01T00:00:00Z"}],"remove":[{"time":"2025-01-01T00:00:00Z"},{"time":"2025-02-01T00:00:00Z"}]}]'`,
+  );
+  const result = await resticForget(
+    restic, "/abs/repo", "'/bin/true'", "kith-db-01",
+    { keepDaily: 7, keepWeekly: 5, keepMonthly: 12 }, 5_000, true,
+  );
+  assert.equal(result.dryRun, true);
+  assert.equal(result.keptCount, 1);
+  assert.equal(result.removedCount, 2);
+  assert.deepEqual(result.removedTimes, ["2025-01-01T00:00:00Z", "2025-02-01T00:00:00Z"]);
+  const argv = await readFile(captured, "utf8");
+  assert.ok(argv.includes("--dry-run"));
+  assert.ok(!argv.includes("--prune"));
+});
+
+test("resticForget fails closed on output that is not a JSON array of groups", async (t) => {
+  const { root } = await fixture(t);
+  const restic = await fakeResticForget(root, "printf 'not json'");
+  await assert.rejects(
+    resticForget(restic, "/abs/repo", "'/bin/true'", "kith-db-01", { keepDaily: 7, keepWeekly: 5, keepMonthly: 12 }, 5_000, true),
+    (error) => error instanceof PostgresBackupError && error.code === "retention_output_invalid",
+  );
 });
