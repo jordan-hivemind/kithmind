@@ -54,6 +54,26 @@ test("source.roots takes the envelope and nothing else", () => {
   );
 });
 
+// ADM-6a. The new read, and the half of its compatibility story that lives on
+// the request side: an old server does not know the operation, and a parser
+// that does not know an operation refuses it rather than guessing. That
+// refusal is what the new watcher treats as "the server did not say", so this
+// is the behaviour the watcher's fallback is built on.
+test("source.itemCounts takes the envelope and nothing else, and an unknown operation is refused", () => {
+  assert.deepEqual(
+    parseWorkerRequest({ ...source, operation: "source.itemCounts" }),
+    { ...source, operation: "source.itemCounts" },
+  );
+  for (const bad of [
+    { ...source, operation: "source.itemCounts", rootAlias: "fixture" },
+    { ...source, operation: "source.itemCounts", maxItems: 10 },
+    // What an old server does with this request.
+    { ...source, operation: "source.itemCountsX" },
+  ]) {
+    assert.throws(() => parseWorkerRequest(bad), WorkerProtocolParseError);
+  }
+});
+
 test("source.rootReport takes a closed state and a bounded count", () => {
   const report = {
     ...source,

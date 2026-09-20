@@ -280,12 +280,25 @@ export const WORKER_PASS_CODE = /^[a-z0-9_]{1,64}$/;
 /** A bound on the counts one pass may report. Matches `source.rootReport`. */
 export const MAX_WORKER_PASS_COUNT = 100_000_000;
 
+/**
+ * ADM-6a. A bound on how many root aliases `source.itemCounts` names.
+ *
+ * A host watches a handful of folders, so the real answer is single digits.
+ * The bound exists because the aliases are read out of stored URIs rather than
+ * out of the roots table, and a bounded response is what keeps an unexpected
+ * URI from turning a read into an unbounded one.
+ */
+export const MAX_WORKER_SOURCE_ITEM_COUNT_ROOTS = 64;
+
 export type WorkerRequest =
   | (WorkerSourceRequest & {
       operation: "source.status";
     })
   | (WorkerSourceRequest & {
       operation: "source.roots";
+    })
+  | (WorkerSourceRequest & {
+      operation: "source.itemCounts";
     })
   | (WorkerSourceRequest & {
       operation: "source.rootReport";
@@ -713,6 +726,43 @@ export type WorkerSourceRootsResult = {
   operation: "source.roots";
   sourceAccountId: string;
   roots: WorkerSourceRoot[];
+};
+
+/**
+ * ADM-6a. How many live items the server holds under each filesystem root
+ * alias, so a watcher can tell "this folder was emptied" from "this journal is
+ * not this source's journal".
+ *
+ * The population is exactly the one `reconcileWorkerScan` walks and would
+ * retire: every `source_items` row of this account whose lifecycle is not
+ * already `unavailable`, `forgotten` or `forgetting`. Counting anything else
+ * would put two different populations on the two sides of the watcher's
+ * comparison, and a guard that compares two different populations is a guard
+ * that fires on healthy passes.
+ *
+ * Counts and root aliases only. An alias is the key the host's own allow-list
+ * is written in, never a path, and no file name or document text is derivable
+ * from any of it.
+ *
+ * A separate operation rather than a field on `source.status`, because the
+ * watcher's response parser rejects a response carrying a key it does not
+ * know: a new field on an existing response would break every already
+ * deployed watcher the moment the server shipped it. An operation an old
+ * watcher never calls cannot break it, and a new watcher calling it against an
+ * old server gets a refusal it already treats as "the server did not say".
+ */
+export type WorkerSourceItemCountsResult = {
+  operation: "source.itemCounts";
+  sourceAccountId: string;
+  /** Every live item of this account, including those under no `fs://` root. */
+  liveItems: number;
+  /**
+   * One row per filesystem root alias holding at least one live item, largest
+   * first. Truncated at `MAX_WORKER_SOURCE_ITEM_COUNT_ROOTS`, and `truncated`
+   * says so: an alias missing from a truncated list is unknown, not zero.
+   */
+  roots: Array<{ rootAlias: string; liveItems: number }>;
+  truncated: boolean;
 };
 
 export type WorkerSourceRootReportResult = {
@@ -1221,6 +1271,7 @@ export type WorkerProviderOriginalAckDetachResult =
 export type WorkerResult =
   | WorkerSourceStatusResult
   | WorkerSourceRootsResult
+  | WorkerSourceItemCountsResult
   | WorkerSourceRootReportResult
   | WorkerDiagnosticsStatusResult
   | WorkerDiagnosticsHeartbeatResult
@@ -1926,6 +1977,9 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
     case "source.roots":
       exactKeys(input, baseKeys);
       return { ...base, operation: "source.roots" };
+    case "source.itemCounts":
+      exactKeys(input, baseKeys);
+      return { ...base, operation: "source.itemCounts" };
     case "source.rootReport": {
       exactKeys(
         input,

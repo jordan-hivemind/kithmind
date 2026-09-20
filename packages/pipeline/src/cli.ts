@@ -33,7 +33,7 @@ import type { RunnerCheckpoint } from "./runnerState.js";
 
 function usage(): never {
   throw new Error(
-    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked [--operator-clear --max-clears <n>]] and [--accept-retirement <root_selection_would_retire_items|root_contents_collapsed>], or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
+    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked [--operator-clear --max-clears <n>]] and [--accept-retirement <root_selection_would_retire_items|root_contents_collapsed|journal_behind_server>], or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
   );
 }
 export function argumentsFor(argv: string[]):
@@ -132,10 +132,13 @@ export function argumentsFor(argv: string[]):
     }
     extra.push(rest[index]!);
   }
+  // ADM-6a review: the third code, on the same terms. Each one still has to be
+  // named, so accepting one refusal never accepts another.
   if (
     acceptRetirement !== undefined &&
     acceptRetirement !== "root_selection_would_retire_items" &&
-    acceptRetirement !== "root_contents_collapsed"
+    acceptRetirement !== "root_contents_collapsed" &&
+    acceptRetirement !== "journal_behind_server"
   )
     usage();
   const allowed =

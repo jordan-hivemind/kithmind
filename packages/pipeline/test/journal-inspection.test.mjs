@@ -232,6 +232,7 @@ test("safe inspection is byte and metadata preserving and reports recovery artif
       configBinding: "current",
       recoveryArtifactCount: 1,
       manualRecoveryRequired: false,
+      journalBehindServer: false,
     });
     assert.deepEqual(after, before);
   } finally {
@@ -345,9 +346,43 @@ test("inspection reports pending cached state and sticky manual recovery without
     assert.equal(sticky.state, "safe");
     assert.equal(sticky.activity, "terminal");
     assert.equal(sticky.manualRecoveryRequired, true);
+    assert.equal(sticky.journalBehindServer, false);
     assert.equal(JSON.stringify(sticky).includes("request_conflict"), false);
   } finally {
     await rm(stickyDirectory, { recursive: true, force: true });
+  }
+});
+
+// ADM-6a. `doctor` has to be able to say why the worker is refusing every
+// pass, and the only record of it on this host is the journal's own terminal
+// checkpoint. The two ADM-4c refusals stay unreported on purpose: they clear
+// themselves, so naming them here would teach the owner to ignore the check.
+test("inspection reports a journal refused for being behind the server, and not the self-clearing refusals", async () => {
+  for (const [code, expected] of [
+    ["journal_behind_server", true],
+    ["root_selection_would_retire_items", false],
+    ["root_contents_collapsed", false],
+  ]) {
+    const { directory, authority, journal } = await fixtureWithJournal({
+      checkpoint: { version: 1, phase: "terminal", code },
+    });
+    await journal.close();
+    const inspection = await inspectJournalReadOnly({
+      directory,
+      binding: authority,
+      codec,
+      credentialForComparison: CREDENTIAL,
+    });
+    try {
+      assert.equal(inspection.state, "safe");
+      assert.equal(inspection.activity, "terminal");
+      assert.equal(inspection.journalBehindServer, expected);
+      assert.equal(inspection.manualRecoveryRequired, false);
+      // Counts and a boolean. Never the root alias, never a path.
+      assert.equal(JSON.stringify(inspection).includes(code), false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   }
 });
 

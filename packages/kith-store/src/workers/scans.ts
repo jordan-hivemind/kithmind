@@ -12,7 +12,7 @@ import type { PrincipalRef } from "../identity/authorization.js";
 import { markMissingInventoryRows, upsertSourceInventoryRow } from "../documents/inventory.js";
 import { newKithId, KITH_ID } from "../ids.js";
 import { markSourceItemUnavailable } from "../provenance/model.js";
-import { camelizeSourceItem, type SourceItemRow } from "../provenance/rows.js";
+import { camelizeSourceItem, type SourceItemRow, type SourceLifecycle } from "../provenance/rows.js";
 import { requireWorkerSourceAccount, ensureSameActor, type LoadedWorkerSource } from "./auth.js";
 import { decodeCursor, keysetPage } from "./cursor.js";
 import { at, digest, exec, nowPlus, row, rows, type WorkerCtx } from "./db.js";
@@ -21,6 +21,33 @@ import { workerProtocolError } from "./errors.js";
 import { accountAdmitsBinaryEntry } from "./profile.js";
 import { consumeWorkerMutationRateLimit } from "./rateLimit.js";
 import { camelizeScan, camelizeScanEntry, type WorkerSourceScanRow } from "./rows.js";
+
+/**
+ * ADM-6a review. The lifecycles `reconcileWorkerScan` leaves alone, in the two
+ * groups its loop treats differently.
+ *
+ * A forgetting or forgotten item is passed over before the scan's mode is even
+ * read: it is on its way out of the archive and no scan may touch it. An item
+ * a previous pass already retired is reached, and then left as it is, because
+ * retiring it twice would spend an observation epoch on no change.
+ *
+ * Read together they are the population reconcile would never mark
+ * unavailable, which is exactly the population `getWorkerSourceItemCounts`
+ * counts: that query builds its `WHERE` clause from this constant rather than
+ * repeating the list. The watcher compares the count it gets back against its
+ * own journal and refuses the pass when the two disagree, so a list that had
+ * drifted from this one would make it refuse healthy passes, or let a fatal
+ * one through.
+ */
+export const RECONCILE_TERMINAL_LIFECYCLES: readonly SourceLifecycle[] = [
+  "forgotten",
+  "forgetting",
+];
+export const RECONCILE_RETIRED_LIFECYCLE: SourceLifecycle = "unavailable";
+export const RECONCILE_EXEMPT_LIFECYCLES: readonly SourceLifecycle[] = [
+  ...RECONCILE_TERMINAL_LIFECYCLES,
+  RECONCILE_RETIRED_LIFECYCLE,
+];
 
 export const WORKER_SCAN_IDLE_MS = 30 * 60 * 1_000;
 export const WORKER_SCAN_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
@@ -513,12 +540,12 @@ export async function reconcileWorkerScan(
   let needsReview = scan.reconcileNeedsReview ?? false;
   for (const item of paginated.page) {
     if (item.spaceId !== source.spaceId || item.sourceAccountId !== source.account.id) workerProtocolError("scan_conflict");
-    if (item.lifecycle === "forgotten" || item.lifecycle === "forgetting" || item.workerLastSeenInventoryEpoch === scan.inventoryEpoch) continue;
+    if (RECONCILE_TERMINAL_LIFECYCLES.includes(item.lifecycle) || item.workerLastSeenInventoryEpoch === scan.inventoryEpoch) continue;
     if (scan.mode === "identity_recovery") {
       needsReview = true;
       continue;
     }
-    if (item.lifecycle !== "unavailable") {
+    if (item.lifecycle !== RECONCILE_RETIRED_LIFECYCLE) {
       const priorWork = await currentDiscoveryWork(ctx, source, item);
       if (priorWork) await obsoletePriorWork(ctx, priorWork, false);
       const observationEpoch = (item.workerObservationEpoch ?? 0) + 1;

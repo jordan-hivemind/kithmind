@@ -513,6 +513,109 @@ function collapsedRoots(
   return collapsed.sort();
 }
 
+/** ADM-6a. What the server says it holds, per root alias and in total. */
+type ServerItemCounts = {
+  liveItems: number;
+  roots: Array<{ rootAlias: string; liveItems: number }>;
+  truncated: boolean;
+};
+
+/** ADM-6a. One root's two counts: the journal's and the server's. */
+type RootItemGap = { rootAlias: string; remembered: number; held: number };
+
+/**
+ * ADM-6a. A journal that does not know what the server holds.
+ *
+ * Both ADM-4c breakers ask the same question -- "is this pass about to retire
+ * a lot?" -- of the same witness, the journal. A host-move rehearsal showed
+ * what that misses. A watcher started with a stale copy of the journal
+ * remembered 29 items where the server held 687 for the same source. All 29
+ * matched files on disk, so nothing was missing, nothing was collapsed,
+ * `retiring` was 0, and the server's reconcile -- which retires every item the
+ * scan did not carry, not every item the journal forgot -- marked 658 items
+ * unavailable. The journal cannot report a loss it has no memory of. Only the
+ * server can.
+ *
+ * So the third breaker asks the server. Per root, because two roots can err in
+ * opposite directions and cancel in a total, and because the innocent case
+ * this must not refuse -- the owner adds a folder -- is a root where both
+ * sides are zero.
+ *
+ * The rule: for a root this pass enumerates, take what the server holds live
+ * under it and what the journal remembers anywhere under it. Refuse when the
+ * server is ahead by at least three items *and* by at least a twentieth of
+ * what it holds. Three is `collapsedRoots`' floor, so a folder of four does
+ * not stand on one item's difference.
+ *
+ * Review of this change: the share was a quarter, taken from
+ * `retirementCircuitBreaker` read the other way round, and it left a gap the
+ * rehearsal's own numbers fit through. A server holding 687 items against a
+ * journal remembering 600 is 87 documents minted fresh and 87 retired, and a
+ * quarter of 687 is 172, so that pass opened in normal mode and neither ADM-4c
+ * breaker saw it either. A twentieth refuses it. The two circuit breakers
+ * bound what one pass may retire *from a journal that knows what it holds*; a
+ * journal that disagrees with the server about the size of the source is not
+ * that, so it does not get that budget.
+ *
+ * Three deliberate asymmetries:
+ *
+ *   * Every remembered binding under the alias counts, not only the ones
+ *     inside the current include-prefixes. Narrowing a root leaves its other
+ *     bindings remembered and its other items retired, so counting only the
+ *     narrowed ones would read a healthy narrowed root as a journal that had
+ *     forgotten the rest. What a narrowing retires is the first breaker's
+ *     business, and it sees it.
+ *   * A journal that knows MORE than the server is never refused. That is
+ *     ordinary: an item retired in an earlier pass keeps its binding.
+ *   * A root the server does not name holds nothing, unless the list was
+ *     truncated, in which case the root is unknown and is skipped. Unknown is
+ *     not zero, and a guard that guesses is worse than a guard that abstains.
+ *
+ * Items under an alias this pass does not enumerate are not compared here.
+ * Those are what `watchedLocation` and the retirement breaker are for, and
+ * counting them would refuse a root removal the owner has already confirmed.
+ */
+function journalBehindServer(
+  roots: SafeRoot[],
+  prior: IdentityBinding[],
+  counts: ServerItemCounts,
+): { behind: RootItemGap[]; compared: RootItemGap[] } {
+  const remembered = new Map<string, number>();
+  for (const binding of prior) {
+    remembered.set(
+      binding.rootAlias,
+      (remembered.get(binding.rootAlias) ?? 0) + 1,
+    );
+  }
+  const held = new Map(
+    counts.roots.map((root) => [root.rootAlias, root.liveItems] as const),
+  );
+  const compared: RootItemGap[] = [];
+  const behind: RootItemGap[] = [];
+  for (const root of roots) {
+    const server = held.get(root.alias) ?? (counts.truncated ? undefined : 0);
+    if (server === undefined) continue;
+    const journal = remembered.get(root.alias) ?? 0;
+    const entry = { rootAlias: root.alias, remembered: journal, held: server };
+    compared.push(entry);
+    const gap = server - journal;
+    if (gap >= 3 && gap >= Math.max(3, Math.ceil(server / 20))) {
+      behind.push(entry);
+    }
+  }
+  // The widest gap first, so the one refusal names the root that would have
+  // cost the most. Alias order breaks ties so the message does not depend on
+  // config order. `compared` stays in the order the roots were given: it is
+  // every root this pass weighed, which is what an operator who overrides the
+  // refusal needs to have been told.
+  behind.sort(
+    (left, right) =>
+      right.held - right.remembered - (left.held - left.remembered) ||
+      (left.rootAlias < right.rootAlias ? -1 : 1),
+  );
+  return { behind, compared };
+}
+
 /** ADM-4c. What one pass will tell the server about one of its roots. */
 type SourceRootReport = {
   sourceRootId: string;
@@ -934,6 +1037,7 @@ function request(
     | JournalOperation
     | "source.status"
     | "source.roots"
+    | "source.itemCounts"
     | "source.rootReport"
     | "diagnostics.passOutcome",
   extra: Record<string, unknown> = {},
@@ -2079,6 +2183,41 @@ export class PipelineRunner {
   }
 
   /**
+   * ADM-6a. What the server says it holds for this source, or `undefined`
+   * when this pass could not ask.
+   *
+   * Never fails the pass, and for one reason that matters more than tidiness:
+   * a server that predates this operation answers `invalid_request`, and the
+   * watcher that ships with this change has to keep working against it. So
+   * every failure -- an old server, a transport error, a response this worker
+   * cannot parse -- means "the server did not say", the guard below abstains,
+   * and the pass behaves exactly as it did before ADM-6a.
+   */
+  private async serverItemCounts(): Promise<ServerItemCounts | undefined> {
+    try {
+      const result = object(
+        await this.transport.call(request(this.config, "source.itemCounts")),
+        "source.itemCounts",
+      );
+      if (result.sourceAccountId !== this.config.sourceAccountId) {
+        throw new PipelineWorkerError("source_mismatch");
+      }
+      return {
+        liveItems: result.liveItems as number,
+        roots: result.roots as ServerItemCounts["roots"],
+        truncated: result.truncated as boolean,
+      };
+    } catch (error) {
+      console.warn(
+        `[pipeline] the server's item counts are unavailable this pass; the journal's own memory stands (${
+          error instanceof Error ? error.message : "unknown error"
+        })`,
+      );
+      return undefined;
+    }
+  }
+
+  /**
    * ADM-4c. The roots this pass reads, and what to report about each server
    * row.
    *
@@ -3038,21 +3177,50 @@ export class PipelineRunner {
    * name the exact code being accepted, and it is recorded here with the
    * counts it is overriding, because "the owner confirmed this deletion" is a
    * thing a later reader has to be able to check.
+   *
+   * ADM-6a. `journal_behind_server` says something different from the other
+   * two -- not "these documents are gone", but "this journal is not this
+   * source's journal" -- so it names a different remedy: start the worker with
+   * this source's own, current journal.
+   *
+   * Review of this change: it names that remedy and no other. The first draft
+   * also offered to remove the journal directory, and in the rehearsal harness
+   * that made things worse. The directory holds the archive catalog and the
+   * scan cache beside the state file, so removing it ended the next four
+   * passes `failed / stale_observation`; removing only the state file left a
+   * source with unavailable items ending `identity_review_required` four
+   * passes running, with no documented way out. An operator reading a refusal
+   * at two in the morning gets the one instruction that works.
+   *
+   * It takes `--accept-retirement journal_behind_server` all the same, on the
+   * same terms as the other two: named explicitly, honoured for one pass, and
+   * logged with the per-root counts it overrode. A guard with no override is a
+   * guard someone edits the source to get past, and the counts in the log are
+   * what a later reader checks the decision against.
    */
   private async refuseRetirement(input: {
-    code: "root_selection_would_retire_items" | "root_contents_collapsed";
+    code:
+      | "root_selection_would_retire_items"
+      | "root_contents_collapsed"
+      | "journal_behind_server";
     detail: string;
     prior: IdentityBinding[];
     roots?: string[];
+    /** The counts an override would be overriding, for the accept log. */
+    counts?: string;
   }): Promise<FilePlan[] | undefined> {
     if (this.options.acceptRetirement === input.code) {
       console.warn(
-        `[pipeline] operator accepted ${input.code} for this pass: ${input.detail}`,
+        `[pipeline] operator accepted ${input.code} for this pass: ${input.detail}${
+          input.counts === undefined ? "" : ` (${input.counts})`
+        }`,
       );
       return undefined;
     }
     console.warn(
-      `[pipeline] ${input.detail}; refusing the scan rather than retiring them. Re-run with --accept-retirement ${input.code} to confirm this is a real removal.`,
+      input.code === "journal_behind_server"
+        ? `[pipeline] ${input.detail}; refusing the scan rather than retiring them. Start the worker with this source's own, current journal and run the pass again. If this journal is already this source's own and current, re-run with --accept-retirement journal_behind_server to proceed for this one pass.`
+        : `[pipeline] ${input.detail}; refusing the scan rather than retiring them. Re-run with --accept-retirement ${input.code} to confirm this is a real removal.`,
     );
     // The sources screen should name the folder, not just the pass.
     if (input.roots?.length) {
@@ -3155,6 +3323,34 @@ export class PipelineRunner {
         roots: collapsed,
       });
       if (refused) return refused;
+    }
+    // ADM-6a. The two breakers above take the journal's word for what this
+    // source holds. This one does not, and so it is the only one that can
+    // catch a journal that is not this source's journal at all. It asks only
+    // on a normal pass: an identity-recovery pass reconciles to `needs_review`
+    // and retires nothing, and a fresh journal in recovery is exactly the
+    // legitimate shape this rule would otherwise read as a disaster.
+    if (!recovery) {
+      const counts = await this.serverItemCounts();
+      const gaps = counts && journalBehindServer(roots, prior, counts);
+      const gap = gaps?.behind[0];
+      if (gaps && gap) {
+        const refused = await this.refuseRetirement({
+          code: "journal_behind_server",
+          detail: `the server holds ${gap.held} live items under watched root ${gap.rootAlias} and this journal remembers ${gap.remembered}`,
+          // Every root the guard weighed, not only the one the message names:
+          // an override covers the whole pass, so the log records the whole
+          // comparison it is overriding.
+          counts: gaps.compared
+            .map(
+              (row) =>
+                `${row.rootAlias}: server ${row.held}, journal ${row.remembered}`,
+            )
+            .join("; "),
+          prior,
+        });
+        if (refused) return refused;
+      }
     }
     await this.journal.transitionCheckpoint({
       checkpoint: {

@@ -79,6 +79,13 @@ export type JournalInspection =
       configBinding: "current" | "changed_quiescent" | "changed_active";
       recoveryArtifactCount: number;
       manualRecoveryRequired: boolean;
+      /**
+       * ADM-6a. The last pass refused itself with `journal_behind_server`:
+       * this journal remembers far less than the server holds for the source,
+       * so a scan planned from it would have retired the difference. It does
+       * not clear on its own, which is why it is inspectable at all.
+       */
+      journalBehindServer: boolean;
     }
   | {
       state: "unsafe";

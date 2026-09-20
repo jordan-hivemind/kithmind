@@ -1,8 +1,11 @@
-import type {
-  ProcessingAssessmentCounts,
-  WorkerProcessingStatus,
-  WorkerRequest,
-  WorkerSourceStatusResult,
+import {
+  FS_ROOT_ALIAS,
+  MAX_WORKER_SOURCE_ITEM_COUNT_ROOTS,
+  type ProcessingAssessmentCounts,
+  type WorkerProcessingStatus,
+  type WorkerRequest,
+  type WorkerSourceItemCountsResult,
+  type WorkerSourceStatusResult,
 } from "@repo/worker-protocol/request";
 import type { PrincipalRef } from "../identity/authorization.js";
 
@@ -10,6 +13,7 @@ import { normalizedCounts } from "./assessment.js";
 import { requireWorkerSourceAccount, type LoadedWorkerSource } from "./auth.js";
 import { row, rows, type WorkerCtx } from "./db.js";
 import { workerProtocolError } from "./errors.js";
+import { RECONCILE_EXEMPT_LIFECYCLES } from "./scans.js";
 import {
   camelizeAssessment,
   camelizeScan,
@@ -238,5 +242,81 @@ export async function getWorkerSourceStatus(
     enumeration: enumeration(source, scan, ctx.now),
     processing: await getProcessingAssessmentStatus(ctx, source),
     recordCoverage: "not_established",
+  };
+}
+
+/**
+ * ADM-6a. How many live items this account holds, in total and per filesystem
+ * root alias.
+ *
+ * The `WHERE` clause is the one thing in here that has to be right. It is
+ * `reconcileWorkerScan`'s own skip list read forwards: that loop passes over
+ * an item whose lifecycle is `forgotten`, `forgetting` or already
+ * `unavailable`, and retires everything else it did not see this epoch. So
+ * those lifecycles, and only those, are the ones this count leaves out.
+ *
+ * Review of this change: the two lists are now one list. The clause below is
+ * generated from `RECONCILE_EXEMPT_LIFECYCLES`, the constant that loop's own
+ * two tests are written against, so neither side can be edited without the
+ * other. `IS DISTINCT FROM` rather than `NOT IN` because the column is
+ * nullable and a null lifecycle is an item reconcile *would* retire, and one
+ * bound parameter per lifecycle rather than an inlined list because nothing
+ * here interpolates a value into SQL.
+ *
+ * The alias comes out of the stored `fs://` URI rather than out of
+ * `source_roots`, because the watcher's side of the comparison is keyed by the
+ * alias in its own host allow-list, and because an item's root is where it
+ * actually is, not which row the owner has configured today. `canonicalFsUri`
+ * validated the URI when it was written; the pattern is applied again here so
+ * that one strange stored row cannot put a value in the response that the
+ * watcher's parser would reject, which would blind the guard entirely rather
+ * than lose one row of it.
+ *
+ * A read: no rate limit and no write, pulled once a pass beside `source.roots`.
+ */
+export async function getWorkerSourceItemCounts(
+  ctx: WorkerCtx,
+  principal: PrincipalRef,
+  request: Extract<WorkerRequest, { operation: "source.itemCounts" }>,
+): Promise<WorkerSourceItemCountsResult> {
+  const source = await requireWorkerSourceAccount(ctx, principal, request);
+  const exempt = RECONCILE_EXEMPT_LIFECYCLES.map(
+    (_, index) => `AND lifecycle IS DISTINCT FROM $${index + 3}`,
+  ).join("\n        ");
+  const counted = await rows<{ root_alias: string | null; live_items: string }>(
+    ctx,
+    `SELECT substring(uri from '^fs://([^/]+)/') AS root_alias,
+            count(*) AS live_items
+       FROM kith.source_items
+      WHERE source_account_id = $1 AND space_id = $2
+        ${exempt}
+      GROUP BY 1`,
+    [source.account.id, source.spaceId, ...RECONCILE_EXEMPT_LIFECYCLES],
+  );
+  let liveItems = 0;
+  const roots: Array<{ rootAlias: string; liveItems: number }> = [];
+  for (const record of counted) {
+    const count = Number(record.live_items);
+    if (!Number.isSafeInteger(count)) workerProtocolError("scan_conflict");
+    liveItems += count;
+    if (record.root_alias === null || !FS_ROOT_ALIAS.test(record.root_alias)) {
+      continue;
+    }
+    roots.push({ rootAlias: record.root_alias, liveItems: count });
+  }
+  if (!Number.isSafeInteger(liveItems)) workerProtocolError("scan_conflict");
+  // Largest first, so a truncated list is the part of the account a mistake
+  // would cost the most. Alias order breaks ties so the response is stable.
+  roots.sort(
+    (left, right) =>
+      right.liveItems - left.liveItems ||
+      (left.rootAlias < right.rootAlias ? -1 : 1),
+  );
+  return {
+    operation: "source.itemCounts",
+    sourceAccountId: source.account.id,
+    liveItems,
+    roots: roots.slice(0, MAX_WORKER_SOURCE_ITEM_COUNT_ROOTS),
+    truncated: roots.length > MAX_WORKER_SOURCE_ITEM_COUNT_ROOTS,
   };
 }

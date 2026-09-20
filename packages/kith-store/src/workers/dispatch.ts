@@ -61,7 +61,7 @@ import {
   getWorkerSourceRoots,
   recordWorkerSourceRootReport,
 } from "./sourceRoots.js";
-import { getWorkerSourceStatus } from "./status.js";
+import { getWorkerSourceItemCounts, getWorkerSourceStatus } from "./status.js";
 import { workerCtx } from "./db.js";
 
 function leaseTokens(count: number): string[] {
@@ -83,6 +83,8 @@ export async function dispatchWorkerRequest(
         return getWorkerSourceStatus(ctx, principal, request);
       case "source.roots":
         return getWorkerSourceRoots(ctx, principal, request);
+      case "source.itemCounts":
+        return getWorkerSourceItemCounts(ctx, principal, request);
       case "source.rootReport":
         return recordWorkerSourceRootReport(ctx, principal, request);
       case "diagnostics.status":
