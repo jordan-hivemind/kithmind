@@ -298,9 +298,14 @@ test("a rendering space closes only next to a currency mark", () => {
   assert.deepEqual(amountsInText("Invoice refs 1, 234, 567"), []);
   assert.deepEqual(amountsInText("3. 12 Pack Soda   5.99"), ["5.99"]);
   // ADM-5g: `5L` is digits with a letter glued to them that is neither a
-  // currency, a magnitude nor a flag, so the token is not an amount at all --
-  // and "2. 5L" does not read as 2.5 either, so the 2 stands on its own.
-  assert.deepEqual(amountsInText("Milk 2. 5L"), ["2"]);
+  // currency, a magnitude nor a flag, so the token is not an amount at all.
+  // ADM-5h re-review: and the 2 no longer stands on its own either. A
+  // trailing point is a whole dollar now, so a point pressed against these
+  // digits with another digit reachable through it makes the line say 2.5L
+  // as readily as it says 2 -- and the same shape offered 780 for
+  // `$780. 554a`. Whether the run beyond the point can be priced is not the
+  // question; that it is there is.
+  assert.deepEqual(amountsInText("Milk 2. 5L"), []);
   // A bare column gap is two numbers or one, and the page does not say which.
   assert.deepEqual(amountsInText("Total 10. 80"), []);
 
@@ -3051,11 +3056,14 @@ test("a bare run of digits never repairs onto a money field", { skip }, async (t
   ]);
 });
 
-/** A line that scales, beside a line that does not. */
+/** A line that scales, beside a line that does not. The amount stands alone,
+ * because a line with a word on it belongs to that word and is never repaired
+ * onto -- `Raised $2.5M` is the raise, whatever the line under it is called. */
 const ROUND_PAGE = [
   "THORNFIELD VENTURES", // 1
-  "Raised $2.5M", // 2
-  "Round summary", // 3
+  "Raised", // 2
+  "$2.5M", // 3
+  "Round summary", // 4
 ].join("\n");
 
 test("a scaled amount is not repaired from a number the page never prints", { skip }, async (t) => {
@@ -3071,7 +3079,7 @@ test("a scaled amount is not repaired from a number the page never prints", { sk
         // page: no line prints 2,500,000. A citation is moved to a line the
         // document prints the value on, and "prints" means the characters
         // that are there.
-        statement("total", "2,500,000", [3]),
+        statement("total", "2,500,000", [4]),
       ],
     }),
     ids,
@@ -3091,7 +3099,10 @@ test("a scaled amount copied as the page prints it still repairs", { skip }, asy
       summary: "Round summary.",
       statements: [
         statement("vendor", "THORNFIELD VENTURES", [1]),
-        statement("total", "$2.5M", [3]),
+        // Cited the line after the amount. The amount is alone on its line,
+        // the line on the far side of it is a label rather than another bare
+        // value, and no other line of the document prints it.
+        statement("total", "$2.5M", [4]),
       ],
     }),
     ids,
@@ -3102,6 +3113,238 @@ test("a scaled amount copied as the page prints it still repairs", { skip }, asy
     (await f.stored()).map((row) => [row.observation_key, row.value]),
   );
   assert.equal(stored.get("total").amount, "2500000");
+});
+
+// ---------------------------------------------------------------------------
+// ADM-5h re-review. Two more conditions on the repair, and the one accepted
+// reading that never recorded the lines it was read from.
+//
+// Every page below stored a value `main` refuses. Each test was verified to
+// fail against 59cd2f4 before the fix landed.
+// ---------------------------------------------------------------------------
+
+/** A receipt whose one item, its own label and the total are three lines.
+ * The item's amount is the only 8.00 on the page. */
+const ITEM_AND_SUBTOTAL_RECEIPT = [
+  "BRACKEN TOOLS", // 1
+  "Mallet 8.00", // 2
+  "Subtotal", // 3
+  "Total 28.00", // 4
+].join("\n");
+
+test("a line item's own amount is not repaired onto another field", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(
+    ITEM_AND_SUBTOTAL_RECEIPT,
+    "synthetic-repair-line-item",
+  );
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS", [1]),
+        statement("line_items", null, [2], {
+          line_items: [{ description: "Mallet", amount: "8.00", lines: [2] }],
+        }),
+        // One line from the mallet's amount, and the mallet's amount is not
+        // the subtotal. A receipt whose subtotal is unprinted has an
+        // unprinted subtotal.
+        statement("subtotal", "8.00", [3]),
+      ],
+    }),
+    ids,
+  );
+  // The vendor and the one item.
+  assert.equal(outcome.stored, 2);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "subtotal", reason: "value_not_in_quote" },
+  ]);
+});
+
+/** The same receipt in the layout the repair exists for: the item's label on
+ * one line and its amount, alone, on the next. Here the target *is* a bare
+ * value and its far neighbour *is* a label, so only the list's own claim on
+ * line 3 stands between the subtotal and the mallet's eight pounds. */
+const COLUMN_ITEM_RECEIPT = [
+  "BRACKEN TOOLS", // 1
+  "Mallet", // 2
+  "8.00", // 3
+  "Subtotal", // 4
+  "Total 28.00", // 5
+].join("\n");
+
+/** The statements of the column receipt above, in either order. A repair is
+ * resolved only after every statement has been read, so which of the two the
+ * model printed first may not change what is stored. */
+function columnItemStatements(listFirst) {
+  const list = statement("line_items", null, [2, 3], {
+    line_items: [{ description: "Mallet", amount: "8.00", lines: [2, 3] }],
+  });
+  const subtotal = statement("subtotal", "8.00", [4]);
+  return [
+    statement("vendor", "BRACKEN TOOLS", [1]),
+    ...(listFirst ? [list, subtotal] : [subtotal, list]),
+  ];
+}
+
+test("a list's line is occupied, and a citation is not repaired onto it", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(COLUMN_ITEM_RECEIPT, "synthetic-repair-list-line");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: columnItemStatements(true),
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 2);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "subtotal", reason: "value_not_in_quote" },
+  ]);
+});
+
+test("and it is occupied whichever statement the model printed first", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(COLUMN_ITEM_RECEIPT, "synthetic-repair-list-order");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: columnItemStatements(false),
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 2);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "subtotal", reason: "value_not_in_quote" },
+  ]);
+});
+
+test("an amount in a column of amounts is not repaired onto", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(COLUMN_TOTALS_RECEIPT, "synthetic-repair-stack");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS LTD.", [1, 2]),
+        // Lines 9, 10 and 11 are `Subtotal`, `Tax` and `Total`; lines 12, 13
+        // and 14 are 20.00, 1.60 and 21.60. The line after `Total` is the
+        // subtotal's amount, and the only thing that says so is counting.
+        // A page whose total is 21.60 stored a total of 20.00.
+        statement("total", "20.00", [11]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "total", reason: "value_not_in_quote" },
+  ]);
+});
+
+/** A receipt that prints one label alone and the next with its amount. */
+const LABELLED_NEIGHBOUR_RECEIPT = [
+  "BRACKEN TOOLS", // 1
+  "Subtotal", // 2
+  "Tax 1.60", // 3
+  "Total 21.60", // 4
+].join("\n");
+
+test("a line that names its own field is not repaired onto", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(
+    LABELLED_NEIGHBOUR_RECEIPT,
+    "synthetic-repair-labelled",
+  );
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS", [1]),
+        // The 1.60 one line away is the tax, and the line says so. A
+        // subtotal read off it is a tax stored as a subtotal, and the page
+        // never printed a subtotal at all.
+        statement("subtotal", "1.60", [2]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "subtotal", reason: "value_not_in_quote" },
+  ]);
+});
+
+/** A service invoice whose invoice number is one line from the odometer
+ * label, which is the shape that turned an invoice number into mileage. */
+const SERVICE_INVOICE = [
+  "FERNDALE MOTORS", // 1
+  "Invoice 48210", // 2
+  "Odometer", // 3
+  "Brake pads replaced", // 4
+].join("\n");
+
+test("an identifier beside a number's label is not repaired onto", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(SERVICE_INVOICE, "synthetic-repair-odometer");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "vehicle_service_receipt",
+      summary: "Brake service.",
+      statements: [
+        statement("vendor", "FERNDALE MOTORS", [1]),
+        // A bare run of digits can never repair onto a *money* field, and
+        // this is the other half: a number field takes one, and the line it
+        // sits on says the digits are an invoice number.
+        statement("odometer_miles", 48210, [3]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "odometer_miles", reason: "value_not_in_quote" },
+  ]);
+});
+
+/** A K-1 cover page, printing a page number and a box in the two places a
+ * number field's label would look for its value. */
+const K1_LABEL_PAGE = [
+  "THORNFIELD ORCHARD PARTNERS LP", // 1
+  "Page 2023", // 2
+  "Tax year", // 3
+  "Profit share", // 4
+  "12 Section 179 deduction", // 5
+].join("\n");
+
+test("a year and a box number are not repaired onto their neighbours", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(K1_LABEL_PAGE, "synthetic-repair-k1-labels");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "schedule_k1",
+      summary: "Partnership K-1.",
+      statements: [
+        statement("partnership", "THORNFIELD ORCHARD PARTNERS LP", [1]),
+        // `Page 2023` is a page number beside a year's label.
+        statement("tax_year", 2023, [3]),
+        // `12 Section 179 deduction` is a box number beside a percentage's
+        // label, and the line prints two numbers besides.
+        statement("profit_share_percent", 12, [4]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "profit_share_percent", reason: "value_not_in_quote" },
+    { field_name: "tax_year", reason: "value_not_in_quote" },
+  ]);
 });
 
 /** A letter that prints a whole date, a year and another year. */

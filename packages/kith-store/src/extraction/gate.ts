@@ -842,9 +842,24 @@ export function amountsInText(
   text: string,
   options?: AmountScanOptions,
 ): string[] {
+  return scanAmounts(text, options).found.map((one) => one.amount);
+}
+
+/** One amount the finder offered, and where it stands in the normalized
+ * text. The span covers everything the amount owns -- its sign, its
+ * parentheses, its currency mark or code, and a `CR`/`DR` marker -- which is
+ * what lets {@link statesOnlyOneAmount} ask what is left of the line. */
+type FoundAmount = { start: number; end: number; amount: string };
+
+/** The finder proper. {@link amountsInText} is this with the positions
+ * dropped, which is all every existing caller wants. */
+function scanAmounts(
+  text: string,
+  options?: AmountScanOptions,
+): { normalized: string; found: FoundAmount[] } {
   const normalized = closeColumnGaps(foldAmountText(text));
   const ordinal = listOrdinalStart(normalized, options);
-  const found: string[] = [];
+  const found: FoundAmount[] = [];
   let at = 0;
   while (at < normalized.length) {
     if (!/\d/.test(normalized[at]!)) {
@@ -866,14 +881,64 @@ export function amountsInText(
         // `CR` says the amount is a credit, not that its sign flips: a line
         // printing "(1,234.56) CR" says the same thing twice, and negating
         // twice made it a charge.
-        found.push(span.credit ? negative(amount) : amount);
+        found.push({
+          start: span.start,
+          end: span.end,
+          amount: span.credit ? negative(amount) : amount,
+        });
       }
     }
     // Past the whole span, parsed or not. Re-entering a span that failed is
     // exactly how a fragment gets offered.
     at = Math.max(span.end, at + 1);
   }
-  return found;
+  return { normalized, found };
+}
+
+/**
+ * What a line may print beside its one amount and still print nothing else.
+ *
+ * Whitespace, dot leaders, cell rules and sentence punctuation. No letter and
+ * no digit: a word beside a number is a label, and a label is what tells a
+ * reader which field the number belongs to. That is the whole point of
+ * {@link statesOnlyOneAmount} -- a line with a label on it belongs to its own
+ * label, and a citation may not be moved onto it.
+ */
+const VALUE_ONLY_RESIDUE =
+  /^[\s\u200b\u200c\u200d\u2060\ufeff.,;:!?*_=~+\-\u2013\u2014()[\]{}|\u00a6\u2502\u2503\u2551"\u201c\u201d\u201e'\u2019\u00b7\u2022\u2026\\/]*$/u;
+
+/**
+ * Whether the line prints one amount and nothing else a reader could read.
+ *
+ * The line is scanned exactly as the finder scans it, the one span it offered
+ * is removed whole -- sign, parentheses, currency mark or code, `CR`/`DR` --
+ * and what is left has to be whitespace and neutral punctuation. A `%` beside
+ * the amount goes with it for the `number` value type, which is the one type
+ * for which a percent sign cannot change what the number is.
+ *
+ * This exists for the citation repair in `extraction/model.ts` and for
+ * nothing else. A repair moves a field's citation onto a neighbouring line,
+ * and the question it has to answer is "does this line belong to the field
+ * that cited it, or to a label of its own". `Tax 1.60` next to `Subtotal`
+ * answers it: the line names its own field, and a subtotal read off it is a
+ * tax stored as a subtotal.
+ */
+export function statesOnlyOneAmount(
+  text: string,
+  options?: AmountScanOptions,
+): boolean {
+  const { normalized, found } = scanAmounts(text, options);
+  if (found.length !== 1) return false;
+  const one = found[0]!;
+  let tail = normalized.slice(one.end);
+  if (options?.percentIsNeutral) {
+    // One percent sign, and only the one pressed against the amount. A
+    // `number` is dimensionless, so `12 %` is the same twelve as `12`; every
+    // other value type refuses the line instead.
+    const mark = afterGap(tail, 0);
+    if (tail[mark] === "%") tail = tail.slice(0, mark) + tail.slice(mark + 1);
+  }
+  return VALUE_ONLY_RESIDUE.test(normalized.slice(0, one.start) + tail);
 }
 
 /** A numbered list's ordinal: digits at the very start of a line, then `.`
@@ -902,6 +967,13 @@ function listOrdinalStart(
   return match ? match[1]!.length : -1;
 }
 
+/** What may stand after the cents for a one-space gap at the point to be a
+ * rendering artifact: nothing, a gap, or a mark that cannot be part of a
+ * number or change one. A digit, a letter, a point or a sign each say the run
+ * is something other than cents. */
+const AFTER_CENTS =
+  "(?:$|[\\s\\u200b\\u200c\\u200d\\u2060\\ufeff,;!?*\"\\u201d)\\]}|\\u00a6\\u2502\\u2503\\u2551])";
+
 /**
  * A parsed receipt prints "$ 165 .00" as readily as "$165.00": the space is a
  * rendering artifact of the column the amount sat in, not a separator. Closed
@@ -919,6 +991,14 @@ function listOrdinalStart(
  * is not minus 82.129961 and `$94. 504. billion` is not ninety-four and a
  * half billion. Every one of those now reads as the ambiguous pair it is,
  * and the finder offers neither side.
+ *
+ * **And the two digits have to end there.** A gap, the end of the line, or a
+ * mark that cannot belong to a number. Anything else and the run is not
+ * cents: a letter makes it a box label or a magnitude (`$6. 25a` read as
+ * 6.25, `$5. 25b` as five and a quarter billion), a second point makes it the
+ * first half of something longer, and a sign makes it a ledger's own
+ * (`€642. 73.-` read as a credit of 642.73). None of those numbers is on
+ * the page, and each of them now reads as the ambiguous pair it is.
  */
 function closeColumnGaps(text: string): string {
   return text
@@ -931,7 +1011,7 @@ function closeColumnGaps(text: string): string {
     )
     .replace(
       new RegExp(
-        `(${CURRENCY_MARK})([ \\u00a0]*)(\\d+\\.)[ \\u00a0](?=\\d\\d(?!\\d))`,
+        `(${CURRENCY_MARK})([ \\u00a0]*)(\\d+\\.)[ \\u00a0](?=\\d\\d${AFTER_CENTS})`,
         "g",
       ),
       "$1$2$3",
@@ -1333,6 +1413,15 @@ function neutralNeighbour(
       if (digits !== undefined) {
         if (digits.from <= 0 && cutOn(-1)) return false;
         if (digits.to >= text.length && cutOn(1)) return false;
+        // A **point** pressed against this span, with a digit reachable
+        // through it, is a decimal point as readily as a full stop. That is
+        // the whole reason `12,345. 80` and `5. 25` offer nothing: the line
+        // says one number to one reader and two to another. Until the ADM-5h
+        // re-review this leaned on the pasted region failing to parse, which
+        // proves the two are separate only when the other one is readable --
+        // so `$780. 554a` offered 780 for a line that may well print 780.554,
+        // and `USD 6. 9a` offered 6. The shape settles it without asking.
+        if (unit === "." && hops === 0) return false;
         return !joinsIntoOneAmount(text, span, digits);
       }
       // No digit through it, so it is punctuation -- and punctuation is not a

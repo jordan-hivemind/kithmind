@@ -928,6 +928,29 @@ const QUOTE_SPEC = [
   ["$ 165 .00", ["165"]],
   ["$82. 12 due", ["82.12"]],
   ["$94. 50 total", ["94.5"]],
+  // ADM-5h re-review: and the cents have to end there. A letter after them
+  // makes the run a box label or a magnitude, a second point makes it the
+  // first half of something longer, and a sign makes it a ledger's own.
+  // `$6. 25a` read as 6.25, `$5. 25b` as five and a quarter billion, and
+  // `€642. 73.-` as a credit of 642.73; the page prints none of them.
+  ["$6. 25a", []],
+  ["$5. 25b", []],
+  ["€642. 73.-", []],
+  ["$5. 25-", []],
+  // The extended fuzz found the rest of that class on its own: a point
+  // pressed against a whole dollar, with a digit reachable through it, is a
+  // decimal point as readily as a full stop -- whether or not the run beyond
+  // it can be priced. `$780. 554a` offered 780 for a line that may well
+  // print 780.554, and `USD 6. 9a` offered 6.
+  ["$780. 554a", []],
+  ["USD 6. 9a", []],
+  ["£792354. 586a", []],
+  // A gap, the end of the line, or a mark that cannot be part of a number
+  // still closes the gap, because that is the column artifact the rule is
+  // for.
+  ["$6. 25", ["6.25"]],
+  ["Total $6. 25, paid", ["6.25"]],
+  ["| $6. 25 |", ["6.25"]],
 
   // A list ordinal counts nothing and is worth nothing. Digits at the very
   // start of a line, then `.` or `)`, then a space and a word, are a bullet,

@@ -561,7 +561,9 @@ function makeCase(random) {
  * number is no answer at all.
  *
  * ADM-5h review found both halves: `$82. 129961.-` read as minus 82.129961
- * and `$94. 504. billion` as ninety-four and a half billion.
+ * and `$94. 504. billion` as ninety-four and a half billion. The re-review
+ * found the third: two digits are cents only when the run ends there, so
+ * `$6. 25a` is not 6.25 and `€642. 73.-` is not a credit of 642.73.
  */
 function makeCurrencyGap(random) {
   const mark = random.pick([
@@ -575,15 +577,41 @@ function makeCurrencyGap(random) {
   ]);
   const whole = random.digits(1 + random.int(6));
   const right = random.digits(1 + random.int(6), true);
-  // Nothing after the number that could sign or scale it: a trailing minus
-  // and a magnitude word are both legitimate readings of their own, and a
-  // generator that printed one would be pricing a token it did not mean.
-  const tail = random.pick(["", " due", " total", "."]);
-  const text = random.chance(0.4)
-    ? `${mark}${whole} .${right}${tail}`
-    : `${mark}${whole}. ${right}${tail}`;
+  // The gap before the point. Nothing after the number that could sign or
+  // scale it: a trailing minus and a magnitude word are both legitimate
+  // readings of their own, and a generator that printed one would be pricing
+  // a token it did not mean.
+  if (random.chance(0.4)) {
+    const tail = random.pick(["", " due", " total", "."]);
+    const text = `${mark}${whole} .${right}${tail}`;
+    const value =
+      right.length === 2
+        ? truthOf({ whole, fraction: right, magnitude: 0, negative: false })
+        : undefined;
+    return { text, tokens: [{ text, value, signKind: "none" }] };
+  }
+  // The gap after the point, where what follows the right-hand run decides
+  // as much as its width does. Two digits are cents only when the run *ends*
+  // there: a letter after them makes it a box label or a magnitude, a second
+  // point makes it the first half of something longer, and a sign makes it a
+  // ledger's own. `$6. 25a`, `$5. 25b` and `€642. 73.-` each read as a
+  // number the page does not print, and the generator prices none of them --
+  // the only reading that cannot be wrong is no reading at all.
+  const tail = random.pick([
+    "",
+    " due",
+    " total",
+    "a",
+    "b",
+    ".",
+    ".-",
+    "-",
+    "+",
+  ]);
+  const ends = tail === "" || tail.startsWith(" ");
+  const text = `${mark}${whole}. ${right}${tail}`;
   const value =
-    right.length === 2
+    right.length === 2 && ends
       ? truthOf({ whole, fraction: right, magnitude: 0, negative: false })
       : undefined;
   return { text, tokens: [{ text, value, signKind: "none" }] };

@@ -79,12 +79,14 @@ import { seedDocumentTypes } from "./seed.js";
 import { sweepUnreferencedExtractionSpans } from "./spanSweep.js";
 import {
   amountsInText,
+  statesOnlyOneAmount,
   candidatesFor,
   checkLineItem,
   foldTextForMatch,
   checkValue,
   readLineItems,
   valueSignature,
+  type AmountScanOptions,
   type Candidate,
   type DateOrder,
   type GateSuccess,
@@ -910,7 +912,7 @@ function isMoneyShaped(value: unknown): boolean {
  * A K-1's dense boxes put the model one line off its value seven times in
  * the backfill, and each of those readings was right about the number. This
  * is the only rule in this file that **relaxes** a check, so every condition
- * below is a refusal and all six have to fail before a citation moves.
+ * below is a refusal and all eight have to fail before a citation moves.
  *
  * - The statement cited no line ids. The legacy quote path has no ids, so
  *   "one line off" means nothing there.
@@ -925,6 +927,16 @@ function isMoneyShaped(value: unknown): boolean {
  *   them is a guess.
  * - Any other line of the whole document states it. A value printed twice
  *   gives no way to say which line states it, on this page or the next.
+ * - The target prints anything besides that one value. A line with a word on
+ *   it belongs to that word: `Tax 1.60` next to `Subtotal` stored a subtotal
+ *   of 1.60, and `Invoice 48210`, `Page 2023` and a K-1's
+ *   `12 Section 179 deduction` each stored a number for the field on the
+ *   line beside them.
+ * - The target's neighbour on the side away from the citation is itself a
+ *   bare value. Then the page prints a column of values, and which of them
+ *   the citation meant is arithmetic on line numbers rather than something
+ *   the document states: `Subtotal`, `Tax`, `Total`, `20.00`, `1.60`,
+ *   `21.60` stored a total of 20.00 from a page whose total is 21.60.
  *
  * The caller adds the two conditions that need the rest of the reply: a line
  * another accepted statement already points at, and a line two statements
@@ -956,6 +968,32 @@ function repairTarget(
   );
   if (carrying.length !== 1) return null;
   const target = carrying[0]!;
+  const scanOf = (line: PageLine): AmountScanOptions => ({
+    ...scan,
+    ...(line.cutStart ? { cutStart: true as const } : {}),
+    ...(line.cutEnd ? { cutEnd: true as const } : {}),
+  });
+  // The target has to be a value and nothing else. A line that prints a word
+  // beside its amount belongs to that word: `Tax 1.60` is the tax, whatever
+  // the line above it is called, and a subtotal read off it is a tax stored
+  // as a subtotal. `Invoice 48210` beside `Odometer`, `Page 2023` beside
+  // `Tax year` and a K-1's `12 Section 179 deduction` beside `Profit share`
+  // are the same document four more times.
+  if (!statesOnlyOneAmount(target.text, scanOf(target))) return null;
+  // And it may not be one of a stack of values. A column receipt prints its
+  // labels together and its amounts together, so the line after `Total` is
+  // the *subtotal's* amount as often as the total's, and the only thing that
+  // says which is counting -- which is the guess this rule exists to refuse.
+  // The neighbour on the side away from the citation settles it: a label
+  // there means the amounts are interleaved with their labels and the
+  // citation missed by one; another bare value there means the page has a
+  // column of them and nothing points into it.
+  const citedIds = new Set(cited.map((one) => one.id));
+  for (const neighbour of page.lines) {
+    if (Math.abs(neighbour.id - target.id) !== 1) continue;
+    if (citedIds.has(neighbour.id)) continue;
+    if (statesOnlyOneAmount(neighbour.text, scanOf(neighbour))) return null;
+  }
   for (const other of loaded.pages) {
     for (const line of other.lines) {
       if (other.shown === page.shown && line.id === target.id) continue;
@@ -1162,6 +1200,11 @@ type GatedLineItems = {
   values: ObservationValue[];
   spanIds: string[];
   valueKeys: string[];
+  /** Every page line an accepted entry's amount was read from. A list is the
+   * only reading that can occupy a dozen lines at once, and until ADM-5h it
+   * occupied none of them: a repair moved another field's citation straight
+   * onto an item's own line. */
+  lineIds: number[];
   /** The sum of the entries that passed. A partial list must not be compared
    * against a stated total, so the caller only carries this when nothing
    * failed. */
@@ -1214,6 +1257,7 @@ async function gateLineItems(
     values: [],
     spanIds: [],
     valueKeys: [],
+    lineIds: [],
     quote: "",
     failed: 1,
     total: 1,
@@ -1232,6 +1276,7 @@ async function gateLineItems(
   const values: ObservationValue[] = [];
   const spanIds: string[] = [];
   const valueKeys: string[] = [];
+  const lineIds: number[] = [];
   const perLine = new Map<number, number>();
   let itemsTotal = "0";
   let currencyAssumed: true | undefined;
@@ -1291,6 +1336,9 @@ async function gateLineItems(
     }
     values.push(checked.value);
     spanIds.push(spanId);
+    // The lines this entry's amount was really read from, so no other
+    // field's citation can be repaired onto one of them.
+    for (const id of linesCovered(page, checked.span)) lineIds.push(id);
     const seenOnLine = perLine.get(checked.lineId) ?? 0;
     perLine.set(checked.lineId, seenOnLine + 1);
     valueKeys.push(
@@ -1305,6 +1353,7 @@ async function gateLineItems(
     values,
     spanIds,
     valueKeys,
+    lineIds,
     ...(failed === 0 ? { itemsTotal } : {}),
     ...(currencyAssumed ? { currencyAssumed } : {}),
     quote,
@@ -1547,6 +1596,17 @@ async function prepare(
         });
       }
       if (listed.values.length > 0) {
+        // A list occupies the lines it was read from, exactly as `accept`
+        // does for every other field. Until ADM-5h it occupied none of them,
+        // and a repair moved another field's citation straight onto an
+        // item's own line: a receipt printing `Mallet 8.00`, `Subtotal` and
+        // `Total 28.00` stored a subtotal of 8.00 off the mallet. Repairs
+        // are resolved only after this loop has seen every statement, so a
+        // list that arrives after the statement that would move onto it
+        // blocks that move just as surely as one that arrives before.
+        for (const id of listed.lineIds) {
+          occupied.add(`${page.shown}|${id}`);
+        }
         accepted.push({
           field,
           page: statement.page,

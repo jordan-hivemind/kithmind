@@ -311,7 +311,7 @@ their exact reading.
 A dense form puts a model one line off its value, so a money or number value
 on none of the cited lines may be stored from a line **next to** one of them.
 This is the only rule in the round that relaxes a check, so it is fenced on
-every side. All eight of these have to hold:
+every side. All ten of these have to hold:
 
 | Condition | Why |
 | --- | --- |
@@ -322,7 +322,16 @@ every side. All eight of these have to hold:
 | The target is within one line id of **every** cited line, on the cited page | One off is the miss this exists for; further is a search of the page |
 | Exactly one line of that window states the value | Choosing between two is a guess |
 | No other line of the **whole document** states it | A value printed twice says nothing about which line states it |
-| No other statement of the run was read from that line, and no second statement would repair onto it | One printed number is one field's |
+| The target line prints that one value and nothing else | A line with a word on it belongs to that word: `Tax 1.60` beside `Subtotal`, `Invoice 48210` beside `Odometer`, `Page 2023` beside `Tax year` and a K-1's `12 Section 179 deduction` beside `Profit share` each stored the neighbour's number |
+| The target's neighbour on the side away from the citation is not itself a bare value | A page that prints its labels together and its amounts together says which amount is which by counting, and counting is the guess this rule refuses: `Subtotal`/`Tax`/`Total` over `20.00`/`1.60`/`21.60` stored a total of 20.00 |
+| No other statement of the run was read from that line, and no second statement would repair onto it | One printed number is one field's. A `line_item_list` occupies the lines its entries were read from, like every other accepted reading, and repairs are resolved only after every statement of the reply has been read, so the order the model printed them in cannot change what is stored |
+
+"Prints that one value and nothing else" means exactly one amount is offered
+for the line and what is left after removing it -- its sign, its parentheses,
+its currency mark or code, a `CR`/`DR` marker, and a percent sign for a
+`number` field -- is whitespace and neutral punctuation. A `CR` the scanner
+does not read as part of the amount leaves letters behind, so the repair
+refuses.
 
 The value stores with the repaired evidence span, so the citation the owner
 sees is the line that prints it. Any condition failing leaves the original
@@ -375,10 +384,16 @@ is the last character of the digits: anything digit-like after it, across any
 gap, makes the point a decimal point instead, and a line printing
 `12,345.   80` offers neither number because it says 12,345.80 as readily as
 it says two cells. For the same reason a rendering space inside a number is
-closed up only when it is a single space **and only before exactly two
-digits**: cents are two digits and nothing else is, so `$82. 129961` and
-`$94. 504. billion` are the ambiguous pairs they look like rather than minus
-82.129961 and ninety-four and a half billion.
+closed up only when it is a single space, **only before exactly two digits**,
+and **only when those two digits end the run** -- a gap, the end of the line,
+or a mark that cannot belong to a number. Cents are two digits and nothing
+else is, so `$82. 129961` and `$94. 504. billion` are the ambiguous pairs
+they look like rather than minus 82.129961 and ninety-four and a half
+billion; and a letter, a second point or a sign after the two digits says the
+run is a box label, a magnitude or a ledger's own sign rather than cents, so
+`$6. 25a`, `$5. 25b` and `€642. 73.-` offer nothing. A point pressed against a
+whole dollar with a digit reachable through it makes the line ambiguous
+whatever stands beyond it, which is how `$780. 554a` offered 780.
 
 **A list ordinal offers nothing (ADM-5h).** Digits at the start of a line,
 then `.` or `)`, then a space and a word, are a bullet: `1. Rent 500.00`
