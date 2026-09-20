@@ -1,5 +1,5 @@
 // The owner's overrides of a finance account's descriptive fields (ADM-2b,
-// migration 033). The archive keeps the adapter's values; these sit beside
+// migration 035). The archive keeps the adapter's values; these sit beside
 // them and win on screen. See the migration for why they are not written into
 // the archive.
 //
