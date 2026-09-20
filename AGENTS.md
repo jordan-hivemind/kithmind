@@ -64,6 +64,18 @@ cleanup. Every agent reads this section before starting.
 | Finish cleanly | Run the four checks. Remove containers and your own scratch files. Tell the owner the PR is ready. The orchestrator removes your worktree and branch at merge. |
 | Do not read the owner's data | No document text, database values or files under the watched folders. Counts, enums and booleans only. Use synthetic fixtures. |
 
+### Waiting costs tokens
+
+Every model turn re-reads the whole conversation. An agent that checks
+"is CI done yet?" twenty times pays for its context twenty times.
+
+| Do | Do not |
+| --- | --- |
+| Wait inside ONE background shell command that loops and sleeps on its own (for example a script that polls `gh pr view` until the three checks finish, then merges). The model is woken once, when it exits. | Check status turn after turn, or run `sleep` in the foreground between model turns. |
+| Sub-agents: push, open the PR, report, stop. The orchestrator gates CI. | Sub-agents waiting for CI or for another agent. |
+| Hand long jobs (backfills, builds, deploys) to a background command and carry on with other work. | Scheduled wake-ups or loops "to see if anything changed". Act when a job finishes or the owner speaks. |
+| Start a fresh orchestrator session every day or two. The tracker and handoff files carry the state. | One endless conversation that carries every topic. |
+
 To get a side-lane PR shipped, the owner tells the orchestrator "ship PR <n>".
 
 UI work follows [`docs/ui-style.md`](docs/ui-style.md).
