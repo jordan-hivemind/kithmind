@@ -307,6 +307,43 @@ line; only a text field may span two adjacent cited ones, and only a text
 field is matched case- and punctuation-folded. Money, numbers and dates keep
 their exact reading.
 
+**One repair, one line, and only where the page leaves no choice (ADM-5h).**
+A dense form puts a model one line off its value, so a money or number value
+on none of the cited lines may be stored from a line **next to** one of them.
+This is the only rule in the round that relaxes a check, so it is fenced on
+every side. All ten of these have to hold:
+
+| Condition | Why |
+| --- | --- |
+| The statement cited line ids | The older quote shape has none, so "one line off" means nothing there |
+| The field is money or number | Dates and text are never repaired |
+| A money value carries a decimal point or a currency mark | A bare run of digits is a suite number, a tax year or a page number, and each of those stored a wrong total end to end |
+| No cited line states a value of that type | Then the model contradicted its own citation rather than missing by a line: `Fee 100.00` cited as a total of 250.00 |
+| The target is within one line id of **every** cited line, on the cited page | One off is the miss this exists for; further is a search of the page |
+| Exactly one line of that window states the value | Choosing between two is a guess |
+| No other line of the **whole document** states it | A value printed twice says nothing about which line states it |
+| The target line prints that one value and nothing else | A line with a word on it belongs to that word: `Tax 1.60` beside `Subtotal`, `Invoice 48210` beside `Odometer`, `Page 2023` beside `Tax year` and a K-1's `12 Section 179 deduction` beside `Profit share` each stored the neighbour's number |
+| The target's neighbour on the side away from the citation is not itself a bare value | A page that prints its labels together and its amounts together says which amount is which by counting, and counting is the guess this rule refuses: `Subtotal`/`Tax`/`Total` over `20.00`/`1.60`/`21.60` stored a total of 20.00 |
+| No other statement of the run was read from that line, and no second statement would repair onto it | One printed number is one field's. A `line_item_list` occupies the lines its entries were read from, like every other accepted reading, and repairs are resolved only after every statement of the reply has been read, so the order the model printed them in cannot change what is stored |
+
+"Prints that one value and nothing else" means exactly one amount is offered
+for the line and what is left after removing it -- its sign, its parentheses,
+its currency mark or code, a `CR`/`DR` marker, and a percent sign for a
+`number` field -- is whitespace and neutral punctuation. A `CR` the scanner
+does not read as part of the amount leaves letters behind, so the repair
+refuses.
+
+The value stores with the repaired evidence span, so the citation the owner
+sees is the line that prints it. Any condition failing leaves the original
+`value_not_in_quote` correction, with the citation the model gave.
+
+**A blank optional field is a field the document does not state (ADM-5h).** A
+statement whose value is empty, whitespace or null is dropped for an optional
+field and opens no item, because that is what leaving the field out would have
+meant. A required field still opens one. Anything the box actually prints is a
+reading and goes to the gate: `0` and `0.00` are amounts, and `-` and `N/A`
+are refused rather than read as zero.
+
 The amount grammar is one explicit rule, written out in
 `packages/kith-store/src/extraction/gate.ts` and pinned by a table in
 `test/extractionGate.test.mjs` that holds every adversarial input the reviews
@@ -339,6 +376,32 @@ A tax or status flag is a separate rule: one letter from a small documented
 set, exactly two decimal places, and nothing after it. `K`, `M` and `B` are
 not in that set, and a lone `C` is refused rather than dropped, because a
 credit marker silently removed loses a sign.
+
+**A whole dollar may print its decimal point with no cents after it
+(ADM-5h).** A tax form prints every filled box that way, so `5.`, `12,345.`
+and `(9,999.)` read as 5, 12345 and -9999. The point is dropped only when it
+is the last character of the digits: anything digit-like after it, across any
+gap, makes the point a decimal point instead, and a line printing
+`12,345.   80` offers neither number because it says 12,345.80 as readily as
+it says two cells. For the same reason a rendering space inside a number is
+closed up only when it is a single space, **only before exactly two digits**,
+and **only when those two digits end the run** -- a gap, the end of the line,
+or a mark that cannot belong to a number. Cents are two digits and nothing
+else is, so `$82. 129961` and `$94. 504. billion` are the ambiguous pairs
+they look like rather than minus 82.129961 and ninety-four and a half
+billion; and a letter, a second point or a sign after the two digits says the
+run is a box label, a magnitude or a ledger's own sign rather than cents, so
+`$6. 25a`, `$5. 25b` and `€642. 73.-` offer nothing. A point pressed against a
+whole dollar with a digit reachable through it makes the line ambiguous
+whatever stands beyond it, which is how `$780. 554a` offered 780.
+
+**A list ordinal offers nothing (ADM-5h).** Digits at the start of a line,
+then `.` or `)`, then a space and a word, are a bullet: `1. Rent 500.00`
+offers 500 and not 1. A leading number with no mark after it is a quantity as
+often as a bullet -- `12 Mill Lane` -- so the rule stops where its shape
+stops, and a box number is still offered. The gate is a whitelist and an
+extra candidate costs nothing; a bare run of digits can never repair a
+citation onto a money field either way.
 
 Each entry of a `line_item_list` carries its own citation and is gated on its
 own: its amount must occur within one cited line, its description folds like
@@ -378,6 +441,14 @@ field names only: operators debug extraction without reading the documents.
 | `KITH_EXTRACT_API_KEY` | daemon environment | Falls back to `OPENAI_API_KEY` on the default endpoint. |
 | per-kind model | `document_types.examples`, an element `{"setting": "extraction_model", "value": "<model>"}` | That kind is read with that model. A kind without one uses the default. A model the provider refuses falls back to the default for that run and opens one `extraction_model_refused` item. |
 | per-kind date order | `document_types.examples`, an element `{"setting": "date_order", "value": "MDY"}` or `"DMY"` | How that kind writes an all-numeric date. |
+| per-kind page bound | `document_types.examples`, an element `{"setting": "max_pages", "value": "25"}` or `{"setting": "max_pages", "value": 25}` | How many pages of a document of that kind the model is shown, in place of the default 12. Capped at 60; a value past the cap, or one that is not a whole number, reads as unset rather than being clamped. |
+| per-kind character bound | `document_types.examples`, an element `{"setting": "max_chars", "value": "120000"}` | The same for characters, in place of the default 60,000. Capped at 400,000. |
+
+A per-kind bound costs the same extra call a per-kind model does, and for the
+same reason: the kind is not known until the reply names it, so a first pass
+that was cut short is read again with the wider bound. Both passes and the
+stored result see the same page list, so a citation to a page the model was
+shown always resolves.
 
 A per-kind override costs one extra call the first time a document is read,
 because the kind is not known until the reply names it; a re-extraction knows
@@ -385,6 +456,48 @@ the kind already and costs one call. Nothing here picks a model.
 
 Two-digit years in a printed date expand 00-69 to the 2000s and 70-99 to the
 1900s.
+
+**A date the document only half prints is stored as half a date (ADM-5h).** A
+tax letter that states `2024`, and a cover letter that states `March 2024`,
+used to lose their date entirely to `date_unparsable`. Both now store, with
+the precision they were printed at: a year keeps `YYYY`, a month keeps
+`YYYY-MM`, and `precision` on the stored value says which. **Nothing is
+padded.** A full day keeps exactly the shape every stored date has had, with
+no `precision` key, so no existing reader changes. A partial date dates no
+event: `occurrence_date` holds a calendar day, so a document whose only date
+is a year stays undated rather than being filed under the first of January.
+
+A partial date is checked against its cited line for exactly the parts it
+claims. A year has to be printed **as a year**: between 1900 and 2100, with a
+digit run of its own, and with nothing glued to its left but a `FY`, `CY` or
+`TY` prefix -- so `98101-2024`, `(206) 555-2024`, `x2024`, `1099-2024` and a
+copyright sign are not years. One space to its left, a currency mark or an
+ISO code makes it money (`$ 2024`, `USD 2024`) and a label such as `Rev.` or
+`Form` makes it a revision or a form number; a street word to its right makes
+it a house number (`2024 Main Street`). A whole date printed on the line
+states its year too, which is the one way a year reads through a slash.
+
+A month and a year have to be printed together, adjacent, and the pair has to
+**open the line or follow a word that introduces a date**, or `Ratio 3/2024`,
+`Pages 3-2024` and `You may 2024` would each file a document under a month
+nobody wrote. A numeric month and year are read through the kind's
+`date_order` like any other date. A two-digit year is refused for a
+partial date, because `March 24` is March 2024 and the twenty-fourth of March
+at once and there is no third part to settle it, and two numbers with no year
+among them (`03/04`) are refused for the same reason.
+
+**A re-extraction never downgrades an exact date (ADM-5h).** Extraction
+replaces a document's observations on every run, and a model reads the same
+page differently from one run to the next. When a run offers only a year or
+only a month and a year for a field that already holds a full day, and the
+stored day begins with what the new run read, the stored day and **its own
+evidence** are kept, and it goes on dating the event. A partial date that
+contradicts the stored one -- a different year, or a different month --
+replaces it, because then the two runs disagree about the document and
+keeping the old day would store a date this run does not support. The kept
+day never borrows the new run's citation: the line the new run cited prints a
+year, and hanging a day off it would be the fabricated citation the gate
+exists to prevent.
 
 An all-numeric date whose first two numbers could both be a month is read only
 when the kind sets `date_order`. `01/02/26` is the first of February or the
@@ -396,6 +509,7 @@ overwhelmingly US, so `MDY` is the likely setting, but it is the owner's to
 make per kind.
 
 A space inside a number is closed up only next to a currency symbol or an ISO
-code, so `$ 165 .00` reads as one amount while `APPLES 12 .99` stays a quantity
-beside a price. A column-rendered amount with no currency mark beside it opens
-a correction instead, which is the cheaper of the two errors.
+code, and only one space, so `$ 165 .00` reads as one amount while
+`APPLES 12 .99` stays a quantity beside a price. A column-rendered amount with
+no currency mark beside it opens a correction instead, which is the cheaper of
+the two errors.

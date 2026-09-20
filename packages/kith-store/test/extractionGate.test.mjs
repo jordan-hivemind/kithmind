@@ -588,11 +588,28 @@ const AMOUNT_SPEC = [
   // Grouping this grammar does not claim to read, refused rather than guessed.
   ["1,23,456.00", undefined],
   [".5", undefined],
-  // A trailing separator is punctuation the line put after the number, so
-  // the finder drops it and reads the number. The scanner is stricter about
-  // a *value*, and ADM-5h moves these two rows to `5` and `12345`.
-  ["5.", undefined, ["5"]],
-  ["12,345.", undefined, ["12345"]],
+  // ADM-5h: a whole dollar printed with the point still there and no cents
+  // after it. A tax form prints every box this way, and both sides read it
+  // now -- the finder already dropped the trailing separator as punctuation,
+  // and the scanner no longer refuses the value the model copies off the
+  // page.
+  ["5.", "5"],
+  ["12,345.", "12345"],
+  ["-9,999.", "-9999"],
+  ["(12,345.)", "-12345"],
+  ["$12,345.", "12345"],
+  ["12,345. USD", "12345"],
+  ["0.", "0"],
+  // A sentence's full stop is the same character in the same place, and the
+  // number before it reads the same way.
+  ["42.00.", "42"],
+  // A point with digits after it is a decimal point, however wide the gap:
+  // the column artifact rule (`$ 165 .00`) owns this shape and reads one
+  // value, so the trailing-dot rule never sees it. The *finder* offers
+  // neither number, because a line printing this says 5.25 as readily as it
+  // says 5 and 25.
+  ["5. 25", "5.25", []],
+  ["12,345. 80", "12345.8", []],
   ["١٫٥", undefined],
   ["１２．９９", "12.99"],
   ["＄12.99", "12.99"],
@@ -882,6 +899,76 @@ const QUOTE_SPEC = [
   ["Total 10. 80", []],
   ["20.00      1.60   21.60", ["20", "1.6", "21.6"]],
   ["Total 12.99", ["12.99"]],
+
+  // ADM-5h: whole dollars printed with a trailing point, as a tax form
+  // prints every box. The line reads the number when nothing digit-like
+  // follows the point, and offers nothing at all when something does --
+  // across any gap, because `12,345.      80` is one amount to one reader
+  // and two cells to another and the page does not say which.
+  // The box number is a number the line prints, so the finder offers it too.
+  // The gate is a whitelist: an extra candidate on the line costs nothing,
+  // and the model's value still has to be one of them.
+  ["Box 1 ordinary business income 12,345.", ["1", "12345"]],
+  ["Ordinary business income 12,345.", ["12345"]],
+  ["Net rental real estate income 5.", ["5"]],
+  ["Paid 42.00.", ["42"]],
+  ["Refund (9,999.)", ["-9999"]],
+  ["Box 1 12,345. 80", []],
+  ["Box 1 12,345.      80", []],
+  ["Item 5. 25 units", []],
+  ["Total 5. 25", []],
+
+  // ADM-5h review: the column-gap rule closes a one-space gap beside a
+  // currency mark only before **exactly two digits**, because cents are two
+  // digits and nothing else is. Without that, a trailing point made
+  // `$82. 129961.-` read as minus 82.129961 and `$94. 504. billion` as
+  // ninety-four and a half billion, and the page prints neither.
+  ["$82. 129961.-", []],
+  ["$94. 504. billion", []],
+  ["$ 165 .00", ["165"]],
+  ["$82. 12 due", ["82.12"]],
+  ["$94. 50 total", ["94.5"]],
+  // ADM-5h re-review: and the cents have to end there. A letter after them
+  // makes the run a box label or a magnitude, a second point makes it the
+  // first half of something longer, and a sign makes it a ledger's own.
+  // `$6. 25a` read as 6.25, `$5. 25b` as five and a quarter billion, and
+  // `€642. 73.-` as a credit of 642.73; the page prints none of them.
+  ["$6. 25a", []],
+  ["$5. 25b", []],
+  ["€642. 73.-", []],
+  ["$5. 25-", []],
+  // The extended fuzz found the rest of that class on its own: a point
+  // pressed against a whole dollar, with a digit reachable through it, is a
+  // decimal point as readily as a full stop -- whether or not the run beyond
+  // it can be priced. `$780. 554a` offered 780 for a line that may well
+  // print 780.554, and `USD 6. 9a` offered 6.
+  ["$780. 554a", []],
+  ["USD 6. 9a", []],
+  ["£792354. 586a", []],
+  // A gap, the end of the line, or a mark that cannot be part of a number
+  // still closes the gap, because that is the column artifact the rule is
+  // for.
+  ["$6. 25", ["6.25"]],
+  ["Total $6. 25, paid", ["6.25"]],
+  ["| $6. 25 |", ["6.25"]],
+
+  // A list ordinal counts nothing and is worth nothing. Digits at the very
+  // start of a line, then `.` or `)`, then a space and a word, are a bullet,
+  // and a bullet that can be stored as a money field is a number on the page
+  // that nobody wrote as one.
+  ["1. Rent 500.00", ["500"]],
+  ["3) Repairs 42.00", ["42"]],
+  ["10. Interest 5.", ["5"]],
+  ["12. Nothing else", []],
+  ["2. 50", []],
+  // Without the mark after the digits, a leading number is a quantity as
+  // often as a bullet -- "12 Mill Lane", "5 units of stock" -- so the rule
+  // stops where its own shape stops and a K-1's box number is still offered.
+  // The gate is a whitelist and an extra candidate on the line costs nothing:
+  // the model's value still has to be one the line prints, and a bare run of
+  // digits can never repair a citation onto a money field (`repairTarget`).
+  ["1 Ordinary business income 12,345.", ["1", "12345"]],
+  ["12 Mill Lane", ["12"]],
 
   // -------------------------------------------------------------------------
   // ADM-5g round five: every counterexample the four reviews produced.

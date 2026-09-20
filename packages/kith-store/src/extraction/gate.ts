@@ -26,6 +26,7 @@
 import type { DocumentFieldValueType } from "../admin/model.js";
 import {
   addDecimals,
+  type DatePrecision,
   canonicalizeDecimal,
   compareDecimals,
   SUPPORTED_CURRENCIES,
@@ -712,7 +713,17 @@ export function parseAmount(raw: string): string | undefined {
  * 1075.
  */
 function readDigits(raw: string): string | undefined {
-  let text = raw;
+  // A tax form prints whole dollars with the point still there and no cents
+  // after it: "5.", "12,345.", "-9,999.". The point is typography rather
+  // than a fraction, so it is dropped and the whole number reads.
+  //
+  // It is only ever dropped from the *end* of the digit core, which is what
+  // "nothing digit-like follows" means mechanically: the core already
+  // swallows digits across any gap ("$ 165 .00" is one value), so a point
+  // with a digit anywhere after it is never the last character here. `5. 25`
+  // reaches this function as `5.25`, not as `5.`, and the finder then calls
+  // that line ambiguous and offers neither number.
+  let text = raw.replace(/(\d)\.$/, "$1");
   // `1000,000` is a thousand under a decimal comma and a million under an
   // English grouping comma, and nothing in the string settles it: four or
   // more digits before a comma are not a group, and a group of exactly three
@@ -831,8 +842,24 @@ export function amountsInText(
   text: string,
   options?: AmountScanOptions,
 ): string[] {
+  return scanAmounts(text, options).found.map((one) => one.amount);
+}
+
+/** One amount the finder offered, and where it stands in the normalized
+ * text. The span covers everything the amount owns -- its sign, its
+ * parentheses, its currency mark or code, and a `CR`/`DR` marker -- which is
+ * what lets {@link statesOnlyOneAmount} ask what is left of the line. */
+type FoundAmount = { start: number; end: number; amount: string };
+
+/** The finder proper. {@link amountsInText} is this with the positions
+ * dropped, which is all every existing caller wants. */
+function scanAmounts(
+  text: string,
+  options?: AmountScanOptions,
+): { normalized: string; found: FoundAmount[] } {
   const normalized = closeColumnGaps(foldAmountText(text));
-  const found: string[] = [];
+  const ordinal = listOrdinalStart(normalized, options);
+  const found: FoundAmount[] = [];
   let at = 0;
   while (at < normalized.length) {
     if (!/\d/.test(normalized[at]!)) {
@@ -840,6 +867,12 @@ export function amountsInText(
       continue;
     }
     const span = amountSpanAt(normalized, at);
+    // A list ordinal counts nothing and is worth nothing. See
+    // {@link listOrdinalStart}.
+    if (span.start === ordinal) {
+      at = Math.max(span.end, at + 1);
+      continue;
+    }
     if (!span.ambiguous && neighboursAreNeutral(normalized, span, options)) {
       const amount = parseAmount(
         collapseGaps(normalized.slice(span.start, span.parseEnd)),
@@ -848,34 +881,137 @@ export function amountsInText(
         // `CR` says the amount is a credit, not that its sign flips: a line
         // printing "(1,234.56) CR" says the same thing twice, and negating
         // twice made it a charge.
-        found.push(span.credit ? negative(amount) : amount);
+        found.push({
+          start: span.start,
+          end: span.end,
+          amount: span.credit ? negative(amount) : amount,
+        });
       }
     }
     // Past the whole span, parsed or not. Re-entering a span that failed is
     // exactly how a fragment gets offered.
     at = Math.max(span.end, at + 1);
   }
-  return found;
+  return { normalized, found };
 }
+
+/**
+ * What a line may print beside its one amount and still print nothing else.
+ *
+ * Whitespace, dot leaders, cell rules and sentence punctuation. No letter and
+ * no digit: a word beside a number is a label, and a label is what tells a
+ * reader which field the number belongs to. That is the whole point of
+ * {@link statesOnlyOneAmount} -- a line with a label on it belongs to its own
+ * label, and a citation may not be moved onto it.
+ */
+const VALUE_ONLY_RESIDUE =
+  /^[\s\u200b\u200c\u200d\u2060\ufeff.,;:!?*_=~+\-\u2013\u2014()[\]{}|\u00a6\u2502\u2503\u2551"\u201c\u201d\u201e'\u2019\u00b7\u2022\u2026\\/]*$/u;
+
+/**
+ * Whether the line prints one amount and nothing else a reader could read.
+ *
+ * The line is scanned exactly as the finder scans it, the one span it offered
+ * is removed whole -- sign, parentheses, currency mark or code, `CR`/`DR` --
+ * and what is left has to be whitespace and neutral punctuation. A `%` beside
+ * the amount goes with it for the `number` value type, which is the one type
+ * for which a percent sign cannot change what the number is.
+ *
+ * This exists for the citation repair in `extraction/model.ts` and for
+ * nothing else. A repair moves a field's citation onto a neighbouring line,
+ * and the question it has to answer is "does this line belong to the field
+ * that cited it, or to a label of its own". `Tax 1.60` next to `Subtotal`
+ * answers it: the line names its own field, and a subtotal read off it is a
+ * tax stored as a subtotal.
+ */
+export function statesOnlyOneAmount(
+  text: string,
+  options?: AmountScanOptions,
+): boolean {
+  const { normalized, found } = scanAmounts(text, options);
+  if (found.length !== 1) return false;
+  const one = found[0]!;
+  let tail = normalized.slice(one.end);
+  if (options?.percentIsNeutral) {
+    // One percent sign, and only the one pressed against the amount. A
+    // `number` is dimensionless, so `12 %` is the same twelve as `12`; every
+    // other value type refuses the line instead.
+    const mark = afterGap(tail, 0);
+    if (tail[mark] === "%") tail = tail.slice(0, mark) + tail.slice(mark + 1);
+  }
+  return VALUE_ONLY_RESIDUE.test(normalized.slice(0, one.start) + tail);
+}
+
+/** A numbered list's ordinal: digits at the very start of a line, then `.`
+ * or `)`, then a space and a word. `1. Rent 500.00` and `3) Repairs 42.00`
+ * both print it, and every form with numbered boxes prints dozens. */
+const LIST_ORDINAL = /^([ \t\u00a0]*)(\d{1,3})[.)][ \u00a0]+\p{L}/u;
+
+/**
+ * Where a line's leading list ordinal begins, or -1.
+ *
+ * An ordinal is a position in a list, never a quantity and never an amount,
+ * so the finder offers it nothing. It reached review as `1. Rent 500.00`
+ * offering both 1 and 500: the 1 is a bullet, and a bullet that can be
+ * stored as a money field is a number on a page that nobody wrote as one.
+ *
+ * Only at the start of a real line. A piece cut out of a longer line has no
+ * start to speak of -- whatever stood to its left is gone -- and the amount
+ * finder refuses everything touching that edge anyway.
+ */
+function listOrdinalStart(
+  text: string,
+  options?: AmountScanOptions,
+): number {
+  if (options?.cutStart) return -1;
+  const match = LIST_ORDINAL.exec(text);
+  return match ? match[1]!.length : -1;
+}
+
+/** What may stand after the cents for a one-space gap at the point to be a
+ * rendering artifact: nothing, a gap, or a mark that cannot be part of a
+ * number or change one. A digit, a letter, a point or a sign each say the run
+ * is something other than cents. */
+const AFTER_CENTS =
+  "(?:$|[\\s\\u200b\\u200c\\u200d\\u2060\\ufeff,;!?*\"\\u201d)\\]}|\\u00a6\\u2502\\u2503\\u2551])";
 
 /**
  * A parsed receipt prints "$ 165 .00" as readily as "$165.00": the space is a
  * rendering artifact of the column the amount sat in, not a separator. Closed
  * up only next to a currency mark, because a bare gap between two numbers is
  * two numbers -- "APPLES 12 .99" is a quantity beside a price.
+ *
+ * **One space, and exactly two digits after the point.** Both halves were
+ * forced by review. The width goes by the rule every other gap in this file
+ * is read by: a gap inside one printed number is one space wide, and a wider
+ * one is a column boundary. ADM-5h, which made a trailing point a whole
+ * dollar, is what forced the point: `\u00a35.<nbsp><nbsp>61` was closed up into 5.61, and
+ * `\u20ac546.<six spaces>82138K` into minus five hundred and forty-six
+ * thousand -- each of them a number the page does not print. The digit
+ * count, because cents are two digits and nothing else is: `$82. 129961.-`
+ * is not minus 82.129961 and `$94. 504. billion` is not ninety-four and a
+ * half billion. Every one of those now reads as the ambiguous pair it is,
+ * and the finder offers neither side.
+ *
+ * **And the two digits have to end there.** A gap, the end of the line, or a
+ * mark that cannot belong to a number. Anything else and the run is not
+ * cents: a letter makes it a box label or a magnitude (`$6. 25a` read as
+ * 6.25, `$5. 25b` as five and a quarter billion), a second point makes it the
+ * first half of something longer, and a sign makes it a ledger's own
+ * (`€642. 73.-` read as a credit of 642.73). None of those numbers is on
+ * the page, and each of them now reads as the ambiguous pair it is.
  */
 function closeColumnGaps(text: string): string {
   return text
     .replace(
       new RegExp(
-        `(${CURRENCY_MARK})([ \\u00a0]*)(\\d+)[ \\u00a0]+\\.(?=\\d)`,
+        `(${CURRENCY_MARK})([ \\u00a0]*)(\\d+)[ \\u00a0]\\.(?=\\d\\d(?!\\d))`,
         "g",
       ),
       "$1$2$3.",
     )
     .replace(
       new RegExp(
-        `(${CURRENCY_MARK})([ \\u00a0]*)(\\d+\\.)[ \\u00a0]+(?=\\d)`,
+        `(${CURRENCY_MARK})([ \\u00a0]*)(\\d+\\.)[ \\u00a0](?=\\d\\d${AFTER_CENTS})`,
         "g",
       ),
       "$1$2$3",
@@ -1236,7 +1372,7 @@ const CONDITIONAL_JOINERS = new Set([":", "/", "#", "'", "’"]);
 function neutralNeighbour(
   text: string,
   span: AmountSpan,
-  at: number,
+  start: number,
   direction: -1 | 1,
   options?: AmountScanOptions,
 ): boolean {
@@ -1246,43 +1382,73 @@ function neutralNeighbour(
    * asks, not only the ones where the span itself touched it. */
   const cutOn = (side: -1 | 1): boolean =>
     Boolean(side === -1 ? options?.cutStart : options?.cutEnd);
-  const unit = text[at]!;
-  // A percent sign scales what it follows, so it is never neutral beside an
-  // amount: "Rate 12.99% on $1,000.00" prints no twelve-dollar charge. The
-  // `number` value type is the one caller for which it is neutral, because a
-  // `number` is dimensionless by construction -- a rate, a count, an odometer
-  // -- and can never become money. See `checkValue`.
-  if (unit === "%" && options?.percentIsNeutral) return true;
-  // An alphanumeric run is one token. One carrying a digit is settled by
-  // pasting it back onto the span; one that does not is a word.
-  if (/[\p{L}\d]/u.test(unit)) {
-    const token = alphanumericRun(text, at);
-    // A token that runs into a cut is only the part of itself that survived.
-    if (token.from <= 0 && cutOn(-1)) return false;
-    if (token.to >= text.length && cutOn(1)) return false;
-    if (/\d/.test(text.slice(token.from, token.to))) {
-      return !joinsIntoOneAmount(text, span, token);
+  let at = start;
+  // Sentence punctuation is stepped over rather than stopped at; the loop is
+  // bounded so a line of nothing but full stops cannot walk the whole page.
+  for (let hops = 0; hops < 64; hops += 1) {
+    const unit = text[at]!;
+    // A percent sign scales what it follows, so it is never neutral beside an
+    // amount: "Rate 12.99% on $1,000.00" prints no twelve-dollar charge. The
+    // `number` value type is the one caller for which it is neutral, because a
+    // `number` is dimensionless by construction -- a rate, a count, an odometer
+    // -- and can never become money. See `checkValue`.
+    if (unit === "%" && options?.percentIsNeutral) return true;
+    // An alphanumeric run is one token. One carrying a digit is settled by
+    // pasting it back onto the span; one that does not is a word.
+    if (/[\p{L}\d]/u.test(unit)) {
+      const token = alphanumericRun(text, at);
+      // A token that runs into a cut is only the part of itself that survived.
+      if (token.from <= 0 && cutOn(-1)) return false;
+      if (token.to >= text.length && cutOn(1)) return false;
+      if (/\d/.test(text.slice(token.from, token.to))) {
+        return !joinsIntoOneAmount(text, span, token);
+      }
+      return neutralWord(text.slice(token.from, token.to));
     }
-    return neutralWord(text.slice(token.from, token.to));
-  }
-  if (unit === "." || unit === ",") {
-    // A separator matters only when a digit is reachable through it.
-    const digits = digitThrough(text, at, direction);
-    if (digits === "edge") return !cutOn(direction);
-    if (digits === undefined) return true;
-    if (digits.from <= 0 && cutOn(-1)) return false;
-    if (digits.to >= text.length && cutOn(1)) return false;
-    return !joinsIntoOneAmount(text, span, digits);
-  }
-  if (NEUTRAL_PUNCTUATION.has(unit)) return true;
-  if (CONDITIONAL_JOINERS.has(unit)) {
-    const touching = direction === -1 ? at === span.start - 1 : at === span.end;
-    if (touching) return false;
-    const beyond =
-      direction === -1 ? beforeGap(text, at) : afterGap(text, at + 1);
-    if (beyond < 0) return !cutOn(-1);
-    if (beyond >= text.length) return !cutOn(1);
-    return !/\d/.test(text[beyond]!);
+    if (unit === "." || unit === ",") {
+      // A separator is part of a *number* only when a digit is reachable
+      // through it.
+      const digits = digitThrough(text, at, direction);
+      if (digits === "edge") return !cutOn(direction);
+      if (digits !== undefined) {
+        if (digits.from <= 0 && cutOn(-1)) return false;
+        if (digits.to >= text.length && cutOn(1)) return false;
+        // A **point** pressed against this span, with a digit reachable
+        // through it, is a decimal point as readily as a full stop. That is
+        // the whole reason `12,345. 80` and `5. 25` offer nothing: the line
+        // says one number to one reader and two to another. Until the ADM-5h
+        // re-review this leaned on the pasted region failing to parse, which
+        // proves the two are separate only when the other one is readable --
+        // so `$780. 554a` offered 780 for a line that may well print 780.554,
+        // and `USD 6. 9a` offered 6. The shape settles it without asking.
+        if (unit === "." && hops === 0) return false;
+        return !joinsIntoOneAmount(text, span, digits);
+      }
+      // No digit through it, so it is punctuation -- and punctuation is not a
+      // wall. Whatever stands beyond it is still this span's neighbour and
+      // still has to be provably harmless. ADM-5h: a whole dollar prints its
+      // point with no cents after it, and that point hid the token behind it.
+      // `\u00a54,543,586.<tab>CR` offered a charge for a line printing a
+      // credit, and `1.<gap>USD-` offered a positive one.
+      const beyond =
+        direction === -1 ? beforeGap(text, at) : afterGap(text, at + 1);
+      if (beyond < 0) return !cutOn(-1);
+      if (beyond >= text.length) return !cutOn(1);
+      at = beyond;
+      continue;
+    }
+    if (NEUTRAL_PUNCTUATION.has(unit)) return true;
+    if (CONDITIONAL_JOINERS.has(unit)) {
+      const touching =
+        direction === -1 ? at === span.start - 1 : at === span.end;
+      if (touching) return false;
+      const beyond =
+        direction === -1 ? beforeGap(text, at) : afterGap(text, at + 1);
+      if (beyond < 0) return !cutOn(-1);
+      if (beyond >= text.length) return !cutOn(1);
+      return !/\d/.test(text[beyond]!);
+    }
+    return false;
   }
   return false;
 }
@@ -1349,12 +1515,37 @@ function joinsIntoOneAmount(
   token: { from: number; to: number },
 ): boolean {
   const other = amountSpanAt(text, nearestDigit(text, token));
-  const start = Math.min(span.start, other.start);
+  let start = Math.min(span.start, other.start);
+  // A pasted region may not begin inside a printed number. `amountSpanAt`
+  // walks left from the *nearest* digit of the neighbouring token, and a
+  // grouping separator stops that walk on its left-hand side, so
+  // `12,345. 80` used to be pasted back together as `,345. 80`. That reads
+  // as nothing, which said the two were provably separate tokens, and the
+  // finder offered 80 for a line that may well print 12,345.80. Widening
+  // the region to the whole digit run is the same question asked about the
+  // text the page actually prints.
+  while (start > 0 && /\d/.test(text[start - 1]!)) start -= 1;
   const end = Math.max(span.parseEnd, other.parseEnd);
   // A region this wide is not one printed amount; refusing is the safe answer
   // and it keeps the check linear on a pathological line.
   if (end - start > 512) return true;
-  return parseAmount(collapseGaps(text.slice(start, end))) !== undefined;
+  const region = collapseGaps(text.slice(start, end));
+  if (parseAmount(region) !== undefined) return true;
+  // The same region without its currency marker.
+  //
+  // "Do these two runs join" is a question about digits and separators, and
+  // the marker can only make the joined reading *harder* to price: a euro
+  // amount refuses `5.123` outright, because a dot is a grouping separator
+  // where euros are printed. Without this, `\u20ac5. 123` read as two
+  // separate cells and offered 5 and 123 for a line that may well print five
+  // point one two three -- while `$5. 123` refused both, which is the answer
+  // a currency cannot be allowed to change.
+  //
+  // Only a marker the region *opens* with. One standing between the two
+  // runs is evidence they are separate -- it introduces the second of them,
+  // which is what `Paid 09/01/2026 $42.00` prints.
+  const bare = region.replace(new RegExp(`^(?:${CURRENCY_MARK})[ ]?`), "");
+  return bare !== region && parseAmount(bare) !== undefined;
 }
 
 function nearestDigit(text: string, token: { from: number; to: number }): number {
@@ -1490,7 +1681,7 @@ const MONTH_FIRST_DATE =
   /([A-Za-z]{3,9})\.?[\s-]+(\d{1,2})(?:st|nd|rd|th)?,?[\s-]+'?(\d{4}|\d{2})(?!\d)/g;
 /** `1 September 2026`, `1st Sep. 2026`. */
 const DAY_FIRST_DATE =
-  /(\d{1,2})(?:st|nd|rd|th)?[\s-]+([A-Za-z]{3,9})\.?,?[\s-]+'?(\d{4}|\d{2})(?!\d)/g;
+  /(\d{1,2})(?:st|nd|rd|th)?[\s-]+(?:of[\s-]+)?([A-Za-z]{3,9})\.?,?[\s-]+'?(\d{4}|\d{2})(?!\d)/g;
 
 /**
  * Whether the quote prints this ISO date.
@@ -1539,7 +1730,7 @@ export type DateOrder = "MDY" | "DMY";
  * that could be read two ways, which is a different answer from "not a date"
  * and gets its own correction reason. */
 export type PrintedDate =
-  | { kind: "date"; iso: string }
+  | { kind: "date"; iso: string; precision: DatePrecision }
   | { kind: "ambiguous" }
   | { kind: "none" };
 
@@ -1567,6 +1758,56 @@ export function readPrintedDate(raw: string, order?: DateOrder): PrintedDate {
   const text = raw.normalize("NFKC").trim();
   if (!text) return { kind: "none" };
 
+  // A year on its own, or a month and a year, is a date. A tax letter states
+  // "2024" and a cover letter states "March 2024", and refusing both lost
+  // the only date those documents have. Padding either to the first of the
+  // month would invent a day the page does not print and that every reader
+  // after this one would repeat as fact, so the value stays exactly as long
+  // as the page and carries its precision with it.
+  //
+  // Anchored whole, all of them: a partial date is the *entire* value, never
+  // a year plucked out of a longer string. `2026-09-18` reaches the ISO
+  // branch below and stays a day.
+  const yearOnly = /^(\d{4})$/.exec(text);
+  if (yearOnly) {
+    return Number(yearOnly[1]) >= 1000
+      ? { kind: "date", iso: yearOnly[1]!, precision: "year" }
+      : { kind: "none" };
+  }
+  // Which part is the year is never a guess here: a year is four digits, a
+  // month is one or two or a name. `03/04` settles nothing at all, so it is
+  // not read as a month and a year by either order; it falls through to the
+  // three-part numeric rule below, matches nothing, and is refused.
+  //
+  // A two-digit year is refused with it. `March 24` is March 2024 and the
+  // twenty-fourth of March at the same time, and a partial date has no third
+  // part to tell them apart -- unlike `9 Apr 26`, where the day is printed
+  // and only the century is missing, which is what `expandTwoDigitYear` is
+  // for and where it stays.
+  const named = /^([A-Za-z]{3,9})\.?,?[\s-]+'?(\d{4})$/.exec(text);
+  const yearFirst = /^(\d{4})[-/.](\d{1,2})$/.exec(text);
+  const monthFirstOnly = /^(\d{1,2})[-/.](\d{4})$/.exec(text);
+  if (named || yearFirst || monthFirstOnly) {
+    const month = named
+      ? monthNumber(named[1]!)
+      : yearFirst
+        ? Number(yearFirst[2])
+        : Number(monthFirstOnly![1]);
+    const year = named
+      ? Number(named[2])
+      : yearFirst
+        ? Number(yearFirst[1])
+        : Number(monthFirstOnly![2]);
+    if (month !== undefined && month >= 1 && month <= 12 && year >= 1000) {
+      return {
+        kind: "date",
+        iso: `${year}-${String(month).padStart(2, "0")}`,
+        precision: "month",
+      };
+    }
+    return { kind: "none" };
+  }
+
   // `(?!\d)` rather than `\b`, so an ISO date with a time glued to it
   // ("2026-09-18T14:32") reads: `T` is a word character, so `\b` refused the
   // very form a machine-written timestamp takes.
@@ -1577,7 +1818,7 @@ export function readPrintedDate(raw: string, order?: DateOrder): PrintedDate {
       Number(isoLike[2]),
       Number(isoLike[3]),
     );
-    return iso ? { kind: "date", iso } : { kind: "none" };
+    return iso ? { kind: "date", iso, precision: "day" } : { kind: "none" };
   }
 
   const numeric = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4}|\d{2})(?!\d)/.exec(
@@ -1592,7 +1833,7 @@ export function readPrintedDate(raw: string, order?: DateOrder): PrintedDate {
     if (resolved === "ambiguous") return { kind: "ambiguous" };
     if (!resolved) return { kind: "none" };
     const iso = isoFrom(namedYear(numeric[3]!), resolved.month, resolved.day);
-    return iso ? { kind: "date", iso } : { kind: "none" };
+    return iso ? { kind: "date", iso, precision: "day" } : { kind: "none" };
   }
 
   // Separators may be spaces or hyphens ("18-Sep-2026"), the comma is
@@ -1609,19 +1850,19 @@ export function readPrintedDate(raw: string, order?: DateOrder): PrintedDate {
         month,
         Number(monthFirst[2]),
       );
-      return iso ? { kind: "date", iso } : { kind: "none" };
+      return iso ? { kind: "date", iso, precision: "day" } : { kind: "none" };
     }
   }
 
   const dayFirst =
-    /^(\d{1,2})(?:st|nd|rd|th)?[\s-]+([A-Za-z]{3,9})\.?,?[\s-]+'?(\d{4}|\d{2})(?!\d)/.exec(
+    /^(\d{1,2})(?:st|nd|rd|th)?[\s-]+(?:of[\s-]+)?([A-Za-z]{3,9})\.?,?[\s-]+'?(\d{4}|\d{2})(?!\d)/.exec(
       text,
     );
   if (dayFirst) {
     const month = monthNumber(dayFirst[2]!);
     if (month) {
       const iso = isoFrom(namedYear(dayFirst[3]!), month, Number(dayFirst[1]));
-      return iso ? { kind: "date", iso } : { kind: "none" };
+      return iso ? { kind: "date", iso, precision: "day" } : { kind: "none" };
     }
   }
   return { kind: "none" };
@@ -1678,10 +1919,20 @@ function dateInQuote(
   iso: string,
   quote: string,
   order?: DateOrder,
+  precision: DatePrecision = "day",
 ): boolean {
-  const [year, month, day] = iso.split("-") as [string, string, string];
   const text = quote.normalize("NFKC");
+
+  // A partial date is checked for exactly the parts it claims, and for
+  // nothing it does not. It gets its own check rather than the day rule's
+  // fast path below, because `includes("2024")` is true of a line printing
+  // an account number ending 120245 and of one printing $2,024.00.
+  if (precision === "year") return printsYear(text, iso, order);
+  if (precision === "month") return printsMonthAndYear(text, iso, order);
+
   if (text.includes(iso)) return true;
+
+  const [year, month, day] = iso.split("-") as [string, string, string];
   const days = [day, String(Number(day))];
 
   // A numeric window is read positionally, by the same rules the value is
@@ -1712,6 +1963,227 @@ function dateInQuote(
     }
   }
   return false;
+}
+
+/**
+ * Whether the line prints this year *as a year*.
+ *
+ * Four digits are a year, a quantity, the whole dollars of an amount and the
+ * middle of an account number, and only what stands around them says which.
+ * So the run of digits and separators the year sits in has to be the year and
+ * nothing else: `2024` and `FY2024` read, `120245`, `2,024` and `2024.00` do
+ * not, and a currency marker pressed against it makes it money.
+ *
+ * This is deliberately narrower than the day rule's substring check. A day
+ * has eight digits in a fixed order and a coincidence is vanishingly
+ * unlikely; a year has four and a page of numbers is full of them.
+ */
+function printsYear(text: string, year: string, order?: DateOrder): boolean {
+  const number = Number(year);
+  if (number < EARLIEST_YEAR || number > LATEST_YEAR) return false;
+  for (const match of text.matchAll(/\d+(?:[.,]\d+)*/g)) {
+    if (match[0] !== year) continue;
+    const at = match.index ?? 0;
+    if (!leftOfYearIsClear(text, at)) continue;
+    // `2024 Main Street` is a house number. A year names no address, and a
+    // document's address block is full of four-digit runs.
+    if (STREET_AFTER_NUMBER.test(text.slice(at + year.length))) continue;
+    return true;
+  }
+  // A whole date printed on the line states its year as plainly as a bare
+  // run does, and this is the only way one reads: `09/18/2024` has a slash
+  // glued to its left, and the rule above refuses that on purpose.
+  return printedDateYears(text, order).has(year);
+}
+
+/** The bounds of a year a document states. Outside them a four-digit run is
+ * a form number, a quantity or a code: `Form 1040` is not the year 1040. */
+const EARLIEST_YEAR = 1900;
+const LATEST_YEAR = 2100;
+
+/** The only letters that may be glued to the left of a year and leave it a
+ * year. A fiscal, calendar or tax year prefix, and nothing else: `x2024` is
+ * not a year, and nothing mechanical tells it from `FY2024` but this list. */
+const YEAR_PREFIXES = new Set(["fy", "cy", "ty"]);
+
+/** Words that, standing to the left, say the number after them is something
+ * else that happens to fall between 1900 and 2100: a revision, a form, a
+ * reference, a room. */
+const NOT_A_YEAR_LABELS = new Set([
+  "rev", "revised", "revision", "ver", "version", "form", "no", "num",
+  "number", "ref", "reference", "acct", "account", "invoice", "suite", "ste",
+  "apt", "unit", "box", "room", "rm", "page", "pg", "line", "id", "pin",
+  "policy", "claim", "order", "check", "cheque", "serial", "model", "lot",
+  "permit", "license", "licence", "ext", "extension",
+]);
+
+/** A street name following a number, which makes the number a house number.
+ * Up to three words between, so `2024 North Main Street` reads. */
+const STREET_AFTER_NUMBER =
+  /^[ \u00a0]+(?:[A-Za-z][A-Za-z.'-]*[ \u00a0]+){0,3}(?:street|st|avenue|ave|road|rd|lane|ln|drive|dr|boulevard|blvd|way|court|ct|place|pl|terrace|ter|highway|hwy|parkway|pkwy|circle|cir|square|sq|trail|trl)\b/i;
+
+/**
+ * Whether what stands to the left of a four-digit run leaves it a year.
+ *
+ * Glued, nothing survives but a year prefix: a letter, a digit, a dash, a
+ * hash, a slash, a currency mark or a symbol all say the run is part of
+ * something longer -- `98101-2024` is a postcode, `(206) 555-2024` a
+ * telephone number, `1099-2024` a form, `x2024` an extension, a copyright
+ * sign a copyright.
+ *
+ * One space away, a currency mark or an ISO code makes it money (`$ 2024`,
+ * `USD 2024`) and a label from {@link NOT_A_YEAR_LABELS} makes it a
+ * revision or a reference (`Rev. 2023`). Every other word is left alone,
+ * because `for the tax year 2024` is exactly the shape a year is printed in.
+ */
+function leftOfYearIsClear(text: string, at: number): boolean {
+  const before = text.slice(0, at);
+  if (before === "") return true;
+  const glued = before.slice(-1);
+  if (!/[\s\u00a0]/.test(glued)) {
+    const word = /([A-Za-z]+)$/.exec(before);
+    return word !== null && YEAR_PREFIXES.has(word[1]!.toLowerCase());
+  }
+  const trimmed = before.replace(/[\s\u00a0]+$/, "");
+  if (trimmed === "") return true;
+  const word = /([A-Za-z]+)\.?$/.exec(trimmed);
+  if (word) {
+    if (SUPPORTED_CURRENCY_SET.has(word[1]!.toUpperCase())) return false;
+    return !NOT_A_YEAR_LABELS.has(word[1]!.toLowerCase());
+  }
+  const mark = trimmed.slice(-1);
+  if (CURRENCY_SYMBOL_CHARS.has(mark)) return false;
+  return mark !== "-" && mark !== "#" && mark !== "/";
+}
+
+/** Every year a whole date on this line prints. */
+function printedDateYears(text: string, order?: DateOrder): Set<string> {
+  const years = new Set<string>();
+  for (const window of text.match(NUMERIC_DATE) ?? []) {
+    const read = readPrintedDate(window, order);
+    if (read.kind === "date" && read.precision === "day") {
+      years.add(read.iso.slice(0, 4));
+    }
+  }
+  for (const [pattern, position] of [
+    [MONTH_FIRST_DATE, "month"],
+    [DAY_FIRST_DATE, "day"],
+  ] as const) {
+    pattern.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(text)) !== null) {
+      const word = position === "month" ? match[1]! : match[2]!;
+      if (monthNumber(word) === undefined) continue;
+      years.add(String(namedYear(match[3]!)));
+    }
+  }
+  return years;
+}
+
+/** A month name pressed against a year, with no day between them:
+ * `March 2024`, `Sep. 2026`. The two dated patterns both require a day, so
+ * neither of them reads this, which is the form a cover letter prints. */
+const MONTH_NAME_AND_YEAR = /([A-Za-z]{3,9})\.?,?[\s-]+'?(\d{4})(?!\d)/g;
+
+/** `09/2026`, `2026-09`. The left-hand guard keeps this off the middle of a
+ * three-part date: in `03/04/2026` the `04/2026` is not a month and a year,
+ * it is the last two thirds of the fourth of March. */
+const NUMERIC_MONTH_AND_YEAR =
+  /(?<![\d/.-])(\d{1,2})[-/.](\d{4})(?!\d)|(?<![\d/.-])(\d{4})[-/.](\d{1,2})(?!\d)/g;
+
+/**
+ * Whether the line prints this month *and* this year, together.
+ *
+ * Adjacency is the whole rule. A month number found somewhere on the line and
+ * a year found somewhere else are two facts about the line and not a date on
+ * it: `Invoice 3 paid in 2024` does not say March 2024, and reading it that
+ * way would file a document under a month no one wrote down.
+ */
+function printsMonthAndYear(
+  text: string,
+  iso: string,
+  order?: DateOrder,
+): boolean {
+  const [year, month] = iso.split("-") as [string, string];
+  const number = Number(month);
+  // The line read whole, which is how a cover letter's only line arrives.
+  const printed = readPrintedDate(text.trim(), order);
+  if (
+    printed.kind === "date" &&
+    (printed.precision === "month"
+      ? printed.iso === iso
+      : printed.precision === "day" && printed.iso.startsWith(`${iso}-`))
+  ) {
+    return true;
+  }
+  // A full numeric date on the line, read positionally by the same rule the
+  // value is read by. `04/03/2024` is in March under `DMY` and in April
+  // under `MDY`, and with neither it is ambiguous and supports nothing.
+  for (const window of text.match(NUMERIC_DATE) ?? []) {
+    const inWindow = readPrintedDate(window, order);
+    if (inWindow.kind === "date" && inWindow.iso.startsWith(`${iso}-`)) {
+      return true;
+    }
+  }
+  // A full date on the line is in this month when it names it and the year.
+  for (const [pattern, position] of [
+    [MONTH_FIRST_DATE, "month"],
+    [DAY_FIRST_DATE, "day"],
+  ] as const) {
+    pattern.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(text)) !== null) {
+      const word = position === "month" ? match[1]! : match[2]!;
+      if (namesMonth(number, word) && String(namedYear(match[3]!)) === year) {
+        return true;
+      }
+    }
+  }
+  MONTH_NAME_AND_YEAR.lastIndex = 0;
+  let named: RegExpExecArray | null;
+  while ((named = MONTH_NAME_AND_YEAR.exec(text)) !== null) {
+    if (!namesMonth(number, named[1]!) || named[2] !== year) continue;
+    if (isDated(text, named.index)) return true;
+  }
+  NUMERIC_MONTH_AND_YEAR.lastIndex = 0;
+  let numeric: RegExpExecArray | null;
+  while ((numeric = NUMERIC_MONTH_AND_YEAR.exec(text)) !== null) {
+    const [printedMonth, printedYear] = numeric[1]
+      ? [numeric[1], numeric[2]!]
+      : [numeric[4]!, numeric[3]!];
+    if (Number(printedMonth) !== number || printedYear !== year) continue;
+    if (isDated(text, numeric.index)) return true;
+  }
+  return false;
+}
+
+/**
+ * Words after which a bare month and year is a date rather than two numbers
+ * that happen to sit next to each other.
+ */
+const DATE_LABELS = new Set([
+  "period", "periods", "date", "dated", "dates", "month", "months",
+  "statement", "for", "of", "as", "through", "thru", "to", "from", "ending",
+  "ended", "end", "beginning", "began", "begins", "effective", "issued",
+  "filed", "due", "paid", "posted", "closing", "closed", "cycle", "year",
+  "fy", "billing", "service", "coverage", "term", "since", "until",
+  "starting", "covering", "between", "on", "in", "by", "quarter", "week",
+]);
+
+/**
+ * Whether a month-and-year token at `at` is printed as a date.
+ *
+ * Two digits beside four are a date only where a date is what the line is
+ * saying. `Ratio 3/2024` is a ratio, `Pages 3-2024` a page range and
+ * `You may 2024` a sentence, and reading any of them as March 2024 would
+ * file a document under a month nobody wrote. So the token has to open the
+ * line or follow a word that introduces a date.
+ */
+function isDated(text: string, at: number): boolean {
+  const before = text.slice(0, at);
+  if (before.trim() === "") return true;
+  const word = /([A-Za-z]+)[.,:;]?[\s\u00a0]*$/.exec(before);
+  return word !== null && DATE_LABELS.has(word[1]!.toLowerCase());
 }
 
 /** One entry of a list, read or refused on its own. */
@@ -1949,19 +2421,31 @@ export function checkValue(input: GateInput): GateResult {
       // is normalized here and checked against the cited lines afterwards, so
       // a date can only be stored when a cited line prints it, in the order
       // that line prints it.
-      const iso = realIsoDate(literal)
-        ? literal
-        : (() => {
-            const printed = readPrintedDate(literal, input.dateOrder);
-            return printed.kind === "date" ? printed.iso : printed.kind;
-          })();
-      if (iso === "ambiguous") return fail("date_ambiguous");
-      if (iso === "none") return fail("date_unparsable");
+      const printed: PrintedDate = realIsoDate(literal)
+        ? { kind: "date", iso: literal, precision: "day" }
+        : readPrintedDate(literal, input.dateOrder);
+      if (printed.kind === "ambiguous") return fail("date_ambiguous");
+      if (printed.kind === "none") return fail("date_unparsable");
       const at = firstMatch((candidate) =>
-        dateInQuote(iso, candidate.text, input.dateOrder),
+        dateInQuote(
+          printed.iso,
+          candidate.text,
+          input.dateOrder,
+          printed.precision,
+        ),
       );
       if (at < 0) return fail("value_not_in_quote");
-      return { ok: true, values: [{ type: "date", value: iso }], support: [at] };
+      return {
+        ok: true,
+        // A day-precision value keeps the shape every stored date has had,
+        // with no `precision` key; a partial one says how much it knows.
+        values: [
+          printed.precision === "day"
+            ? { type: "date", value: printed.iso }
+            : { type: "date", value: printed.iso, precision: printed.precision },
+        ],
+        support: [at],
+      };
     }
     case "number": {
       // Through `parseAmount`, not a bare canonicalize: a percentage prints as

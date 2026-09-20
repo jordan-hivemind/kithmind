@@ -35,6 +35,8 @@ import {
   applyCorrection,
   checkValue,
   diagnoseExtractions,
+  documentTypeBound,
+  isBlankReading,
   valueSignature,
   citedLines,
   pageLines,
@@ -44,7 +46,10 @@ import {
   printedDateToIso,
   runDocumentExtractionJob,
   seedDocumentTypes,
+  MAX_KIND_CHARS,
+  MAX_KIND_PAGES,
 } from "../dist/extraction/index.js";
+import { hydrateObservation } from "../dist/records/index.js";
 import {
   admitInlineWork,
   processInlineWork,
@@ -293,9 +298,14 @@ test("a rendering space closes only next to a currency mark", () => {
   assert.deepEqual(amountsInText("Invoice refs 1, 234, 567"), []);
   assert.deepEqual(amountsInText("3. 12 Pack Soda   5.99"), ["5.99"]);
   // ADM-5g: `5L` is digits with a letter glued to them that is neither a
-  // currency, a magnitude nor a flag, so the token is not an amount at all --
-  // and "2. 5L" does not read as 2.5 either, so the 2 stands on its own.
-  assert.deepEqual(amountsInText("Milk 2. 5L"), ["2"]);
+  // currency, a magnitude nor a flag, so the token is not an amount at all.
+  // ADM-5h re-review: and the 2 no longer stands on its own either. A
+  // trailing point is a whole dollar now, so a point pressed against these
+  // digits with another digit reachable through it makes the line say 2.5L
+  // as readily as it says 2 -- and the same shape offered 780 for
+  // `$780. 554a`. Whether the run beyond the point can be priced is not the
+  // question; that it is there is.
+  assert.deepEqual(amountsInText("Milk 2. 5L"), []);
   // A bare column gap is two numbers or one, and the page does not say which.
   assert.deepEqual(amountsInText("Total 10. 80"), []);
 
@@ -376,6 +386,348 @@ test("a printed date normalizes to ISO, and nothing is invented", () => {
   assert.equal(printedDateToIso("sometime in April"), undefined);
   assert.equal(printedDateToIso("13/32/26"), undefined);
   assert.equal(printedDateToIso(""), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// ADM-5h. Five rules, each one a document the live extraction could not read,
+// and each one written as a table so a change to it has to be argued for.
+//
+// The rule that governs all of them: **a document that states less is stored
+// as less.** Nothing here pads, rounds, or fills in. A year is a year, a
+// blank box is a field the document does not state, and a whole dollar
+// printed with a trailing point is that whole dollar.
+// ---------------------------------------------------------------------------
+
+/**
+ * What a copied date reads as. The third column is the precision, and a
+ * missing one means the input is not a date at all.
+ *
+ * `undefined` is a refusal, and a refusal here is safe: the field opens a
+ * correction and the owner sees it. A *padded* date is not safe, which is why
+ * no row of this table reads a year as the first of January.
+ */
+const PARTIAL_DATE_SPEC = [
+  // A whole date, which is what nearly every row was before this change and
+  // what every one of them still is when the page prints a day.
+  ["2026-09-18", "2026-09-18", "day"],
+  ["09/18/26", "2026-09-18", "day"],
+  ["September 18th, 2026", "2026-09-18", "day"],
+  ["1st of September 2026", "2026-09-01", "day"],
+  ["18-Sep-2026", "2026-09-18", "day"],
+  // A year alone. A tax letter states this and nothing else.
+  ["2024", "2024", "year"],
+  ["1999", "1999", "year"],
+  // A month and a year, named or numbered, in either order.
+  ["March 2024", "2024-03", "month"],
+  ["Mar. 2024", "2024-03", "month"],
+  ["September 2026", "2026-09", "month"],
+  ["2026-09", "2026-09", "month"],
+  ["2026/09", "2026-09", "month"],
+  ["09/2026", "2026-09", "month"],
+  ["9/2026", "2026-09", "month"],
+  // Refused. Two numbers with no year among them are a month and a day in
+  // one country and a day and a month in another, and `date_order` settles
+  // which is which only when the third part says a year is present at all.
+  ["03/04", undefined],
+  ["12/31", undefined],
+  // A two-digit year has no third part to settle it either: `March 24` is
+  // March 2024 and the twenty-fourth of March at the same time.
+  ["March 24", undefined],
+  ["03/24", undefined],
+  ["24", undefined],
+  // Not a year, or not only a year.
+  ["999", undefined],
+  ["0999", undefined],
+  ["12024", undefined],
+  ["2026-13", undefined],
+  ["March 2024 statement", undefined],
+  ["sometime in 2024", undefined],
+  ["", undefined],
+];
+
+test("a date the page half prints is stored as half a date", () => {
+  for (const [input, iso, precision] of PARTIAL_DATE_SPEC) {
+    const read = readPrintedDate(input, "MDY");
+    if (iso === undefined) {
+      assert.notEqual(
+        read.kind,
+        "date",
+        JSON.stringify(input) + " must not read as a date",
+      );
+      continue;
+    }
+    assert.deepEqual(
+      read,
+      { kind: "date", iso, precision },
+      JSON.stringify(input),
+    );
+  }
+  // The order knob cannot turn a two-part numeric date into a month and a
+  // year. Under either reading `03/04` is a month and a day, and this store
+  // does not invent the year.
+  for (const order of ["MDY", "DMY", undefined]) {
+    assert.notEqual(readPrintedDate("03/04", order).kind, "date");
+  }
+});
+
+/**
+ * Whether a cited line supports a partial date.
+ *
+ * Narrower than the day rule on purpose. A day has eight digits in a fixed
+ * order and a coincidence is vanishingly unlikely; a year has four, and a
+ * page of a financial document is full of four-digit runs that are not years.
+ */
+const PARTIAL_DATE_QUOTE_SPEC = [
+  // A year, printed as a year.
+  ["2024", "For the tax year 2024", true],
+  ["2024", "FY2024 partnership return", true],
+  ["2024", "Filed 09/18/2024", true],
+  ["2024", "Dated March 4, 2024", true],
+  // A year the line does not print. Each of these carries the four digits
+  // and none of them states the year: the account number runs through them,
+  // the amount has cents after them, the currency mark makes them money.
+  ["2024", "Account 120245 summary", false],
+  ["2024", "Invoice 12024 enclosed", false],
+  ["2024", "Balance 2,024.00 due", false],
+  ["2024", "Balance 2024.00 due", false],
+  ["2024", "Fee $2024", false],
+  ["2024", "Statement period 2023", false],
+  // ADM-5h review: every four-digit run it found that a document prints
+  // and that is not a year. A postcode, a telephone number, an extension, a
+  // copyright, a revision, a form number, an amount and an address each
+  // carry four digits, and what stands beside them is the only thing that
+  // says which.
+  ["2024", "Seattle WA 98101-2024", false],
+  ["2024", "Call (206) 555-2024", false],
+  ["2024", "Extension x2024", false],
+  ["2019", "\u00a92019 Bracken Tools", false],
+  ["2023", "Rev. 2023", false],
+  ["2024", "Form 1099-2024", false],
+  ["2024", "Paid $ 2024", false],
+  ["2024", "Paid USD 2024", false],
+  ["2024", "2024 Main Street", false],
+  ["2024", "2024 North Main Street, Suite 3", false],
+  // A fiscal, calendar or tax year prefix is the one thing that may be
+  // glued to a year's left and leave it a year.
+  ["2024", "TY2024 return", true],
+  ["2024", "CY2024 summary", true],
+  // And a year is a year between 1900 and 2100. Outside that a four-digit
+  // run is a form number: `Form 1040` is not the year 1040.
+  ["1040", "Form 1040", false],
+  ["1065", "Schedule K-1 (Form 1065)", false],
+  ["1899", "Filed in 1899", false],
+  ["1900", "Filed in 1900", true],
+  ["2100", "Filed in 2100", true],
+  ["2101", "Filed in 2101", false],
+  // A month and a year have to be printed together. A month number found in
+  // one part of the line and a year in another are two facts about the line,
+  // not a date on it.
+  ["March 2024", "Statement period March 2024", true],
+  ["March 2024", "Period 03/2024", true],
+  ["March 2024", "Period 2024-03", true],
+  ["March 2024", "Dated March 15, 2024", true],
+  ["March 2024", "Closing statement 2024-03-31", true],
+  ["March 2024", "Invoice 3 paid in 2024", false],
+  ["March 2024", "Period 04/2024", false],
+  // ADM-5h review: two digits beside four are a date only where a date is
+  // what the line is saying. A ratio, a page range and a sentence each
+  // print the same characters.
+  ["March 2024", "Ratio 3/2024", false],
+  ["March 2024", "Pages 3-2024", false],
+  ["May 2024", "You may 2024", false],
+  ["May 2024", "Statement period May 2024", true],
+  ["March 2024", "Covering 3/2024", true],
+  ["March 2024", "Statement period March 2023", false],
+  // `date_order` decides which part of a numeric date is the month, and the
+  // month-precision check obeys it rather than taking whichever part fits.
+  ["April 2024", "Dated 04/03/2024", true],
+  ["March 2024", "Dated 04/03/2024", false],
+  ["March 2024", "Dated 03/04/2024", true],
+  ["April 2024", "Dated 03/04/2024", false],
+];
+
+test("a partial date is checked for exactly the parts it claims", () => {
+  for (const [value, quote, supported] of PARTIAL_DATE_QUOTE_SPEC) {
+    const result = checkValue({
+      valueType: "date",
+      value,
+      candidates: asCandidates(quote),
+      pageText: quote,
+      defaultCurrency: "USD",
+      dateOrder: "MDY",
+    });
+    assert.equal(
+      result.ok,
+      supported,
+      JSON.stringify(value) + " cited to " + JSON.stringify(quote),
+    );
+    if (!result.ok) assert.equal(result.reason, "value_not_in_quote");
+  }
+});
+
+test("a stored date says how much of it the document printed", () => {
+  // A day keeps exactly the shape every stored date has had, with no
+  // `precision` key at all, so nothing already written changes and no reader
+  // has to learn a new field to keep being right about a full date.
+  assert.deepEqual(
+    checkValue({
+      valueType: "date",
+      value: "18 September 2026",
+      candidates: asCandidates("Closed 18 September 2026"),
+      pageText: "Closed 18 September 2026",
+      defaultCurrency: "USD",
+    }).values,
+    [{ type: "date", value: "2026-09-18" }],
+  );
+  // A partial one carries its precision, which is what stops a reader ever
+  // taking it for a day.
+  assert.deepEqual(
+    checkValue({
+      valueType: "date",
+      value: "2024",
+      candidates: asCandidates("For the tax year 2024"),
+      pageText: "For the tax year 2024",
+      defaultCurrency: "USD",
+    }).values,
+    [{ type: "date", value: "2024", precision: "year" }],
+  );
+  assert.deepEqual(
+    checkValue({
+      valueType: "date",
+      value: "March 2024",
+      candidates: asCandidates("Statement period March 2024"),
+      pageText: "Statement period March 2024",
+      defaultCurrency: "USD",
+    }).values,
+    [{ type: "date", value: "2024-03", precision: "month" }],
+  );
+});
+
+/**
+ * What counts as "the document does not state this".
+ *
+ * Nothing and only nothing. A box the form leaves empty is not a failed
+ * reading and must not open an item the owner has to dismiss; a box that
+ * prints *something* is a reading and goes to the gate, whatever it prints.
+ * The dash is the row that matters: a dash is not zero, and reading it as
+ * zero would put a number on the page that nobody wrote.
+ */
+const BLANK_SPEC = [
+  [null, true],
+  [undefined, true],
+  ["", true],
+  ["   ", true],
+  ["\t\n ", true],
+  ["\u00a0", true],
+  ["\u200b", true],
+  [[], true],
+  ["0", false],
+  ["0.00", false],
+  [0, false],
+  ["-", false],
+  ["N/A", false],
+  ["None", false],
+  ["nil", false],
+  [".", false],
+  [false, false],
+  [["something"], false],
+];
+
+test("only a box with nothing in it counts as unstated", () => {
+  for (const [value, blank] of BLANK_SPEC) {
+    assert.equal(isBlankReading(value), blank, JSON.stringify(value) ?? "undefined");
+  }
+});
+
+test("a kind may widen its own page and character bounds, up to a ceiling", () => {
+  const examples = (name, value) => [{ setting: name, value }];
+  assert.equal(
+    documentTypeBound(examples("max_pages", "25"), "max_pages", MAX_KIND_PAGES),
+    25,
+  );
+  assert.equal(
+    documentTypeBound(
+      examples("max_chars", "120000"),
+      "max_chars",
+      MAX_KIND_CHARS,
+    ),
+    120000,
+  );
+  // Unset, and everything that is not a whole number, reads as unset: the
+  // global default then applies, which is what every kind does until the
+  // owner says otherwise.
+  for (const raw of ["", "0", "-5", "12.5", "lots", "1e3", " 25"]) {
+    assert.equal(
+      documentTypeBound(examples("max_pages", raw), "max_pages", MAX_KIND_PAGES),
+      null,
+      JSON.stringify(raw),
+    );
+  }
+  // JSON has a number type as well as a string type, and this row is
+  // hand-edited as often as it is written by the admin screen. Both say the
+  // same thing; honouring only the string made a bound the owner had set
+  // read as unset, and the document came back truncated with nothing saying
+  // why.
+  assert.equal(
+    documentTypeBound(
+      [{ setting: "max_pages", value: 25 }],
+      "max_pages",
+      MAX_KIND_PAGES,
+    ),
+    25,
+  );
+  assert.equal(
+    documentTypeBound(
+      [{ setting: "max_chars", value: 120000 }],
+      "max_chars",
+      MAX_KIND_CHARS,
+    ),
+    120000,
+  );
+  for (const raw of [25.5, 0, -5, MAX_KIND_PAGES + 1, Number.NaN]) {
+    assert.equal(
+      documentTypeBound(
+        [{ setting: "max_pages", value: raw }],
+        "max_pages",
+        MAX_KIND_PAGES,
+      ),
+      null,
+      String(raw),
+    );
+  }
+  assert.equal(documentTypeBound([], "max_pages", MAX_KIND_PAGES), null);
+  assert.equal(documentTypeBound(null, "max_pages", MAX_KIND_PAGES), null);
+  assert.equal(
+    documentTypeBound(["an example"], "max_pages", MAX_KIND_PAGES),
+    null,
+  );
+  // Past the ceiling is ignored rather than clamped. A clamp would read a
+  // typo as a number nobody chose; ignoring it leaves the documented default
+  // in place, and one document cannot spend a whole run's budget either way.
+  assert.equal(
+    documentTypeBound(
+      examples("max_pages", String(MAX_KIND_PAGES + 1)),
+      "max_pages",
+      MAX_KIND_PAGES,
+    ),
+    null,
+  );
+  assert.equal(
+    documentTypeBound(
+      examples("max_chars", String(MAX_KIND_CHARS + 1)),
+      "max_chars",
+      MAX_KIND_CHARS,
+    ),
+    null,
+  );
+  assert.equal(
+    documentTypeBound(
+      examples("max_pages", String(MAX_KIND_PAGES)),
+      "max_pages",
+      MAX_KIND_PAGES,
+    ),
+    MAX_KIND_PAGES,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -534,6 +886,9 @@ test("a citation outside the page is a named failure, not a wrong fact", { skip 
   // tell "we number pages differently" from "that line id is off the end".
   // ADM-5f: a line id off the end of the page is still out of range; two
   // real-but-wrong lines are a value the citation does not support.
+  // ADM-5h: the page prints 20.00 exactly once, on line 7 -- and line 1 is
+  // six lines away from it. A citation is only ever repaired one line, so
+  // this one is not repaired, and the refusal stands.
   assert.deepEqual(await f.corrections(), [
     { field_name: "total", reason: "citation_out_of_range" },
     { field_name: "tax", reason: "citation_page_unknown" },
@@ -784,6 +1139,11 @@ test("a line between two cited lines cannot support a value", { skip }, async (t
     }),
     ids,
   );
+  // ADM-5h changed nothing here. The value is on line 5, one line from both
+  // cited lines -- but both of those lines state an amount of their own, and
+  // a model that cited `Chisel | 12.00` and reported 8.00 did not miss by a
+  // line, it contradicted the line it pointed at. A citation is only ever
+  // repaired away from lines that state no value at all.
   assert.equal(outcome.stored, 1);
   assert.deepEqual(await f.corrections(), [
     { field_name: "total", reason: "value_not_in_quote" },
@@ -1182,7 +1542,7 @@ test("a column receipt stores its money fields from far-apart lines", { skip }, 
 
 test("a value on neither cited line is still refused", { skip }, async (t) => {
   const f = await fixture(t);
-  const ids = await f.ingest(COLUMN_TOTALS_RECEIPT, "synthetic-column-wrong");
+  const ids = await f.ingest(COLUMN_TOTALS_RECEIPT, "synthetic-column-neither");
   const outcome = await f.extract(
     fakeModel({
       kind: "receipt",
@@ -1191,6 +1551,11 @@ test("a value on neither cited line is still refused", { skip }, async (t) => {
         // Lines 9 and 14 are "Subtotal" and "21.60". Claiming the subtotal is
         // 20.00 cites two real lines, neither of which prints it, and the
         // 20.00 sitting on line 12 in between must not rescue it.
+        //
+        // ADM-5h changed nothing about this. Line 14 states an amount of its
+        // own, so the citation is not one line off anything -- it
+        // contradicts itself -- and line 12 is two lines from 14 and three
+        // from 9 in any case.
         statement("subtotal", "20.00", [9, 14]),
       ],
     }),
@@ -1200,6 +1565,61 @@ test("a value on neither cited line is still refused", { skip }, async (t) => {
   assert.deepEqual(await f.corrections(), [
     { field_name: "subtotal", reason: "value_not_in_quote" },
   ]);
+});
+
+test("a citation one line off its value is repaired, and no further", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(COLUMN_TOTALS_RECEIPT, "synthetic-column-wrong");
+  // The layout the repair exists for: a label on one line and its amount on
+  // the next, which is what a column receipt and a dense tax form both emit.
+  const page = [
+    "BRACKEN TOOLS LTD.", // 1
+    "Subtotal", // 2
+    "20.00", // 3
+    "Tax", // 4
+    "1.60", // 5
+    "Total", // 6
+    "21.60", // 7
+    "Paid by card", // 8
+  ].join("\n");
+  await repaginate(f, ids, [[0, page]]);
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS LTD.", [1]),
+        // Cited the label. The amount is on the next line, no other line of
+        // the document states it, and the cited line states nothing at all
+        // -- so the citation moves one line and the value is stored.
+        statement("subtotal", "20.00", [2]),
+        // The same miss from the other side: cited the line after the value.
+        statement("total", "21.60", [8]),
+        // Five lines away. One line off is the miss this exists for; five is
+        // a search of the page, and the refusal stands.
+        statement("tax", "1.60", [1]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 3);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "tax", reason: "value_not_in_quote" },
+  ]);
+  // Each repaired citation points at the line that states the value, never
+  // at the line the model named.
+  const spans = await f.rows(
+    `SELECT o.observation_type AS field, s."start", s."end"
+       FROM kith.observations o
+       JOIN kith.evidence_spans s ON s.id = (o.value_evidence->>0)
+      WHERE o.space_id = $1 AND o.observation_type IN ('subtotal', 'total')
+      ORDER BY o.observation_type`,
+    [f.spaceId],
+  );
+  assert.deepEqual(
+    spans.map((row) => page.slice(row.start, row.end)),
+    ["20.00", "21.60"],
+  );
 });
 
 test("a vendor may be folded and split, but a number may not", { skip }, async (t) => {
@@ -1284,6 +1704,10 @@ test("the diagnostic answers in numbers and never in text", { skip }, async (t) 
       statements: [
         statement("vendor", "BRACKEN TOOLS LTD.", [1, 2]),
         // Cited the label lines only: the amount is on 12, not on 9 or 11.
+        // Line 11 is one line from 12, but line 9 is three, and a citation
+        // is repaired only when *every* line it names is within one of the
+        // value. So the failure reaches the diagnostic, which is what this
+        // test is about.
         statement("subtotal", "20.00", [9, 11]),
       ],
     }),
@@ -1525,7 +1949,10 @@ test("a value cut in half cannot be stored", { skip }, async (t) => {
   });
   const outcome = await f.extract(model, ids);
   // Only the vendor: the three fabricated readings have no line that prints
-  // them, because no line was ever cut through a value.
+  // them, because no line was ever cut through a value. ADM-5h's repair does
+  // not rescue `subtotal` either -- the only piece carrying 1,234.56 carries
+  // it against a cut edge, and the repair reads a line with the edges it
+  // really has, exactly as the gate does.
   assert.equal(outcome.stored, 1);
   assert.deepEqual(
     (await f.stored()).map((row) => row.observation_key),
@@ -2131,4 +2558,870 @@ test("a correction that lands on nothing says so as it is made", { skip }, async
   );
   assert.ok(orphan, "the owner is told the correction never reached the sum");
   assert.equal(orphan.field_name, "line_items");
+});
+
+// ---------------------------------------------------------------------------
+// ADM-5h against whole pages. Two synthetic documents, each shaped like the
+// one the live extraction could not read, and neither carrying anything real.
+// ---------------------------------------------------------------------------
+
+/**
+ * A partnership K-1, synthetic in every field.
+ *
+ * Two things at once, because the document does them at once: every filled
+ * box prints a whole dollar with the point still there and no cents after it,
+ * and two boxes are simply empty. Before ADM-5h the first refused every
+ * amount and the second opened a correction for each blank box.
+ */
+const K1_PAGE = [
+  "SCHEDULE K-1 (Form 1065)",
+  "Partnership: Thornfield Orchard Partners LP",
+  "Tax year 2024",
+  "Partner: A. Sample Holder",
+  "1 Ordinary business income 12,345.",
+  "2 Net rental real estate income",
+  "5 Interest income 5.",
+  "6a Ordinary dividends",
+  "9a Net long-term capital gain (9,999.)",
+  "L Ending capital account 1,234,567.",
+].join("\n");
+
+test("a K-1's whole dollars read, and its empty boxes stay quiet", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(K1_PAGE, "synthetic-k1-page");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "schedule_k1",
+      summary: "A partner's K-1 for the 2024 tax year.",
+      statements: [
+        statement("partnership", "Thornfield Orchard Partners LP", [2]),
+        statement("tax_year", "2024", [3]),
+        statement("recipient_as_written", "A. Sample Holder", [4]),
+        statement("ordinary_business_income", "12,345.", [5]),
+        // The two empty boxes, in the two shapes a reply prints them: an
+        // empty string and a null. Neither is a failed reading and neither
+        // may open an item for the owner to dismiss.
+        statement("net_rental_real_estate_income", "", [6]),
+        statement("dividend_income", null, [8]),
+        statement("interest_income", "5.", [7]),
+        statement("capital_gain", "(9,999.)", [9]),
+        statement("capital_account_ending", "1,234,567.", [10]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.kind, "schedule_k1");
+  assert.equal(outcome.failed, 0, "an empty box is not a correction");
+  assert.deepEqual(await f.corrections(), []);
+  const stored = new Map(
+    (await f.stored()).map((row) => [row.observation_key, row.value]),
+  );
+  // The blanks are absent, exactly as if the model had left the field out.
+  assert.equal(stored.has("net_rental_real_estate_income"), false);
+  assert.equal(stored.has("dividend_income"), false);
+  // Every printed whole dollar reads as the whole dollar it prints, sign and
+  // grouping included.
+  assert.equal(stored.get("ordinary_business_income").amount, "12345");
+  assert.equal(stored.get("interest_income").amount, "5");
+  assert.equal(stored.get("capital_gain").amount, "-9999");
+  assert.equal(stored.get("capital_account_ending").amount, "1234567");
+});
+
+/**
+ * A cover letter whose only date is a year, which is the whole point of it.
+ * The letter that prompted this stated "2024" and nothing else, and the
+ * document lost its date entirely to `date_unparsable`.
+ */
+const YEAR_ONLY_LETTER = [
+  "Thornfield Orchard Partners LP",
+  "Dear Partner,",
+  "Enclosed is your Schedule K-1 for the tax year 2024.",
+  "No amount is due with this letter.",
+  "Reference 88120",
+].join("\n");
+
+/** The same letter from a partnership that prints a whole date. */
+const DATED_LETTER = [
+  "Thornfield Orchard Partners LP",
+  "Dear Partner,",
+  "Enclosed is your Schedule K-1, sent 18 March 2024.",
+  "Reference 88121",
+].join("\n");
+
+test("a letter whose only date is a year keeps it, and dates no event with it", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(YEAR_ONLY_LETTER, "synthetic-year-only-letter");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "letter_or_notice",
+      summary: "A cover letter enclosing a K-1.",
+      statements: [
+        statement("sender", "Thornfield Orchard Partners LP", [1]),
+        statement("letter_date", "2024", [3]),
+        statement("subject", "  ", [3]),
+        statement("reference_number", "88120", [5]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.failed, 0);
+  assert.deepEqual(await f.corrections(), []);
+  const stored = new Map(
+    (await f.stored()).map((row) => [row.observation_key, row.value]),
+  );
+  // Stored as a year and labelled a year. Nothing padded it to January.
+  assert.deepEqual(stored.get("letter_date"), {
+    type: "date",
+    value: "2024",
+    precision: "year",
+  });
+  assert.equal(stored.has("subject"), false, "a blank subject is unstated");
+  // And it dates no event. `occurrence_date` holds a calendar day, and a
+  // year has none to give, so the event stays undated rather than being
+  // filed under the first of January -- where every list, timeline and
+  // window query in the store would have read it as a fact.
+  const row = (
+    await f.rows(
+      `SELECT occurrence_date, occurrence->>'precision' AS precision
+         FROM kith.observations
+        WHERE space_id = $1 AND observation_type = 'letter_date'`,
+      [f.spaceId],
+    )
+  )[0];
+  assert.equal(row.occurrence_date, null);
+  assert.equal(row.precision, "unknown");
+  // Every read of an observation goes through the stored-value validator, so
+  // a shape it refuses is a row nothing can load. This is that read.
+  const id = (
+    await f.rows(
+      `SELECT id FROM kith.observations
+        WHERE space_id = $1 AND observation_type = 'letter_date'`,
+      [f.spaceId],
+    )
+  )[0].id;
+  const hydrated = await withKithTransaction(f.pool, (client) =>
+    hydrateObservation(client, { spaceId: f.spaceId, observationId: id }),
+  );
+  assert.deepEqual(hydrated.observation.value, {
+    type: "date",
+    value: "2024",
+    precision: "year",
+  });
+});
+
+test("a letter that prints a whole date still dates its event", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(DATED_LETTER, "synthetic-dated-letter");
+  await f.extract(
+    fakeModel({
+      kind: "letter_or_notice",
+      summary: "A cover letter enclosing a K-1.",
+      statements: [
+        statement("sender", "Thornfield Orchard Partners LP", [1]),
+        statement("letter_date", "18 March 2024", [3]),
+        statement("reference_number", "88121", [4]),
+      ],
+    }),
+    ids,
+  );
+  assert.deepEqual(await f.corrections(), []);
+  const stored = new Map(
+    (await f.stored()).map((row) => [row.observation_key, row.value]),
+  );
+  // A day keeps the shape it always had, with no `precision` key.
+  assert.deepEqual(stored.get("letter_date"), {
+    type: "date",
+    value: "2024-03-18",
+  });
+  const row = (
+    await f.rows(
+      `SELECT occurrence_date, occurrence->>'precision' AS precision
+         FROM kith.observations
+        WHERE space_id = $1 AND observation_type = 'letter_date'`,
+      [f.spaceId],
+    )
+  )[0];
+  assert.equal(row.precision, "date");
+  assert.equal(
+    row.occurrence_date instanceof Date
+      ? row.occurrence_date.toISOString().slice(0, 10)
+      : String(row.occurrence_date).slice(0, 10),
+    "2024-03-18",
+  );
+});
+
+/** Fifteen pages, with the total on the last one. More than the global page
+ * bound and inside the ceiling a kind may raise it to. */
+function longDocument() {
+  const pages = [["BRACKEN TOOLS", "09/18/26 14:32"].join("\n")];
+  for (let ordinal = 1; ordinal < 14; ordinal += 1) {
+    pages.push(`Chisel | 1.00\nMallet | 2.00`);
+  }
+  pages.push("Total | 21.60");
+  return pages.map((text, ordinal) => [ordinal, text]);
+}
+
+async function setKindBound(f, kind, name, value) {
+  await f.client.query(
+    `UPDATE kith.document_types SET examples = $3::jsonb
+      WHERE space_id = $1 AND kind = $2`,
+    [f.spaceId, kind, JSON.stringify([{ setting: name, value }])],
+  );
+}
+
+test("a kind that asks for more pages is read again with them", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest("placeholder", "synthetic-fifteen-pages");
+  await repaginate(f, ids, longDocument());
+  await setKindBound(f, "receipt", "max_pages", "15");
+  const model = fakeModel((call) => ({
+    kind: "receipt",
+    summary: "A long receipt.",
+    statements:
+      call === 1
+        ? [statement("vendor", "BRACKEN TOOLS", [1])]
+        : [
+            statement("vendor", "BRACKEN TOOLS", [1]),
+            statement("purchase_date", "09/18/26", [2]),
+            { field: "total", value: "21.60", line_items: null, page: 15, lines: [1] },
+          ],
+  }));
+  const outcome = await f.extract(model, ids);
+  // Two passes: the first cannot know the kind, and the bound belongs to the
+  // kind. The second is the one whose reading is kept.
+  assert.equal(model.requests.length, 2);
+  assert.doesNotMatch(model.requests[0].prompt, /=== page 15 ===/);
+  assert.match(model.requests[1].prompt, /=== page 15 ===/);
+  assert.equal(outcome.truncated, false, "nothing was left unread");
+  const stored = new Map(
+    (await f.stored()).map((row) => [row.observation_key, row.value]),
+  );
+  assert.equal(stored.get("total").amount, "21.6");
+  const row = (
+    await f.rows(
+      "SELECT pages_read, pages_total FROM kith.document_extractions WHERE space_id = $1",
+      [f.spaceId],
+    )
+  )[0];
+  assert.equal(Number(row.pages_read), 15);
+  assert.equal(Number(row.pages_total), 15);
+});
+
+test("a bound past the ceiling is ignored, not clamped", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest("placeholder", "synthetic-fifteen-pages-capped");
+  await repaginate(f, ids, longDocument());
+  await setKindBound(f, "receipt", "max_pages", String(MAX_KIND_PAGES + 1));
+  const model = fakeModel({
+    kind: "receipt",
+    summary: "A long receipt.",
+    statements: [statement("vendor", "BRACKEN TOOLS", [1])],
+  });
+  const outcome = await f.extract(model, ids);
+  // One pass, at the global default: a setting outside the ceiling reads as
+  // unset, so nothing widened and the document is honestly reported as
+  // partially read.
+  assert.equal(model.requests.length, 1);
+  assert.equal(outcome.truncated, true);
+  const row = (
+    await f.rows(
+      "SELECT pages_read, pages_total FROM kith.document_extractions WHERE space_id = $1",
+      [f.spaceId],
+    )
+  )[0];
+  assert.equal(Number(row.pages_read), 12);
+  assert.equal(Number(row.pages_total), 15);
+});
+
+// ---------------------------------------------------------------------------
+// ADM-5h review: the six ways a repaired citation could store a wrong number.
+//
+// The unique-line repair is the only rule in this round that *relaxes* a
+// check, so it gets its own section. Every document below stored a wrong
+// value end to end under the first version of the repair, and every one of
+// them is refused now. The positive case -- a value one line off its
+// citation -- is "a citation one line off its value is repaired, and no
+// further" above, and it still stores.
+// ---------------------------------------------------------------------------
+
+/** A line long enough to be cut, with its amount against the cut. The en
+ * dash after the amount is what lets the splitter cut there at all: it is
+ * not one of the marks that bind a sign to a number. */
+const CUT_EDGE_INVOICE = [
+  "HALLOWAY JOINERY",
+  `Adjustment for the prior period as agreed ${"and noted ".repeat(19)}100.00 – see note`,
+  "Balance carried forward",
+].join("\n");
+
+test("a citation is never repaired onto a line the splitter cut", { skip }, async (t) => {
+  // The piece the splitter produced states 100.00 against an unknown edge:
+  // whatever stood beyond the cut -- here an en dash the ledger may well be
+  // using as a trailing minus -- is gone. Read without that edge it offers
+  // a charge the page does not print, which is exactly what the first
+  // version of the repair did when it rebuilt candidates by hand.
+  const piece = pageLines(CUT_EDGE_INVOICE)[1];
+  assert.equal(piece.cutEnd, true);
+  assert.deepEqual(amountsInText(piece.text), ["100"]);
+  assert.deepEqual(amountsInText(piece.text, { cutEnd: true }), []);
+
+  const f = await fixture(t);
+  const ids = await f.ingest(TABLE_RECEIPT, "synthetic-cut-repair");
+  await repaginate(f, ids, [[0, CUT_EDGE_INVOICE]]);
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "invoice",
+      summary: "Joinery invoice.",
+      statements: [
+        statement("vendor", "HALLOWAY JOINERY", [1]),
+        // One line from the piece that seems to carry 100.00.
+        statement("total", "100.00", [1]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "total", reason: "value_not_in_quote" },
+  ]);
+});
+
+/** A fee one line above a total, which is every receipt with a service
+ * charge on it. */
+const FEE_AND_TOTAL_RECEIPT = [
+  "BRACKEN TOOLS", // 1
+  "Fee 100.00", // 2
+  "Total 250.00", // 3
+].join("\n");
+
+test("a value the cited line contradicts is never repaired", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(FEE_AND_TOTAL_RECEIPT, "synthetic-fee-and-total");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS", [1]),
+        // The cited line prints a total, and it is not this one. A model
+        // that says 100.00 while pointing at `Total 250.00` has not missed
+        // by a line: it has contradicted its own citation, and moving the
+        // citation would store the fee as the total.
+        statement("total", "100.00", [3]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "total", reason: "value_not_in_quote" },
+  ]);
+});
+
+test("a value another page also prints is never repaired", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(TABLE_RECEIPT, "synthetic-repair-two-pages");
+  const deposit = [
+    "ACME SUPPLY CO", // 1
+    "Deposit 100.00", // 2
+    "Thank you for your custom", // 3
+  ].join("\n");
+  const totals = ["Total 100.00", "Total 100.00"].join("\n");
+  await repaginate(f, ids, [
+    [0, deposit],
+    [1, totals],
+  ]);
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Supply receipt.",
+      statements: [
+        statement("vendor", "ACME SUPPLY CO", [1]),
+        // One line from `Deposit 100.00`, and the page states 100.00 once.
+        // The *document* does not: page two prints it twice, so which line
+        // states the total is exactly the question a repair may not answer.
+        statement("total", "100.00", [3]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "total", reason: "value_not_in_quote" },
+  ]);
+});
+
+test("two fields cannot repair onto the same line", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(TABLE_RECEIPT, "synthetic-repair-contested");
+  const page = [
+    "BRACKEN TOOLS", // 1
+    "Subtotal", // 2
+    "Tax", // 3
+    "Total", // 4
+    "20.00", // 5
+    "Paid by card", // 6
+  ].join("\n");
+  await repaginate(f, ids, [[0, page]]);
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS", [1]),
+        // One amount and three fields claiming it. Each of them is one line
+        // from it and would repair onto it alone; together they are a
+        // reply nobody can believe, and a document with one number cannot
+        // state three different ones.
+        statement("subtotal", "20.00", [4]),
+        statement("tax", "20.00", [4]),
+        statement("total", "20.00", [6]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "subtotal", reason: "value_not_in_quote" },
+    { field_name: "tax", reason: "value_not_in_quote" },
+    { field_name: "total", reason: "value_not_in_quote" },
+  ]);
+});
+
+test("a line another statement was already read from is not repaired onto", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(TABLE_RECEIPT, "synthetic-repair-occupied");
+  const page = [
+    "BRACKEN TOOLS", // 1
+    "Subtotal 20.00", // 2
+    "Amount due", // 3
+  ].join("\n");
+  await repaginate(f, ids, [[0, page]]);
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS", [1]),
+        // Cited and read from line 2.
+        statement("subtotal", "20.00", [2]),
+        // One line from the same amount. The subtotal was read off that
+        // line, so the total is not also read off it: one printed number is
+        // one field's, and the second reading is a guess about which.
+        statement("total", "20.00", [3]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 2);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "total", reason: "value_not_in_quote" },
+  ]);
+});
+
+test("a bare run of digits never repairs onto a money field", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(TABLE_RECEIPT, "synthetic-repair-bare-digits");
+  const page = [
+    "BRACKEN TOOLS", // 1
+    "Suite 400", // 2
+    "Order summary", // 3
+    "Tax year 2024", // 4
+    "Filed under", // 5
+    "Page 2 of 5", // 6
+    "Thank you", // 7
+  ].join("\n");
+  await repaginate(f, ids, [[0, page]]);
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS", [1]),
+        // Each of these is one line from a run of digits that is not an
+        // amount: a suite number, a tax year and a page number. A printed
+        // money amount carries a decimal point or a currency mark; none of
+        // these does, and each of them stored a wrong total end to end.
+        statement("total", "400", [3]),
+        statement("tax", "2024", [5]),
+        statement("subtotal", "2", [7]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "subtotal", reason: "value_not_in_quote" },
+    { field_name: "tax", reason: "value_not_in_quote" },
+    { field_name: "total", reason: "value_not_in_quote" },
+  ]);
+});
+
+/** A line that scales, beside a line that does not. The amount stands alone,
+ * because a line with a word on it belongs to that word and is never repaired
+ * onto -- `Raised $2.5M` is the raise, whatever the line under it is called. */
+const ROUND_PAGE = [
+  "THORNFIELD VENTURES", // 1
+  "Raised", // 2
+  "$2.5M", // 3
+  "Round summary", // 4
+].join("\n");
+
+test("a scaled amount is not repaired from a number the page never prints", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ROUND_PAGE, "synthetic-repair-scaled");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Round summary.",
+      statements: [
+        statement("vendor", "THORNFIELD VENTURES", [1]),
+        // The scaled reading is right about the money and wrong about the
+        // page: no line prints 2,500,000. A citation is moved to a line the
+        // document prints the value on, and "prints" means the characters
+        // that are there.
+        statement("total", "2,500,000", [4]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "total", reason: "value_not_in_quote" },
+  ]);
+});
+
+test("a scaled amount copied as the page prints it still repairs", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ROUND_PAGE, "synthetic-repair-scaled-copied");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Round summary.",
+      statements: [
+        statement("vendor", "THORNFIELD VENTURES", [1]),
+        // Cited the line after the amount. The amount is alone on its line,
+        // the line on the far side of it is a label rather than another bare
+        // value, and no other line of the document prints it.
+        statement("total", "$2.5M", [4]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 2);
+  assert.deepEqual(await f.corrections(), []);
+  const stored = new Map(
+    (await f.stored()).map((row) => [row.observation_key, row.value]),
+  );
+  assert.equal(stored.get("total").amount, "2500000");
+});
+
+// ---------------------------------------------------------------------------
+// ADM-5h re-review. Two more conditions on the repair, and the one accepted
+// reading that never recorded the lines it was read from.
+//
+// Every page below stored a value `main` refuses. Each test was verified to
+// fail against 59cd2f4 before the fix landed.
+// ---------------------------------------------------------------------------
+
+/** A receipt whose one item, its own label and the total are three lines.
+ * The item's amount is the only 8.00 on the page. */
+const ITEM_AND_SUBTOTAL_RECEIPT = [
+  "BRACKEN TOOLS", // 1
+  "Mallet 8.00", // 2
+  "Subtotal", // 3
+  "Total 28.00", // 4
+].join("\n");
+
+test("a line item's own amount is not repaired onto another field", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(
+    ITEM_AND_SUBTOTAL_RECEIPT,
+    "synthetic-repair-line-item",
+  );
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS", [1]),
+        statement("line_items", null, [2], {
+          line_items: [{ description: "Mallet", amount: "8.00", lines: [2] }],
+        }),
+        // One line from the mallet's amount, and the mallet's amount is not
+        // the subtotal. A receipt whose subtotal is unprinted has an
+        // unprinted subtotal.
+        statement("subtotal", "8.00", [3]),
+      ],
+    }),
+    ids,
+  );
+  // The vendor and the one item.
+  assert.equal(outcome.stored, 2);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "subtotal", reason: "value_not_in_quote" },
+  ]);
+});
+
+/** The same receipt in the layout the repair exists for: the item's label on
+ * one line and its amount, alone, on the next. Here the target *is* a bare
+ * value and its far neighbour *is* a label, so only the list's own claim on
+ * line 3 stands between the subtotal and the mallet's eight pounds. */
+const COLUMN_ITEM_RECEIPT = [
+  "BRACKEN TOOLS", // 1
+  "Mallet", // 2
+  "8.00", // 3
+  "Subtotal", // 4
+  "Total 28.00", // 5
+].join("\n");
+
+/** The statements of the column receipt above, in either order. A repair is
+ * resolved only after every statement has been read, so which of the two the
+ * model printed first may not change what is stored. */
+function columnItemStatements(listFirst) {
+  const list = statement("line_items", null, [2, 3], {
+    line_items: [{ description: "Mallet", amount: "8.00", lines: [2, 3] }],
+  });
+  const subtotal = statement("subtotal", "8.00", [4]);
+  return [
+    statement("vendor", "BRACKEN TOOLS", [1]),
+    ...(listFirst ? [list, subtotal] : [subtotal, list]),
+  ];
+}
+
+test("a list's line is occupied, and a citation is not repaired onto it", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(COLUMN_ITEM_RECEIPT, "synthetic-repair-list-line");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: columnItemStatements(true),
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 2);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "subtotal", reason: "value_not_in_quote" },
+  ]);
+});
+
+test("and it is occupied whichever statement the model printed first", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(COLUMN_ITEM_RECEIPT, "synthetic-repair-list-order");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: columnItemStatements(false),
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 2);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "subtotal", reason: "value_not_in_quote" },
+  ]);
+});
+
+test("an amount in a column of amounts is not repaired onto", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(COLUMN_TOTALS_RECEIPT, "synthetic-repair-stack");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS LTD.", [1, 2]),
+        // Lines 9, 10 and 11 are `Subtotal`, `Tax` and `Total`; lines 12, 13
+        // and 14 are 20.00, 1.60 and 21.60. The line after `Total` is the
+        // subtotal's amount, and the only thing that says so is counting.
+        // A page whose total is 21.60 stored a total of 20.00.
+        statement("total", "20.00", [11]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "total", reason: "value_not_in_quote" },
+  ]);
+});
+
+/** A receipt that prints one label alone and the next with its amount. */
+const LABELLED_NEIGHBOUR_RECEIPT = [
+  "BRACKEN TOOLS", // 1
+  "Subtotal", // 2
+  "Tax 1.60", // 3
+  "Total 21.60", // 4
+].join("\n");
+
+test("a line that names its own field is not repaired onto", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(
+    LABELLED_NEIGHBOUR_RECEIPT,
+    "synthetic-repair-labelled",
+  );
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS", [1]),
+        // The 1.60 one line away is the tax, and the line says so. A
+        // subtotal read off it is a tax stored as a subtotal, and the page
+        // never printed a subtotal at all.
+        statement("subtotal", "1.60", [2]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "subtotal", reason: "value_not_in_quote" },
+  ]);
+});
+
+/** A service invoice whose invoice number is one line from the odometer
+ * label, which is the shape that turned an invoice number into mileage. */
+const SERVICE_INVOICE = [
+  "FERNDALE MOTORS", // 1
+  "Invoice 48210", // 2
+  "Odometer", // 3
+  "Brake pads replaced", // 4
+].join("\n");
+
+test("an identifier beside a number's label is not repaired onto", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(SERVICE_INVOICE, "synthetic-repair-odometer");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "vehicle_service_receipt",
+      summary: "Brake service.",
+      statements: [
+        statement("vendor", "FERNDALE MOTORS", [1]),
+        // A bare run of digits can never repair onto a *money* field, and
+        // this is the other half: a number field takes one, and the line it
+        // sits on says the digits are an invoice number.
+        statement("odometer_miles", 48210, [3]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "odometer_miles", reason: "value_not_in_quote" },
+  ]);
+});
+
+/** A K-1 cover page, printing a page number and a box in the two places a
+ * number field's label would look for its value. */
+const K1_LABEL_PAGE = [
+  "THORNFIELD ORCHARD PARTNERS LP", // 1
+  "Page 2023", // 2
+  "Tax year", // 3
+  "Profit share", // 4
+  "12 Section 179 deduction", // 5
+].join("\n");
+
+test("a year and a box number are not repaired onto their neighbours", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(K1_LABEL_PAGE, "synthetic-repair-k1-labels");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "schedule_k1",
+      summary: "Partnership K-1.",
+      statements: [
+        statement("partnership", "THORNFIELD ORCHARD PARTNERS LP", [1]),
+        // `Page 2023` is a page number beside a year's label.
+        statement("tax_year", 2023, [3]),
+        // `12 Section 179 deduction` is a box number beside a percentage's
+        // label, and the line prints two numbers besides.
+        statement("profit_share_percent", 12, [4]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "profit_share_percent", reason: "value_not_in_quote" },
+    { field_name: "tax_year", reason: "value_not_in_quote" },
+  ]);
+});
+
+/** A letter that prints a whole date, a year and another year. */
+const YEAR_AND_DATE_LETTER = [
+  "THORNFIELD ORCHARD PARTNERS LP", // 1
+  "Dear Partner,", // 2
+  "Your Schedule K-1 was sent 18 March 2024.", // 3
+  "For the tax year 2024", // 4
+  "Rolling into fiscal year 2025", // 5
+].join("\n");
+
+test("a re-extraction never downgrades an exact date to a partial one", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(YEAR_AND_DATE_LETTER, "synthetic-date-downgrade");
+  const letterDate = async () =>
+    (
+      await f.rows(
+        `SELECT value, occurrence_date FROM kith.observations
+          WHERE space_id = $1 AND observation_type = 'letter_date'`,
+        [f.spaceId],
+      )
+    )[0];
+  const reading = (value, lines) =>
+    fakeModel({
+      kind: "letter_or_notice",
+      summary: "A cover letter enclosing a K-1.",
+      statements: [
+        statement("sender", "THORNFIELD ORCHARD PARTNERS LP", [1]),
+        statement("letter_date", value, lines),
+      ],
+    });
+
+  // The first run reads the whole date.
+  await f.extract(reading("18 March 2024", [3]), ids, NOW + 2_000);
+  const first = await letterDate();
+  assert.deepEqual(first.value, { type: "date", value: "2024-03-18" });
+
+  // The second reads only the year off another line. The two agree as far
+  // as the second one goes, so the day stands: a document does not stop
+  // stating a date because one run of one model read less of it.
+  await f.extract(reading("2024", [4]), ids, NOW + 3_000);
+  const second = await letterDate();
+  assert.deepEqual(second.value, { type: "date", value: "2024-03-18" });
+  assert.deepEqual(await f.corrections(), []);
+  // And it still dates the event, rather than dropping off the timeline.
+  assert.equal(
+    second.occurrence_date instanceof Date
+      ? second.occurrence_date.toISOString().slice(0, 10)
+      : String(second.occurrence_date).slice(0, 10),
+    "2024-03-18",
+  );
+  // The kept day keeps its own evidence. The line the second run cited
+  // prints a year, and hanging a day off it would be the fabricated
+  // citation this whole gate exists to prevent.
+  const span = (
+    await f.rows(
+      `SELECT s."start", s."end" FROM kith.observations o
+         JOIN kith.evidence_spans s ON s.id = (o.value_evidence->>0)
+        WHERE o.space_id = $1 AND o.observation_type = 'letter_date'`,
+      [f.spaceId],
+    )
+  )[0];
+  assert.equal(
+    YEAR_AND_DATE_LETTER.slice(span.start, span.end),
+    "Your Schedule K-1 was sent 18 March 2024.",
+  );
+
+  // A partial date that *contradicts* the stored one is a different
+  // reading of the document, not a coarser one, and it replaces it. Keeping
+  // 2024-03-18 under a run that read 2025 would store a date this run does
+  // not support.
+  await f.extract(reading("2025", [5]), ids, NOW + 4_000);
+  const third = await letterDate();
+  assert.deepEqual(third.value, {
+    type: "date",
+    value: "2025",
+    precision: "year",
+  });
+  assert.equal(third.occurrence_date, null);
 });

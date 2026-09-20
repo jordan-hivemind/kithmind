@@ -373,6 +373,23 @@ function makeAmount(random) {
       : random.pick(["", " ", random.pick(GAPS)])
     : "";
 
+  // ADM-5h: a whole dollar printed with the point still there and no cents
+  // after it -- `5.`, `12,345.`, `(9,999.)`. Every box of a tax form prints
+  // this way. The point is typography and not a fraction, so the value the
+  // oracle computed above is the same with it or without it: `truthOf` is
+  // never told about it, which is what makes this generated form a test of
+  // the grammar rather than a copy of it.
+  //
+  // Only where the point can be the last character of the number. A
+  // magnitude, a fraction or a flag after it would print a token no reader
+  // would price the way the oracle does.
+  const trailingDot =
+    fractionLength === 0 &&
+    magnitudeKind === "none" &&
+    !flag &&
+    random.chance(0.14);
+  const printedDigits = trailingDot ? `${digits}.` : digits;
+
   // The sign, in every shape a ledger prints one.
   const signKind = random.pick([
     "none",
@@ -407,7 +424,7 @@ function makeAmount(random) {
   // A magnitude letter is pressed against the digits; a word may be a gap
   // away. Either way it is part of the number, and the currency marker goes
   // outside both.
-  let core = digits;
+  let core = printedDigits;
   if (magnitudeKind === "letter") core = `${digits}${suffix}`;
   else if (magnitudeKind === "word") core = `${digits}${suffixGap}${suffix}`;
   // A magnitude word and a trailing currency code need something between
@@ -437,7 +454,15 @@ function makeAmount(random) {
   }
 
   const value = truthOf({ whole, fraction, magnitude, negative });
-  return { text, value, currencyName, grouping, signKind, magnitudeKind };
+  return {
+    text,
+    value,
+    currencyName,
+    grouping,
+    signKind,
+    magnitudeKind,
+    trailingDot,
+  };
 }
 
 /** `1234567` as `1,234,567`: the last groups are three digits and the first
@@ -470,7 +495,10 @@ function word(random) {
 
 /** One case: the string to scan, and every value it prints. */
 function makeCase(random) {
-  const shape = random.int(6);
+  const shape = random.int(9);
+  if (shape === 6) return makeCurrencyGap(random);
+  if (shape === 7) return makeTrailingDotPair(random);
+  if (shape === 8) return makeListOrdinal(random);
   if (shape === 0) {
     const token = makeToken(random);
     return { text: token.text, tokens: [token], single: true };
@@ -515,6 +543,117 @@ function makeCase(random) {
   return {
     text: `${word(random)} ${word(random)}${columnGap(random)}${left.text}${columnGap(random)}${right.text}${trailing}`,
     tokens: [left, right],
+  };
+}
+
+/**
+ * `$82. 129961`, `$ 165 .00`: a currency-marked number with a one-space gap
+ * at its decimal point.
+ *
+ * A parsed receipt prints the gap and means nothing by it, so the grammar
+ * closes it up -- and the width of what it closes decides what the line
+ * says. The oracle's rule here is written from the pieces and owes the
+ * implementation nothing: **cents are two digits and nothing else is.** Where
+ * the right-hand run is two digits the line prints one number and the
+ * generator knows which. Where it is not, the line prints something this
+ * generator cannot price -- 82 and 129961 as two cells, or 82.129961 as one,
+ * and the text does not say -- so the only answer that cannot be a wrong
+ * number is no answer at all.
+ *
+ * ADM-5h review found both halves: `$82. 129961.-` read as minus 82.129961
+ * and `$94. 504. billion` as ninety-four and a half billion. The re-review
+ * found the third: two digits are cents only when the run ends there, so
+ * `$6. 25a` is not 6.25 and `€642. 73.-` is not a credit of 642.73.
+ */
+function makeCurrencyGap(random) {
+  const mark = random.pick([
+    "$",
+    "\u20ac",
+    "\u00a3",
+    "\u00a5",
+    "\u20b9",
+    "USD ",
+    "EUR ",
+  ]);
+  const whole = random.digits(1 + random.int(6));
+  const right = random.digits(1 + random.int(6), true);
+  // The gap before the point. Nothing after the number that could sign or
+  // scale it: a trailing minus and a magnitude word are both legitimate
+  // readings of their own, and a generator that printed one would be pricing
+  // a token it did not mean.
+  if (random.chance(0.4)) {
+    const tail = random.pick(["", " due", " total", "."]);
+    const text = `${mark}${whole} .${right}${tail}`;
+    const value =
+      right.length === 2
+        ? truthOf({ whole, fraction: right, magnitude: 0, negative: false })
+        : undefined;
+    return { text, tokens: [{ text, value, signKind: "none" }] };
+  }
+  // The gap after the point, where what follows the right-hand run decides
+  // as much as its width does. Two digits are cents only when the run *ends*
+  // there: a letter after them makes it a box label or a magnitude, a second
+  // point makes it the first half of something longer, and a sign makes it a
+  // ledger's own. `$6. 25a`, `$5. 25b` and `€642. 73.-` each read as a
+  // number the page does not print, and the generator prices none of them --
+  // the only reading that cannot be wrong is no reading at all.
+  const tail = random.pick([
+    "",
+    " due",
+    " total",
+    "a",
+    "b",
+    ".",
+    ".-",
+    "-",
+    "+",
+  ]);
+  const ends = tail === "" || tail.startsWith(" ");
+  const text = `${mark}${whole}. ${right}${tail}`;
+  const value =
+    right.length === 2 && ends
+      ? truthOf({ whole, fraction: right, magnitude: 0, negative: false })
+      : undefined;
+  return { text, tokens: [{ text, value, signKind: "none" }] };
+}
+
+/**
+ * `12,345. 80`, `5. 25`: a point with no cents after it, then another
+ * number, and no currency marker to say the gap is inside one number.
+ *
+ * ADM-5h made a trailing point a whole dollar, which is what a tax form
+ * prints. That reading stops exactly here: `12,345. 80` is twelve thousand
+ * three hundred and forty-five point eight to one reader and two cells to
+ * another, and nothing in the characters chooses. The oracle prices neither,
+ * so the finder may offer neither.
+ */
+function makeTrailingDotPair(random) {
+  const left = random.chance(0.5)
+    ? groupFrom(random.digits(4 + random.int(3)), ",")
+    : random.digits(1 + random.int(4));
+  const right = random.digits(1 + random.int(4), true);
+  const tail = random.pick(["", " units", " due", "."]);
+  return {
+    text: `${left}. ${right}${tail}`,
+    tokens: [{ text: `${left}. ${right}`, value: undefined, signKind: "none" }],
+  };
+}
+
+/**
+ * `1. Rent 500.00`, `3) Repairs 42.00`: a numbered list.
+ *
+ * An ordinal is a position in a list. It is not a quantity, not a price and
+ * not a count, and the line prints exactly one value: the token's. ADM-5h
+ * review found the finder offering the bullet, and a bullet that can be
+ * stored as a money field is a number on the page nobody wrote as one.
+ */
+function makeListOrdinal(random) {
+  const ordinal = random.digits(1 + random.int(2));
+  const mark = random.pick([".", ")"]);
+  const token = makeToken(random);
+  return {
+    text: `${ordinal}${mark} ${word(random)} ${token.text}`,
+    tokens: [token],
   };
 }
 

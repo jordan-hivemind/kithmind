@@ -8,8 +8,22 @@ export type ObservationValue =
   | { type: "integer"; value: string; unitCode?: string }
   | { type: "text"; value: string }
   | { type: "boolean"; value: boolean }
-  | { type: "date"; value: string }
+  /**
+   * A calendar date, possibly partial.
+   *
+   * `precision` omitted means a full day and `value` is `YYYY-MM-DD`, which
+   * is every date this type held before. A document that states only a year
+   * or only a month states only that: a tax letter's "2024" and a cover
+   * letter's "March 2024" are dates, and padding either to the first of the
+   * month invents a day the page does not print and that a reader would then
+   * repeat as fact. So `year` carries `YYYY` and `month` carries `YYYY-MM`,
+   * and a read hands the precision on rather than the padding.
+   */
+  | { type: "date"; value: string; precision?: DatePrecision }
   | { type: "entity"; entityId: string };
+/** How much of a date the document actually printed. */
+export type DatePrecision = "year" | "month" | "day";
+
 export type OccurrenceComparison =
   "before" | "same" | "after" | "ambiguous" | "unknown";
 
@@ -305,11 +319,32 @@ export function canonicalizeObservationValue(
       };
     case "boolean":
       return value;
-    case "date":
+    case "date": {
+      const precision = value.precision ?? "day";
+      if (precision === "year") {
+        if (!/^\d{4}$/.test(value.value)) {
+          throw new Error("Observation year must use YYYY");
+        }
+        return { type: "date", value: value.value, precision };
+      }
+      if (precision === "month") {
+        if (!/^\d{4}-\d{2}$/.test(value.value)) {
+          throw new Error("Observation month must use YYYY-MM");
+        }
+        const month = Number(value.value.slice(5));
+        if (month < 1 || month > 12) {
+          throw new Error("Observation month is not a real month");
+        }
+        return { type: "date", value: value.value, precision };
+      }
+      // A day-precision value keeps the shape it always had, with no
+      // `precision` key, so every row written before partial dates reads back
+      // unchanged and every comparison of a stored value still holds.
       return {
         type: "date",
         value: validateIsoCalendarDate(value.value, "Observation date"),
       };
+    }
     case "entity":
       return value;
   }
