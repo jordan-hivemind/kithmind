@@ -239,11 +239,25 @@ test(
       `CREATE ROLE "${providerRole}" LOGIN PASSWORD '${providerRolePassword}' NOCREATEROLE NOCREATEDB NOSUPERUSER`,
     );
     await admin.query(`ALTER SCHEMA kith OWNER TO "${providerRole}"`);
-    const tables = (
-      await admin.query(`SELECT tablename FROM pg_tables WHERE schemaname = 'kith'`)
+    // Every relation in the schema, not only the ones `pg_tables` lists. A
+    // provider's project-owner role owns the views in its own schema too, and
+    // `grantProofAppRole` revokes and grants `ON ALL TABLES IN SCHEMA kith`,
+    // which Postgres expands to views as well. Reassigning tables alone left
+    // migration 032's two sensitivity views owned by the superuser, and the
+    // first `REVOKE ALL ON ALL TABLES IN SCHEMA kith FROM PUBLIC` then failed
+    // with 42501 on a relation this role did not own -- a fixture that no
+    // longer modelled the host it stands in for, not a defect in the grants.
+    const relations = (
+      await admin.query(
+        `SELECT c.relname, c.relkind FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'kith' AND c.relkind IN ('r', 'p', 'v', 'm')`,
+      )
     ).rows;
-    for (const { tablename } of tables) {
-      await admin.query(`ALTER TABLE kith."${tablename}" OWNER TO "${providerRole}"`);
+    for (const { relname, relkind } of relations) {
+      const kind =
+        relkind === "v" ? "VIEW" : relkind === "m" ? "MATERIALIZED VIEW" : "TABLE";
+      await admin.query(`ALTER ${kind} kith."${relname}" OWNER TO "${providerRole}"`);
     }
     await admin.end();
 

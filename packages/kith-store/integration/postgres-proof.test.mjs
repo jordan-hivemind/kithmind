@@ -466,9 +466,20 @@ test(
     // kith_id domain, so the domain cannot be dropped while any of them
     // exist. Found by the domain itself rather than a hardcoded table list,
     // so this keeps working unmodified as later migrations add more of them.
+    //
+    // `information_schema.columns` describes views as well as tables, and a
+    // view whose column comes from a kith_id column is listed here exactly
+    // like the table it reads (migration 032's `source_item_sensitivity` and
+    // `document_sensitivity` are the first two). `DROP TABLE` refuses a view
+    // -- 42809, "is not a table" -- so the list is joined to
+    // `information_schema.tables` and restricted to base tables. The views
+    // still go: they depend on the tables below and the CASCADE takes them.
     const migratedTables = await restoredOwner.query(
-      `SELECT DISTINCT table_name FROM information_schema.columns
-        WHERE table_schema = 'kith' AND domain_schema = 'kith' AND domain_name = 'kith_id'`,
+      `SELECT DISTINCT c.table_name FROM information_schema.columns c
+         JOIN information_schema.tables t
+           ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+        WHERE c.table_schema = 'kith' AND c.domain_schema = 'kith'
+          AND c.domain_name = 'kith_id' AND t.table_type = 'BASE TABLE'`,
     );
     if (migratedTables.rows.length > 0) {
       const names = migratedTables.rows
@@ -483,6 +494,12 @@ test(
     // `CREATE OR REPLACE` so the replay survives either way; this is the other
     // half, so the rewind means what it says.
     await restoredOwner.query("DROP FUNCTION IF EXISTS kith.record_change()");
+    // Migration 32's function, for the same reason and with one difference:
+    // it is a plain `CREATE FUNCTION`, so a rewind that leaves it behind does
+    // not merely misdescribe version 1, it makes the replay fail outright.
+    await restoredOwner.query(
+      "DROP FUNCTION IF EXISTS kith.sensitivity_rank(text)",
+    );
     // Undo migration 6's renames as well. It gave the plain `spaces` and
     // `api_keys` names to the kith_id-keyed tables (just dropped above) and moved
     // the prototype's uuid-keyed pair to `proof_*`. A database genuinely at
