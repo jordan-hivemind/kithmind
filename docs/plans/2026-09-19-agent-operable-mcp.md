@@ -1,5 +1,10 @@
 # Agent-operable MCP server
 
+> Superseded for owner-management behavior by
+> [MCP owner data management](./2026-09-20-mcp-owner-management.md). The
+> confirmation, write-receipt, undo and domain-grant sections below were not
+> implemented and are not current requirements.
+
 Date: 2026-09-19. Status: design, not adopted.
 
 > Amended 2026-09-20: sensitivity re-scoped by the owner, see PR #319.

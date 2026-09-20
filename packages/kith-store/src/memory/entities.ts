@@ -21,10 +21,16 @@ import {
   scheduleInvestmentLinksForEntity,
   withLinkEnqueueSavepoint,
 } from "../admin/investmentLinkWork.js";
+import {
+  type Principal,
+  requireSpaceAccess,
+} from "../identity/authorization.js";
 import { row, rows, exec, ms, type IdentityCtx } from "../identity/db.js";
+import { IdentityError } from "../identity/errors.js";
 import { assertKithId, newKithId } from "../ids.js";
 
-export type EntityKind = "person" | "organization" | "project" | "place" | "other";
+export type EntityKind =
+  "person" | "organization" | "project" | "place" | "other";
 
 const ENTITY_KINDS = new Set<string>([
   "person",
@@ -73,7 +79,9 @@ const ENTITY_NAME_MAX_CHARS = 200;
 const ENTITY_KEY_MAX_CHARS = 160;
 
 function stringArray(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+  return Array.isArray(value)
+    ? value.filter((v): v is string => typeof v === "string")
+    : [];
 }
 
 function toEntity(record: EntityRow): Entity {
@@ -133,7 +141,9 @@ export function normalizeEntityKey(
     normalized.length > ENTITY_KEY_MAX_CHARS ||
     !/^[a-z][a-z0-9_-]*:[a-z0-9][a-z0-9._-]*$/.test(normalized)
   ) {
-    throw new Error("Entity key must look like person:rowan or organization:openai");
+    throw new Error(
+      "Entity key must look like person:rowan or organization:openai",
+    );
   }
   // A generated key always carries its kind. A supplied one has to agree, or
   // the entity is stored under an identity that contradicts its own kind and
@@ -153,7 +163,8 @@ function normalizeAliases(
   for (const alias of aliases ?? []) {
     const cleaned = boundedText(alias, "Entity alias", ENTITY_NAME_MAX_CHARS);
     const normalized = normalizeEntityName(cleaned);
-    if (normalized !== canonicalNormalized) byNormalized.set(normalized, cleaned);
+    if (normalized !== canonicalNormalized)
+      byNormalized.set(normalized, cleaned);
   }
   return {
     aliases: [...byNormalized.values()].slice(0, 20),
@@ -162,7 +173,10 @@ function normalizeAliases(
 }
 
 /** One entity row by id, unchecked against any space. Callers space-check. */
-export async function getEntity(ctx: IdentityCtx, id: string): Promise<Entity | null> {
+export async function getEntity(
+  ctx: IdentityCtx,
+  id: string,
+): Promise<Entity | null> {
   const record = await row<EntityRow>(
     ctx,
     `SELECT id, space_id, user_id, key, kind, canonical_name, normalized_name,
@@ -171,6 +185,89 @@ export async function getEntity(ctx: IdentityCtx, id: string): Promise<Entity | 
     [assertKithId(id, "invalid_entity_id")],
   );
   return record ? toEntity(record) : null;
+}
+
+/**
+ * Bounded entity discovery for owner tools. Names and aliases are both
+ * matched with the same normalizer that writes them, so the caller never has
+ * to guess which spelling is canonical.
+ */
+export async function listEntities(
+  ctx: IdentityCtx,
+  spaceIds: readonly string[],
+  args: {
+    kind?: EntityKind;
+    name?: string;
+    limit?: number;
+    cursor?: string;
+  } = {},
+): Promise<{ entities: Entity[]; nextCursor: string | null }> {
+  const uniqueSpaces = [...new Set(spaceIds)].map((id) =>
+    assertKithId(id, "invalid_space_id"),
+  );
+  if (uniqueSpaces.length === 0) return { entities: [], nextCursor: null };
+  const limit = Math.min(Math.max(args.limit ?? 50, 1), 100);
+  const offset = args.cursor === undefined ? 0 : Number(args.cursor);
+  if (!Number.isSafeInteger(offset) || offset < 0) {
+    throw new Error("Invalid cursor");
+  }
+  const kind = args.kind;
+  if (kind !== undefined && !ENTITY_KINDS.has(kind)) {
+    throw new Error("Entity kind is invalid");
+  }
+  const normalizedName = args.name ? normalizeEntityName(args.name) : null;
+  const records = await rows<EntityRow>(
+    ctx,
+    `SELECT id, space_id, user_id, key, kind, canonical_name, normalized_name,
+            aliases, normalized_aliases, created_at, updated_at
+       FROM kith.entities
+      WHERE space_id = ANY($1::text[])
+        AND ($2::text IS NULL OR kind = $2)
+        AND ($3::text IS NULL OR normalized_name = $3
+             OR normalized_aliases ? $3)
+      ORDER BY canonical_name, id LIMIT $4 OFFSET $5`,
+    [uniqueSpaces, kind ?? null, normalizedName, limit + 1, offset],
+  );
+  return {
+    entities: records.slice(0, limit).map(toEntity),
+    nextCursor: records.length > limit ? String(offset + limit) : null,
+  };
+}
+
+/** Replaces one entity's retrieval and document-matching aliases. */
+export async function setEntityAliases(
+  ctx: IdentityCtx,
+  args: { principal: Principal; entityId: string; aliases: readonly string[] },
+): Promise<Entity> {
+  const entity = await getEntity(ctx, args.entityId);
+  if (!entity) throw new IdentityError("Entity not found");
+  try {
+    await requireSpaceAccess(ctx, args.principal, entity.spaceId, "write");
+  } catch (error) {
+    if (error instanceof IdentityError && error.message === "Space not found") {
+      throw new IdentityError("Entity not found");
+    }
+    throw error;
+  }
+  const normalized = normalizeAliases(args.aliases, entity.canonicalName);
+  await exec(
+    ctx,
+    `UPDATE kith.entities SET aliases = $2::jsonb,
+       normalized_aliases = $3::jsonb, updated_at = $4 WHERE id = $1`,
+    [
+      entity.id,
+      JSON.stringify(normalized.aliases),
+      JSON.stringify(normalized.normalizedAliases),
+      new Date(ctx.now),
+    ],
+  );
+  await withLinkEnqueueSavepoint(ctx, { entityId: entity.id }, () =>
+    scheduleInvestmentLinksForEntity(ctx, {
+      spaceId: entity.spaceId,
+      entityId: entity.id,
+    }),
+  );
+  return (await getEntity(ctx, entity.id))!;
 }
 
 /**
@@ -189,9 +286,16 @@ export async function resolveEntity(
   spaceId: string,
   selector: EntitySelector,
 ): Promise<Entity> {
-  const canonicalName = boundedText(selector.name, "Entity name", ENTITY_NAME_MAX_CHARS);
+  const canonicalName = boundedText(
+    selector.name,
+    "Entity name",
+    ENTITY_NAME_MAX_CHARS,
+  );
   const normalizedName = normalizeEntityName(canonicalName);
-  const requestedKey = selector.key?.trim().normalize("NFKC").toLocaleLowerCase("en-US");
+  const requestedKey = selector.key
+    ?.trim()
+    .normalize("NFKC")
+    .toLocaleLowerCase("en-US");
   const selectsMe =
     selector.kind === "person" &&
     (requestedKey === "me" ||

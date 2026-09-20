@@ -25,8 +25,10 @@ export {
   normalizeEntityName,
   normalizeLiteralName,
   resolveEntity,
+  listEntities,
   loadSpaceEntityIndex,
   resolveLiteralName,
+  setEntityAliases,
 } from "./entities.js";
 export * from "./facts.js";
 export {

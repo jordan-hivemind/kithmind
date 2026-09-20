@@ -30,7 +30,7 @@ describe("MCP memory quality contract", () => {
     }) as unknown as WithMcpPrincipal,
   } as const;
 
-  test("tells capable clients to recall verbatim and capture only grounded facts", async () => {
+  test("keeps startup routing compact and publishes on-demand help", async () => {
     const server = createMcpServer(credential, "user-test");
     const client = new Client({ name: "memory-quality-test", version: "1" });
     const [clientTransport, serverTransport] =
@@ -42,15 +42,17 @@ describe("MCP memory quality contract", () => {
         client.connect(clientTransport),
       ]);
       const instructions = client.getInstructions();
-      expect(instructions).toContain("complete current message verbatim");
-      expect(instructions).toContain(
-        "Never turn assistant suggestions, guesses, deductions, unconfirmed implications, or incidental connector mentions into user memory",
+      expect(instructions).toContain("kith://help/start");
+      expect(instructions).toContain("get_kith_capabilities");
+      expect(instructions).toContain("never interchange");
+      expect(instructions!.length).toBeLessThan(1_000);
+
+      const resources = await client.listResources();
+      expect(resources.resources.map((resource) => resource.uri)).toContain(
+        "kith://help/start",
       );
-      expect(instructions).toContain("Never store a derived age");
-      expect(instructions).toContain("present a small atomic preview");
-      expect(instructions).toContain("version strings");
-      expect(instructions).toContain("Mark isCore true only");
-      expect(instructions).toContain("client-mediated");
+      const start = await client.readResource({ uri: "kith://help/start" });
+      expect(JSON.stringify(start.contents)).toContain("Use list_spaces");
 
       // The default profile is "full": narrowing the surface removes tools
       // that connected clients and the bundled skills already call, so it has
@@ -103,6 +105,13 @@ describe("MCP memory quality contract", () => {
         idempotentHint: true,
         openWorldHint: false,
       });
+
+      const help = await client.callTool({
+        name: "get_kith_help",
+        arguments: { topic: "corrections" },
+      });
+      expect(JSON.stringify(help.content)).toContain("sourceItemId");
+      expect(JSON.stringify(help.content)).toContain("exactRecordStatus");
     } finally {
       await client.close();
       await server.close();

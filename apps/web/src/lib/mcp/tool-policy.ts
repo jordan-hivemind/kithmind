@@ -28,6 +28,18 @@ const idempotentAdditive = {
   idempotentHint: true,
 } as const satisfies McpToolAnnotations;
 
+const managedWrite = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: false,
+  openWorldHint: false,
+} as const satisfies McpToolAnnotations;
+
+const destructiveWrite = {
+  ...managedWrite,
+  destructiveHint: true,
+} as const satisfies McpToolAnnotations;
+
 /**
  * MCP annotations are risk hints for the host, not permission grants. Keep this
  * map exhaustive so new tools cannot silently inherit the protocol's
@@ -63,6 +75,19 @@ export const MCP_TOOL_ANNOTATIONS = {
   [MCP_TOOL_NAMES.captureThought]: idempotentAdditive,
   [MCP_TOOL_NAMES.listInvestments]: readOnly,
   [MCP_TOOL_NAMES.getInvestment]: readOnly,
+  [MCP_TOOL_NAMES.getKithHelp]: readOnly,
+  [MCP_TOOL_NAMES.getKithCapabilities]: readOnly,
+  [MCP_TOOL_NAMES.listEntities]: readOnly,
+  [MCP_TOOL_NAMES.manageEntityAliases]: managedWrite,
+  [MCP_TOOL_NAMES.manageInvestment]: managedWrite,
+  [MCP_TOOL_NAMES.manageInvestmentEntry]: destructiveWrite,
+  [MCP_TOOL_NAMES.listSupportingDocumentLinks]: readOnly,
+  [MCP_TOOL_NAMES.manageSupportingDocumentLink]: managedWrite,
+  [MCP_TOOL_NAMES.listAttention]: readOnly,
+  [MCP_TOOL_NAMES.manageAttention]: managedWrite,
+  [MCP_TOOL_NAMES.manageMemory]: destructiveWrite,
+  [MCP_TOOL_NAMES.manageAccountDisplayOverride]: managedWrite,
+  [MCP_TOOL_NAMES.correctExtractedValue]: managedWrite,
 } as const satisfies Record<McpToolName, McpToolAnnotations>;
 
 export const MCP_MEMORY_TOOL_NAMES = [
@@ -85,6 +110,8 @@ export const MCP_MEMORY_TOOL_NAMES = [
   MCP_TOOL_NAMES.captureThought,
   MCP_TOOL_NAMES.listInvestments,
   MCP_TOOL_NAMES.getInvestment,
+  MCP_TOOL_NAMES.getKithHelp,
+  MCP_TOOL_NAMES.getKithCapabilities,
 ] as const;
 
 export type McpToolProfile = "memory" | "full";
@@ -92,10 +119,9 @@ export type McpToolProfile = "memory" | "full";
 /**
  * Default to the complete surface. Narrowing has to stay an explicit opt-in
  * rather than an upgrade-time surprise, because it can remove tools that
- * connected clients and the bundled plugin skills already call. Since the
- * lists and insights tools were retired (P2-39l) the memory profile happens to
- * cover every registered tool, and narrowing is a no-op until a tool outside
- * memory and documents is added.
+ * connected clients and the bundled plugin skills already call. The explicit
+ * memory profile keeps recall, capture, investment reads and discovery, while
+ * omitting the owner-management tools registered by the full profile.
  */
 export function resolveMcpToolProfile(
   value = process.env.MCP_TOOL_PROFILE,

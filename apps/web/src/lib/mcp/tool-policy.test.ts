@@ -34,13 +34,13 @@ describe("MCP tool profile", () => {
     );
   });
 
-  it("exposes every read-only memory/document tool in the memory profile", () => {
-    const readOnlyTools = Object.entries(MCP_TOOL_ANNOTATIONS)
-      .filter(([, annotations]) => annotations.readOnlyHint)
-      .map(([name]) => name);
-
-    for (const name of readOnlyTools) {
-      expect(MCP_MEMORY_TOOL_NAMES).toContain(name);
-    }
+  it("keeps discovery available while management stays in the full profile", () => {
+    expect(MCP_MEMORY_TOOL_NAMES).toContain("get_kith_help");
+    expect(MCP_MEMORY_TOOL_NAMES).toContain("get_kith_capabilities");
+    expect(MCP_MEMORY_TOOL_NAMES).not.toContain("manage_investment");
+    expect(MCP_TOOL_ANNOTATIONS.manage_investment_entry).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+    });
   });
 });
