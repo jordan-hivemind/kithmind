@@ -17,6 +17,10 @@
 // (section 2.5): `rememberFact` in `facts.ts` checks it once before calling
 // `resolveEntity`.
 
+import {
+  scheduleInvestmentLinksForEntity,
+  withLinkEnqueueSavepoint,
+} from "../admin/investmentLinkWork.js";
 import { row, rows, exec, ms, type IdentityCtx } from "../identity/db.js";
 import { assertKithId, newKithId } from "../ids.js";
 
@@ -236,6 +240,16 @@ export async function resolveEntity(
     }
     const mergedAliases = [...aliasMap.values()].slice(0, 20);
     const mergedNormalizedAliases = [...aliasMap.keys()].slice(0, 20);
+    // Did this resolve actually teach the entity a name it did not have? The
+    // merge appends, so a comparison of the normalized list against the
+    // stored one answers it exactly. Almost every call arrives with nothing
+    // new -- the same organization named the same way, one fact after
+    // another -- and those must wake nothing.
+    const aliasesChanged =
+      mergedNormalizedAliases.length !== entity.normalizedAliases.length ||
+      mergedNormalizedAliases.some(
+        (alias, index) => alias !== entity.normalizedAliases[index],
+      );
     await exec(
       ctx,
       `UPDATE kith.entities
@@ -248,6 +262,22 @@ export async function resolveEntity(
         new Date(ctx.now),
       ],
     );
+    if (aliasesChanged) {
+      // ADM-8c: the investment matcher compares a document's parties against
+      // this entity's aliases, so a new alias changes what that document is
+      // about -- and nothing else in the system observes it. The investment
+      // row has not been touched and no entry has moved.
+      //
+      // Inside a savepoint: this is the system's own work in the middle of
+      // capturing a fact, and a queue row that cannot be written must not
+      // cost the owner the fact. See `withLinkEnqueueSavepoint`.
+      await withLinkEnqueueSavepoint(ctx, { entityId: entity.id }, () =>
+        scheduleInvestmentLinksForEntity(ctx, {
+          spaceId,
+          entityId: entity.id,
+        }),
+      );
+    }
     return (await getEntity(ctx, entity.id))!;
   }
 

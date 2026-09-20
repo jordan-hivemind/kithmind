@@ -12,6 +12,7 @@ import test from "node:test";
 
 import {
   createKithPool,
+  KITH_SERIALIZATION_ATTEMPTS,
   newKithId,
   withKithTransaction,
 } from "../dist/index.js";
@@ -376,6 +377,134 @@ test("storing an investment kind's extraction enqueues its link job", { skip }, 
     ).length,
     1,
   );
+});
+
+/**
+ * The `deferred_work` kind CHECK as it stands at schema 33: `investment_link`
+ * is not in it. This is the window between applying migration 034 and
+ * deploying the build that knows the kind, in reverse -- the build arrives
+ * first -- and it is the shape of any later failure of the enqueue too.
+ */
+async function narrowDeferredKinds(f) {
+  await f.client.query(
+    `ALTER TABLE kith.deferred_work
+       DROP CONSTRAINT deferred_work_kind_check,
+       ADD CONSTRAINT deferred_work_kind_check
+         CHECK (kind IN ('inline_ingestion', 'embedding_fill',
+                         'card_queue_tick', 'document_extraction'))`,
+  );
+}
+
+/** Captures `console.error` for the duration of `work`. */
+async function recordedErrors(work) {
+  const original = console.error;
+  const lines = [];
+  console.error = (...args) => lines.push(args);
+  try {
+    await work();
+  } finally {
+    console.error = original;
+  }
+  return lines;
+}
+
+test("an enqueue that cannot be written never fails the extraction", { skip }, async (t) => {
+  // ADM-8c: an investments feature must not be able to lose a document. The
+  // enqueue sits in a SAVEPOINT, so a constraint it cannot satisfy costs the
+  // job and nothing else; `kith-investment-link-backfill` is the repair.
+  const f = await fixture(t);
+  await f.seed();
+  await narrowDeferredKinds(f);
+  const notice = await f.ingest(CALL_NOTICE, "synthetic-call-2");
+
+  let outcome;
+  const logged = await recordedErrors(async () => {
+    outcome = await f.extract(
+      stubModel(callNoticeReading()),
+      notice.sourceItemId,
+      notice.generationId,
+    );
+  });
+
+  assert.equal(outcome.kind, "capital_call_notice");
+  assert.equal(outcome.failed, 0);
+  assert.equal(outcome.stored, 3, "the statements are stored");
+  const stored = await f.rows(
+    "SELECT kind FROM kith.document_extractions WHERE source_item_id = $1",
+    [notice.sourceItemId],
+  );
+  assert.equal(stored.length, 1, "the extraction committed");
+  assert.deepEqual(
+    await f.rows(
+      "SELECT id FROM kith.deferred_work WHERE kind = 'investment_link'",
+    ),
+    [],
+  );
+
+  // Recorded once, through the scrubbed log path, and nowhere else: no
+  // attention row, no alert.
+  assert.equal(logged.length, 1);
+  assert.match(String(logged[0][0]), /investment_link/);
+  const corrections = await f.rows(
+    "SELECT id FROM kith.corrections WHERE reason = 'investment_link_enqueue_failed'",
+  );
+  assert.deepEqual(corrections, []);
+});
+
+test("a serialization failure in the enqueue still fails the transaction", { skip }, async (t) => {
+  // The savepoint must not swallow 40001 or 40P01: those mean "run the whole
+  // transaction again", and catching them here would commit an extraction
+  // whose other writes the server has already decided to throw away.
+  const f = await fixture(t);
+  await f.seed();
+  // A sequence, not a table, so the count survives the rollbacks it is
+  // counting: that is how this proves the transaction ran again rather than
+  // merely that one attempt threw.
+  await f.client.query("CREATE SEQUENCE kith.test_link_attempts");
+  await f.client.query(
+    `CREATE FUNCTION kith.test_refuse_link_job() RETURNS trigger
+       LANGUAGE plpgsql AS $$
+     BEGIN
+       PERFORM nextval('kith.test_link_attempts');
+       RAISE EXCEPTION 'simulated serialization failure'
+         USING ERRCODE = '40001';
+     END $$`,
+  );
+  await f.client.query(
+    `CREATE TRIGGER test_refuse_link_job BEFORE INSERT ON kith.deferred_work
+       FOR EACH ROW WHEN (NEW.kind = 'investment_link')
+       EXECUTE FUNCTION kith.test_refuse_link_job()`,
+  );
+  const notice = await f.ingest(CALL_NOTICE, "synthetic-call-3");
+
+  await assert.rejects(
+    () =>
+      f.extract(
+        stubModel(callNoticeReading()),
+        notice.sourceItemId,
+        notice.generationId,
+      ),
+    (error) => error.code === "40001",
+  );
+  const attempts = await f.rows(
+    "SELECT last_value::int AS n FROM kith.test_link_attempts",
+  );
+  assert.equal(
+    attempts[0].n,
+    KITH_SERIALIZATION_ATTEMPTS,
+    "the whole transaction was retried, exactly as it is today",
+  );
+  assert.deepEqual(
+    await f.rows(
+      "SELECT id FROM kith.document_extractions WHERE source_item_id = $1",
+      [notice.sourceItemId],
+    ),
+    [],
+    "nothing committed: the transaction is meant to run again",
+  );
+  await f.client.query("DROP TRIGGER test_refuse_link_job ON kith.deferred_work");
+  await f.client.query("DROP FUNCTION kith.test_refuse_link_job()");
+  await f.client.query("DROP SEQUENCE kith.test_link_attempts");
 });
 
 test("a clean reading becomes cited observations that query_records can read", { skip }, async (t) => {

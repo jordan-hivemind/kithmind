@@ -38,7 +38,10 @@
 
 import type { ClientBase, Pool } from "pg";
 
-import { scheduleInvestmentLinkForExtraction } from "../admin/investmentLinkWork.js";
+import {
+  scheduleInvestmentLinkForExtraction,
+  withLinkEnqueueSavepoint,
+} from "../admin/investmentLinkWork.js";
 import type {
   DocumentFieldCheck,
   DocumentFieldValueType,
@@ -2341,14 +2344,25 @@ async function store(
   // transaction that replaced them. A re-extraction enqueues it again, which
   // is the point -- a corrected amount has to be able to turn a suggestion
   // into a link -- and the dedupe key collapses a burst of re-activations
-  // onto one queued row. A kind the scorer has no rules for enqueues nothing.
-  await scheduleInvestmentLinkForExtraction(
+  // onto one queued row.
+  //
+  // INSIDE A SAVEPOINT, because an investments feature must never be able to
+  // lose a document: a queue row that cannot be written must not take the
+  // statements, the spans and the corrections down with it. See
+  // `withLinkEnqueueSavepoint` for which triggers get that treatment, which
+  // must not, and why 40001 and 40P01 still propagate.
+  await withLinkEnqueueSavepoint(
     { client, now },
-    {
-      spaceId: loaded.spaceId,
-      sourceItemId: loaded.sourceItemId,
-      kind: documentKind,
-    },
+    { sourceItemId: loaded.sourceItemId, documentKind },
+    () =>
+      scheduleInvestmentLinkForExtraction(
+        { client, now },
+        {
+          spaceId: loaded.spaceId,
+          sourceItemId: loaded.sourceItemId,
+          kind: documentKind,
+        },
+      ),
   );
   return {
     sourceItemId: loaded.sourceItemId,

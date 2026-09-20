@@ -54,6 +54,7 @@ import {
 import { KITH_ID } from "../ids.js";
 import { IdentityError } from "../identity/errors.js";
 import type { ObservationValue } from "../records/values.js";
+import { scrubLogFields, scrubThrown } from "../sensitivity/sinks.js";
 import { evaluateDocumentLinks } from "./investmentLinks.js";
 import {
   amountMatches,
@@ -135,21 +136,95 @@ export function investmentLinkDedupeKey(sourceItemId: string): string {
 }
 
 /**
+ * The follow-up a change gets when the document's job is ALREADY RUNNING.
+ *
+ * At most one per running job, which is what the job's own id in the key
+ * buys: a burst of saves against one running job produces one follow-up, and
+ * the next burst, against the next running job, produces the next.
+ */
+function investmentLinkFollowUpKey(
+  sourceItemId: string,
+  runningJobId: string,
+): string {
+  return `${investmentLinkDedupeKey(sourceItemId)}:after:${runningJobId}`;
+}
+
+/**
  * Enqueues one document's re-evaluation, in the caller's transaction.
  *
  * Call this from inside the write that caused it. The row commits with that
  * write or not at all, which is what stops a job existing for a change that
  * rolled back, and a change existing with no job behind it.
+ *
+ * A RUNNING JOB CANNOT ABSORB A CHANGE THAT CAME AFTER IT, and that is why
+ * this does not simply call `schedule`.
+ *
+ * `schedule` de-duplicates against `queued` AND `running` rows, which is
+ * right for a scheduler whose job has not started reading yet and wrong for
+ * one whose job already has. The interleaving the reviewer reproduced: a
+ * notice is `auto_linked` at 25,000; its job is claimed and its handler reads
+ * the entry; the owner saves 31,000; his fan-out finds the running row and
+ * de-duplicates; the handler commits the decision it reached from the old
+ * amount. Both jobs end `done`, nothing is queued, nothing errors, and a
+ * wrong `auto_linked` row stands with the date it moved still moved. Silent
+ * wrong data, which is the one unacceptable failure.
+ *
+ * So the pending row is read `FOR UPDATE` and three cases fall out:
+ *
+ *   * NO ROW. An ordinary `schedule`.
+ *   * `queued`. The lock is the guarantee: `claim` takes its candidate with
+ *     `FOR UPDATE SKIP LOCKED`, so it skips this row until this transaction
+ *     commits, and the job it eventually runs reads the write that is being
+ *     made now.
+ *   * `running`. A second job, under the follow-up key, because this one's
+ *     reading is already older than the change.
+ *
+ * And the read itself closes the variant where the caller's snapshot still
+ * shows `queued` although the row was claimed just after it was taken:
+ * `SELECT ... FOR UPDATE` over a row a committed concurrent transaction has
+ * updated raises 40001 under `SERIALIZABLE`, so `withKithTransaction` retries
+ * the whole write against a snapshot that sees the job running. That is the
+ * honest answer -- the alternative is deciding "already queued" from a
+ * reading that was true a moment ago.
+ *
+ * `schedule` itself is untouched: every other kind keeps the de-duplication
+ * it was designed with.
  */
 export async function scheduleInvestmentLink(
   ctx: LinkWorkCtx,
   input: { spaceId: string; sourceItemId: string },
 ): Promise<ScheduleResult> {
+  const dedupeKey = investmentLinkDedupeKey(input.sourceItemId);
+  const payload = {
+    spaceId: input.spaceId,
+    sourceItemId: input.sourceItemId,
+  };
+  // At most one row can match: `deferred_work_dedupe_idx` is unique over
+  // `(kind, dedupe_key)` among `queued` and `running` rows.
+  const pending = await ctx.client.query<{ id: string; state: string }>(
+    `SELECT id, state FROM kith.deferred_work
+      WHERE kind = 'investment_link' AND dedupe_key = $1
+        AND state IN ('queued', 'running')
+      FOR UPDATE`,
+    [dedupeKey],
+  );
+  const existing = pending.rows[0];
+  if (existing === undefined) {
+    return await schedule(ctx, {
+      kind: "investment_link",
+      spaceId: input.spaceId,
+      payload,
+      dedupeKey,
+    });
+  }
+  if (existing.state === "queued") {
+    return { id: existing.id, deduped: true };
+  }
   return await schedule(ctx, {
     kind: "investment_link",
     spaceId: input.spaceId,
-    payload: { spaceId: input.spaceId, sourceItemId: input.sourceItemId },
-    dedupeKey: investmentLinkDedupeKey(input.sourceItemId),
+    payload,
+    dedupeKey: investmentLinkFollowUpKey(input.sourceItemId, existing.id),
   });
 }
 
@@ -160,19 +235,106 @@ export async function scheduleInvestmentLink(
  * replaces the document's statements, so the matcher always sees the reading
  * that has just landed rather than the one before it.
  *
- * Gated on the kind, for the reason `MATCHABLE_KIND_NAMES` gives. A document
- * whose kind CHANGES from a matchable one to another is not covered by this
- * gate and is not covered without it either -- `evaluateDocumentLinks`
- * returns `kind_not_matchable` before it sweeps anything -- so the gate costs
- * nothing that the scorer does not already cost. Slice 3's nightly sweep is
- * where that case belongs.
+ * Gated on the kind, for the reason `MATCHABLE_KIND_NAMES` gives -- WITH ONE
+ * EXCEPTION, and it is the one that matters.
+ *
+ * A re-extraction can change a document's kind. A parser upgrade, or a
+ * corrected reading, turns what was a capital call notice into a receipt, and
+ * that document is still carrying everything the notice earned: an
+ * `auto_linked` row, a mirror on the entry, and a date that link moved. The
+ * kind gate would enqueue nothing, the rows would stand on evidence the
+ * document no longer states, and nothing in this slice would ever look at it
+ * again.
+ *
+ * So a document that already holds ANY link row is always enqueued, whatever
+ * it is now read as, and `evaluateDocumentLinks` sweeps it: rule-made rows go
+ * and give their dates back, owner-decided rows are untouched. A document
+ * with no link row and a kind the scorer cannot read is still no job at all,
+ * which is what keeps every receipt in the archive out of the queue.
  */
 export async function scheduleInvestmentLinkForExtraction(
   ctx: LinkWorkCtx,
   input: { spaceId: string; sourceItemId: string; kind: string | null },
 ): Promise<ScheduleResult | null> {
-  if (input.kind === null || matchableKind(input.kind) === null) return null;
+  if (input.kind !== null && matchableKind(input.kind) !== null) {
+    return await scheduleInvestmentLink(ctx, input);
+  }
+  const held = await ctx.client.query(
+    `SELECT 1 FROM kith.investment_document_links
+      WHERE space_id = $1 AND source_item_id = $2 LIMIT 1`,
+    [input.spaceId, input.sourceItemId],
+  );
+  if (held.rows.length === 0) return null;
   return await scheduleInvestmentLink(ctx, input);
+}
+
+/**
+ * Runs an enqueue so that it cannot fail the write it follows.
+ *
+ * WHICH TRIGGERS GET THIS, AND WHICH MUST NOT.
+ *
+ * It is for the two triggers that sit on the SYSTEM's own work: the enqueue
+ * at the end of `store` (`extraction/model.ts`) and the one beside an alias
+ * merge in `resolveEntity` (`memory/entities.ts`). Both follow a write whose
+ * value does not depend on the queue at all -- a document's statements, a
+ * fact the owner captured -- and losing one of those because an investments
+ * queue row could not be written is disproportionate to the harm. The first
+ * shape of that was concrete: this code against schema 33, before migration
+ * 034 widened `deferred_work_kind_check`, raises 23514 for every matchable
+ * kind. The repair is `kith-investment-link-backfill`, which an operator
+ * already has.
+ *
+ * It is NOT for the triggers on the owner's own entry, investment and link
+ * writes. Those writes are the ones that INVALIDATE a link: an amount that
+ * has moved, a party renamed, a rejection. Committing one of them while
+ * silently failing to queue the re-evaluation leaves a live `auto_linked`
+ * row standing on evidence that no longer supports it, with nothing that
+ * will ever look at it again. A failed save is visible and the owner retries
+ * it; a saved amount with a stale link behind it is the one unacceptable
+ * failure. They also cannot meet the schema-33 window: the previous web
+ * build calls none of them, and the new one only ships after 034 is applied.
+ *
+ * 40001 and 40P01 are never swallowed here. They do not mean "the enqueue
+ * failed"; they mean the server has decided to throw the whole transaction
+ * away, so they propagate and `withKithTransaction` retries it exactly as it
+ * does today. Anything else is recorded once through the scrubbed log path
+ * (`sensitivity/sinks.ts`) and nowhere else: no attention item, no alert.
+ */
+export async function withLinkEnqueueSavepoint(
+  ctx: LinkWorkCtx,
+  context: Record<string, unknown>,
+  work: () => Promise<unknown>,
+): Promise<void> {
+  try {
+    await ctx.client.query("SAVEPOINT investment_link_enqueue");
+  } catch (error) {
+    // 25P01, "no active SQL transaction". Every service path opens one
+    // (`withKithTransaction`), so this is a caller running statement by
+    // statement -- and for such a caller the guard is vacuous: the write this
+    // enqueue follows has already committed, so there is nothing left to roll
+    // back and nothing to protect. Do the work plainly and let it answer for
+    // itself.
+    if ((error as { code?: unknown }).code !== "25P01") throw error;
+    await work();
+    return;
+  }
+  try {
+    await work();
+    await ctx.client.query("RELEASE SAVEPOINT investment_link_enqueue");
+  } catch (error) {
+    const code = (error as { code?: unknown }).code;
+    if (code === "40001" || code === "40P01") throw error;
+    await ctx.client.query("ROLLBACK TO SAVEPOINT investment_link_enqueue");
+    await ctx.client.query("RELEASE SAVEPOINT investment_link_enqueue");
+    console.error(
+      "investment_link enqueue skipped",
+      scrubLogFields({
+        ...context,
+        name: error instanceof Error ? error.name : typeof error,
+        message: scrubThrown(error),
+      }),
+    );
+  }
 }
 
 export type FanOutResult = {
@@ -253,6 +415,48 @@ export async function scheduleInvestmentLinksFor(
     if (!result.deduped) enqueued += 1;
   }
   return { linked: linkedCount, candidates, enqueued };
+}
+
+/**
+ * Investments one entity's alias change fans out to. An entity is usually one
+ * investment; a manager with two funds under one name is the case that makes
+ * this a loop rather than a lookup.
+ */
+const MAX_LINK_TRIGGER_INVESTMENTS = 25;
+
+/**
+ * An alias was added to an entity, so every investment bound to it may now
+ * match documents it did not match a moment ago.
+ *
+ * The scorer compares a document's organization values against
+ * `investments.name` AND `entities.normalized_aliases` (`loadInvestmentNames`
+ * in `investmentLinks.ts`), so teaching the store that "SMP IV Fund" is the
+ * same organization changes what its notices are about. Nothing else observes
+ * that: the investment row has not been touched and no entry has moved.
+ *
+ * Archived investments are not filtered out. Their documents are re-examined
+ * and the evaluation then finds no investment to match, which is the sweep
+ * doing its job rather than a job that should not have existed.
+ */
+export async function scheduleInvestmentLinksForEntity(
+  ctx: LinkWorkCtx,
+  input: { spaceId: string; entityId: string },
+): Promise<number> {
+  const investments = await ctx.client.query<{ id: string }>(
+    `SELECT id FROM kith.investments
+      WHERE space_id = $1 AND entity_id = $2
+      ORDER BY id LIMIT $3`,
+    [input.spaceId, input.entityId, MAX_LINK_TRIGGER_INVESTMENTS],
+  );
+  let enqueued = 0;
+  for (const investment of investments.rows) {
+    const result = await scheduleInvestmentLinksFor(ctx, {
+      spaceId: input.spaceId,
+      investmentId: investment.id,
+    });
+    enqueued += result.enqueued;
+  }
+  return enqueued;
 }
 
 /** The same fan-out, starting from an entry id. Reads the entry's own type,

@@ -21,6 +21,7 @@ import test from "node:test";
 import {
   createKithPool,
   newKithId,
+  withKithQueueTransaction,
   withKithTransaction,
 } from "../dist/index.js";
 import {
@@ -31,6 +32,8 @@ import {
   listInvestmentDocumentLinks,
   listInvestmentEntries,
   rejectInvestmentDocumentLink,
+  runInvestmentLinkJob,
+  scheduleInvestmentLink,
   scheduleInvestmentLinkBackfill,
   scheduleInvestmentLinkForExtraction,
   scheduleInvestmentLinksFor,
@@ -38,11 +41,15 @@ import {
   updateInvestmentEntry,
 } from "../dist/admin/index.js";
 import {
+  claim,
+  complete,
   defaultRegistry,
   drain,
   schedule,
   deferredCtx,
 } from "../dist/deferred/index.js";
+import { identityCtx } from "../dist/identity/index.js";
+import { resolveEntity } from "../dist/memory/index.js";
 import {
   identityDatabase,
   makeSpace,
@@ -538,6 +545,428 @@ test("a stored extraction enqueues the document, and only an investment kind", {
     "SELECT count(*)::int AS n FROM kith.corrections",
   );
   assert.equal(corrections.rows[0].n, 0);
+});
+
+// ---------------------------------------------------------------------------
+// A running job and a concurrent owner
+// ---------------------------------------------------------------------------
+
+/**
+ * One investment, one capital call entry at 25,000, and the notice that
+ * auto-links to it. The state the two tests below start their interleaving
+ * from.
+ */
+async function autoLinkedFixture(t) {
+  const base = await fixture(t);
+  const investmentId = await createInvestment(base.ctx, {
+    principal: base.principal,
+    spaceId: base.spaceId,
+    name: FUND,
+  });
+  const entry = await createInvestmentEntry(base.ctx, {
+    principal: base.principal,
+    investmentId,
+    entryType: "capital_call_paid",
+    entryDate: "2026-03-31",
+    amount: "25000.00",
+  });
+  const notice = await seedDocument(base.ctx, base.spaceId, {
+    kind: "capital_call_notice",
+    statements: [
+      org("fund", FUND),
+      money("amount_called", "25000.00"),
+      date("due_date", "2026-04-02"),
+    ],
+  });
+  await scheduleInvestmentLinkForExtraction(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: notice.sourceItemId,
+    kind: "capital_call_notice",
+  });
+  await run(base);
+  const [link] = await listInvestmentDocumentLinks(base.ctx, [base.spaceId], {});
+  assert.equal(link.state, "auto_linked");
+  assert.equal(link.score, 10);
+  return { ...base, investmentId, entryId: entry.id, notice, key: investmentLinkDedupeKey(notice.sourceItemId) };
+}
+
+/**
+ * A raw `SERIALIZABLE` transaction this test drives by hand, because what is
+ * under test is an interleaving and `withKithTransaction` has no seam in the
+ * middle of one. The isolation and the search path are the ones it sets.
+ *
+ * `finish` is idempotent and every caller runs it from a `finally`. The
+ * fixture's `pool.end()` waits for every checked-out client, so a connection
+ * left open by a failed assertion would hang the suite rather than report it.
+ */
+async function openSerializable(base) {
+  const client = await base.pool.connect();
+  let open = true;
+  const finish = async (verb) => {
+    if (!open) return;
+    open = false;
+    try {
+      await client.query(verb);
+    } catch {
+      // The transaction may already be aborted; the release is what matters.
+    }
+    client.release();
+  };
+  await client.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+  await client.query("SET LOCAL search_path TO kith");
+  return { client, finish };
+}
+
+test("a running job does not swallow a concurrent owner edit", { skip }, async (t) => {
+  const base = await autoLinkedFixture(t);
+
+  // A nightly pass, or a re-extraction: the document's job is queued again,
+  // and the daemon claims it.
+  await scheduleInvestmentLinkForExtraction(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.notice.sourceItemId,
+    kind: "capital_call_notice",
+  });
+  const claimed = await withKithQueueTransaction(base.pool, (client) =>
+    claim(deferredCtx(client, NOW + 1_000)),
+  );
+  assert.equal(claimed.dedupeKey, base.key);
+
+  // The handler runs and reaches the same decision it did before -- the entry
+  // still says 25,000 as far as its snapshot is concerned -- and has not
+  // committed yet.
+  const handler = await openSerializable(base);
+  try {
+    await runInvestmentLinkJob(
+      deferredCtx(handler.client, NOW + 1_000),
+      claimed.payload,
+      claimed,
+    );
+
+    // The owner saves a different amount while that transaction is open. His
+    // UPDATE may wait on the handler, so it is deliberately not awaited here.
+    const save = withKithTransaction(base.pool, (client) =>
+      updateInvestmentEntry(identityCtx(client, NOW + 2_000), {
+        principal: base.principal,
+        entryId: base.entryId,
+        amount: "31000.00",
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await handler.finish("COMMIT");
+    await save;
+  } finally {
+    await handler.finish("ROLLBACK");
+  }
+
+  // THE BUG THIS PINS: the fan-out used to find the running row and
+  // de-duplicate onto it, so the owner's edit was absorbed by a job that had
+  // already read the old amount. Nothing new was queued, nothing errored, and
+  // a wrong `auto_linked` row stayed -- the running row below was the only
+  // one, and it was about to finish. A running job can no longer absorb an
+  // edit: it gets a follow-up, one per running job.
+  const pending = await queuedKeys(base);
+  assert.deepEqual(
+    pending.map((row) => row.dedupe_key).sort(),
+    [base.key, `${base.key}:after:${claimed.id}`].sort(),
+  );
+  assert.equal(
+    pending.find((row) => row.dedupe_key.endsWith(claimed.id)).state,
+    "queued",
+  );
+  // A second save while the same job runs collapses onto that follow-up
+  // rather than making a third row.
+  await withKithTransaction(base.pool, (client) =>
+    updateInvestmentEntry(identityCtx(client, NOW + 2_500), {
+      principal: base.principal,
+      entryId: base.entryId,
+      amount: "31500.00",
+    }),
+  );
+  assert.equal((await queuedKeys(base)).length, 2);
+
+  await withKithQueueTransaction(base.pool, (client) =>
+    complete(deferredCtx(client, NOW + 3_000), {
+      id: claimed.id,
+      leaseToken: claimed.leaseToken,
+    }),
+  );
+  await run(base, NOW + 4_000);
+
+  // What a fresh evaluation gives: party and date, no amount.
+  const links = await listInvestmentDocumentLinks(base.ctx, [base.spaceId], {});
+  assert.equal(links.length, 1);
+  assert.equal(links[0].state, "suggested");
+  assert.equal(links[0].score, 6);
+  const entry = await entryRow(base, base.investmentId, base.entryId);
+  assert.equal(entry.amount, "31500.00");
+  assert.equal(entry.documentId, null, "the mirror followed the demotion");
+});
+
+test("a job claimed after the saver's snapshot is a serialization failure, not a swallowed edit", { skip }, async (t) => {
+  const base = await autoLinkedFixture(t);
+  await scheduleInvestmentLinkForExtraction(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.notice.sourceItemId,
+    kind: "capital_call_notice",
+  });
+
+  // The saver's snapshot is taken here, while the job is still queued.
+  const saver = await openSerializable(base);
+  try {
+    const seen = await saver.client.query(
+      `SELECT state FROM kith.deferred_work
+        WHERE kind = 'investment_link' AND dedupe_key = $1
+          AND state IN ('queued', 'running')`,
+      [base.key],
+    );
+    assert.equal(seen.rows[0].state, "queued");
+
+    // The daemon claims it after that snapshot. The saver cannot see this.
+    const claimed = await withKithQueueTransaction(base.pool, (client) =>
+      claim(deferredCtx(client, NOW + 1_000)),
+    );
+    assert.equal(claimed.dedupeKey, base.key);
+
+    // Reading the row `FOR UPDATE` is what refuses to decide on a stale
+    // reading: the queued row the saver can still see has been claimed
+    // since, so PostgreSQL raises 40001 and `withKithTransaction` retries
+    // the whole save against a snapshot that sees the job running.
+    await assert.rejects(
+      () =>
+        scheduleInvestmentLink(deferredCtx(saver.client, NOW + 2_000), {
+          spaceId: base.spaceId,
+          sourceItemId: base.notice.sourceItemId,
+        }),
+      (error) => error.code === "40001",
+    );
+  } finally {
+    await saver.finish("ROLLBACK");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Aliases
+// ---------------------------------------------------------------------------
+
+test("a new alias on the investment's entity wakes the documents that use it", { skip }, async (t) => {
+  const base = await fixture(t);
+  const investmentId = await createInvestment(base.ctx, {
+    principal: base.principal,
+    spaceId: base.spaceId,
+    name: FUND,
+  });
+  const entry = await createInvestmentEntry(base.ctx, {
+    principal: base.principal,
+    investmentId,
+    entryType: "capital_call_paid",
+    entryDate: "2026-03-31",
+    amount: "9000.00",
+  });
+  // The notice calls the fund by a short name the owner has not taught the
+  // store yet, and for an amount the entry does not claim. Nothing about it
+  // reaches this investment.
+  const notice = await seedDocument(base.ctx, base.spaceId, {
+    kind: "capital_call_notice",
+    statements: [
+      org("fund", "SMP IV Fund"),
+      money("amount_called", "25000.00"),
+      date("due_date", "2026-04-02"),
+    ],
+  });
+  await scheduleInvestmentLinkForExtraction(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: notice.sourceItemId,
+    kind: "capital_call_notice",
+  });
+  await run(base);
+  assert.deepEqual(
+    await listInvestmentDocumentLinks(base.ctx, [base.spaceId], {}),
+    [],
+  );
+
+  // He teaches it the short name. The scorer reads aliases, so this changes
+  // what that notice is about -- and nothing used to notice.
+  await resolveEntity(base.ctx, base.userId, base.spaceId, {
+    kind: "organization",
+    name: FUND,
+    aliases: ["SMP IV Fund"],
+  });
+  assert.deepEqual(
+    (await queuedKeys(base)).map((row) => row.dedupe_key),
+    [investmentLinkDedupeKey(notice.sourceItemId)],
+  );
+
+  await run(base, NOW + 1_000);
+  const links = await listInvestmentDocumentLinks(base.ctx, [base.spaceId], {});
+  assert.equal(links.length, 1);
+  assert.equal(links[0].state, "suggested");
+  assert.equal(links[0].entryId, entry.id);
+
+  // Resolving the same entity again with nothing new changes no alias, so it
+  // wakes nothing: this must not become a job per fact captured.
+  await run(base, NOW + 2_000);
+  await resolveEntity(base.ctx, base.userId, base.spaceId, {
+    kind: "organization",
+    name: FUND,
+    aliases: ["SMP IV Fund"],
+  });
+  assert.deepEqual(await queuedKeys(base), []);
+});
+
+test("an alias on an entity no investment is bound to wakes nothing", { skip }, async (t) => {
+  const base = await fixture(t);
+  await seedDocument(base.ctx, base.spaceId, {
+    kind: "capital_call_notice",
+    statements: [org("fund", "Synthetic Unrelated Holdings")],
+  });
+  await resolveEntity(base.ctx, base.userId, base.spaceId, {
+    kind: "organization",
+    name: "Synthetic Unrelated Holdings",
+  });
+  await resolveEntity(base.ctx, base.userId, base.spaceId, {
+    kind: "organization",
+    name: "Synthetic Unrelated Holdings",
+    aliases: ["SUH"],
+  });
+  assert.deepEqual(await queuedKeys(base), []);
+});
+
+// ---------------------------------------------------------------------------
+// A document that stops being an investment document
+// ---------------------------------------------------------------------------
+
+async function dateCorrections(base) {
+  const found = await base.client.query(
+    `SELECT original_value, corrected_value, state FROM kith.corrections
+      WHERE detector = 'investment_link_date' ORDER BY created_at, id`,
+  );
+  return found.rows;
+}
+
+test("a re-extraction to a kind the scorer cannot read gives the date back", { skip }, async (t) => {
+  const base = await fixture(t);
+  const investmentId = await createInvestment(base.ctx, {
+    principal: base.principal,
+    spaceId: base.spaceId,
+    name: FUND,
+  });
+  const entry = await createInvestmentEntry(base.ctx, {
+    principal: base.principal,
+    investmentId,
+    entryType: "capital_call_paid",
+    entryDate: "2026-03-31",
+    amount: "25000.00",
+    dateIsEstimated: true,
+  });
+  const notice = await seedDocument(base.ctx, base.spaceId, {
+    kind: "capital_call_notice",
+    statements: [
+      org("fund", FUND),
+      money("amount_called", "25000.00"),
+      date("due_date", "2026-04-02"),
+    ],
+  });
+  await scheduleInvestmentLinkForExtraction(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: notice.sourceItemId,
+    kind: "capital_call_notice",
+  });
+  await run(base);
+  const before = await entryRow(base, investmentId, entry.id);
+  assert.equal(before.entryDate, "2026-04-02");
+  assert.equal(before.dateIsEstimated, false);
+  assert.equal((await dateCorrections(base)).length, 1);
+
+  // A parser upgrade, or a corrected kind: the same source item is now read
+  // as something the scorer has no rules for at all.
+  await base.client.query(
+    `UPDATE kith.document_extractions SET kind = 'receipt'
+      WHERE space_id = $1 AND source_item_id = $2`,
+    [base.spaceId, notice.sourceItemId],
+  );
+
+  // THE HOLE THIS PINS: the trigger used to enqueue nothing for a
+  // non-matchable kind, and the evaluation used to return before it swept,
+  // so the `auto_linked` row stood with the date it had moved still moved --
+  // a date the owner's own paper no longer justifies.
+  const scheduled = await scheduleInvestmentLinkForExtraction(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: notice.sourceItemId,
+    kind: "receipt",
+  });
+  assert.notEqual(scheduled, null, "a document that holds a link is enqueued");
+  await run(base, NOW + 1_000);
+
+  assert.deepEqual(
+    await listInvestmentDocumentLinks(base.ctx, [base.spaceId], {}),
+    [],
+    "the rule made the row, so the rule takes it back",
+  );
+  const after = await entryRow(base, investmentId, entry.id);
+  assert.equal(after.entryDate, "2026-03-31", "the estimate is back");
+  assert.equal(after.dateIsEstimated, true);
+  assert.equal(after.documentId, null);
+  const corrections = await dateCorrections(base);
+  assert.equal(corrections.length, 2, "the move and its reversal, both recorded");
+  assert.equal(corrections[1].original_value, "2026-04-02");
+  assert.equal(corrections[1].corrected_value, "2026-03-31");
+});
+
+test("an owner-decided link survives a kind the scorer cannot read", { skip }, async (t) => {
+  const base = await fixture(t);
+  const investmentId = await createInvestment(base.ctx, {
+    principal: base.principal,
+    spaceId: base.spaceId,
+    name: FUND,
+  });
+  const notice = await seedDocument(base.ctx, base.spaceId, {
+    kind: "capital_call_notice",
+    statements: [org("fund", FUND), money("amount_called", "25000.00")],
+  });
+  const entry = await createInvestmentEntry(base.ctx, {
+    principal: base.principal,
+    investmentId,
+    entryType: "capital_call_paid",
+    entryDate: "2026-03-31",
+    amount: "25000.00",
+    documentId: notice.documentId,
+  });
+  await base.client.query(
+    `UPDATE kith.document_extractions SET kind = 'receipt'
+      WHERE space_id = $1 AND source_item_id = $2`,
+    [base.spaceId, notice.sourceItemId],
+  );
+  await scheduleInvestmentLinkForExtraction(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: notice.sourceItemId,
+    kind: "receipt",
+  });
+  await run(base);
+
+  const links = await listInvestmentDocumentLinks(base.ctx, [base.spaceId], {});
+  assert.equal(links.length, 1);
+  assert.equal(links[0].state, "confirmed");
+  assert.equal(links[0].decidedBy, "owner");
+  const stored = await entryRow(base, investmentId, entry.id);
+  assert.equal(stored.documentId, notice.documentId);
+});
+
+test("a document with no link and a kind the scorer cannot read is not a job", { skip }, async (t) => {
+  const base = await fixture(t);
+  const other = await seedDocument(base.ctx, base.spaceId, {
+    kind: "receipt",
+    statements: [org("vendor", "Synthetic Hardware")],
+  });
+  assert.equal(
+    await scheduleInvestmentLinkForExtraction(base.ctx, {
+      spaceId: base.spaceId,
+      sourceItemId: other.sourceItemId,
+      kind: "receipt",
+    }),
+    null,
+  );
+  assert.deepEqual(await queuedKeys(base), []);
 });
 
 // ---------------------------------------------------------------------------
