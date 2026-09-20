@@ -355,7 +355,21 @@ spaced magnitude letters, unit words, scale words it declares unpriceable,
 unbalanced parentheses, a credit marker in front of an amount, double signs,
 digits from other scripts inside a number, `$N. N`, a decimal head beside
 space groups, pipe-rendered rows and two-line wraps. `KITH_AMOUNT_FUZZ_CASES`
-and `KITH_AMOUNT_FUZZ_SEEDS` run it harder than the suite does. A magnitude suffix is **applied**, not dropped and not refused, under two
+and `KITH_AMOUNT_FUZZ_SEEDS` run it harder than the suite does.
+
+**The generator asserts recall as well as refusal.** A gate that offers
+nothing at all can never offer a wrong number, so the four wrong-number
+invariants would pass a grammar that is useless -- and the first round of
+ADM-5k lost about a third of the correct offers on pipe rows without a single
+invariant noticing. Five families of plain shape are generated with the
+opposite claim: every amount printed on them must come back with its exact
+value. They are pipe-rendered rows of two to six amount cells, columns of
+amounts across lines, a form's lettered rows, a place or company name beside a
+figure, and a plainly labelled amount. Each is built from amounts this grammar
+is documented to read -- no magnitude, no flag, no damage, and no euro comma
+group, whose locale ambiguity is documented behaviour rather than a shape the
+grammar is meant to read. `KITH_AMOUNT_FUZZ_RECALL=1` prints the measured rate
+per family. A magnitude suffix is **applied**, not dropped and not refused, under two
 rules that together keep it from inventing a number.
 
 An **abbreviation** (`k`, `m`, `b`, `mm`, `mn`, `bn`) scales only when it is
@@ -378,20 +392,28 @@ prints beside an amount now falls in one of three tables.
 | Table | Words | What happens |
 | --- | --- | --- |
 | Scale, read | `thousand(s)`, `million(s)`, `billion(s)`, `trillion(s)`, `lakh(s)`, `crore(s)`, and the abbreviations `k`, `m`, `b`, `mm`, `mn`, `bn` glued to the digits beside a currency marker | The point moves. Each of these spells one number and no other |
-| Scale, refused | `mil`, `mio`, `mln`, `mill(s)`, `thou(s)`, `grand`, `bil`, `bill(s)`, `tn`, `trn`, `tril(l)`, `lac(s)`, and a magnitude abbreviation a space away from its digits | The word joins the token and the whole token is refused. `mil` is a million, a millilitre and a thousandth of an inch; `mill` is a million and a property-tax mill; `bill` is a billion and an invoice; `grand` is a thousand and an adjective; `tn` is a trillion and Tennessee |
-| Unit | `cent(s)`, `percent`, `percentage`, `pct`, `bp`, `bps`, `basis`, `share(s)`, `unit(s)`, `per`, `each`, `ea`, `apiece` | Refused for a money field. A unit is not a scale: `45 cents` is not forty-five dollars and `45.00 percent` is not forty-five of anything a money field stores |
+| Scale, refused outright | `mil`, `mio`, `mln`, `thous`, `trn`, `tril(l)`, `lac(s)`, and a magnitude abbreviation a space away from its digits | The word joins the token and the whole token is refused. None of these is an English word or a name |
+| Scale, refused after the amount | `mill(s)`, `thou`, `grand`, `bil`, `bill(s)`, `tn` | The same, but only directly after the amount and only where the word does not open a name. `mill` is a million and a property-tax mill; `bill` is a billion and an invoice; `grand` is a thousand and an adjective; `tn` is a trillion and Tennessee |
+| Unit | `cent(s)`, `percent`, `percentage`, `pct`, `bp`, `bps`, `basis` | Refused for a money field. A unit is not a scale: `45 cents` is not forty-five dollars and `45.00 percent` is not forty-five of anything a money field stores |
+| Counted unit | `share(s)`, `unit(s)` | Refused for a money field **only where the amount prints no currency mark**. `100 shares` is a holding; `$50,000.00 Shares issued` is fifty thousand dollars, and the mark says so |
 
 A **unit** word counts only where a unit can stand, which is directly after
 the amount: `Cost basis 1,234.56` is a money line with a label on it, and
-`1,234.56 basis points` is not a money value at all. A **scale** word is
-refused on either side, which is the rule the grammar has had since ADM-5g;
-`Grand Total 1,234.56` still reads, because the word beside the amount is
-`Total`. The `number` value type is dimensionless by construction and keeps
-its existing reading of units, exactly as it already keeps `12 %`.
+`1,234.56 basis points` is not a money value at all. `per`, `each` and
+`apiece` are not units here at all: a rate is still the printed dollars, and
+the gate's claim is that the cited text prints the value rather than that the
+value is a total. The `number` value type is dimensionless by construction and
+keeps its existing reading of units, exactly as it already keeps `12 %`.
 
-Recall lost to this, deliberately: `12 Mill Lane` offered 12 and now offers
-nothing. A street and a fund print the same characters, and `$2.5 mill` was
-the reading that mattered.
+**A Capitalized word followed by another Capitalized word is a name**, and a
+name is never a scale. That one test, applied wherever a scale word stands
+beside an amount, is what lets `$1,250.00 Mill Creek Partners LP`,
+`500.00 Grand Rapids` and `12 Mill Lane` read while `$2.5 mill` and
+`$2.5 Mill` refuse -- and it closes the mirror hole in the same move:
+`45.00 Thousand Oaks` offered forty-five thousand and `45.00 Lakh Street` four
+and a half million, because a *read* magnitude was scaling a place name. The
+finder has no gazetteer, and every other way of telling a town from a
+multiplier is a guess.
 
 The scaling is exact, by moving the decimal point. A token carrying a suffix
 has exactly one value, the scaled one, on both the value side and the quote
@@ -435,7 +457,10 @@ readings are refused and `$82. 12 due` and `$94. 50 total` lose their amounts
 with it. And **the marker has to be a currency this store prices**: three
 capitals are a word far more often than a code everywhere else in this file,
 and the gap-closing rule was reading any of them, so `FEE 162. 95` and
-`QTY 12. 34` closed up into amounts.
+`QTY 12. 34` closed up into amounts. The second round added the third: **a gap
+and a digit after the two digits is the next cell**, so `$7. 42 849.70` no
+longer offers 7.42 and 849.70 for a line that prints either two cells or one
+number and does not say which.
 
 **Neutral punctuation is not a wall (ADM-5k).** A bar, a semicolon or a
 quote mark cannot sign or scale a number, and the finder therefore stopped at
@@ -443,10 +468,24 @@ one and offered the amount -- so the marker behind it was invisible.
 `| Payment | 45.00 | CR |` printed a credit and offered a charge, `$45.00 |
 million` offered forty-five and `-| 45.00` offered a positive. The finder now
 steps over neutral punctuation to the real neighbour beyond it, bounded like
-every other walk in the file. A pipe-rendered table is how many of this
-store's parsed receipts print a column, and that recall is unchanged:
-`| Total | 1,234.56 |` still offers 1,234.56, because what stands past the
-bar is the end of the line.
+every other walk in the file.
+
+**And what stands past a rule is a cell, asked as a cell.** Stepping over the
+bar and stopping at the first character refused a third of the correct offers
+on pipe-rendered tables, which is how several of this store's parsed receipts
+print a column: a cell opening with `$`, `(`, `-`, a currency code or a
+label's closing parenthesis looked exactly like a marker. A cell says nothing
+about the amount on the other side of the rule when it is any of three
+things, each decided mechanically:
+
+| Harmless cell | Example |
+| --- | --- |
+| One printed amount and nothing else, sign and marker included | `$150.00`, `(6.00)`, `-1,204.17`, `3,200`, `£9,898.64 CR` |
+| A lone currency code, or a blank marker | `USD`, `N/A`, `none` |
+| A label: no digit, balanced parentheses, nothing that signs or scales, every word neutral on its own account | `Net income (loss)`, `Check`, `Dividends` |
+
+Everything else falls through to the ordinary neighbour rule, so a `CR`, `DR`,
+`%`, magnitude or unit cell refuses exactly as it did.
 
 **An unreadable neighbour is unknown, not separate (ADM-5k).** A digit this
 grammar must not read poisons its token, and the poison mark cut the token in
@@ -466,6 +505,14 @@ about `401K`, not a proof that the 1 stands alone. The pasted region is now
 asked four ways: as it stands, without a currency marker it opens with, with
 a marker it does not print, and without a trailing tail that belongs to
 neither run.
+
+**A compound amount is one number (ADM-5k).** `$3 million 2 thousand`,
+`1 crore 25 lakh` and `5 lakh 20 thousand` are each one figure said the way a
+person says it out loud, and the finder offered the first half whole -- short
+by whatever the second half adds. Two scaled spans a **single space** apart,
+the larger scale first, are refused together. One space, because a wider gap
+is a column and a column of scaled cells is two amounts: `| $2.5M | $3.0K |`
+still reads both.
 
 **A decimal head never takes space groups (ADM-5k).** A single space before a
 run of exactly three digits is a grouping separator in `$1 000 000` and a
@@ -487,12 +534,32 @@ exists to prevent.
 Scale and sign, and deliberately nothing else. A column receipt prints one
 amount per line and a form labels its boxes, so a digit or an ordinary word on
 the next line is the common case and refusing those would cost every receipt
-and every K-1 in the store. For the same reason a single letter, which is
-never neutral *within* a line, is refused across a wrap only when it is one of
-the letters that carries a scale or a sign (`k`, `m`, `b`, `c`, `d`): a K-1's
-`L Ending capital account` would otherwise refuse the box above it. A cut edge
-carries no wrap token, because a cut is not a line break and what lay beyond
-it is still gone.
+and every K-1 in the store. A cut edge carries no wrap token, because a cut is not
+a line break and what lay beyond it is still gone.
+
+Three more rules on the same edge, all of them from the first confirmation
+review, which measured the first round refusing an eighth of the correct
+offers on amount columns:
+
+- **An amount the neighbouring line prints for itself is a value, not a
+  marker.** The question is asked of the *edge*: that line's own reading has
+  to run up to the break. `$20.00` over `$1.60` over `$21.60` is a column and
+  every line of it reads; `($ 9,696,944)` over `197,577.62` is two amounts;
+  `45.00 CR` over the next row is a credit of its own, because the `CR` has a
+  number in front of it on its own line. An amount in the *middle* of the
+  neighbouring line settles nothing, which is what keeps `raised $2.5` over
+  `million from` refusing.
+- **A single closing letter is a row label when a word follows it.** A K-1
+  prints `K Net rental real estate income` and `M Section 179 deduction`, and
+  a W-2 prints code `D`; refusing the box above each of them cost the form.
+  A closing letter refuses only where it stands alone, ends its line, or is
+  followed by punctuation or a digit.
+- **What a reader cannot see is not a token.** Zero-width characters and soft
+  hyphens are stripped before the lead is cut, a blank line is looked past
+  rather than stopped at, and punctuation in front of the word is stepped over
+  the way it is within a line. A next line beginning `*CR`, `[CR]`, `.million`
+  or `, million`, or sitting behind a blank line, hid its marker and offered
+  the unsigned or unscaled value.
 
 **Known behaviour, documented rather than fixed.** A grouping separator at a
 line end with digits on the next line could be one wrapped number:
