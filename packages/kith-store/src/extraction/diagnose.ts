@@ -144,7 +144,10 @@ function linesCarrying(
   for (const line of lines) {
     const asAmount =
       amount !== undefined &&
-      amountsInText(line.text).some(
+      amountsInText(line.text, {
+        cutStart: line.cutStart,
+        cutEnd: line.cutEnd,
+      }).some(
         (candidate) => compareDecimalsSafely(candidate, amount) === 0,
       );
     const asDate =

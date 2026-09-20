@@ -1169,6 +1169,15 @@ async function prepare(
                     located.legacy.start,
                     located.legacy.end,
                   ),
+                  // Not cut edges, deliberately and in the same way the
+                  // non-list legacy branch below leaves them unset. The model
+                  // chose where this quote began and ended, so an edge here
+                  // is neither a printed boundary nor a cut this file made,
+                  // and ADM-5g does not change what the legacy shape reads.
+                  // The line-id path, which every current kind uses, cites
+                  // whole lines and carries real edges.
+                  cutStart: false,
+                  cutEnd: false,
                 },
               ]
             : [];
