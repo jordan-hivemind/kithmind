@@ -26,6 +26,7 @@ import {
 } from "../dist/admin/index.js";
 import {
   WorkerProtocolError,
+  getWorkerSourceItemCounts,
   getWorkerSourceRoots,
   recordWorkerSourceRootReport,
   workerCtx,
@@ -700,4 +701,129 @@ test("a watcher's state reaches the sources screen", { skip }, async (t) => {
   ).find((row) => row.id === f.sourceAccountId);
   assert.equal(source.status, "problem");
   assert.equal(source.problem, "missing");
+});
+
+// ADM-6a. `source.itemCounts`, the one thing a watcher cannot work out for
+// itself: how many items this account would lose if its scan were wrong.
+//
+// The population is the one `reconcileWorkerScan` walks and retires. If the
+// two ever drift apart, the watcher's guard is comparing one population
+// against another, and it will refuse healthy passes or pass a fatal one --
+// so every lifecycle below is here to pin that boundary, not for coverage.
+
+async function addSourceItem(f, fields) {
+  const id = newKithId();
+  await f.client.query(
+    `INSERT INTO kith.source_items
+       (id, space_id, created_at, source_account_id, external_id, uri, lifecycle)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6)`,
+    [
+      id,
+      fields.spaceId ?? f.spaceId,
+      fields.sourceAccountId ?? f.sourceAccountId,
+      `ext-${id}`,
+      fields.uri,
+      fields.lifecycle ?? "available",
+    ],
+  );
+  return id;
+}
+
+test("the live item count is the population reconcile would retire, per root", {
+  skip,
+}, async (t) => {
+  const f = await fixture(t);
+  for (const [uri, lifecycle] of [
+    ["fs://investing/2026/first.pdf", "available"],
+    ["fs://investing/2026/second.pdf", "available"],
+    ["fs://investing/2026/third.pdf", "available"],
+    // A null lifecycle is an item reconcile would retire, so it is live here.
+    ["fs://investing/2026/fourth.pdf", null],
+    ["fs://dropbox/Finance/first.pdf", "available"],
+    ["fs://dropbox/Finance/second.pdf", "available"],
+    // The three reconcile passes over, and this count must too.
+    ["fs://investing/2026/retired.pdf", "unavailable"],
+    ["fs://investing/2026/forgotten.pdf", "forgotten"],
+    ["fs://investing/2026/forgetting.pdf", "forgetting"],
+    // Live, and under no filesystem root: in the total, in no root row.
+    ["https://example.invalid/statement", "available"],
+    // A URI whose alias the watcher's own parser would refuse. One strange
+    // stored row must cost its own root row, not the whole answer.
+    ["fs://Investing/2026/odd.pdf", "available"],
+  ]) {
+    await addSourceItem(f, { uri, lifecycle });
+  }
+  // Another account in this space, and an account in another space. Neither is
+  // this credential's, and neither may appear in either number.
+  await addSourceItem(f, {
+    sourceAccountId: f.siblingAccountId,
+    uri: "fs://investing/2026/sibling.pdf",
+  });
+  await addSourceItem(f, {
+    spaceId: f.otherSpaceId,
+    sourceAccountId: f.otherAccountId,
+    uri: "fs://investing/2026/other-space.pdf",
+  });
+
+  const result = await getWorkerSourceItemCounts(
+    workerCtx(f.client, NOW),
+    f.worker,
+    {
+      ...PROTOCOL,
+      operation: "source.itemCounts",
+      spaceId: f.spaceId,
+      sourceAccountId: f.sourceAccountId,
+    },
+  );
+  assert.equal(result.sourceAccountId, f.sourceAccountId);
+  assert.equal(
+    result.liveItems,
+    8,
+    "four under investing, two under dropbox, and the two live items under no usable alias",
+  );
+  assert.deepEqual(
+    result.roots,
+    [
+      { rootAlias: "investing", liveItems: 4 },
+      { rootAlias: "dropbox", liveItems: 2 },
+    ],
+    "largest first, and nothing from another account or another space",
+  );
+  assert.equal(result.truncated, false);
+  assert.equal(
+    JSON.stringify(result).includes("2026"),
+    false,
+    "counts and aliases only: no path and no file name",
+  );
+
+  // An account this credential was never granted answers the same way every
+  // other worker read does, and says nothing about what it holds.
+  await assert.rejects(
+    getWorkerSourceItemCounts(workerCtx(f.client, NOW), f.worker, {
+      ...PROTOCOL,
+      operation: "source.itemCounts",
+      spaceId: f.spaceId,
+      sourceAccountId: f.siblingAccountId,
+    }),
+    expectProtocolCode("not_authorized"),
+  );
+});
+
+test("an account holding nothing counts nothing", { skip }, async (t) => {
+  const f = await fixture(t);
+  const result = await getWorkerSourceItemCounts(
+    workerCtx(f.client, NOW),
+    f.worker,
+    {
+      ...PROTOCOL,
+      operation: "source.itemCounts",
+      spaceId: f.spaceId,
+      sourceAccountId: f.sourceAccountId,
+    },
+  );
+  assert.deepEqual(
+    [result.liveItems, result.roots, result.truncated],
+    [0, [], false],
+    "a source nobody has enumerated yet is zero everywhere, which is what keeps the watcher's guard quiet on its first pass",
+  );
 });

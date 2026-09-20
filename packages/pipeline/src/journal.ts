@@ -864,6 +864,27 @@ function manualRecoveryRequired(value: JsonValue): boolean {
   );
 }
 
+/**
+ * ADM-6a. Whether the last pass refused itself because this journal disagrees
+ * with the server about what the source holds.
+ *
+ * Only this one code, and not the two ADM-4c refusals beside it. Those clear
+ * themselves: the disk comes back, the folder mounts, and the next pass runs.
+ * This one does not. It says the journal is not this source's journal, which
+ * stays true however many passes run, so it is a standing condition `doctor`
+ * has to name -- and naming a self-clearing refusal there would teach the
+ * owner to ignore the check.
+ */
+function journalBehindServer(value: JsonValue): boolean {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    value.phase === "terminal" &&
+    value.code === "journal_behind_server"
+  );
+}
+
 async function inspectDirectoryEntries(directory: string): Promise<number> {
   let inspected = 0;
   let recoveryArtifactCount = 0;
@@ -1009,6 +1030,7 @@ async function inspectExistingJournal<C extends JsonValue, R extends JsonValue>(
         configBinding,
         recoveryArtifactCount,
         manualRecoveryRequired: manualRecoveryRequired(parsed.checkpoint),
+        journalBehindServer: journalBehindServer(parsed.checkpoint),
       };
     }
     await requireStableInspectionDirectory(

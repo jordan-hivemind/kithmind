@@ -21,7 +21,7 @@
 
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { mkdir, rename, utimes, writeFile } from "node:fs/promises";
+import { cp, mkdir, rename, rm, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -828,6 +828,17 @@ test(
 );
 
 /** Every live item of this source, with the path the server last recorded. */
+/**
+ * ADM-6a. A journal directory, copied the way an operator copies one.
+ *
+ * Replacing the destination rather than merging into it, because a merged
+ * journal is neither of the two journals and would prove nothing about either.
+ */
+async function copyDirectory(from, to) {
+  await rm(to, { recursive: true, force: true });
+  await cp(from, to, { recursive: true, mode: 0 });
+}
+
 async function sourceItems(f) {
   const { rows } = await f.client.query(
     `SELECT i.id, i.external_id, i.uri, i.lifecycle,
@@ -1385,6 +1396,107 @@ test(
     });
     assert.deepEqual(restored, [
       { state: "complete", scanned: 41, published: 0 },
+    ]);
+  },
+);
+
+// ADM-6a. The host move, end to end: real handlers, a real database, and the
+// mistake an operator actually makes.
+//
+// A move copies the journal between machines. Copy an old one -- a backup, the
+// wrong host's, a folder synced before the last pass -- and both ADM-4c
+// breakers stay quiet, because both of them ask the journal what this source
+// holds and the journal answers honestly about a world that has moved on. The
+// files it forgot are on disk, so they are minted as new identities, and the
+// server's account-wide reconcile retires the items it already had for the
+// very same documents.
+test(
+  "a journal copied before the last pass refuses rather than retiring what the server holds",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const transport = inProcessWorkerTransport(f.pool, {
+      userId: f.userId,
+      credentialId: f.credential.id,
+    });
+    // Eight documents, four of them held back so the provider knows all eight
+    // from the start and the first pass still sees only half of them.
+    const workspace = await rehearsalWorkspace(t, { documents: 8 });
+    installFakeDropbox(t, workspace);
+    const held = join(workspace.base, "held");
+    await mkdir(held, { mode: 0o700 });
+    const later = workspace.files.slice(4);
+    for (const file of later) {
+      await rename(
+        join(workspace.root, file.relativePath),
+        join(held, file.relativePath),
+      );
+    }
+    const runtime = rehearsalProfile();
+    const config = rehearsalConfig({
+      endpoint: "http://127.0.0.1:0/api/worker",
+      spaceId: f.spaceId,
+      sourceAccountId: f.sourceAccountId,
+      workspace,
+      runtime,
+      provider: true,
+    });
+    const settle = () =>
+      rehearsalUntilSettled({
+        config,
+        credential: f.credential.rawKey,
+        transport,
+        runtime,
+      });
+    const first = await settle();
+    assert.equal(first.at(-1).state, "complete", JSON.stringify(first));
+    assert.equal((await sourceItems(f)).length, 4);
+
+    // The copy the operator carries to the new host, taken here.
+    const stale = join(workspace.base, "journal-copy");
+    await copyDirectory(workspace.journalDir, stale);
+
+    // The world moves on: four more documents are filed the ordinary way.
+    for (const file of later) {
+      await rename(
+        join(held, file.relativePath),
+        join(workspace.root, file.relativePath),
+      );
+    }
+    const second = await settle();
+    assert.equal(second.at(-1).state, "complete", JSON.stringify(second));
+    const live = await sourceItems(f);
+    assert.equal(live.length, 8);
+
+    // The move: the new host starts from the copy. Every document it
+    // remembers is still on disk, so nothing is missing and nothing has
+    // collapsed. Only the server knows this journal is four documents behind.
+    const current = join(workspace.base, "journal-current");
+    await copyDirectory(workspace.journalDir, current);
+    await copyDirectory(stale, workspace.journalDir);
+    const refused = await rehearsalPass({
+      config,
+      credential: f.credential.rawKey,
+      transport,
+      runtime,
+    });
+    assert.deepEqual(refused, {
+      state: "incomplete",
+      code: "journal_behind_server",
+      scanned: 0,
+      published: 0,
+    });
+    assert.deepEqual(
+      (await sourceItems(f)).map((row) => row.lifecycle),
+      live.map(() => "available"),
+      "and not one item was marked unavailable",
+    );
+
+    // The remedy the refusal names: this source's own journal. It costs a
+    // pass, and nothing else.
+    await copyDirectory(current, workspace.journalDir);
+    assert.deepEqual(await settle(), [
+      { state: "complete", scanned: 8, published: 0 },
     ]);
   },
 );

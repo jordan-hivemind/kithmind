@@ -1580,6 +1580,121 @@ test("the maxFiles ceiling is the scan manifest's, and the default is unchanged"
   assert.equal(MAX_WORKER_SCAN_ENTRIES, 1024);
 });
 
+// ADM-6a. The other half of the compatibility story, and the reason the count
+// arrives as its own operation rather than as a field on `source.status`: a
+// watcher refuses any response carrying a key it does not know, so an additive
+// field on an existing response breaks every watcher already deployed the day
+// the server ships it. This test pins that strictness, because it is the whole
+// argument for the shape of this change.
+test("a response carrying an unknown key is refused, whichever operation it answers", () => {
+  const status = {
+    operation: "source.status",
+    sourceAccountId: "source_1",
+    inventoryEpoch: 3,
+    completedInventoryEpoch: 3,
+    manifestVersion: 4,
+    enumeration: { state: "complete", scanId: "scan_1", completedAt: 1 },
+    processing: { state: "not_assessed" },
+    recordCoverage: "not_established",
+  };
+  assert.deepEqual(
+    parseWorkerResponse(JSON.stringify(status), "source.status"),
+    status,
+    "the shape an already-deployed watcher expects is unchanged",
+  );
+  assert.throws(() =>
+    parseWorkerResponse(
+      JSON.stringify({ ...status, liveItems: 687 }),
+      "source.status",
+    ),
+  );
+  assert.throws(() =>
+    parseWorkerResponse(
+      JSON.stringify({
+        operation: "source.roots",
+        sourceAccountId: "source_1",
+        roots: [],
+        liveItems: 687,
+      }),
+      "source.roots",
+    ),
+  );
+});
+
+test("the server's live item counts are validated against a closed shape", () => {
+  const ok = {
+    operation: "source.itemCounts",
+    sourceAccountId: "source_1",
+    liveItems: 687,
+    roots: [
+      { rootAlias: "investing", liveItems: 600 },
+      { rootAlias: "fixture", liveItems: 87 },
+    ],
+    truncated: false,
+  };
+  assert.deepEqual(
+    parseWorkerResponse(JSON.stringify(ok), "source.itemCounts"),
+    ok,
+  );
+  assert.deepEqual(
+    parseWorkerResponse(
+      JSON.stringify({
+        operation: "source.itemCounts",
+        sourceAccountId: "source_1",
+        liveItems: 0,
+        roots: [],
+        truncated: false,
+      }),
+      "source.itemCounts",
+    ).roots,
+    [],
+    "an account holding nothing is a valid answer, and is what a new source says",
+  );
+  for (const mutate of [
+    (value) => {
+      // An alias, never a path: this value is compared against the host's own
+      // allow-list keys and is printed in the refusal.
+      value.roots[0].rootAlias = "/Users/someone/Finance";
+    },
+    (value) => {
+      value.roots[0].rootAlias = "Investing";
+    },
+    (value) => {
+      value.roots[0].liveItems = -1;
+    },
+    (value) => {
+      value.roots[0].liveItems = 1.5;
+    },
+    (value) => {
+      value.roots[0].relativePath = "Investing/2026";
+    },
+    (value) => {
+      value.roots[1].rootAlias = "investing";
+    },
+    (value) => {
+      delete value.truncated;
+    },
+    (value) => {
+      value.liveItems = "687";
+    },
+    (value) => {
+      value.unexpected = true;
+    },
+    (value) => {
+      value.roots = Array.from({ length: 65 }, (_, index) => ({
+        rootAlias: `root-${index}`,
+        liveItems: 1,
+      }));
+    },
+  ]) {
+    const invalid = structuredClone(ok);
+    mutate(invalid);
+    assert.throws(() =>
+      parseWorkerResponse(JSON.stringify(invalid), "source.itemCounts"),
+    );
+  }
+});
+
 test("the watched-folder list and its report are validated against closed shapes", () => {
   const ok = {
     operation: "source.roots",

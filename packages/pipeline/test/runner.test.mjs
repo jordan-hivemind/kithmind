@@ -5797,10 +5797,37 @@ test("a plan under a new parser fingerprint needs work while old rows are retain
 // chosen step keeps each case about identity and nothing else, and the
 // terminal checkpoint still records the bindings the next pass would read.
 
-function identityTransport({ failAt, entries, requests }) {
+function identityTransport({
+  failAt,
+  entries,
+  requests,
+  itemCounts,
+  enumeration,
+}) {
   return {
     async call(request) {
       requests.push(request);
+      // ADM-6a. `itemCounts: undefined` is a server that predates the
+      // operation: it throws the way this stub throws for anything it does not
+      // know, which is what the deployed worker sees against an old server.
+      if (request.operation === "source.itemCounts") {
+        if (itemCounts === undefined) {
+          throw new Error(`unexpected operation ${request.operation}`);
+        }
+        if (itemCounts === "refused") {
+          return { error: { code: "invalid_request" } };
+        }
+        return {
+          operation: "source.itemCounts",
+          sourceAccountId: "source",
+          liveItems: itemCounts.roots.reduce(
+            (total, root) => total + root.liveItems,
+            0,
+          ),
+          truncated: itemCounts.truncated ?? false,
+          roots: itemCounts.roots,
+        };
+      }
       // ADM-9. Every pass reports how it ended, including the ones that never
       // open a scan. `failAt: "passOutcome"` is the server that refuses it --
       // an old one answering an unknown operation -- as the safe error
@@ -5826,7 +5853,7 @@ function identityTransport({ failAt, entries, requests }) {
           inventoryEpoch: 1,
           completedInventoryEpoch: 1,
           manifestVersion: 1,
-          enumeration: {
+          enumeration: enumeration ?? {
             state: "complete",
             scanId: "old_scan",
             completedAt: 1,
@@ -5885,6 +5912,12 @@ async function identityPass({
   roots = [],
   overrides = {},
   acceptRetirement,
+  // ADM-6a. What the server says it holds, and how it says the source was
+  // last enumerated. Both default to the pre-ADM-6a stub: a server that does
+  // not know `source.itemCounts`, and a source enumerated once already.
+  itemCounts,
+  enumeration,
+  checkpoint,
   providers = [
     { rootAlias: "fixture", ids, ...(lookupFailure ? { lookupFailure } : {}) },
   ],
@@ -5895,7 +5928,7 @@ async function identityPass({
   const askedByRoot = [];
   const journal = await openJournal(
     setup.journalDir,
-    terminalCheckpoint(bindings),
+    checkpoint ?? terminalCheckpoint(bindings),
   );
   try {
     const runner = new PipelineRunner(
@@ -5905,7 +5938,13 @@ async function identityPass({
         roots: [...setup.config.roots, ...roots],
       },
       journal,
-      identityTransport({ failAt, entries, requests }),
+      identityTransport({
+        failAt,
+        entries,
+        requests,
+        itemCounts,
+        enumeration,
+      }),
       undefined,
       acceptRetirement === undefined ? {} : { acceptRetirement },
       providers.map((provider) => ({
@@ -5943,7 +5982,7 @@ async function identityPass({
       asked,
       askedByRoot,
       requests,
-      bindings: journal.checkpoint.bindings,
+      bindings: journal.checkpoint.bindings ?? [],
     };
   } finally {
     await journal.close();
@@ -7417,6 +7456,241 @@ test("a subtree selection that watches nothing it used to also refuses", async (
     } finally {
       await journal.close();
     }
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// ADM-6a. The host-move rehearsal, and the third breaker it asked for.
+//
+// Both ADM-4c breakers take the journal's word for what this source holds, so
+// neither can see a journal that is not this source's journal. The rehearsal
+// started a watcher with a stale copy: it remembered a handful of items where
+// the server held two hundred for the same source. Every remembered item was
+// still on disk, so nothing was missing and nothing had collapsed; the rest of
+// the disk was minted as fresh identities, and the server's account-wide
+// reconcile marked the items it already had -- the same documents -- as
+// unavailable.
+
+const REHEARSAL_FILES = 200;
+const REHEARSAL_REMEMBERED = 6;
+
+function rehearsalBindings() {
+  return Array.from({ length: REHEARSAL_REMEMBERED }, (_, index) => ({
+    rootAlias: "fixture",
+    relativePath: `file-${index}.txt`,
+    externalId: randomUUID(),
+  }));
+}
+
+test("a journal that remembers a fraction of what the server holds would mint the rest as new identities", async () => {
+  const setup = await fixture(REHEARSAL_FILES);
+  try {
+    const bindings = rehearsalBindings();
+    const remembered = new Set(bindings.map((row) => row.externalId));
+    // No `itemCounts`: the server predates the operation, which is where this
+    // began and is what a watcher of this build still has to survive.
+    const pass = await identityPass({ setup, bindings, providers: [] });
+    assert.equal(pass.mode, "normal", "the scan opened");
+    const minted = pass.bindings.filter(
+      (row) => !remembered.has(row.externalId),
+    );
+    assert.equal(
+      minted.length,
+      REHEARSAL_FILES - REHEARSAL_REMEMBERED,
+      "every file the stale journal had forgotten took a brand-new identity, and the server's own items for those same documents are what its reconcile then retires",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a journal that remembers a fraction of what the server holds refuses the pass before the scan opens", async () => {
+  const setup = await fixture(REHEARSAL_FILES);
+  try {
+    const bindings = rehearsalBindings();
+    const pass = await identityPass({
+      setup,
+      bindings,
+      providers: [],
+      itemCounts: {
+        roots: [{ rootAlias: "fixture", liveItems: REHEARSAL_FILES }],
+      },
+    });
+    assert.equal(pass.result.state, "incomplete");
+    assert.equal(pass.result.code, "journal_behind_server");
+    assert.equal(pass.mode, undefined, "the scan never opened");
+    assert.deepEqual(
+      pass.bindings.map((row) => row.externalId).sort(),
+      bindings.map((row) => row.externalId).sort(),
+      "and nothing was minted or forgotten: the next pass sees the same journal",
+    );
+    assert.equal(
+      pass.requests.some((row) => row.operation === "scan.begin"),
+      false,
+      "nothing reached the server that could lead to a reconcile",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// This refusal is not a deletion to confirm, so unlike the other two it has no
+// way through. Confirming a deletion nobody performed is the mistake.
+test("accepting a retirement never accepts a journal that is behind the server", async () => {
+  const setup = await fixture(REHEARSAL_FILES);
+  try {
+    for (const acceptRetirement of [
+      "journal_behind_server",
+      "root_selection_would_retire_items",
+      "root_contents_collapsed",
+    ]) {
+      const pass = await identityPass({
+        setup,
+        bindings: rehearsalBindings(),
+        providers: [],
+        acceptRetirement,
+        itemCounts: {
+          roots: [{ rootAlias: "fixture", liveItems: REHEARSAL_FILES }],
+        },
+      });
+      assert.equal(pass.result.code, "journal_behind_server");
+      assert.equal(pass.mode, undefined, "the scan never opened");
+    }
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// The refusal has to be narrow, or it becomes a watcher that never runs. Each
+// of these is a shape a healthy host produces, and each one of them is a pass
+// that must go on to open its scan.
+test("a journal that is not behind the server runs the pass", async () => {
+  const setup = await fixture(10);
+  const remembered = Array.from({ length: 10 }, (_, index) => ({
+    rootAlias: "fixture",
+    relativePath: `file-${index}.txt`,
+    externalId: randomUUID(),
+  }));
+  try {
+    const cases = [
+      [
+        "the server holds exactly what the journal remembers",
+        { roots: [{ rootAlias: "fixture", liveItems: 10 }] },
+      ],
+      [
+        // Ordinary. A forgotten item keeps its binding and stops being live,
+        // and so does one retired in an earlier pass.
+        "the journal knows more than the server",
+        { roots: [{ rootAlias: "fixture", liveItems: 1 }] },
+      ],
+      [
+        // Two more than remembered, on ten. Under both the floor and the
+        // quarter: a standing refusal for two items would be a watcher that
+        // refuses on noise.
+        "the server is ahead by less than the breaker's share",
+        { roots: [{ rootAlias: "fixture", liveItems: 12 }] },
+      ],
+      [
+        // Unknown is not zero, and it is not a number to compare against
+        // either. The guard abstains rather than guesses.
+        "the root is missing from a truncated list",
+        {
+          truncated: true,
+          roots: [{ rootAlias: "investing", liveItems: 900 }],
+        },
+      ],
+      [
+        // An old server answering an operation it does not know. The watcher
+        // that ships with this change still runs against it.
+        "the server refuses the operation",
+        "refused",
+      ],
+    ];
+    for (const [reason, itemCounts] of cases) {
+      const pass = await identityPass({
+        setup,
+        bindings: remembered,
+        providers: [],
+        itemCounts,
+      });
+      assert.notEqual(pass.result.code, "journal_behind_server", reason);
+      assert.equal(pass.mode, "normal", reason);
+    }
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// The owner adds a folder. Nothing is in it yet and the server has nothing
+// under it, so both sides are zero and neither the new root nor the old one
+// may be read as a journal that has fallen behind.
+test("adding a root the server has never held does not refuse the pass", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  const added = await secondRoot(setup, "investing", {});
+  try {
+    const pass = await identityPass({
+      setup,
+      roots: [added],
+      providers: [],
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "statement.txt",
+          externalId: randomUUID(),
+        },
+      ],
+      itemCounts: { roots: [{ rootAlias: "fixture", liveItems: 1 }] },
+    });
+    assert.notEqual(pass.result.code, "journal_behind_server");
+    assert.equal(pass.mode, "normal", "the scan opened");
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("the first enumeration of a new source does not refuse the pass", async () => {
+  const setup = await fixture(5);
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: [],
+      providers: [],
+      checkpoint: initialCheckpoint,
+      enumeration: { state: "never" },
+      itemCounts: { roots: [] },
+    });
+    assert.notEqual(pass.result.code, "journal_behind_server");
+    assert.equal(pass.mode, "normal", "the scan opened");
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// A watcher with no journal against an enumerated source is the remedy this
+// refusal points at, so it must not be the thing the refusal fires on. It
+// cannot be: an identity-recovery pass reconciles to `needs_review` and
+// retires nothing, so the guard is never asked.
+test("identity recovery with a fresh journal never asks the server what it holds", async () => {
+  const setup = await fixture(REHEARSAL_FILES);
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: [],
+      providers: [],
+      checkpoint: initialCheckpoint,
+      itemCounts: {
+        roots: [{ rootAlias: "fixture", liveItems: REHEARSAL_FILES }],
+      },
+    });
+    assert.equal(pass.mode, "identity_recovery");
+    assert.notEqual(pass.result.code, "journal_behind_server");
+    assert.equal(
+      pass.requests.some((row) => row.operation === "source.itemCounts"),
+      false,
+      "a pass that cannot retire anything does not need the count",
+    );
   } finally {
     await rm(setup.base, { recursive: true, force: true });
   }

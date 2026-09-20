@@ -1,5 +1,6 @@
 import {
   FS_ROOT_ALIAS,
+  MAX_WORKER_SOURCE_ITEM_COUNT_ROOTS,
   MAX_WORKER_SOURCE_ROOTS,
   SOURCE_ROOT_KINDS,
 } from "@repo/worker-protocol/request";
@@ -22,6 +23,7 @@ const MAX_URI_ALIASES = 8;
 const MAX_FILE_BYTES = 65_536;
 const MAX_ARCHIVE_CIPHER_BYTES = 65 * 1024 * 1024;
 const MAX_SOURCE_ROOTS = MAX_WORKER_SOURCE_ROOTS;
+const MAX_SOURCE_ITEM_COUNT_ROOTS = MAX_WORKER_SOURCE_ITEM_COUNT_ROOTS;
 const MAX_SOURCE_ROOT_EXPECTED_TYPES = 64;
 const ID = /^[A-Za-z0-9_-]{1,256}$/;
 const UUID =
@@ -461,6 +463,47 @@ function sourceRoots(value: Record<string, unknown>): void {
     for (const type of root.expectedTypes) {
       text(type, "expectedTypes entry", { maxUtf16: 256 });
     }
+  }
+}
+
+/**
+ * ADM-6a. The server's own count of the items its reconcile would retire.
+ *
+ * Counts and root aliases, nothing else: this response is read before a scan
+ * opens, so everything in it has to be safe to log and safe to compare, and a
+ * path or a file name would be neither.
+ */
+function sourceItemCounts(value: Record<string, unknown>): void {
+  exact(value, [
+    "operation",
+    "sourceAccountId",
+    "liveItems",
+    "roots",
+    "truncated",
+  ]);
+  id(value.sourceAccountId, "sourceAccountId");
+  integer(value.liveItems, "liveItems");
+  boolean(value.truncated, "truncated");
+  if (
+    !Array.isArray(value.roots) ||
+    value.roots.length > MAX_SOURCE_ITEM_COUNT_ROOTS
+  ) {
+    failure("roots is invalid");
+  }
+  const seen = new Set<string>();
+  for (const entry of value.roots) {
+    const root = record(entry);
+    exact(root, ["rootAlias", "liveItems"]);
+    const alias = text(root.rootAlias, "rootAlias", {
+      maxUtf16: 64,
+      pattern: FS_ROOT_ALIAS,
+    });
+    // One alias, one count. Two rows for one alias would make "what does the
+    // server hold here" a question with two answers, and the guard below picks
+    // whichever it read last.
+    if (seen.has(alias)) failure("roots is invalid");
+    seen.add(alias);
+    integer(root.liveItems, "root liveItems");
   }
 }
 
@@ -1393,6 +1436,9 @@ export function parseWorkerResponse(
       break;
     case "source.roots":
       sourceRoots(result);
+      break;
+    case "source.itemCounts":
+      sourceItemCounts(result);
       break;
     case "source.rootReport":
       sourceRootReport(result);

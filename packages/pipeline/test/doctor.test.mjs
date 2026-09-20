@@ -567,6 +567,7 @@ test("journal activity degrades while recovery hazards block", async (context) =
     credentialBinding: "current",
     recoveryArtifactCount: 0,
     manualRecoveryRequired: false,
+    journalBehindServer: false,
   };
   const cases = [
     [{ state: "contended" }, "degraded", "contended"],
@@ -591,6 +592,18 @@ test("journal activity degrades while recovery hazards block", async (context) =
       { ...baseInspection, manualRecoveryRequired: true },
       "blocked",
       "manual_recovery_required",
+    ],
+    // ADM-6a: a standing condition, so it blocks, and it outranks the
+    // self-clearing hazards it can appear beside.
+    [
+      { ...baseInspection, journalBehindServer: true },
+      "blocked",
+      "journal_behind_server",
+    ],
+    [
+      { ...baseInspection, journalBehindServer: true, activity: "scan" },
+      "blocked",
+      "journal_behind_server",
     ],
     [
       { ...baseInspection, pending: true, credentialBinding: "unverified" },

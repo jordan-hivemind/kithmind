@@ -106,6 +106,7 @@ export type JournalCheck = {
     | "credential_recovery_required"
     | "credential_comparison_unavailable"
     | "manual_recovery_required"
+    | "journal_behind_server"
     | "unsupported_platform"
     | "invalid_directory"
     | "invalid_permissions"
@@ -739,6 +740,13 @@ function journalResult(inspection: JournalInspection): JournalCheck {
       state: "fail",
       code: "manual_recovery_required",
     };
+  }
+  // ADM-6a. Ahead of every self-clearing condition below, because it is not
+  // one. The worker will refuse every pass until someone gives it the right
+  // journal or none, and a report that said `recovery_pending` instead would
+  // read as "wait".
+  if (inspection.journalBehindServer) {
+    return { id: "journal", state: "fail", code: "journal_behind_server" };
   }
   if (inspection.credentialBinding === "changed_active") {
     return {
