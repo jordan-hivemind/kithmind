@@ -109,11 +109,18 @@ CREATE TABLE kith.investment_document_links (
   -- A rule's or a model's decision must cite what it was made from. The
   -- owner's own decision is its own provenance -- `actor_user_id` and
   -- `decided_at` -- and he may attach a document the rule never proposed.
-  CONSTRAINT investment_document_links_evidence_check
+  --
+  -- Named `..._required_check` and `..._named_check`, not `..._check`: the
+  -- inline column CHECKs above already claimed
+  -- `investment_document_links_evidence_check` and
+  -- `investment_document_links_model_check`, the names PostgreSQL would
+  -- otherwise auto-assign these two. Migrations 030 and 031 hit the same
+  -- thing; it fails at apply time with 42710, not silently.
+  CONSTRAINT investment_document_links_evidence_required_check
     CHECK (decided_by = 'owner' OR jsonb_array_length(evidence) >= 1),
   -- A model answer names its model and nothing else does, so a row cannot
   -- claim a model it did not use, or use one it does not name.
-  CONSTRAINT investment_document_links_model_check
+  CONSTRAINT investment_document_links_model_named_check
     CHECK ((decided_by = 'model') = (model IS NOT NULL)),
   FOREIGN KEY (investment_id, space_id)
     REFERENCES kith.investments (id, space_id) ON DELETE CASCADE,

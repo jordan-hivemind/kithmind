@@ -32,6 +32,7 @@ import { IdentityError } from "../identity/errors.js";
 import { assertKithId, newKithId } from "../ids.js";
 import { resolveEntity } from "../memory/entities.js";
 import { spacePredicate } from "../spaces.js";
+import { setEntryDocument } from "./investmentLinks.js";
 import {
   INVESTMENT_ENTRY_TYPES,
   INVESTMENT_STATUSES,
@@ -228,6 +229,17 @@ function isoDate(value: unknown, name: string): string {
   const parsed = new Date(`${value}T00:00:00Z`);
   if (Number.isNaN(parsed.getTime()) || !parsed.toISOString().startsWith(value)) {
     typedError("invalid_input", `${name} must be an ISO date`);
+  }
+  return value;
+}
+
+/** A flag, or its default. Anything else is bad input rather than a silent
+ * `false`: `dateIsEstimated: "true"` from a hand-written request must not
+ * quietly store the opposite of what it says. */
+function boolean(value: unknown, name: string, fallback = false): boolean {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== "boolean") {
+    typedError("invalid_input", `${name} must be true or false`);
   }
   return value;
 }
@@ -540,6 +552,7 @@ type EntryDbRow = {
   note: string | null;
   document_id: string | null;
   evidence_span_id: string | null;
+  date_is_estimated: boolean;
 };
 
 function toEntry(record: EntryDbRow): InvestmentEntry {
@@ -555,6 +568,7 @@ function toEntry(record: EntryDbRow): InvestmentEntry {
     note: record.note,
     documentId: record.document_id,
     evidenceSpanId: record.evidence_span_id,
+    dateIsEstimated: record.date_is_estimated,
   };
 }
 
@@ -588,7 +602,8 @@ export async function listInvestmentEntries(
   const records = await rows<EntryDbRow>(
     ctx,
     `SELECT id, space_id, investment_id, entry_type, entry_date, amount,
-            currency, exchange_rate, note, document_id, evidence_span_id
+            currency, exchange_rate, note, document_id, evidence_span_id,
+            date_is_estimated
        FROM kith.investment_entries
       WHERE ${predicate.sql} AND investment_id = ANY($2::text[])
       ORDER BY entry_date, id
@@ -1044,20 +1059,25 @@ export async function archiveInvestment(
 
 /** A document may only be linked when it is in the entry's own space. The
  * composite foreign key would refuse anything else, but a foreign key
- * violation is a 500 and this is ordinary bad input. */
+ * violation is a 500 and this is ordinary bad input.
+ *
+ * The source item comes back with it because the link a document attachment
+ * now writes is keyed on the source item, not on the document row: a re-parse
+ * mints a new document and the source item survives it (ADM-8b, migration
+ * 033). */
 async function documentInSpace(
   ctx: IdentityCtx,
   spaceId: string,
   documentId: string,
-): Promise<string> {
+): Promise<{ id: string; sourceItemId: string }> {
   const id = assertKithId(documentId, "invalid_document_id");
-  const found = await row<{ id: string }>(
+  const found = await row<{ id: string; source_item_id: string }>(
     ctx,
-    "SELECT id FROM kith.documents WHERE id = $1 AND space_id = $2",
+    "SELECT id, source_item_id FROM kith.documents WHERE id = $1 AND space_id = $2",
     [id, spaceId],
   );
   if (!found) typedError("document_not_found", "Document not found");
-  return id;
+  return { id: found.id, sourceItemId: found.source_item_id };
 }
 
 export type CreateEntryArgs = {
@@ -1070,6 +1090,15 @@ export type CreateEntryArgs = {
   exchangeRate?: string | null;
   note?: string | null;
   documentId?: string | null;
+  /**
+   * True when `entryDate` is an estimate rather than a stated date.
+   *
+   * The import sets it on a commitment it dated from the investment's first
+   * payment (ADM-8b, slice 1b); the drawer sets it when the owner ticks the
+   * box. It defaults to false, so an entry that says nothing is an entry
+   * whose date is the owner's own and can never be rewritten by a document.
+   */
+  dateIsEstimated?: boolean;
   /** The import's stable row key. A second import of the same file re-uses it
    * and the unique index turns the insert into a no-op. */
   importKey?: string | null;
@@ -1097,17 +1126,21 @@ export async function createInvestmentEntry(
     "Import key",
     IMPORT_KEY_MAX_CHARS,
   );
-  const documentId =
+  const document =
     args.documentId === undefined || args.documentId === null
       ? null
       : await documentInSpace(ctx, target.spaceId, args.documentId);
+  const dateIsEstimated = boolean(args.dateIsEstimated, "Date is estimated");
 
   const id = newKithId();
+  // `document_id` is deliberately not in this INSERT any more. It is a mirror
+  // of `kith.investment_document_links` (ADM-8b) and `setEntryDocument` is the
+  // one thing that writes it, in this same transaction, immediately below.
   const inserted = await row<{ id: string }>(
     ctx,
     `INSERT INTO kith.investment_entries
        (id, space_id, investment_id, entry_type, entry_date, amount, currency,
-        exchange_rate, note, document_id, import_key)
+        exchange_rate, note, import_key, date_is_estimated)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      ON CONFLICT (space_id, import_key) WHERE import_key IS NOT NULL
        DO NOTHING
@@ -1122,11 +1155,22 @@ export async function createInvestmentEntry(
       amounts.currency,
       amounts.exchangeRate,
       note,
-      documentId,
       importKey,
+      dateIsEstimated,
     ],
   );
-  if (inserted) return { id: inserted.id, created: true };
+  if (inserted) {
+    if (document !== null) {
+      await setEntryDocument(ctx, {
+        spaceId: target.spaceId,
+        investmentId: target.id,
+        entryId: inserted.id,
+        actorUserId: args.principal.userId,
+        document,
+      });
+    }
+    return { id: inserted.id, created: true };
+  }
   const existing = await row<{ id: string }>(
     ctx,
     `SELECT id FROM kith.investment_entries
@@ -1184,6 +1228,17 @@ async function writableEntry(
  * to GBP while leaving a null rate behind would store a row whose USD value is
  * null, so `money` is re-run over the merged values rather than over the
  * patch.
+ *
+ * `entryDate` and `dateIsEstimated` move together for a related reason.
+ * Typing a date is how the owner states one, so a patch that sets the date
+ * and says nothing about the marker CLEARS it: the date is now his. He keeps
+ * the marker by sending `dateIsEstimated: true` in the same patch, which is
+ * what the drawer's tick box does.
+ *
+ * `documentId` no longer writes the column. It goes through
+ * `setEntryDocument`, so attaching a document writes an owner-confirmed link
+ * and detaching one rejects the live link -- which is also what stops a
+ * sweep from re-attaching what the owner just took off.
  */
 export async function updateInvestmentEntry(
   ctx: IdentityCtx,
@@ -1199,6 +1254,7 @@ export async function updateInvestmentEntry(
     exchangeRate?: string | null;
     note?: string | null;
     documentId?: string | null;
+    dateIsEstimated?: boolean;
   },
 ): Promise<void> {
   const target = await writableEntry(
@@ -1210,7 +1266,8 @@ export async function updateInvestmentEntry(
   const current = await row<EntryDbRow>(
     ctx,
     `SELECT id, space_id, investment_id, entry_type, entry_date, amount,
-            currency, exchange_rate, note, document_id, evidence_span_id
+            currency, exchange_rate, note, document_id, evidence_span_id,
+            date_is_estimated
        FROM kith.investment_entries WHERE id = $1 AND space_id = $2`,
     [target.id, target.spaceId],
   );
@@ -1229,12 +1286,19 @@ export async function updateInvestmentEntry(
     exchangeRate:
       args.exchangeRate === undefined ? current.exchange_rate : args.exchangeRate,
   });
-  const documentId =
-    args.documentId === undefined
-      ? current.document_id
-      : args.documentId === null
-        ? null
-        : await documentInSpace(ctx, target.spaceId, args.documentId);
+  const document =
+    args.documentId === undefined || args.documentId === null
+      ? null
+      : await documentInSpace(ctx, target.spaceId, args.documentId);
+  // Absent and unaccompanied by a new date: leave the marker alone. Absent
+  // beside a new date: the owner typed the date, so it is no longer an
+  // estimate. Present: he said which it is.
+  const dateIsEstimated =
+    args.dateIsEstimated === undefined
+      ? args.entryDate === undefined
+        ? current.date_is_estimated
+        : false
+      : boolean(args.dateIsEstimated, "Date is estimated");
   await exec(
     ctx,
     `UPDATE kith.investment_entries SET
@@ -1244,7 +1308,7 @@ export async function updateInvestmentEntry(
        currency = $6,
        exchange_rate = $7,
        note = CASE WHEN $8::boolean THEN $9 ELSE note END,
-       document_id = $10
+       date_is_estimated = $10
      WHERE id = $1 AND space_id = $2`,
     [
       target.id,
@@ -1256,9 +1320,18 @@ export async function updateInvestmentEntry(
       amounts.exchangeRate,
       args.note !== undefined,
       optionalText(args.note ?? null, "Note", NOTE_MAX_CHARS),
-      documentId,
+      dateIsEstimated,
     ],
   );
+  if (args.documentId !== undefined) {
+    await setEntryDocument(ctx, {
+      spaceId: target.spaceId,
+      investmentId: target.investmentId,
+      entryId: target.id,
+      actorUserId: args.principal.userId,
+      document,
+    });
+  }
 }
 
 /** An entry is a mistake or it is not, so this one is a real delete. The

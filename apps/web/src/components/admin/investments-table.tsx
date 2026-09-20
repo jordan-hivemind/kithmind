@@ -244,6 +244,20 @@ export function InvestmentsTable({
       };
       if (editingEntryId !== null) {
         const entryId = editingEntryId;
+        // `documentId` is sent only when the owner actually changed it.
+        //
+        // Since ADM-8b a null `documentId` in a patch means DETACH, and a
+        // detach rejects the entry's link so that nothing links it again. A
+        // drawer opened from a row loaded before an automatic link landed
+        // would otherwise send that stale null on the next unrelated edit --
+        // a note, a rounded amount -- and permanently reject a link the owner
+        // never looked at.
+        const stored =
+          (entries ?? []).find((entry) => entry.id === entryId)?.documentId ??
+          null;
+        const { documentId, ...unchangedDocument } = body;
+        const patch =
+          stored === documentId ? unchangedDocument : body;
         await optimistic.mutateAsync({
           apply: () =>
             patchEntries((current) =>
@@ -255,7 +269,7 @@ export function InvestmentsTable({
             send(
               `/api/kith/investments/${draft.investmentId}/entries`,
               "PATCH",
-              { entryId, ...body },
+              { entryId, ...patch },
             ),
         });
         return;
@@ -284,7 +298,7 @@ export function InvestmentsTable({
           ),
       });
     },
-    [editingEntryId, optimistic, patchEntries],
+    [editingEntryId, entries, optimistic, patchEntries],
   );
 
   const saveInvestment = useCallback(

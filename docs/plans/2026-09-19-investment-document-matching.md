@@ -1,9 +1,14 @@
 # Investment document matching and the attention queue
 
 Date: 2026-09-19
-Status: proposed. Extends section 12 of
+Status: adopted, in build. Slice 1b of section 8 is the last slice landed
+(ADM-8b); slices 2 to 7 are not built. Extends section 12 of
 [`2026-09-18-admin-panel-and-ingestion.md`](2026-09-18-admin-panel-and-ingestion.md),
 which fixed the auto-link rule but not the pipeline, the queue or the alerts.
+
+Where the implementation has settled a question this plan left open, it says
+so in place: see "Migrations", "Which one is the source of truth" and "What
+slice 1 settled that this plan did not" in section 3.
 
 The owner enters the dollars. The system finds the paper, says nothing when it
 succeeds, and reaches him when it cannot. Silent wrong data is the one
@@ -157,7 +162,8 @@ Some payment dates are estimates too. A matched document that states the real
 date should correct the estimate.
 
 The marker is one column, `investment_entries.date_is_estimated boolean NOT NULL
-DEFAULT false`, in migration 028. The import
+DEFAULT false`, in migration 033 (see "Migrations" below for why the number
+moved). The import
 (`apps/web/src/lib/kith/investment-import.ts`) sets it, replacing section 12's
 rule that a commitment row without a signed date is unimportable. An entry the
 owner types is marked only if he ticks the box in the drawer.
@@ -210,29 +216,87 @@ not a market conversion, so it reads as estimated, the same caveat
 
 ### Migrations
 
-One migration, `028_investment_links_and_attention.sql`:
+This section was written as one migration numbered 028. It has become two,
+and neither is 028. A version is a POSITION in `KITH_MIGRATIONS` and
+`applyKithSchema` refuses a gap, so a number cannot be reserved ahead of the
+ones beside it: 028 was spent by ADM-4b, and the attention queue's half landed
+as **030** (ADM-8a). The link table's half is **033**
+(`033_investment_document_links.sql`, ADM-8b), and what remains -- the two
+deferred-work kinds -- belongs to slice 2 and will take its own position.
+
+Migration 030 (ADM-8a) delivered items 4 and 5 in a different and better
+shape: `corrections` gained `severity`, `detector`, `dedupe_key`,
+`dismissed_at`/`dismissed_by`/`dismiss_reason` and `snoozed_until` with the
+`dismissed` and `snoozed` states, and the suppression list is
+`kith.attention_mutes` (`scope_kind`/`scope_value`) rather than
+`kith.attention_suppressions`. Read that migration, not this paragraph, for
+the queue's schema.
+
+Migration 033 (ADM-8b, slices 1 and 1b) delivers:
 
 1. `kith.investment_document_links`, its indexes, and a `kith.record_change`
    trigger (migration 023) so the screens update live.
-2. A unique index on `(space_id, source_item_id, coalesce(entry_id, ''))`.
-3. `kith.deferred_work` kind check extended with `investment_link` and
-   `investment_sweep`, as migration 027 extended it.
-4. `kith.corrections`: `target_kind` extended with `entry`, `investment` and
-   `link`; columns `class` (`money_at_risk`, `system_breakage`, null for a
-   quiet queue item), `detector`, `dedupe_key`, `snooze_until`, `last_seen_at`,
-   `last_alerted_at`, `alert_count`; a unique index on `(space_id,
-   dedupe_key)` where `state = 'open'`.
-5. `kith.attention_suppressions`: `id, space_id, created_at, actor_user_id,
-   reason, scope, detector, investment_id, before_date`. `scope` is
-   `detector`, `investment`, or `before_date`, backing bulk dismiss and the
-   per-investment and per-detector "do not track documents" switches
-   (section 4). The sweep checks it before opening a row, the same place it
-   already checks for an open dismiss.
-6. `investment_entries.date_is_estimated`, defaulting false, so every existing
+2. A unique index on
+   `(space_id, source_item_id, investment_id, coalesce(entry_id::text, ''))`.
+   `investment_id` is in the key and the plan's version did not have it:
+   without it a document could carry only ONE investment-level link, and an
+   investment platform statement covers many investments at once. For an
+   entry-level row it changes nothing, since an entry belongs to exactly one
+   investment.
+3. A second unique index, `(space_id, entry_id)` where the state is
+   `auto_linked` or `confirmed`: **at most one live link per entry.** This is
+   what makes `investment_entries.document_id` a well-defined mirror rather
+   than a choice among several, and it is also what makes this section's
+   "exactly one document offers a date" condition structurally true.
+4. `kith.corrections.target_kind` extended with `entry` only. `investment`
+   and `link` arrive with the detectors in slice 3 that write them: a CHECK
+   widened for a writer that does not exist yet is a CHECK nothing tests.
+5. `investment_entries.date_is_estimated`, defaulting false, so every existing
    row reads as owner-entered and none can be rewritten by this feature.
 
-No second migration. Every query in `extraction/corrections.ts` filters
-`target_kind = 'document'`, so the widened check disturbs no existing path.
+The `kith.deferred_work` kind check is NOT extended here. `investment_link`
+and `investment_sweep` belong to slice 2, with the handler and the triggers
+that use them.
+
+Every query in `extraction/corrections.ts` filters `target_kind = 'document'`,
+so the widened check disturbs no existing path.
+
+### Which one is the source of truth (ADM-8b)
+
+`kith.investment_document_links` is. `investment_entries.document_id` keeps
+the meaning it has had since migration 022 -- the entry's primary citation,
+read by the totals, the screen and `get_investment` -- but nothing writes it
+directly any more. It is a MIRROR: the document of the entry's one live link,
+or null. `syncEntryDocument` in
+`packages/kith-store/src/admin/investmentLinks.ts` is the only writer, and it
+runs in the same transaction as every link write. The live-link unique index
+above is what makes "the entry's link" singular; a whole-table consistency
+query in `test/investmentLinks.test.mjs` runs after every transition and
+fails if the two ever disagree.
+
+The drawer's own "attach this document" goes through the same path: it writes
+an owner-decided `confirmed` link. Detaching (`documentId: null` on a patch)
+REJECTS the live link, with `reason = 'owner_detached'` -- the owner taking a
+document off an entry is the clearest statement there is that the two do not
+belong together, and a later sweep must not put it back. The drawer therefore
+sends `documentId` only when it changed, so a stale row cannot reject a link
+the owner never looked at.
+
+### What slice 1 settled that this plan did not (ADM-8b)
+
+| Question the plan left open | What was built, and why |
+| --- | --- |
+| Which money value on a page counts as the amount | ONE field per kind (`amount_called`, `amount_sent`, `amount_distributed`, `amount_committed`), not "any money value". A call notice prints `total_commitment` beside the amount it is calling, and matching on that links a notice to a commitment entry. |
+| Which entries a kind may be about | A kind names its entry types: a capital call notice never proposes itself against a distribution. A kind this scorer has no rules for produces no candidates at all, rather than being scored on coincidences. |
+| How a partial date scores | It does not. `precision: "year"` and `"month"` satisfy no window at any kind and replace no date. The alternative is a fabricated day, and a fabricated day is what would then be read back as fact. The cost is a suggestion instead of an auto-link, which is the safe direction. |
+| The `investment_agreement` window when `signed_on` is null | It falls back to +/-90 days around the ENTRY's date. An imported commitment's date is estimated exactly when the sheet had no Docs Signed date, which is exactly when `signed_on` is null -- so anchoring only on `signed_on` would make the window unavailable in the one case the date rule exists for. |
+| Which direction a cross-currency compare runs | The rate lives on the entry (migration 025), so a non-USD ENTRY is compared with a USD document within the importer's tolerance. A non-USD DOCUMENT against a USD entry has no recorded rate and scores no amount point; inventing a market rate is the fabrication this design refuses. |
+| `schedule_k1`'s date window | It has none. `tax_year` is a number field, not a date (`extraction/seed.ts`), so a K-1 links at the investment level on its party alone. |
+| What a tie is, exactly | An auto-link needs the best candidate to lead the runner-up by MORE than `LINK_TIE_MARGIN_POINTS` (2), so a three-point gap. Two candidates that both fire party, amount and date link nothing whatever the gap. |
+| What rejecting does to a date the link replaced | It puts it back, and marks it estimated again, and records the reversal as its own resolved correction. The exception is the owner's: if he has edited the date since, his value stands and the marker is left as he left it. |
+| A document whose date equals the estimate | The marker is cleared and NO correction row is written. Nothing changed, and a digest line saying "2026-03-01 became 2026-03-01" is noise. |
+| Legacy estimated commitments from the ADM-3b import | Not back-marked. They carry the note "date estimated from first payment" and keep it; a backfill keyed off a free-text note is the kind of guess that becomes a silently wrong date. Every pre-033 row reads as owner-entered. |
+| Section 1's three new document kinds | Not seeded here. The scorer names `wire_confirmation` and `capital_account_statement` in its kind table already, so it needs no change on the day extraction learns to read them; a kind no document carries simply never appears. |
 
 ## 4. Discrepancy detection
 
@@ -366,7 +430,7 @@ House style, with the existing components
 | K-1 checklist tab | Pull-only, on request: pick a tax year, see every investment missing a `schedule_k1` for it. No badge and no count on the main screen |
 
 Live updates come from the change feed. The new table gets its trigger in
-migration 028; `corrections` and `investment_entries` already have one.
+migration 033; `corrections` and `investment_entries` already have one.
 
 ## 7. MCP
 
@@ -386,7 +450,7 @@ Both questions are then one call each, with exact decimal amounts.
 
 | Slice | Delivers | Testable at the end | Second-model review |
 | --- | --- | --- | --- |
-| 1 | Migration 028, link table, deterministic scorer | Synthetic fixtures produce the right auto, suggest and none decisions | Yes, it writes `investment_entries.document_id` |
+| 1 | Migration 033, link table, deterministic scorer | Synthetic fixtures produce the right auto, suggest and none decisions | Yes, it writes `investment_entries.document_id` |
 | 1b | Estimated-date marker, import change, date replacement rule | An estimated date moves and is recorded; a non-estimated one never does | Yes, it changes a financial date |
 | 2 | `investment_link` kind, three triggers, backfill command | Fixture documents link themselves through one drain | No |
 | 3 | Attention items, the six detectors, bulk dismiss and do-not-track suppressions | Fixtures open items and clear them next sweep; a suppressed key never opens one | No |

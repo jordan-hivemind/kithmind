@@ -190,8 +190,28 @@ export type InvestmentEntry = {
   currency: string;
   exchangeRate: string | null;
   note: string | null;
+  /**
+   * The document this entry cites.
+   *
+   * A MIRROR of `kith.investment_document_links` as of ADM-8b, not a column
+   * anything writes directly: it holds the document of the entry's one live
+   * link (`auto_linked` or `confirmed`) and nothing else. See
+   * `investmentLinks.ts` for which one is the source of truth and what keeps
+   * the two from disagreeing.
+   */
   documentId: string | null;
   evidenceSpanId: string | null;
+  /**
+   * True when this date is an estimate rather than something stated.
+   *
+   * The import sets it on a commitment it dated from the investment's first
+   * payment because the sheet had no signing date; the owner sets it from the
+   * drawer on a date he is guessing at. It is the ONLY thing that lets a
+   * matched document replace this date. Every row that existed before
+   * migration 033 is false, so nothing already in the database can be
+   * rewritten by document matching.
+   */
+  dateIsEstimated: boolean;
 };
 
 export type Correction = {
