@@ -11,6 +11,10 @@ const token = randomBytes(32).toString("hex");
 const cookie = serializeSessionToken({ secret }, token);
 
 const ENV = { KITH_SESSION_SECRET: secret } as const;
+const DEVELOPMENT_ENV = {
+  KITH_SESSION_SECRET: secret,
+  NODE_ENV: "development",
+} as const;
 
 function request(pathname: string, method = "GET", cookieHeader?: string) {
   return new NextRequest(`https://brain.example.test${pathname}`, {
@@ -25,7 +29,30 @@ function signedIn(value = cookie) {
   return `__Host-kith_session=${value}`;
 }
 
+function signedInLocally(value = cookie) {
+  return `kith_session=${value}`;
+}
+
 describe("web authentication middleware", () => {
+  test("accepts only the development cookie name in local development", async () => {
+    expect(
+      await handleMiddlewareRequest(
+        request("/settings", "GET", signedInLocally()),
+        { env: DEVELOPMENT_ENV },
+      ),
+    ).toBeUndefined();
+    const hostPrefixed = await handleMiddlewareRequest(
+      request("/settings", "GET", signedIn()),
+      { env: DEVELOPMENT_ENV },
+    );
+    expect(hostPrefixed?.status).toBe(307);
+
+    const developmentInProduction = await handleMiddlewareRequest(
+      request("/settings", "GET", signedInLocally()),
+      { env: ENV },
+    );
+    expect(developmentInProduction?.status).toBe(307);
+  });
   test.each(["/api/ingest", "/api/worker"])(
     "lets the exact bearer endpoint %s reach its route handler",
     async (pathname) => {

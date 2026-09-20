@@ -40,6 +40,9 @@ Keyword search and capture work without either key.
 
 Open the deployed web app and sign up. This account owns your Personal space.
 Everything you capture goes there unless you later create a shared space.
+Password sign-in remains available. To add Google as a second sign-in method,
+follow the optional [Google web sign-in setup](docs/google-sign-in.md), then
+connect the Google identity from **Settings** while signed in.
 
 ### Step 3. Connect your assistant
 

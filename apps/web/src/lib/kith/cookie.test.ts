@@ -3,8 +3,8 @@
 // `lib/kith/cookie.ts` is a second implementation of one security check, needed
 // because middleware runs on the edge runtime and the store's
 // `parseSessionToken` uses `node:crypto`. This file is the thing that keeps the
-// two from drifting: it imports the real `SESSION_COOKIE_NAME`,
-// `serializeSessionToken` and `sessionCookie` from `@repo/kith-store/identity`
+// two from drifting: it imports the real production and development cookie
+// names, `serializeSessionToken` and `sessionCookie` from the identity package
 // and asserts the edge verifier accepts exactly what they produce and nothing
 // else.
 //
@@ -14,6 +14,7 @@
 import { randomBytes } from "node:crypto";
 
 import {
+  DEVELOPMENT_SESSION_COOKIE_NAME,
   parseSessionToken,
   serializeSessionToken,
   SESSION_COOKIE_NAME,
@@ -22,13 +23,15 @@ import {
 import { describe, expect, test } from "vitest";
 
 import {
+  KITH_DEVELOPMENT_SESSION_COOKIE_NAME,
   KITH_SESSION_COOKIE_NAME,
   readKithSessionCookie,
   verifyKithSessionCookie,
 } from "./cookie";
 
 const secret = randomBytes(32).toString("hex");
-const config = { secret, secure: false };
+const config = { secret, secure: true };
+const developmentConfig = { secret, secure: false };
 const token = randomBytes(32).toString("hex");
 
 describe("the edge session cookie check", () => {
@@ -40,6 +43,27 @@ describe("the edge session cookie check", () => {
     expect(readKithSessionCookie(header)).toBe(
       serializeSessionToken(config, token),
     );
+  });
+
+  test("uses a distinct plain-HTTP development cookie", () => {
+    expect(KITH_DEVELOPMENT_SESSION_COOKIE_NAME).toBe(
+      DEVELOPMENT_SESSION_COOKIE_NAME,
+    );
+    const header = sessionCookie(
+      developmentConfig,
+      token,
+      Date.now() + 1000,
+    ).split(";")[0];
+    expect(readKithSessionCookie(header, true)).toBe(
+      serializeSessionToken(developmentConfig, token),
+    );
+    expect(readKithSessionCookie(header)).toBeNull();
+    expect(
+      readKithSessionCookie(
+        `${SESSION_COOKIE_NAME}=${serializeSessionToken(config, token)}`,
+        true,
+      ),
+    ).toBeNull();
   });
 
   test("accepts exactly what the store signs", async () => {

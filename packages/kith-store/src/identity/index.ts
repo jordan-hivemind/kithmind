@@ -52,6 +52,8 @@ export {
 export { hashPassword, verifyPassword } from "./scrypt.js";
 
 export {
+  DEVELOPMENT_SESSION_COOKIE_NAME,
+  GOOGLE_PROVIDER,
   PASSWORD_PROVIDER,
   SESSION_COOKIE_NAME,
   SESSION_DURATION_MS,
@@ -59,7 +61,10 @@ export {
   changePassword,
   clearedSessionCookie,
   createSession,
+  getGoogleAccount,
   getPasswordAccount,
+  isGoogleAccountLinked,
+  linkGoogleAccount,
   parseSessionToken,
   readSessionCookie,
   removeExpiredSessions,
@@ -71,7 +76,9 @@ export {
   revokeUserSessions,
   serializeSessionToken,
   sessionCookie,
+  sessionCookieName,
   signIn,
+  signInWithGoogle,
   signOut,
   signUp,
   touchSession,

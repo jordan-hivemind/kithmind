@@ -26,9 +26,8 @@ type Environment = Readonly<Record<string, string | undefined>>;
  * allows a plain-HTTP local run to pass `secure: false` from a
  * development-only branch. This is that branch, and it is keyed on
  * `NODE_ENV === "development"`, which Next.js sets for `next dev` and never for
- * `next build`. Note that `__Host-` requires `Secure`, so a development run
- * without HTTPS is the only case where the cookie is not host-prefixed in
- * effect.
+ * `next build`. The identity package uses a separate unprefixed cookie name in
+ * that branch because browsers reject an insecure `__Host-` cookie.
  */
 function secureCookie(env: Environment): boolean {
   return env.NODE_ENV !== "development";

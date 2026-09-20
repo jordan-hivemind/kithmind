@@ -94,6 +94,21 @@ test("web preflight accepts an empty tool profile as the default", () => {
   assert.deepEqual(validateWebEnvironment(environment), []);
 });
 
+test("web preflight accepts Google OAuth only as a complete optional group", () => {
+  const environment = {
+    ...validWebEnvironment(),
+    GOOGLE_OAUTH_CLIENT_ID: "synthetic-client.apps.example.test",
+    GOOGLE_OAUTH_CLIENT_SECRET: "synthetic-secret",
+    GOOGLE_OAUTH_ORIGIN: "https://brain.example.test",
+  };
+  assert.deepEqual(validateWebEnvironment(environment), []);
+
+  delete environment.GOOGLE_OAUTH_CLIENT_SECRET;
+  assert.deepEqual(validateWebEnvironment(environment), [
+    { name: "GOOGLE_OAUTH_CLIENT_SECRET", problem: "missing" },
+  ]);
+});
+
 test("web preflight returns names only for missing variables", () => {
   assert.deepEqual(
     validateWebEnvironment({}),
@@ -114,12 +129,16 @@ test("web preflight rejects malformed values", () => {
   environment.KITH_SESSION_SECRET = "too-short";
   environment.MCP_OAUTH_ENCRYPTION_KEY = "short";
   environment.MCP_TOOL_PROFILE = "everything";
+  environment.GOOGLE_OAUTH_CLIENT_ID = "synthetic-client.apps.example.test";
+  environment.GOOGLE_OAUTH_CLIENT_SECRET = "synthetic-secret";
+  environment.GOOGLE_OAUTH_ORIGIN = "http://localhost:3000";
 
   assert.deepEqual(validateWebEnvironment(environment), [
     { name: "MCP_PUBLIC_ORIGIN", problem: "invalid" },
     { name: "KITH_DATABASE_URL", problem: "invalid" },
     { name: "KITH_SESSION_SECRET", problem: "invalid" },
     { name: "MCP_OAUTH_ENCRYPTION_KEY", problem: "invalid" },
+    { name: "GOOGLE_OAUTH_ORIGIN", problem: "invalid" },
     { name: "MCP_TOOL_PROFILE", problem: "invalid" },
   ]);
 });

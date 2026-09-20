@@ -18,6 +18,9 @@ import {
   createSession,
   ensurePersonalSpace,
   getPasswordAccount,
+  getGoogleAccount,
+  isGoogleAccountLinked,
+  linkGoogleAccount,
   removeExpiredSessions,
   requireMcpPrincipal,
   requireWebPrincipal,
@@ -28,6 +31,7 @@ import {
   revokeUserSessions,
   sessionCookie,
   signIn,
+  signInWithGoogle,
   signOut,
   signUp,
   verifyPassword,
@@ -163,6 +167,95 @@ test(
           String(email),
         );
       }
+    });
+  },
+);
+
+test(
+  "links a Google subject without changing the user or memberships",
+  { skip },
+  async (t) => {
+    const db = await identityDatabase(t);
+    await db.tx(async (ctx) => {
+      const created = await signUp(ctx, {
+        email: "owner@example.test",
+        password: "a strong enough password",
+      });
+      const before = await ctx.client.query(
+        "SELECT space_id, role FROM kith.space_members WHERE user_id = $1 ORDER BY space_id",
+        [created.userId],
+      );
+
+      // The provider email is verified metadata, not linking authority, so it
+      // may intentionally differ from the existing password address.
+      await linkGoogleAccount(ctx, {
+        userId: created.userId,
+        providerAccountId: "google-subject-owner",
+        verifiedEmail: "different-google-address@example.test",
+      });
+      assert.equal(await isGoogleAccountLinked(ctx, created.userId), true);
+      const googleAccount = await getGoogleAccount(ctx, "google-subject-owner");
+      assert.ok(googleAccount);
+      assert.deepEqual(googleAccount, {
+        id: googleAccount.id,
+        userId: created.userId,
+        provider: "google",
+        providerAccountId: "google-subject-owner",
+        secret: null,
+        emailVerified: "different-google-address@example.test",
+      });
+
+      const googleSession = await signInWithGoogle(ctx, {
+        providerAccountId: "google-subject-owner",
+      });
+      assert.equal(googleSession.userId, created.userId);
+      const after = await ctx.client.query(
+        "SELECT space_id, role FROM kith.space_members WHERE user_id = $1 ORDER BY space_id",
+        [created.userId],
+      );
+      assert.deepEqual(after.rows, before.rows);
+
+      // Password remains available after Google is linked.
+      assert.equal(
+        (
+          await signIn(ctx, {
+            email: "owner@example.test",
+            password: "a strong enough password",
+          })
+        ).userId,
+        created.userId,
+      );
+
+      const other = await signUp(ctx, {
+        email: "other@example.test",
+        password: "another strong password",
+      });
+      assert.equal(
+        await refusal(() =>
+          linkGoogleAccount(ctx, {
+            userId: other.userId,
+            providerAccountId: "google-subject-owner",
+            verifiedEmail: "other-google@example.test",
+          }),
+        ),
+        "Invalid credentials",
+      );
+      assert.equal(
+        await refusal(() =>
+          linkGoogleAccount(ctx, {
+            userId: created.userId,
+            providerAccountId: "different-google-subject",
+            verifiedEmail: "different-google-address@example.test",
+          }),
+        ),
+        "Invalid credentials",
+      );
+      assert.equal(
+        await refusal(() =>
+          signInWithGoogle(ctx, { providerAccountId: "unlinked-subject" }),
+        ),
+        "Invalid credentials",
+      );
     });
   },
 );

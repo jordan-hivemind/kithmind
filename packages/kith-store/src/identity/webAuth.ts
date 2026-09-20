@@ -36,7 +36,7 @@ import {
   webPrincipal,
   type Principal,
 } from "./authorization.js";
-import { at, exec, ms, row, type IdentityCtx } from "./db.js";
+import { at, exec, ms, row, rows, type IdentityCtx } from "./db.js";
 import { IdentityError, notAuthenticated } from "./errors.js";
 import { sha256 as sha256Hex } from "../hash.js";
 import { hashPassword, verifyPassword } from "./scrypt.js";
@@ -44,11 +44,17 @@ import { hashPassword, verifyPassword } from "./scrypt.js";
 /** The provider id the stored accounts already carry. */
 export const PASSWORD_PROVIDER = "password";
 
+/** Google accounts are keyed by the immutable OpenID Connect `sub` claim. */
+export const GOOGLE_PROVIDER = "google";
+
 /** Session lifetime, unchanged: effectively permanent until explicit logout. */
 export const SESSION_DURATION_MS = 1000 * 60 * 60 * 24 * 365 * 10;
 
 /** The cookie name. Host-prefixed, so a subdomain cannot set it. */
 export const SESSION_COOKIE_NAME = "__Host-kith_session";
+
+/** Plain-HTTP development cannot issue a valid `__Host-` cookie. */
+export const DEVELOPMENT_SESSION_COOKIE_NAME = "kith_session";
 
 /**
  * How stale `kith.sessions.last_used_at` may get before a resolve refreshes it.
@@ -120,6 +126,15 @@ export type SessionResolveOptions = {
   readonly touch?: boolean;
 };
 
+/** Production and development use distinct names, so neither accepts the other. */
+export function sessionCookieName(
+  config: Pick<SessionConfig, "secure">,
+): string {
+  return config.secure === false
+    ? DEVELOPMENT_SESSION_COOKIE_NAME
+    : SESSION_COOKIE_NAME;
+}
+
 function requireSecret(config: SessionConfig): string {
   if (
     typeof config.secret !== "string" ||
@@ -176,7 +191,7 @@ export function sessionCookie(
   expiresAt: number,
 ): string {
   const attributes = [
-    `${SESSION_COOKIE_NAME}=${serializeSessionToken(config, token)}`,
+    `${sessionCookieName(config)}=${serializeSessionToken(config, token)}`,
     "Path=/",
     "HttpOnly",
     "SameSite=Lax",
@@ -189,7 +204,7 @@ export function sessionCookie(
 /** The `Set-Cookie` value that ends a session in the browser. */
 export function clearedSessionCookie(config: SessionConfig): string {
   const attributes = [
-    `${SESSION_COOKIE_NAME}=`,
+    `${sessionCookieName(config)}=`,
     "Path=/",
     "HttpOnly",
     "SameSite=Lax",
@@ -208,12 +223,14 @@ export function clearedSessionCookie(config: SessionConfig): string {
  */
 export function readSessionCookie(
   header: string | null | undefined,
+  config: Pick<SessionConfig, "secure"> = {},
 ): string | null {
   if (typeof header !== "string") return null;
+  const name = sessionCookieName(config);
   for (const part of header.split(";")) {
     const separator = part.indexOf("=");
     if (separator < 1) continue;
-    if (part.slice(0, separator).trim() !== SESSION_COOKIE_NAME) continue;
+    if (part.slice(0, separator).trim() !== name) continue;
     return part.slice(separator + 1).trim();
   }
   return null;
@@ -410,7 +427,7 @@ export async function requireWebSession(
 ): Promise<{ principal: Principal; session: SessionRecord }> {
   const token = parseSessionToken(
     args.config,
-    readSessionCookie(args.cookieHeader),
+    readSessionCookie(args.cookieHeader, args.config),
   );
   const session = await resolveSessionToken(ctx, token, {
     touch: args.touch,
@@ -457,6 +474,90 @@ export async function getPasswordAccount(
         emailVerified: record.email_verified,
       }
     : null;
+}
+
+/** The Google identity with this immutable provider subject, or null. */
+export async function getGoogleAccount(
+  ctx: IdentityCtx,
+  providerAccountId: string,
+): Promise<AuthAccount | null> {
+  const record = await row<{
+    id: string;
+    user_id: string;
+    provider: string;
+    provider_account_id: string;
+    secret: string | null;
+    email_verified: string | null;
+  }>(
+    ctx,
+    `SELECT id, user_id, provider, provider_account_id, secret, email_verified
+       FROM kith.auth_accounts WHERE provider = $1 AND provider_account_id = $2`,
+    [GOOGLE_PROVIDER, providerAccountId],
+  );
+  return record
+    ? {
+        id: record.id,
+        userId: record.user_id,
+        provider: record.provider,
+        providerAccountId: record.provider_account_id,
+        secret: record.secret,
+        emailVerified: record.email_verified,
+      }
+    : null;
+}
+
+async function googleAccountsForUser(
+  ctx: IdentityCtx,
+  userId: string,
+): Promise<AuthAccount[]> {
+  const records = await rows<{
+    id: string;
+    user_id: string;
+    provider: string;
+    provider_account_id: string;
+    secret: string | null;
+    email_verified: string | null;
+  }>(
+    ctx,
+    `SELECT id, user_id, provider, provider_account_id, secret, email_verified
+       FROM kith.auth_accounts
+      WHERE provider = $1 AND user_id = $2
+      ORDER BY created_at, id
+      LIMIT 2`,
+    [GOOGLE_PROVIDER, userId],
+  );
+  return records.map((record) => ({
+    id: record.id,
+    userId: record.user_id,
+    provider: record.provider,
+    providerAccountId: record.provider_account_id,
+    secret: record.secret,
+    emailVerified: record.email_verified,
+  }));
+}
+
+/** Whether this Kith user has exactly one Google identity linked. */
+export async function isGoogleAccountLinked(
+  ctx: IdentityCtx,
+  userId: string,
+): Promise<boolean> {
+  const accounts = await googleAccountsForUser(ctx, userId);
+  // Multiple identities are not a state the linking path creates. Fail closed
+  // rather than letting the UI imply that an ambiguous identity is healthy.
+  if (accounts.length > 1) throw new IdentityError("Invalid credentials");
+  return accounts.length === 1;
+}
+
+function requireGoogleSubject(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 255 ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    throw new IdentityError("Invalid credentials");
+  }
+  return value;
 }
 
 function requireValidPassword(password: unknown): string {
@@ -541,6 +642,78 @@ export async function signUp(
 }
 
 /**
+ * Links one verified Google identity to an already authenticated Kith user.
+ *
+ * The caller proves the Kith side by resolving the live web session before it
+ * calls this function. The Google callback proves the provider side with a
+ * signed ID token. Email is retained as verified provider metadata, but is not
+ * account authority: it may differ from the password address and can change
+ * without changing Google's immutable `sub`.
+ */
+export async function linkGoogleAccount(
+  ctx: IdentityCtx,
+  args: { userId: string; providerAccountId: string; verifiedEmail: string },
+): Promise<void> {
+  const providerAccountId = requireGoogleSubject(args.providerAccountId);
+  const verifiedEmail = requireValidEmail(args.verifiedEmail);
+  if (!(await userExists(ctx, args.userId))) {
+    throw new IdentityError("Invalid credentials");
+  }
+
+  const subjectAccount = await getGoogleAccount(ctx, providerAccountId);
+  if (subjectAccount) {
+    // A retry of the same completed callback is harmless. The same provider
+    // identity can never move between Kith users through this path.
+    if (subjectAccount.userId === args.userId) return;
+    throw new IdentityError("Invalid credentials");
+  }
+
+  const userAccounts = await googleAccountsForUser(ctx, args.userId);
+  if (userAccounts.length !== 0) {
+    // Replacing a linked identity needs a separate authenticated recovery flow.
+    // Treat it as invalid here so a callback cannot silently switch accounts.
+    throw new IdentityError("Invalid credentials");
+  }
+
+  await exec(
+    ctx,
+    `INSERT INTO kith.auth_accounts
+       (id, user_id, provider, provider_account_id, email_verified)
+       VALUES ($1, $2, $3, $4, $5)`,
+    [
+      newKithId(),
+      args.userId,
+      GOOGLE_PROVIDER,
+      providerAccountId,
+      verifiedEmail,
+    ],
+  );
+}
+
+/** Opens an ordinary Kith web session for an explicitly linked Google subject. */
+export async function signInWithGoogle(
+  ctx: IdentityCtx,
+  args: { providerAccountId: string },
+): Promise<{
+  userId: string;
+  sessionId: string;
+  token: string;
+  expiresAt: number;
+}> {
+  const account = await getGoogleAccount(
+    ctx,
+    requireGoogleSubject(args.providerAccountId),
+  );
+  if (!account || !(await userExists(ctx, account.userId))) {
+    throw new IdentityError("Invalid credentials");
+  }
+  return {
+    userId: account.userId,
+    ...(await createSession(ctx, account.userId)),
+  };
+}
+
+/**
  * A well-formed stored secret that no password produces. When the account
  * does not exist, the sign-in verifies the supplied password against this
  * value instead of skipping the KDF, so an unknown email costs the same
@@ -621,7 +794,7 @@ export async function signOut(
 ): Promise<{ setCookie: string }> {
   const token = parseSessionToken(
     args.config,
-    readSessionCookie(args.cookieHeader),
+    readSessionCookie(args.cookieHeader, args.config),
   );
   const session = await resolveSessionToken(ctx, token);
   if (session) await revokeSession(ctx, session.id);

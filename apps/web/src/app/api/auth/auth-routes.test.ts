@@ -28,7 +28,7 @@ import {
   resolveSessionToken,
 } from "@repo/kith-store/identity";
 import pg from "pg";
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 
 import { setKithPool } from "@/lib/kith/pool";
 
@@ -36,7 +36,7 @@ const adminUrl = process.env.KITH_STORE_DATABASE_URL;
 const describeWithDatabase = adminUrl ? describe : describe.skip;
 
 const secret = randomBytes(32).toString("hex");
-const config = { secret, secure: false };
+const config = { secret, secure: true };
 const PASSWORD = "a strong enough password";
 
 type Routes = {
@@ -44,6 +44,25 @@ type Routes = {
   signUp: (request: Request) => Promise<Response>;
   signOut: (request: Request) => Promise<Response>;
   changePassword: (request: Request) => Promise<Response>;
+  googleStart: (
+    request: Request,
+    options?: {
+      env?: Readonly<Record<string, string | undefined>>;
+      now?: number;
+    },
+  ) => Promise<Response>;
+  googleCallback: (
+    request: Request,
+    dependencies?: {
+      env?: Readonly<Record<string, string | undefined>>;
+      now?: number;
+      exchangeCode?: () => Promise<string>;
+      verifyIdToken?: () => Promise<{
+        subject: string;
+        verifiedEmail: string;
+      }>;
+    },
+  ) => Promise<Response>;
 };
 
 /** A distinct email per case, so the per-account rate limit is never the reason
@@ -87,13 +106,27 @@ function cookieHeaderFrom(response: Response): string {
   return setCookie.split(";")[0]!;
 }
 
+function namedCookie(response: Response, name: string): string {
+  const headers = response.headers as Headers & {
+    getSetCookie?: () => string[];
+  };
+  const values = headers.getSetCookie?.() ?? [];
+  const selected = values.find((value) => value.startsWith(`${name}=`));
+  if (selected === undefined) {
+    throw new Error(`no ${name} Set-Cookie on the response`);
+  }
+  return selected.split(";")[0]!;
+}
+
 describeWithDatabase("the kith session routes", () => {
   let pool: pg.Pool;
   let restorePool: () => void;
   let routes: Routes;
   let databaseName: string;
 
-  async function onAdmin<T>(work: (admin: pg.Client) => Promise<T>): Promise<T> {
+  async function onAdmin<T>(
+    work: (admin: pg.Client) => Promise<T>,
+  ): Promise<T> {
     const admin = new pg.Client({ connectionString: adminUrl });
     await admin.connect();
     try {
@@ -142,6 +175,9 @@ describeWithDatabase("the kith session routes", () => {
       signUp: (await import("./sign-up/route")).POST,
       signOut: (await import("./sign-out/route")).POST,
       changePassword: (await import("./change-password/route")).POST,
+      googleStart: (await import("./google/route")).handleGoogleOAuthStart,
+      googleCallback: (await import("./google/callback/route"))
+        .handleGoogleOAuthCallback,
     };
   }, 60_000);
 
@@ -169,8 +205,7 @@ describeWithDatabase("the kith session routes", () => {
     expect(setCookie).toContain("__Host-kith_session=");
     expect(setCookie).toContain("HttpOnly");
     expect(setCookie).toContain("SameSite=Lax");
-    // No `Secure` only because this run is not production; the attribute is on
-    // everywhere else. See `lib/kith/session.ts`.
+    expect(setCookie).toContain("Secure");
     expect(setCookie).toContain("Path=/");
 
     const cookie = cookieHeaderFrom(response);
@@ -190,7 +225,8 @@ describeWithDatabase("the kith session routes", () => {
   test("sign-in gives one message for an unknown account and a wrong password", async () => {
     const account = email();
     expect(
-      (await post(routes.signUp, { email: account, password: PASSWORD })).status,
+      (await post(routes.signUp, { email: account, password: PASSWORD }))
+        .status,
     ).toBe(204);
 
     const wrongPassword = await post(routes.signIn, {
@@ -204,7 +240,9 @@ describeWithDatabase("the kith session routes", () => {
 
     expect(wrongPassword.status).toBe(401);
     expect(unknownAccount.status).toBe(401);
-    expect(await wrongPassword.json()).toEqual({ error: "Invalid credentials" });
+    expect(await wrongPassword.json()).toEqual({
+      error: "Invalid credentials",
+    });
     expect(await unknownAccount.json()).toEqual({
       error: "Invalid credentials",
     });
@@ -231,6 +269,170 @@ describeWithDatabase("the kith session routes", () => {
     expect(correct.status).toBe(204);
   });
 
+  test("explicitly links Google, keeps memberships, and signs in by subject", async () => {
+    const googleEnv = {
+      NODE_ENV: "production",
+      KITH_SESSION_SECRET: secret,
+      GOOGLE_OAUTH_CLIENT_ID: "synthetic-client.apps.example.test",
+      GOOGLE_OAUTH_CLIENT_SECRET: "synthetic-client-secret",
+      GOOGLE_OAUTH_ORIGIN: "https://brain.example.test",
+    } as const;
+    const passwordCookie = cookieHeaderFrom(
+      await post(routes.signUp, { email: email(), password: PASSWORD }),
+    );
+    const userId = await principalFor(passwordCookie);
+    expect(userId).not.toBeNull();
+    const membershipsBefore = await pool.query(
+      "SELECT space_id, role FROM kith.space_members WHERE user_id = $1 ORDER BY space_id",
+      [userId],
+    );
+
+    const linkStart = await routes.googleStart(
+      new Request("https://brain.example.test/api/auth/google?action=link", {
+        headers: { cookie: passwordCookie },
+      }),
+      { env: googleEnv },
+    );
+    expect(linkStart.status).toBe(302);
+    const authorize = new URL(linkStart.headers.get("location")!);
+    expect(authorize.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(authorize.searchParams.get("nonce")).toBeTruthy();
+    const oauthCookie = namedCookie(linkStart, "__Host-kith_google_oauth");
+    const state = authorize.searchParams.get("state")!;
+
+    const linked = await routes.googleCallback(
+      new Request(
+        `https://brain.example.test/api/auth/google/callback?code=synthetic-code&state=${encodeURIComponent(state)}`,
+        { headers: { cookie: `${passwordCookie}; ${oauthCookie}` } },
+      ),
+      {
+        env: googleEnv,
+        exchangeCode: async () => "synthetic-id-token",
+        verifyIdToken: async () => ({
+          subject: "google-owner-subject",
+          // The existing Kith session is linking authority. A verified Google
+          // address does not have to equal the password provider address.
+          verifiedEmail: "chosen-google-account@example.test",
+        }),
+      },
+    );
+    expect(linked.status).toBe(302);
+    expect(linked.headers.get("location")).toBe(
+      "https://brain.example.test/settings?google=linked#account",
+    );
+    const membershipsAfter = await pool.query(
+      "SELECT space_id, role FROM kith.space_members WHERE user_id = $1 ORDER BY space_id",
+      [userId],
+    );
+    expect(membershipsAfter.rows).toEqual(membershipsBefore.rows);
+
+    const signInStart = await routes.googleStart(
+      new Request("https://brain.example.test/api/auth/google"),
+      { env: googleEnv },
+    );
+    const signInAuthorize = new URL(signInStart.headers.get("location")!);
+    const signedIn = await routes.googleCallback(
+      new Request(
+        `https://brain.example.test/api/auth/google/callback?code=synthetic-code&state=${encodeURIComponent(signInAuthorize.searchParams.get("state")!)}`,
+        {
+          headers: {
+            cookie: namedCookie(signInStart, "__Host-kith_google_oauth"),
+          },
+        },
+      ),
+      {
+        env: googleEnv,
+        exchangeCode: async () => "synthetic-id-token",
+        verifyIdToken: async () => ({
+          subject: "google-owner-subject",
+          verifiedEmail: "renamed-google-account@example.test",
+        }),
+      },
+    );
+    expect(signedIn.status).toBe(302);
+    expect(signedIn.headers.get("location")).toBe(
+      "https://brain.example.test/",
+    );
+    expect(
+      await principalFor(namedCookie(signedIn, "__Host-kith_session")),
+    ).toBe(userId);
+  });
+
+  test("Google callback refuses bad state, bad token, and a changed linking session", async () => {
+    const googleEnv = {
+      NODE_ENV: "production",
+      KITH_SESSION_SECRET: secret,
+      GOOGLE_OAUTH_CLIENT_ID: "synthetic-client.apps.example.test",
+      GOOGLE_OAUTH_CLIENT_SECRET: "synthetic-client-secret",
+      GOOGLE_OAUTH_ORIGIN: "https://brain.example.test",
+    } as const;
+    const firstCookie = cookieHeaderFrom(
+      await post(routes.signUp, { email: email(), password: PASSWORD }),
+    );
+    const secondCookie = cookieHeaderFrom(
+      await post(routes.signUp, { email: email(), password: PASSWORD }),
+    );
+
+    const start = await routes.googleStart(
+      new Request("https://brain.example.test/api/auth/google?action=link", {
+        headers: { cookie: firstCookie },
+      }),
+      { env: googleEnv },
+    );
+    const authorize = new URL(start.headers.get("location")!);
+    const oauthCookie = namedCookie(start, "__Host-kith_google_oauth");
+    const state = authorize.searchParams.get("state")!;
+    const exchangeCode = vi.fn(async () => "synthetic-id-token");
+
+    const badState = await routes.googleCallback(
+      new Request(
+        "https://brain.example.test/api/auth/google/callback?code=synthetic-code&state=wrong",
+        { headers: { cookie: `${firstCookie}; ${oauthCookie}` } },
+      ),
+      { env: googleEnv, exchangeCode },
+    );
+    expect(badState.status).toBe(400);
+    expect(exchangeCode).not.toHaveBeenCalled();
+
+    const badToken = await routes.googleCallback(
+      new Request(
+        `https://brain.example.test/api/auth/google/callback?code=synthetic-code&state=${encodeURIComponent(state)}`,
+        { headers: { cookie: `${firstCookie}; ${oauthCookie}` } },
+      ),
+      {
+        env: googleEnv,
+        exchangeCode,
+        verifyIdToken: async () => {
+          throw new Error("synthetic invalid token");
+        },
+      },
+    );
+    expect(badToken.status).toBe(401);
+
+    const changedSession = await routes.googleCallback(
+      new Request(
+        `https://brain.example.test/api/auth/google/callback?code=synthetic-code&state=${encodeURIComponent(state)}`,
+        { headers: { cookie: `${secondCookie}; ${oauthCookie}` } },
+      ),
+      {
+        env: googleEnv,
+        exchangeCode,
+        verifyIdToken: async () => ({
+          subject: "must-not-link",
+          verifiedEmail: "verified@example.test",
+        }),
+      },
+    );
+    expect(changedSession.status).toBe(401);
+    expect(
+      (
+        await pool.query(
+          "SELECT id FROM kith.auth_accounts WHERE provider = 'google' AND provider_account_id = 'must-not-link'",
+        )
+      ).rows,
+    ).toHaveLength(0);
+  });
+
   test("sign-out revokes the session on the server, not just in the browser", async () => {
     const account = email();
     const opened = await post(routes.signUp, {
@@ -248,7 +450,7 @@ describeWithDatabase("the kith session routes", () => {
     // never saw the clearing response is still refused, because the row is
     // revoked rather than the browser merely being told to forget it.
     expect(await principalFor(cookie)).toBeNull();
-    const token = parseSessionToken(config, readSessionCookie(cookie));
+    const token = parseSessionToken(config, readSessionCookie(cookie, config));
     const row = await withKithTransaction(pool, (client) =>
       resolveSessionToken(identityCtx(client), token),
     );
@@ -301,7 +503,8 @@ describeWithDatabase("the kith session routes", () => {
 
     // The new password is the one that works now.
     expect(
-      (await post(routes.signIn, { email: account, password: PASSWORD })).status,
+      (await post(routes.signIn, { email: account, password: PASSWORD }))
+        .status,
     ).toBe(401);
     expect(
       (
@@ -347,7 +550,8 @@ describeWithDatabase("the kith session routes", () => {
 
     // The original password still works, so neither refusal changed anything.
     expect(
-      (await post(routes.signIn, { email: account, password: PASSWORD })).status,
+      (await post(routes.signIn, { email: account, password: PASSWORD }))
+        .status,
     ).toBe(204);
   });
 
