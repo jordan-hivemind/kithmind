@@ -372,7 +372,15 @@ export function amountMatches(input: {
   if (!DECIMAL.test(input.entryExchangeRate)) return { matched: false };
   const entryUsdCents = multiplyToCents(entryMagnitude, input.entryExchangeRate);
   const documentCents = unitsAtScale(documentMagnitude, CENTS);
-  const tolerance = rateToleranceCents(entryUsdCents);
+  // The tolerance is a fraction OF THE DOCUMENT'S OWN STATED AMOUNT, not of
+  // the converted one, and the two differ below the converted figure. The
+  // importer measures its 1% against the sheet's own USD column -- the
+  // independently stated number -- and this is the same rule on the same
+  // side, so a GBP call the importer accepted cannot be a call the matcher
+  // refuses. `apps/web/src/lib/kith/rate-tolerance-parity.test.ts` runs both
+  // implementations over one table of cases and is what caught the two
+  // disagreeing here.
+  const tolerance = rateToleranceCents(documentCents);
   return {
     matched: absoluteBigInt(documentCents - entryUsdCents) <= tolerance,
     converted: {

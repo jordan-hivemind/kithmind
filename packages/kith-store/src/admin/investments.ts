@@ -32,7 +32,7 @@ import { IdentityError } from "../identity/errors.js";
 import { assertKithId, newKithId } from "../ids.js";
 import { resolveEntity } from "../memory/entities.js";
 import { spacePredicate } from "../spaces.js";
-import { setEntryDocument } from "./investmentLinks.js";
+import { forgetReplacedDates, setEntryDocument } from "./investmentLinks.js";
 import {
   INVESTMENT_ENTRY_TYPES,
   INVESTMENT_STATUSES,
@@ -1236,9 +1236,11 @@ async function writableEntry(
  * what the drawer's tick box does.
  *
  * `documentId` no longer writes the column. It goes through
- * `setEntryDocument`, so attaching a document writes an owner-confirmed link
- * and detaching one rejects the live link -- which is also what stops a
- * sweep from re-attaching what the owner just took off.
+ * `setEntryDocument`, which writes an owner-confirmed link. A NULL
+ * `documentId` does nothing at all: removing a document is
+ * `rejectInvestmentDocumentLink`, deliberately and explicitly, because a
+ * patch that carries the whole entry cannot tell "take this document off"
+ * apart from "I loaded this row before the link landed".
  */
 export async function updateInvestmentEntry(
   ctx: IdentityCtx,
@@ -1323,7 +1325,14 @@ export async function updateInvestmentEntry(
       dateIsEstimated,
     ],
   );
-  if (args.documentId !== undefined) {
+  if (args.entryDate !== undefined) {
+    // He typed a date, so no link owns it any more. Without this, rejecting
+    // a link afterwards would read "the entry's date is still the one I
+    // wrote" -- true only because he happened to retype the same day -- and
+    // revert his date to the estimate it replaced.
+    await forgetReplacedDates(ctx, target.spaceId, target.id);
+  }
+  if (document !== null) {
     await setEntryDocument(ctx, {
       spaceId: target.spaceId,
       investmentId: target.investmentId,

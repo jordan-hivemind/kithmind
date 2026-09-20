@@ -20,6 +20,7 @@ import test from "node:test";
 
 import { applyKithSchema, KITH_MIGRATIONS, newKithId } from "../dist/index.js";
 import {
+  adoptLegacyEntryDocuments,
   confirmInvestmentDocumentLink,
   createInvestment,
   createInvestmentEntry,
@@ -28,6 +29,7 @@ import {
   listInvestmentDocumentLinks,
   listInvestmentEntries,
   rejectInvestmentDocumentLink,
+  syncEntryDocument,
   updateInvestmentEntry,
 } from "../dist/admin/index.js";
 import {
@@ -200,17 +202,26 @@ const date = (field, value, precision) => ({
  * The invariant, as one query.
  *
  * For every entry in the database: its `document_id` must equal the document
- * of its one live link, or be null when it has none. A row that fails this is
- * a mirror that has drifted from its source of truth, which is the whole
- * failure mode the link table was introduced to make impossible.
+ * of its PRIMARY link -- the oldest live one -- or be null when it has none.
+ * A row that fails this is a mirror that has drifted from its source of
+ * truth, which is the whole failure mode the link table was introduced to
+ * make impossible.
+ *
+ * `LATERAL ... LIMIT 1` and not a plain join: an entry may carry several live
+ * links (a notice and the wire that paid it), and only one of them is the
+ * citation the entry shows.
  */
 async function consistent(ctx) {
   const drift = await ctx.client.query(
     `SELECT e.id, e.document_id, l.document_id AS link_document_id
        FROM kith.investment_entries e
-       LEFT JOIN kith.investment_document_links l
-         ON l.space_id = e.space_id AND l.entry_id = e.id
-        AND l.state IN ('auto_linked', 'confirmed')
+       LEFT JOIN LATERAL (
+         SELECT document_id FROM kith.investment_document_links l
+          WHERE l.space_id = e.space_id AND l.entry_id = e.id
+            AND l.state IN ('auto_linked', 'confirmed')
+          ORDER BY l.created_at, l.id
+          LIMIT 1
+       ) l ON true
       WHERE e.document_id IS DISTINCT FROM l.document_id`,
   );
   assert.deepEqual(
@@ -227,6 +238,92 @@ async function linksFor(base, filters) {
 // ---------------------------------------------------------------------------
 // The migration itself
 // ---------------------------------------------------------------------------
+
+/**
+ * Two entries with a document attached the way the previous build attached
+ * one, against a schema at version 32: raw SQL, because the store's own
+ * functions do not exist at that version and are exactly what is under test.
+ */
+async function seedLegacyAttachments(client) {
+  const ids = {
+    userId: newKithId(),
+    spaceId: newKithId(),
+    investmentId: newKithId(),
+    linkedEntryId: newKithId(),
+    orphanEntryId: newKithId(),
+    sourceAccountId: newKithId(),
+    sourceItemId: newKithId(),
+    generationId: newKithId(),
+    documentId: newKithId(),
+    orphanDocumentId: newKithId(),
+  };
+  await client.query("INSERT INTO kith.users (id, name) VALUES ($1, 'Owner')", [
+    ids.userId,
+  ]);
+  await client.query(
+    `INSERT INTO kith.spaces (id, kind, name, created_by)
+       VALUES ($1, 'shared', 'Synthetic', $2)`,
+    [ids.spaceId, ids.userId],
+  );
+  await client.query(
+    `INSERT INTO kith.source_accounts (id, space_id, created_at, connector, enabled)
+       VALUES ($1, $2, transaction_timestamp(), 'synthetic', true)`,
+    [ids.sourceAccountId, ids.spaceId],
+  );
+  await client.query(
+    `INSERT INTO kith.source_items
+       (id, space_id, created_at, source_account_id, external_id_hash, title,
+        lifecycle, original_link_available, desired_processing_epoch)
+       VALUES ($1, $2, transaction_timestamp(), $3, $4, 'Notice', 'available',
+               true, 0)`,
+    [
+      ids.sourceItemId,
+      ids.spaceId,
+      ids.sourceAccountId,
+      `${ids.sourceItemId}`.padEnd(64, "a").slice(0, 64),
+    ],
+  );
+  await client.query(
+    `INSERT INTO kith.processing_generations
+       (id, space_id, created_at, source_account_id, source_item_id,
+        desired_processing_epoch, card_generation, state)
+       VALUES ($1, $2, transaction_timestamp(), $3, $4, 0, false, 'ready')`,
+    [ids.generationId, ids.spaceId, ids.sourceAccountId, ids.sourceItemId],
+  );
+  for (const [documentId, sourceItemId] of [
+    [ids.documentId, ids.sourceItemId],
+    [ids.orphanDocumentId, null],
+  ]) {
+    await client.query(
+      `INSERT INTO kith.documents
+         (id, space_id, created_at, processing_generation_id, source_item_id,
+          document_key, title, doc_type, captured_at, evidence_span_ids,
+          publication_state)
+         VALUES ($1, $2, transaction_timestamp(), $3, $4, $5, 'Notice',
+                 'capital_call_notice', transaction_timestamp(), '[]'::jsonb,
+                 'active')`,
+      [documentId, ids.spaceId, ids.generationId, sourceItemId, `doc-${documentId}`],
+    );
+  }
+  await client.query(
+    `INSERT INTO kith.investments (id, space_id, name) VALUES ($1, $2, 'Fund')`,
+    [ids.investmentId, ids.spaceId],
+  );
+  for (const [entryId, documentId] of [
+    [ids.linkedEntryId, ids.documentId],
+    [ids.orphanEntryId, ids.orphanDocumentId],
+  ]) {
+    await client.query(
+      `INSERT INTO kith.investment_entries
+         (id, space_id, created_at, investment_id, entry_type, entry_date,
+          amount, currency, document_id)
+       VALUES ($1, $2, transaction_timestamp() - interval '1 year', $3,
+               'capital_call_paid', DATE '2025-01-01', 25000.00, 'USD', $4)`,
+      [entryId, ids.spaceId, ids.investmentId, documentId],
+    );
+  }
+  return ids;
+}
 
 test(
   "the migration applies on a database at version 32 and reaches 33",
@@ -257,7 +354,42 @@ test(
     );
     assert.equal(before.rows[0].n, 0);
 
+    // Two entries with a document attached the way the previous build
+    // attached one: a bare `document_id` with nothing behind it. One has a
+    // document with a source item; the other's document has none, and must
+    // keep its mirror rather than be given an invented link.
+    const seeded = await seedLegacyAttachments(client);
+
     assert.equal(await applyKithSchema(client), 33);
+
+    const adopted = await client.query(
+      `SELECT entry_id, document_id, source_item_id, state, decided_by, reason,
+              created_at = (SELECT created_at FROM kith.investment_entries
+                             WHERE id = l.entry_id) AS dated_at_the_entry
+         FROM kith.investment_document_links l`,
+    );
+    assert.equal(adopted.rows.length, 1, "only the adoptable one is adopted");
+    assert.equal(adopted.rows[0].entry_id, seeded.linkedEntryId);
+    assert.equal(adopted.rows[0].document_id, seeded.documentId);
+    assert.equal(adopted.rows[0].source_item_id, seeded.sourceItemId);
+    assert.equal(adopted.rows[0].state, "confirmed");
+    assert.equal(adopted.rows[0].decided_by, "owner");
+    assert.equal(adopted.rows[0].reason, "legacy_attached");
+    // Dated at the entry, so it is older than anything the rule can make and
+    // is therefore the primary link.
+    assert.equal(adopted.rows[0].dated_at_the_entry, true);
+
+    // Neither mirror moved, including the one that could not be adopted.
+    const mirrors = await client.query(
+      "SELECT id, document_id FROM kith.investment_entries ORDER BY id",
+    );
+    assert.deepEqual(
+      Object.fromEntries(mirrors.rows.map((row) => [row.id, row.document_id])),
+      {
+        [seeded.linkedEntryId]: seeded.documentId,
+        [seeded.orphanEntryId]: seeded.orphanDocumentId,
+      },
+    );
 
     // The three things 033 adds, and the legacy value of the marker.
     const columns = await client.query(
@@ -771,7 +903,39 @@ test("attaching a document from the drawer writes an owner link, not a bare id",
   await consistent(base.ctx);
 });
 
-test("detaching a document rejects the link, so nothing puts it back", { skip }, async (t) => {
+test("a null documentId on an entry patch never rejects and never clears", { skip }, async (t) => {
+  // The accident this rule exists for: the drawer is open on an entry with
+  // no document, an auto-link lands from the change feed, and the owner's
+  // next unrelated edit carries the stale `documentId: null`. That used to
+  // reject the link permanently and revert the date it had moved.
+  const base = await estimatedCallFixture(t);
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  const [link] = await linksFor(base, {});
+  assert.equal(link.state, "auto_linked");
+  assert.equal((await entryRow(base)).entryDate, "2026-03-12");
+
+  await updateInvestmentEntry(base.ctx, {
+    principal: base.principal,
+    entryId: base.entryId,
+    investmentId: base.investmentId,
+    documentId: null,
+    note: "just fixing the note",
+  });
+
+  const after = await linksFor(base, {});
+  assert.equal(after.length, 1);
+  assert.equal(after[0].state, "auto_linked", "the link is untouched");
+  const entry = await entryRow(base);
+  assert.equal(entry.documentId, base.document.documentId, "the mirror stands");
+  assert.equal(entry.entryDate, "2026-03-12", "and so does the date it moved");
+  assert.equal(entry.note, "just fixing the note");
+  await consistent(base.ctx);
+});
+
+test("a document comes off an entry only through an explicit reject", { skip }, async (t) => {
   const base = await autoLinkFixture(t);
   await updateInvestmentEntry(base.ctx, {
     principal: base.principal,
@@ -779,15 +943,19 @@ test("detaching a document rejects the link, so nothing puts it back", { skip },
     investmentId: base.investmentId,
     documentId: base.document.documentId,
   });
-  await updateInvestmentEntry(base.ctx, {
+  const [link] = await linksFor(base, {});
+  assert.equal(link.state, "confirmed");
+
+  await rejectInvestmentDocumentLink(base.ctx, {
     principal: base.principal,
-    entryId: base.entryId,
-    investmentId: base.investmentId,
-    documentId: null,
+    linkId: link.id,
   });
-  const links = await linksFor(base, {});
-  assert.equal(links[0].state, "rejected");
-  assert.equal(links[0].reason, "owner_detached");
+  const after = await linksFor(base, {});
+  assert.equal(after[0].state, "rejected");
+  const entries = await listInvestmentEntries(base.ctx, [base.spaceId], [
+    base.investmentId,
+  ]);
+  assert.equal(entries[0].documentId, null);
   await consistent(base.ctx);
 
   // And the sweep does not re-make it.
@@ -1234,4 +1402,473 @@ test("a USD notice outside the tolerance is only a suggestion", { skip }, async 
   assert.equal(links[0].state, "suggested");
   assert.equal(links[0].score, 6);
   await consistent(base.ctx);
+});
+
+// ---------------------------------------------------------------------------
+// B1: entries that already carry a document (second review)
+// ---------------------------------------------------------------------------
+
+/** An entry whose `document_id` was set the way the old build set it: a bare
+ * column write with no link row behind it. */
+async function legacyAttach(base, entryId, documentId) {
+  await base.ctx.client.query(
+    `UPDATE kith.investment_entries SET document_id = $3
+      WHERE id = $1 AND space_id = $2`,
+    [entryId, base.spaceId, documentId],
+  );
+  await base.ctx.client.query(
+    `DELETE FROM kith.investment_document_links
+      WHERE space_id = $1 AND entry_id = $2`,
+    [base.spaceId, entryId],
+  );
+}
+
+test("a legacy attachment is not linked over by a matching notice", { skip }, async (t) => {
+  const base = await autoLinkFixture(t);
+  const owned = await seedDocument(base.ctx, base.spaceId, {
+    kind: "capital_call_notice",
+    title: "The owner's own choice",
+    statements: [org("fund", "Synthetic Growth Partners III")],
+  });
+  await legacyAttach(base, base.entryId, owned.documentId);
+
+  const result = await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  assert.equal(
+    result.autoLinkedEntryId,
+    null,
+    "an entry that already carries a document is not auto-linked over",
+  );
+  const entry = await entryRow(base);
+  assert.equal(entry.documentId, owned.documentId, "the owner's document stands");
+  const links = await linksFor(base, { sourceItemId: base.document.sourceItemId });
+  assert.equal(links[0].state, "suggested");
+  // And the attachment has been adopted, so it is now a real link.
+  const adopted = await linksFor(base, { sourceItemId: owned.sourceItemId });
+  assert.equal(adopted.length, 1);
+  assert.equal(adopted[0].state, "confirmed");
+  assert.equal(adopted[0].decidedBy, "owner");
+  assert.equal(adopted[0].reason, "legacy_attached");
+  await consistent(base.ctx);
+});
+
+test("an amount-only suggestion never nulls a legacy mirror", { skip }, async (t) => {
+  const base = await autoLinkFixture(t, {
+    uri: "fs://archive/Unsorted/scan.pdf",
+    statements: [money("amount_called", "25000.00")],
+  });
+  const owned = await seedDocument(base.ctx, base.spaceId, {
+    kind: "capital_call_notice",
+    title: "The owner's own choice",
+    statements: [org("fund", "Synthetic Growth Partners III")],
+  });
+  await legacyAttach(base, base.entryId, owned.documentId);
+
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  const entry = await entryRow(base);
+  assert.equal(
+    entry.documentId,
+    owned.documentId,
+    "a suggestion must never take a document off an entry",
+  );
+  const offered = await linksFor(base, { sourceItemId: base.document.sourceItemId });
+  assert.equal(offered[0].state, "suggested");
+  await consistent(base.ctx);
+});
+
+test("the backfill is idempotent, and is a dry run until asked", { skip }, async (t) => {
+  const base = await autoLinkFixture(t);
+  const owned = await seedDocument(base.ctx, base.spaceId, {
+    kind: "capital_call_notice",
+    statements: [org("fund", "Synthetic Growth Partners III")],
+  });
+  await legacyAttach(base, base.entryId, owned.documentId);
+
+  const dry = await adoptLegacyEntryDocuments(base.ctx, {
+    spaceIds: [base.spaceId],
+  });
+  assert.deepEqual(dry, { pending: 1, adopted: 0, unadoptable: 0 });
+  assert.deepEqual(await linksFor(base, {}), [], "a dry run writes nothing");
+
+  const first = await adoptLegacyEntryDocuments(base.ctx, {
+    spaceIds: [base.spaceId],
+    apply: true,
+  });
+  assert.equal(first.adopted, 1);
+  const second = await adoptLegacyEntryDocuments(base.ctx, {
+    spaceIds: [base.spaceId],
+    apply: true,
+  });
+  assert.deepEqual(second, { pending: 0, adopted: 0, unadoptable: 0 });
+  assert.equal((await linksFor(base, {})).length, 1);
+  await consistent(base.ctx);
+});
+
+test("an attached document with no source item keeps its mirror and gets no link", { skip }, async (t) => {
+  const base = await autoLinkFixture(t);
+  const owned = await seedDocument(base.ctx, base.spaceId, {
+    kind: "capital_call_notice",
+    statements: [org("fund", "Synthetic Growth Partners III")],
+  });
+  await legacyAttach(base, base.entryId, owned.documentId);
+  await base.ctx.client.query(
+    "UPDATE kith.documents SET source_item_id = NULL WHERE id = $1",
+    [owned.documentId],
+  );
+
+  const counts = await adoptLegacyEntryDocuments(base.ctx, {
+    spaceIds: [base.spaceId],
+    apply: true,
+  });
+  assert.deepEqual(counts, { pending: 0, adopted: 0, unadoptable: 1 });
+  assert.deepEqual(await linksFor(base, {}), [], "no link is invented");
+
+  // And the mirror survives a sync, rather than being cleared for want of a
+  // row to justify it.
+  await syncEntryDocument(base.ctx, base.spaceId, base.entryId);
+  assert.equal((await entryRow(base)).documentId, owned.documentId);
+});
+
+// ---------------------------------------------------------------------------
+// F1: a rule auto-link that stops qualifying (second review)
+// ---------------------------------------------------------------------------
+
+/** An estimated capital call, and the notice that auto-links to it and moves
+ * its date from the guess to the stated one. */
+async function estimatedCallFixture(t, overrides = {}) {
+  const base = await fixture(t);
+  const investmentId = await createInvestment(base.ctx, {
+    principal: base.principal,
+    spaceId: base.spaceId,
+    name: "Synthetic Growth Partners III",
+  });
+  const entry = await createInvestmentEntry(base.ctx, {
+    principal: base.principal,
+    investmentId,
+    entryType: "capital_call_paid",
+    entryDate: "2026-03-10",
+    amount: "25000.00",
+    dateIsEstimated: true,
+  });
+  const document = await seedDocument(base.ctx, base.spaceId, {
+    kind: "capital_call_notice",
+    uri: "fs://archive/Investments/Synthetic Growth Partners III/call.pdf",
+    statements: overrides.statements ?? [
+      org("fund", "Synthetic Growth Partners III"),
+      money("amount_called", "25000.00"),
+      date("due_date", "2026-03-12"),
+    ],
+  });
+  return { ...base, investmentId, entryId: entry.id, document };
+}
+
+test("a second identical entry demotes the auto-link AND gives the date back", { skip }, async (t) => {
+  const base = await estimatedCallFixture(t);
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  let entry = await entryRow(base);
+  assert.equal(entry.entryDate, "2026-03-12");
+  assert.equal(entry.dateIsEstimated, false);
+
+  await createInvestmentEntry(base.ctx, {
+    principal: base.principal,
+    investmentId: base.investmentId,
+    entryType: "capital_call_paid",
+    entryDate: "2026-03-20",
+    amount: "25000.00",
+  });
+  const result = await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  assert.equal(result.autoLinkedEntryId, null);
+
+  const links = await linksFor(base, {});
+  assert.deepEqual([...new Set(links.map((link) => link.state))], ["suggested"]);
+  entry = await entryRow(base);
+  assert.equal(entry.entryDate, "2026-03-10", "the guess comes back");
+  assert.equal(entry.dateIsEstimated, true, "and is a guess again");
+  assert.equal(entry.documentId, null);
+  for (const link of links) assert.equal(link.dateCorrectionId, null);
+  const rows = await dateCorrections(base);
+  assert.equal(rows.length, 2, "moved, then put back, both recorded");
+  await consistent(base.ctx);
+});
+
+test("a document corrected to name nothing gives the date back and drops the row", { skip }, async (t) => {
+  const base = await estimatedCallFixture(t);
+  // No folder to fall back on, so correcting the party leaves the document
+  // matching nothing at all -- which used to end the pass before the sweep.
+  await base.ctx.client.query(
+    "UPDATE kith.source_items SET uri = 'fs://archive/Unsorted/scan.pdf' WHERE id = $1",
+    [base.document.sourceItemId],
+  );
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  assert.equal((await entryRow(base)).entryDate, "2026-03-12");
+
+  await base.ctx.client.query(
+    `UPDATE kith.observations
+        SET value = '{"type":"text","value":"A Different Fund"}'::jsonb
+      WHERE space_id = $1 AND observation_key = 'fund'`,
+    [base.spaceId],
+  );
+  await base.ctx.client.query(
+    `UPDATE kith.observations
+        SET value = '{"type":"money","amount":"9.99","currency":"USD"}'::jsonb
+      WHERE space_id = $1 AND observation_key = 'amount_called'`,
+    [base.spaceId],
+  );
+  const result = await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  assert.equal(result.reason, "no_investment_matched");
+  assert.deepEqual(await linksFor(base, {}), [], "the stale row is gone");
+  const entry = await entryRow(base);
+  assert.equal(entry.entryDate, "2026-03-10");
+  assert.equal(entry.dateIsEstimated, true);
+  assert.equal(entry.documentId, null);
+  await consistent(base.ctx);
+});
+
+test("an owner-confirmed link is never swept, whatever the rule now thinks", { skip }, async (t) => {
+  const base = await estimatedCallFixture(t);
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  const [link] = await linksFor(base, {});
+  await confirmInvestmentDocumentLink(base.ctx, {
+    principal: base.principal,
+    linkId: link.id,
+  });
+  await createInvestmentEntry(base.ctx, {
+    principal: base.principal,
+    investmentId: base.investmentId,
+    entryType: "capital_call_paid",
+    entryDate: "2026-03-20",
+    amount: "25000.00",
+  });
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  const after = (await linksFor(base, { entryIds: [base.entryId] }))[0];
+  assert.equal(after.state, "confirmed");
+  const entry = await entryRow(base);
+  assert.equal(entry.entryDate, "2026-03-12", "his decision keeps its date");
+  assert.equal(entry.documentId, base.document.documentId);
+  await consistent(base.ctx);
+});
+
+test("a re-extracted date moves the entry only while the entry still holds this link's date", { skip }, async (t) => {
+  const base = await estimatedCallFixture(t);
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  assert.equal((await entryRow(base)).entryDate, "2026-03-12");
+
+  await base.ctx.client.query(
+    `UPDATE kith.observations
+        SET value = '{"type":"date","value":"2026-03-13"}'::jsonb
+      WHERE space_id = $1 AND observation_key = 'due_date'`,
+    [base.spaceId],
+  );
+  const result = await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  assert.deepEqual(result.datesReplaced, [base.entryId]);
+  assert.equal((await entryRow(base)).entryDate, "2026-03-13");
+  const rows = await dateCorrections(base);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].original_value, "2026-03-12");
+  assert.equal(rows[1].corrected_value, "2026-03-13");
+
+  // Now the owner types a date of his own, and the document changes again.
+  await updateInvestmentEntry(base.ctx, {
+    principal: base.principal,
+    entryId: base.entryId,
+    investmentId: base.investmentId,
+    entryDate: "2026-03-01",
+  });
+  await base.ctx.client.query(
+    `UPDATE kith.observations
+        SET value = '{"type":"date","value":"2026-03-14"}'::jsonb
+      WHERE space_id = $1 AND observation_key = 'due_date'`,
+    [base.spaceId],
+  );
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  assert.equal(
+    (await entryRow(base)).entryDate,
+    "2026-03-01",
+    "his date is not the one this link wrote, so nothing moves",
+  );
+});
+
+test("retyping the very date the document gave still makes it his", { skip }, async (t) => {
+  const base = await estimatedCallFixture(t);
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  const [link] = await linksFor(base, {});
+  // He retypes 2026-03-12 -- the same day the notice gave. Without clearing
+  // the link's claim, rejecting would read "still my date" and revert it.
+  await updateInvestmentEntry(base.ctx, {
+    principal: base.principal,
+    entryId: base.entryId,
+    investmentId: base.investmentId,
+    entryDate: "2026-03-12",
+  });
+  assert.equal((await linksFor(base, {}))[0].dateCorrectionId, null);
+
+  const rejected = await rejectInvestmentDocumentLink(base.ctx, {
+    principal: base.principal,
+    linkId: link.id,
+  });
+  assert.equal(rejected.dateReverted, false);
+  const entry = await entryRow(base);
+  assert.equal(entry.entryDate, "2026-03-12", "his date stands");
+  assert.equal(entry.dateIsEstimated, false);
+  await consistent(base.ctx);
+});
+
+// ---------------------------------------------------------------------------
+// More than one live link, and the primary (second review)
+// ---------------------------------------------------------------------------
+
+/** The wire that paid the same call the notice announced. */
+async function seedWire(base) {
+  return seedDocument(base.ctx, base.spaceId, {
+    kind: "wire_confirmation",
+    statements: [
+      org("sender", "Synthetic Growth Partners III"),
+      money("amount_sent", "25000.00"),
+      date("value_date", "2026-03-11"),
+    ],
+  });
+}
+
+test("a notice and the wire that paid it can both be confirmed", { skip }, async (t) => {
+  const base = await estimatedCallFixture(t);
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  assert.equal((await linksFor(base, {}))[0].state, "auto_linked");
+
+  const wire = await seedWire(base);
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: wire.sourceItemId,
+  });
+  const [offered] = await linksFor(base, { sourceItemId: wire.sourceItemId });
+  assert.equal(offered.state, "suggested");
+
+  // The second confirmation is allowed. It used to be refused, which left the
+  // wire as an offer nobody could act on.
+  const confirmed = await confirmInvestmentDocumentLink(base.ctx, {
+    principal: base.principal,
+    linkId: offered.id,
+  });
+  assert.equal(confirmed.dateReplaced, false, "only the primary dates an entry");
+  const live = (await linksFor(base, { entryIds: [base.entryId] })).filter(
+    (link) => link.state === "auto_linked" || link.state === "confirmed",
+  );
+  assert.equal(live.length, 2);
+  const entry = await entryRow(base);
+  assert.equal(
+    entry.documentId,
+    base.document.documentId,
+    "the mirror follows the primary, which is the older link",
+  );
+  assert.equal(entry.entryDate, "2026-03-12", "the notice's date, not the wire's");
+  await consistent(base.ctx);
+});
+
+test("rejecting the primary promotes the next live link and re-runs the date rule", { skip }, async (t) => {
+  const base = await estimatedCallFixture(t);
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  const [notice] = await linksFor(base, {});
+  const wire = await seedWire(base);
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: wire.sourceItemId,
+  });
+  const [offered] = await linksFor(base, { sourceItemId: wire.sourceItemId });
+  await confirmInvestmentDocumentLink(base.ctx, {
+    principal: base.principal,
+    linkId: offered.id,
+  });
+
+  const rejected = await rejectInvestmentDocumentLink(base.ctx, {
+    principal: base.principal,
+    linkId: notice.id,
+  });
+  assert.equal(rejected.dateReverted, true, "the notice's date goes back");
+  assert.equal(rejected.dateReplaced, true, "and the wire's takes its place");
+  const entry = await entryRow(base);
+  assert.equal(entry.documentId, wire.documentId, "the wire is now the primary");
+  assert.equal(entry.entryDate, "2026-03-11", "dated by the wire");
+  assert.equal(entry.dateIsEstimated, false);
+  await consistent(base.ctx);
+});
+
+// ---------------------------------------------------------------------------
+// The foreign keys that clear one column (second review)
+// ---------------------------------------------------------------------------
+
+test("deleting a document under a link clears its document and keeps the row", { skip }, async (t) => {
+  const base = await autoLinkFixture(t);
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  const [link] = await linksFor(base, {});
+  // A bare composite `ON DELETE SET NULL` would null `space_id` too and fail
+  // with 23502 here.
+  await base.ctx.client.query("DELETE FROM kith.documents WHERE id = $1", [
+    base.document.documentId,
+  ]);
+  const after = await linksFor(base, {});
+  assert.equal(after.length, 1, "the row survives, so a rejection would too");
+  assert.equal(after[0].id, link.id);
+  assert.equal(after[0].documentId, null);
+  assert.equal(after[0].spaceId, base.spaceId);
+  assert.equal(after[0].sourceItemId, base.document.sourceItemId);
+});
+
+test("deleting a correction under a link clears only the correction id", { skip }, async (t) => {
+  const base = await estimatedCallFixture(t);
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  const [link] = await linksFor(base, {});
+  assert.equal(typeof link.dateCorrectionId, "string");
+  await base.ctx.client.query("DELETE FROM kith.corrections WHERE id = $1", [
+    link.dateCorrectionId,
+  ]);
+  const after = await linksFor(base, {});
+  assert.equal(after.length, 1);
+  assert.equal(after[0].dateCorrectionId, null);
+  assert.equal(after[0].spaceId, base.spaceId);
 });

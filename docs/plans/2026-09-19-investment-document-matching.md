@@ -243,15 +243,25 @@ Migration 033 (ADM-8b, slices 1 and 1b) delivers:
    investment platform statement covers many investments at once. For an
    entry-level row it changes nothing, since an entry belongs to exactly one
    investment.
-3. A second unique index, `(space_id, entry_id)` where the state is
-   `auto_linked` or `confirmed`: **at most one live link per entry.** This is
-   what makes `investment_entries.document_id` a well-defined mirror rather
-   than a choice among several, and it is also what makes this section's
-   "exactly one document offers a date" condition structurally true.
+3. A partial index on `(space_id, entry_id, created_at, id)` over the live
+   states, which is what makes the PRIMARY link cheap to find. There is
+   deliberately no "one live link per entry" UNIQUE index: see "Which one is
+   the source of truth" below for why an entry may carry a notice and the
+   wire that paid it at once.
 4. `kith.corrections.target_kind` extended with `entry` only. `investment`
    and `link` arrive with the detectors in slice 3 that write them: a CHECK
    widened for a writer that does not exist yet is a CHECK nothing tests.
-5. `investment_entries.date_is_estimated`, defaulting false, so every existing
+5. The backfill that adopts every already-attached document as a link, and
+   the `RAISE NOTICE` that counts what it adopted and what it could not.
+6. Composite `ON DELETE SET NULL` keys name the column they clear --
+   `SET NULL (document_id)`, `SET NULL (date_correction_id)`. A bare
+   composite `SET NULL` nulls every column of the key, `space_id` included,
+   which is NOT NULL, so the delete fails with 23502 instead. Migration 022's
+   own `investment_entries.document_id` and `evidence_span_id` keys carry the
+   same defect and are repaired here: deleting a document that an entry cited
+   used to fail outright, and a re-parse that removes a document row is
+   exactly what this feature makes routine.
+7. `investment_entries.date_is_estimated`, defaulting false, so every existing
    row reads as owner-entered and none can be rewritten by this feature.
 
 The `kith.deferred_work` kind check is NOT extended here. `investment_link`
@@ -266,21 +276,64 @@ so the widened check disturbs no existing path.
 `kith.investment_document_links` is. `investment_entries.document_id` keeps
 the meaning it has had since migration 022 -- the entry's primary citation,
 read by the totals, the screen and `get_investment` -- but nothing writes it
-directly any more. It is a MIRROR: the document of the entry's one live link,
+directly any more. It is a MIRROR: the document of the entry's PRIMARY link,
 or null. `syncEntryDocument` in
 `packages/kith-store/src/admin/investmentLinks.ts` is the only writer, and it
-runs in the same transaction as every link write. The live-link unique index
-above is what makes "the entry's link" singular; a whole-table consistency
+runs in the same transaction as every link write. A whole-table consistency
 query in `test/investmentLinks.test.mjs` runs after every transition and
 fails if the two ever disagree.
 
-The drawer's own "attach this document" goes through the same path: it writes
-an owner-decided `confirmed` link. Detaching (`documentId: null` on a patch)
-REJECTS the live link, with `reason = 'owner_detached'` -- the owner taking a
-document off an entry is the clearest statement there is that the two do not
-belong together, and a later sweep must not put it back. The drawer therefore
-sends `documentId` only when it changed, so a stale row cannot reject a link
-the owner never looked at.
+**More than one live link, and the primary.** An entry may carry several live
+(`auto_linked` or `confirmed`) links: a capital call notice and the wire
+confirmation that paid it are both the paper for one payment. The first
+implementation allowed only one, and the second document then sat as a
+suggestion nobody could act on, which is noise. The PRIMARY link is the
+OLDEST live one, by `created_at` then `id`, and it alone decides the mirror
+and the date rule. Oldest rather than newest and rather than "the confirmed
+one", because it is the only ordering that does not move under the owner:
+confirming a second document must not silently re-point the first one's
+citation. Rejecting the primary promotes the next live link, and the date
+rule then runs again for the promoted one under the same guards.
+
+**Adopting what is already attached.** Every drawer attachment made before
+migration 033 set `document_id` with no link row behind it, and the old build
+goes on making more of them between the schema apply and the deploy. Such an
+entry reads to the matcher as an entry with no document, so the first notice
+that scores ten points auto-links over the owner's own choice and the mirror
+moves with nothing recording it. Migration 033 therefore backfills a
+`confirmed`, `decided_by = 'owner'`, `reason = 'legacy_attached'` link for
+each one, dated at the ENTRY's own `created_at` so it is the primary; the
+same statement is `adoptLegacyEntryDocuments`, reachable from
+`scripts/investment-links-adopt.mjs` (dry run by default), to be run once more
+after the deploy. `syncEntryDocument` adopts one it meets at runtime for the
+same reason, and NEVER clears a mirror it cannot account for: when the
+document row is gone or has no source item, the mirror is left exactly as it
+is and no link is invented.
+
+**A document comes off an entry only through an explicit reject.** The
+drawer's "attach this document" writes an owner-decided `confirmed` link. A
+NULL `documentId` on an entry patch does nothing at all. It used to reject the
+live link permanently and revert the date it had moved, and that was a loaded
+gun: the drawer sends the whole entry on every save and the screen refreshes
+its rows from the change feed while the drawer is open, so an automatic link
+landing in that window turned the owner's next unrelated edit -- a note, a
+rounded cent -- into a permanent rejection of a link he had never seen.
+Removing a document is now `rejectInvestmentDocumentLink` and nothing else.
+The drawer also sends `documentId`, `entryDate` and `dateIsEstimated` only
+when they differ from the values it was OPENED with (`entryPatchFields` in
+`apps/web/src/lib/kith/investment-entry-patch.ts`), never from the live row,
+which is the version that moves.
+
+**A rule's auto-link is the rule's to take back.** When a rule-made
+`auto_linked` row stops qualifying -- a second identical entry appears, the
+document's party or amount is corrected, the document now names no investment
+at all -- the pass reverts the date it replaced, through the same recorded
+correction a rejection uses, and demotes or deletes the row. Nothing is
+remembered: a demotion is not a rejection, because the owner said nothing. An
+owner-decided row is never swept, whatever the rule now thinks. And a
+re-extraction that changes the date on a still-qualifying primary link moves
+the entry only while the entry still holds the date THAT LINK wrote; if the
+owner has typed over it since, his date stands.
 
 ### What slice 1 settled that this plan did not (ADM-8b)
 
@@ -291,6 +344,7 @@ the owner never looked at.
 | How a partial date scores | It does not. `precision: "year"` and `"month"` satisfy no window at any kind and replace no date. The alternative is a fabricated day, and a fabricated day is what would then be read back as fact. The cost is a suggestion instead of an auto-link, which is the safe direction. |
 | The `investment_agreement` window when `signed_on` is null | It falls back to +/-90 days around the ENTRY's date. An imported commitment's date is estimated exactly when the sheet had no Docs Signed date, which is exactly when `signed_on` is null -- so anchoring only on `signed_on` would make the window unavailable in the one case the date rule exists for. |
 | Which direction a cross-currency compare runs | The rate lives on the entry (migration 025), so a non-USD ENTRY is compared with a USD document within the importer's tolerance. A non-USD DOCUMENT against a USD entry has no recorded rate and scores no amount point; inventing a market rate is the fabrication this design refuses. |
+| What the 1% is 1% OF | The document's own stated amount, not the converted one, which is what the importer measures against (the sheet's own USD column). The two are not the same number below the converted figure, and the first implementation used the converted one -- a GBP call the importer had accepted could be a call the matcher refused. `apps/web/src/lib/kith/rate-tolerance-parity.test.ts` runs both implementations over one table of cases and is what caught it. |
 | `schedule_k1`'s date window | It has none. `tax_year` is a number field, not a date (`extraction/seed.ts`), so a K-1 links at the investment level on its party alone. |
 | What a tie is, exactly | An auto-link needs the best candidate to lead the runner-up by MORE than `LINK_TIE_MARGIN_POINTS` (2), so a three-point gap. Two candidates that both fire party, amount and date link nothing whatever the gap. |
 | What rejecting does to a date the link replaced | It puts it back, and marks it estimated again, and records the reversal as its own resolved correction. The exception is the owner's: if he has edited the date since, his value stands and the marker is left as he left it. |

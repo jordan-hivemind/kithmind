@@ -29,7 +29,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { type ColumnDef } from "@tanstack/react-table";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 
 import {
   emptyEntry,
@@ -48,6 +48,7 @@ import {
 } from "@/components/ui/data-table";
 import { buttonClass, primaryButtonClass } from "@/components/ui/drawer";
 import { archiveDate, tableDecimal, tableInteger } from "@/lib/kith/format";
+import { entryPatchFields } from "@/lib/kith/investment-entry-patch";
 import {
   type ImportPreview,
   type ImportWriter,
@@ -121,6 +122,20 @@ export function InvestmentsTable({
   const [expandedIds, setExpandedIds] = useState<string[]>([]);
   const [entryDraft, setEntryDraft] = useState<EntryDraft | null>(null);
   const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
+  /**
+   * The entry's document, date and estimated marker as they were when the
+   * drawer opened.
+   *
+   * A ref and not state, deliberately: nothing renders from it and a re-render
+   * must not reset it. It is what `entryPatchFields` compares the draft
+   * against, so that a link landing from the change feed while the drawer is
+   * open cannot become a write the owner never made.
+   */
+  const entryAtOpen = useRef<{
+    documentId: string | null;
+    entryDate: string;
+    dateIsEstimated: boolean;
+  } | null>(null);
   const [investmentDraft, setInvestmentDraft] =
     useState<InvestmentDraft | null>(null);
   const [editingInvestmentId, setEditingInvestmentId] = useState<string | null>(
@@ -244,25 +259,24 @@ export function InvestmentsTable({
       };
       if (editingEntryId !== null) {
         const entryId = editingEntryId;
-        // `documentId` is sent only when the owner actually changed it.
-        //
-        // Since ADM-8b a null `documentId` in a patch means DETACH, and a
-        // detach rejects the entry's link so that nothing links it again. A
-        // drawer opened from a row loaded before an automatic link landed
-        // would otherwise send that stale null on the next unrelated edit --
-        // a note, a rounded amount -- and permanently reject a link the owner
-        // never looked at.
-        const stored =
-          (entries ?? []).find((entry) => entry.id === entryId)?.documentId ??
-          null;
-        const { documentId, ...unchangedDocument } = body;
-        const patch =
-          stored === documentId ? unchangedDocument : body;
+        // `documentId`, `entryDate` and `dateIsEstimated` go only when the
+        // owner changed them, measured against the values the drawer was
+        // OPENED with -- never against the live row, which the change feed
+        // refreshes underneath an open drawer. `entryPatchFields` is that
+        // rule, and it has its own test.
+        const patch = entryPatchFields(
+          { ...body, dateIsEstimated: draft.dateIsEstimated },
+          entryAtOpen.current ?? {
+            documentId: body.documentId,
+            entryDate: body.entryDate,
+            dateIsEstimated: draft.dateIsEstimated,
+          },
+        );
         await optimistic.mutateAsync({
           apply: () =>
             patchEntries((current) =>
               current.map((entry) =>
-                entry.id === entryId ? { ...entry, ...body } : entry,
+                entry.id === entryId ? { ...entry, ...patch } : entry,
               ),
             ),
           run: () =>
@@ -298,7 +312,7 @@ export function InvestmentsTable({
           ),
       });
     },
-    [editingEntryId, entries, optimistic, patchEntries],
+    [editingEntryId, optimistic, patchEntries],
   );
 
   const saveInvestment = useCallback(
@@ -573,6 +587,14 @@ export function InvestmentsTable({
       });
     } else {
       setEditingEntryId(row.id);
+      // The snapshot `entryPatchFields` measures against. Taken once, here,
+      // when the row goes into the drawer: the live row moves under an open
+      // drawer and this must not.
+      entryAtOpen.current = {
+        documentId: row.documentId,
+        entryDate: row.entryDate,
+        dateIsEstimated: row.dateIsEstimated,
+      };
       setEntryDraft({
         investmentId: row.investmentId,
         entryType: row.entryType,
@@ -582,6 +604,7 @@ export function InvestmentsTable({
         exchangeRate: row.exchangeRate ?? "",
         note: row.note ?? "",
         documentId: row.documentId,
+        dateIsEstimated: row.dateIsEstimated,
       });
     }
   }, []);

@@ -584,9 +584,13 @@ export async function evaluateDocumentLinks(
     }
   }
 
-  if (matched.length === 0 && entryRecords.length === 0) {
-    return none("no_investment_matched", extraction.kind);
-  }
+  // A document that matches nothing is NOT an early return. It used to be,
+  // and that was the hole: correcting a fund's name so the document no longer
+  // names any investment left the `auto_linked` row it had already made
+  // standing, with the date it had already moved still moved. The pass runs
+  // to the end with no candidates, the sweep below finds the stale row, and
+  // the date goes back. `matchedNothing` only changes what is reported.
+  const matchedNothing = matched.length === 0 && entryRecords.length === 0;
 
   // Which candidate entries already carry a live link from ANOTHER document.
   // From another: re-evaluating the same document must keep its own auto-link
@@ -602,6 +606,25 @@ export async function evaluateDocumentLinks(
       [spaceId, entryIds, [...LIVE_STATES], sourceItemId],
     );
     for (const record of live) liveElsewhere.add(record.entry_id);
+    // An entry whose mirror is set but whose links are empty is an
+    // attachment made before migration 033, or one the OLD build wrote in
+    // the window between the schema apply and the deploy. It is the owner's
+    // own choice of document and it counts as a live link here, or the first
+    // notice that scores ten points auto-links straight over it and the
+    // mirror moves with nothing recording that it did. The backfill adopts
+    // these as real links; this is the belt for the window before it runs.
+    const attached = await rows<{ id: string }>(
+      ctx,
+      `SELECT e.id FROM kith.investment_entries e
+        WHERE e.space_id = $1 AND e.id = ANY($2::text[])
+          AND e.document_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM kith.investment_document_links l
+             WHERE l.space_id = e.space_id AND l.entry_id = e.id
+               AND l.document_id = e.document_id)`,
+      [spaceId, entryIds],
+    );
+    for (const record of attached) liveElsewhere.add(record.id);
   }
 
   const byInvestment = new Map(
@@ -683,25 +706,77 @@ export async function evaluateDocumentLinks(
         entryId: entry.candidate.entryId,
         replacement: entry.candidate.dateReplacement,
       });
-      if (replaced) datesReplaced.push(entry.candidate.entryId);
+      // A re-extraction can change the very date this link already wrote.
+      // `replaceEstimatedDate` will not touch it a second time -- the marker
+      // is cleared, which is what makes it idempotent -- so the refresh is
+      // its own step with its own guard: the entry's date must still be the
+      // one THIS link wrote, or the owner has typed over it and it is his.
+      const refreshed =
+        replaced ||
+        (await refreshReplacedDate(ctx, {
+          spaceId,
+          linkId,
+          entryId: entry.candidate.entryId,
+          replacement: entry.candidate.dateReplacement,
+        }));
+      if (refreshed) datesReplaced.push(entry.candidate.entryId);
     }
   }
 
-  // Sweep the offers this pass no longer makes. `suggested` only: a live or
-  // rejected row is a decision, not an offer.
-  const keep = [...written.keys()];
-  const stale = existing.filter(
-    (link) =>
-      link.state === "suggested" &&
-      !keep.includes(pairKey(link.investment_id, link.entry_id)),
+  // The stale sweep.
+  //
+  // Two kinds of row go, and the difference is who decided them:
+  //
+  //   * A `suggested` row this pass no longer produces is simply gone. An
+  //     offer nobody acted on is not a decision.
+  //   * A RULE-made `auto_linked` row this pass no longer produces as an
+  //     auto-link has stopped qualifying -- a second identical entry turned
+  //     up, or the document's party or amount was corrected, or it now names
+  //     no investment at all. The rule made it, so the rule takes it back:
+  //     the date it moved goes back first, through the same recorded
+  //     correction a rejection uses, and then the row is demoted (the upsert
+  //     above already wrote `suggested` over it) or deleted.
+  //
+  // An owner-decided row is never swept, whatever the rule now thinks. And a
+  // demotion is NOT a rejection: nothing is remembered, because the owner
+  // said nothing. The document may qualify again tomorrow.
+  const keep = new Map(
+    [...written.entries()].map(([key, entry]) => [key, entry.state]),
   );
-  for (const link of stale) {
-    await exec(
-      ctx,
-      `DELETE FROM kith.investment_document_links
-        WHERE id = $1 AND space_id = $2 AND state = 'suggested'`,
-      [link.id, spaceId],
-    );
+  for (const link of existing) {
+    const key = pairKey(link.investment_id, link.entry_id);
+    const now = keep.get(key);
+    const wasRuleAutoLink =
+      link.state === "auto_linked" && link.decided_by === "rule";
+    const demoted = wasRuleAutoLink && now !== "auto_linked";
+    const dropped = link.state === "suggested" && now === undefined;
+    if (!demoted && !dropped) continue;
+    if (demoted) {
+      await revertReplacedDate(ctx, { spaceId, link });
+    }
+    if (now === undefined) {
+      // The mirror goes first, and it has to. `syncEntryDocument` adopts a
+      // `document_id` that no link accounts for -- that is what protects the
+      // owner's own attachments -- and it cannot tell one of those from a
+      // document this very statement has just unlinked. Clearing it here
+      // leaves nothing to misread.
+      if (link.entry_id !== null && link.document_id !== null) {
+        await exec(
+          ctx,
+          `UPDATE kith.investment_entries
+              SET document_id = NULL, evidence_span_id = NULL
+            WHERE id = $1 AND space_id = $2 AND document_id = $3`,
+          [link.entry_id, spaceId, link.document_id],
+        );
+      }
+      await exec(
+        ctx,
+        `DELETE FROM kith.investment_document_links
+          WHERE id = $1 AND space_id = $2
+            AND state IN ('suggested', 'auto_linked') AND decided_by = 'rule'`,
+        [link.id, spaceId],
+      );
+    }
     if (link.entry_id !== null) touchedEntries.add(link.entry_id);
   }
 
@@ -710,8 +785,8 @@ export async function evaluateDocumentLinks(
   }
 
   return {
-    evaluated: true,
-    reason: "scored",
+    evaluated: !matchedNothing,
+    reason: matchedNothing ? "no_investment_matched" : "scored",
     kind: extraction.kind,
     autoLinkedEntryId: decision.autoLink?.entryId ?? null,
     suggestedCount: [...written.values()].filter(
@@ -792,35 +867,202 @@ async function upsertRuleLink(
 // ---------------------------------------------------------------------------
 
 /**
+ * The entry's PRIMARY link: the oldest live one, by `created_at` then `id`.
+ *
+ * An entry may carry several live links -- a notice and the wire that paid
+ * it -- and exactly one of them is the citation the entry shows, the totals
+ * read and the date rule may act through. Oldest rather than newest, and
+ * rather than "the confirmed one", because it is the only ordering that does
+ * not change under the owner: confirming a second document must not silently
+ * re-point the first one's citation.
+ */
+async function primaryLink(
+  ctx: IdentityCtx,
+  spaceId: string,
+  entryId: string,
+): Promise<LinkDbRow | null> {
+  return row<LinkDbRow>(
+    ctx,
+    `SELECT ${LINK_COLUMNS} FROM kith.investment_document_links
+      WHERE space_id = $1 AND entry_id = $2
+        AND state IN ('auto_linked', 'confirmed')
+      ORDER BY created_at, id
+      LIMIT 1`,
+    [spaceId, entryId],
+  );
+}
+
+/**
  * Make `investment_entries.document_id` say what the links say.
  *
  * Called in the same transaction as every link write. The entry's citation is
- * the document of its one live link, and its `evidence_span_id` is the first
+ * the document of its PRIMARY link, and its `evidence_span_id` is the first
  * span that link cites -- looked up rather than trusted, so a span a cleanup
  * pass has since removed leaves a null instead of failing the write.
+ *
+ * IT NEVER CLEARS A MIRROR IT DOES NOT UNDERSTAND. An entry whose
+ * `document_id` is set and whose links hold no row for that document is an
+ * attachment made before migration 033, or one the previous build wrote in
+ * the window between the schema apply and the deploy. It is the owner's own
+ * choice. This function ADOPTS it -- an owner-decided `confirmed` link dated
+ * at the entry's own `created_at`, so it is the primary -- rather than
+ * overwriting it with whatever the rule has just decided. An earlier draft
+ * nulled it instead, and a notice that only ever produced a SUGGESTION took
+ * the owner's document off the entry with nothing recording that it had.
+ *
+ * When the document row is gone, or has no source item, there is nothing
+ * truthful to put in `source_item_id` and no link is invented: the mirror is
+ * left exactly as it is and this function returns without writing.
  */
 export async function syncEntryDocument(
   ctx: IdentityCtx,
   spaceId: string,
   entryId: string,
 ): Promise<void> {
+  const adopted = await adoptEntryMirror(ctx, spaceId, entryId);
+  if (adopted === "unadoptable") return;
+  const primary = await primaryLink(ctx, spaceId, entryId);
   await exec(
     ctx,
-    `WITH live AS (
-       SELECT document_id, evidence->0->>'evidenceSpanId' AS span
-         FROM kith.investment_document_links
-        WHERE space_id = $1 AND entry_id = $2
-          AND state IN ('auto_linked', 'confirmed')
-        LIMIT 1
-     )
-     UPDATE kith.investment_entries e
-        SET document_id = (SELECT document_id FROM live),
+    `UPDATE kith.investment_entries e
+        SET document_id = $3,
             evidence_span_id = (
-              SELECT s.id FROM kith.evidence_spans s, live
-               WHERE s.id = live.span AND s.space_id = e.space_id)
+              SELECT s.id FROM kith.evidence_spans s
+               WHERE s.id = $4 AND s.space_id = e.space_id)
       WHERE e.id = $2 AND e.space_id = $1`,
-    [spaceId, entryId],
+    [
+      spaceId,
+      entryId,
+      primary?.document_id ?? null,
+      (Array.isArray(primary?.evidence)
+        ? ((primary.evidence as LinkEvidence[])[0]?.evidenceSpanId ?? null)
+        : null),
+    ],
   );
+}
+
+/**
+ * Adopt a mirror value no link accounts for. See `syncEntryDocument`.
+ *
+ * `"unadoptable"` means the mirror points at something this table cannot
+ * describe, and the caller must leave the entry alone rather than clear it.
+ */
+async function adoptEntryMirror(
+  ctx: IdentityCtx,
+  spaceId: string,
+  entryId: string,
+): Promise<"none" | "adopted" | "unadoptable"> {
+  const orphan = await row<{
+    investment_id: string;
+    document_id: string;
+    created_at: Date;
+    source_item_id: string | null;
+  }>(
+    ctx,
+    `SELECT e.investment_id, e.document_id, e.created_at, d.source_item_id
+       FROM kith.investment_entries e
+       LEFT JOIN kith.documents d
+         ON d.id = e.document_id AND d.space_id = e.space_id
+      WHERE e.id = $1 AND e.space_id = $2
+        AND e.document_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM kith.investment_document_links l
+           WHERE l.space_id = e.space_id AND l.entry_id = e.id
+             AND l.document_id = e.document_id)`,
+    [entryId, spaceId],
+  );
+  if (!orphan) return "none";
+  if (orphan.source_item_id === null) return "unadoptable";
+  await exec(
+    ctx,
+    `INSERT INTO kith.investment_document_links
+       (id, space_id, created_at, investment_id, entry_id, document_id,
+        source_item_id, state, score, signals, evidence, decided_by,
+        decided_at, reason)
+     VALUES (md5('kith.investment_document_links:legacy_attached:' || $2),
+             $1, $3, $4, $2, $5, $6, 'confirmed', 0, '[]'::jsonb, '[]'::jsonb,
+             'owner', $3, 'legacy_attached')
+     ON CONFLICT (space_id, source_item_id, investment_id,
+                  coalesce(entry_id::text, ''))
+     DO NOTHING`,
+    [
+      spaceId,
+      entryId,
+      orphan.created_at,
+      orphan.investment_id,
+      orphan.document_id,
+      orphan.source_item_id,
+    ],
+  );
+  return "adopted";
+}
+
+/**
+ * The migration's backfill, as a function the orchestrator can run again.
+ *
+ * The schema is applied before the new build deploys, and the OLD build goes
+ * on writing bare `document_id` values in that window. This adopts those, and
+ * is idempotent for the same reason the migration's copy is: the id is
+ * derived from the entry id, so a second run conflicts with the first run's
+ * own row. `scripts/investment-links-adopt.mjs` is the operator's route to
+ * it, dry run by default.
+ *
+ * Counts only. Nothing about a document, an amount or a name is returned or
+ * logged, because the operator running this does not need to read the owner's
+ * papers to know the backfill worked.
+ */
+export async function adoptLegacyEntryDocuments(
+  ctx: IdentityCtx,
+  args: { spaceIds?: readonly string[]; apply?: boolean } = {},
+): Promise<{ pending: number; adopted: number; unadoptable: number }> {
+  const spaceIds =
+    args.spaceIds === undefined
+      ? null
+      : args.spaceIds.map((id) => assertKithId(id, "invalid_space_id"));
+  const scope = spaceIds === null ? "" : " AND e.space_id = ANY($1::text[])";
+  const values = spaceIds === null ? [] : [spaceIds];
+  const counts = await row<{ pending: string; unadoptable: string }>(
+    ctx,
+    `SELECT
+       count(*) FILTER (WHERE d.source_item_id IS NOT NULL)::text AS pending,
+       count(*) FILTER (WHERE d.id IS NULL OR d.source_item_id IS NULL)::text
+         AS unadoptable
+       FROM kith.investment_entries e
+       LEFT JOIN kith.documents d
+         ON d.id = e.document_id AND d.space_id = e.space_id
+      WHERE e.document_id IS NOT NULL${scope}
+        AND NOT EXISTS (
+          SELECT 1 FROM kith.investment_document_links l
+           WHERE l.space_id = e.space_id AND l.entry_id = e.id
+             AND l.document_id = e.document_id)`,
+    values,
+  );
+  const pending = Number(counts?.pending ?? 0);
+  const unadoptable = Number(counts?.unadoptable ?? 0);
+  if (args.apply !== true) return { pending, adopted: 0, unadoptable };
+  const written = await rows<{ id: string }>(
+    ctx,
+    `INSERT INTO kith.investment_document_links
+       (id, space_id, created_at, investment_id, entry_id, document_id,
+        source_item_id, state, score, signals, evidence, decided_by,
+        decided_at, reason)
+     SELECT
+       md5('kith.investment_document_links:legacy_attached:' || e.id),
+       e.space_id, e.created_at, e.investment_id, e.id, e.document_id,
+       d.source_item_id, 'confirmed', 0, '[]'::jsonb, '[]'::jsonb, 'owner',
+       e.created_at, 'legacy_attached'
+       FROM kith.investment_entries e
+       JOIN kith.documents d
+         ON d.id = e.document_id AND d.space_id = e.space_id
+      WHERE e.document_id IS NOT NULL${scope}
+        AND d.source_item_id IS NOT NULL
+     ON CONFLICT (space_id, source_item_id, investment_id,
+                  coalesce(entry_id::text, ''))
+     DO NOTHING
+     RETURNING id`,
+    values,
+  );
+  return { pending, adopted: written.length, unadoptable };
 }
 
 // ---------------------------------------------------------------------------
@@ -944,13 +1186,13 @@ async function replaceEstimatedDate(
     [args.entryId, args.spaceId],
   );
   if (!current || !current.date_is_estimated) return false;
-  const live = await row<{ count: string }>(
-    ctx,
-    `SELECT count(*)::text AS count FROM kith.investment_document_links
-      WHERE space_id = $1 AND entry_id = $2 AND state IN ('auto_linked', 'confirmed')`,
-    [args.spaceId, args.entryId],
-  );
-  if (Number(live?.count ?? 0) !== 1) return false;
+  // Only the PRIMARY link may move a date. An entry can carry a notice and
+  // the wire that paid it, and the two can state different days; taking
+  // whichever happened to be written last would make the entry's date depend
+  // on the order documents were ingested in. The primary is the oldest live
+  // link and does not move under the owner, so the rule is stable.
+  const primary = await primaryLink(ctx, args.spaceId, args.entryId);
+  if (!primary || primary.id !== args.linkId) return false;
 
   const previous = calendarDate(current.entry_date)!;
   if (previous === replacement.date) {
@@ -1011,6 +1253,110 @@ async function replaceEstimatedDate(
     [args.linkId, args.spaceId, correctionId],
   );
   return true;
+}
+
+/**
+ * Carry a re-extracted date through to an entry this link has already dated.
+ *
+ * `replaceEstimatedDate` runs once and then cannot run again, because it
+ * clears the marker -- which is exactly what makes it idempotent and is not
+ * something to undo. So the case where the document itself changes its mind
+ * (a re-extraction reads `2026-01-15` where it read `2026-01-05`, or the
+ * owner corrects the observation) needs its own step.
+ *
+ * The guard is in the UPDATE's own WHERE and it is the whole safety of this
+ * function: the entry's date must still be THE DATE THIS LINK WROTE. If the
+ * owner has typed anything over it since, the row does not match, nothing
+ * moves, and his date stands. The marker is not touched either way -- it was
+ * cleared when the first replacement landed and the date is still a stated
+ * one, just a differently stated one.
+ */
+async function refreshReplacedDate(
+  ctx: IdentityCtx,
+  args: {
+    spaceId: string;
+    linkId: string;
+    entryId: string;
+    replacement: DateReplacement | null;
+  },
+): Promise<boolean> {
+  const replacement = args.replacement;
+  if (!replacement) return false;
+  const link = await row<{ date_correction_id: string | null }>(
+    ctx,
+    `SELECT date_correction_id FROM kith.investment_document_links
+      WHERE id = $1 AND space_id = $2`,
+    [args.linkId, args.spaceId],
+  );
+  if (!link || link.date_correction_id === null) return false;
+  const primary = await primaryLink(ctx, args.spaceId, args.entryId);
+  if (!primary || primary.id !== args.linkId) return false;
+  const correction = await row<{ corrected_value: unknown }>(
+    ctx,
+    `SELECT corrected_value FROM kith.corrections
+      WHERE id = $1 AND space_id = $2 AND target_kind = 'entry'`,
+    [link.date_correction_id, args.spaceId],
+  );
+  const written = correction?.corrected_value;
+  if (typeof written !== "string" || written === replacement.date) return false;
+  const moved = await row<{ id: string }>(
+    ctx,
+    `UPDATE kith.investment_entries SET entry_date = $4
+      WHERE id = $1 AND space_id = $2 AND entry_date = $3::date
+      RETURNING id`,
+    [args.entryId, args.spaceId, written, replacement.date],
+  );
+  if (!moved) return false;
+  const correctionId = newKithId();
+  await exec(
+    ctx,
+    `INSERT INTO kith.corrections
+       (id, space_id, target_kind, target_id, field_name, original_value,
+        corrected_value, reason, state, resolved_at, detector, dedupe_key,
+        severity)
+     VALUES ($1,$2,'entry',$3,'entry_date',to_jsonb($4::text),to_jsonb($5::text),
+             $6,'resolved',transaction_timestamp(),$7,$8,'info')`,
+    [
+      correctionId,
+      args.spaceId,
+      args.entryId,
+      written,
+      replacement.date,
+      `${LINK_DATE_DETECTOR}_refreshed:${args.linkId}:${replacement.field}:${replacement.observationKey}:${replacement.evidenceSpanId}`,
+      LINK_DATE_DETECTOR,
+      `${LINK_DATE_DETECTOR}_refreshed:${args.entryId}:${args.linkId}:${replacement.date}`,
+    ],
+  );
+  await exec(
+    ctx,
+    `UPDATE kith.investment_document_links SET date_correction_id = $3
+      WHERE id = $1 AND space_id = $2`,
+    [args.linkId, args.spaceId, correctionId],
+  );
+  return true;
+}
+
+/**
+ * Let go of every date claim on one entry, because the owner has just typed
+ * a date of his own.
+ *
+ * Without this, rejecting a link afterwards would read "the entry's date is
+ * still the one I wrote" -- true, but only because he happened to retype the
+ * same day -- and revert HIS date to an older estimate. Clearing the claim
+ * is what makes a typed date final: from here on no link owns it, so no
+ * rejection can take it back.
+ */
+export async function forgetReplacedDates(
+  ctx: IdentityCtx,
+  spaceId: string,
+  entryId: string,
+): Promise<void> {
+  await exec(
+    ctx,
+    `UPDATE kith.investment_document_links SET date_correction_id = NULL
+      WHERE space_id = $1 AND entry_id = $2 AND date_correction_id IS NOT NULL`,
+    [spaceId, entryId],
+  );
 }
 
 /**
@@ -1133,7 +1479,14 @@ async function writableLink(
  * A confirmation may move a date, for the same reason an auto-link may: a
  * `suggested` document the owner accepts is now the entry's evidence, and if
  * the entry's date was an estimate the document's date is better. The rule is
- * the same one, with the same guards.
+ * the same one, with the same guards -- including that only the PRIMARY link
+ * may move a date, so confirming a wire beside an already-live notice cites
+ * the wire on the entry's documents list and changes no date.
+ *
+ * Confirming a SECOND live link is allowed and always was meant to be: a
+ * notice and the wire that paid it are both the paper for one payment. An
+ * earlier draft refused it, which left the second document as a suggestion
+ * the owner could never act on -- noise, and noise is a defect.
  */
 export async function confirmInvestmentDocumentLink(
   ctx: IdentityCtx,
@@ -1141,23 +1494,6 @@ export async function confirmInvestmentDocumentLink(
 ): Promise<{ dateReplaced: boolean }> {
   const link = await writableLink(ctx, args.principal, args.linkId);
   if (link.state === "confirmed") return { dateReplaced: false };
-  if (link.entry_id !== null) {
-    // The live-link index would refuse this with a unique violation; refusing
-    // it here says which rule was broken.
-    const live = await row<{ id: string }>(
-      ctx,
-      `SELECT id FROM kith.investment_document_links
-        WHERE space_id = $1 AND entry_id = $2 AND id <> $3
-          AND state IN ('auto_linked', 'confirmed')`,
-      [link.space_id, link.entry_id, link.id],
-    );
-    if (live) {
-      typedError(
-        "entry_already_linked",
-        "This entry already cites a document; reject that link first",
-      );
-    }
-  }
   await exec(
     ctx,
     `UPDATE kith.investment_document_links
@@ -1185,13 +1521,25 @@ export async function confirmInvestmentDocumentLink(
  * table and not a nullable id.
  *
  * A date this link replaced goes back (see `revertReplacedDate`).
+ *
+ * This is the ONLY way a document comes off an entry. An entry patch that
+ * happens to carry a null `documentId` does not detach -- see
+ * `setEntryDocument` for why that had to change.
+ *
+ * Rejecting the PRIMARY link promotes the next live one, if there is one, and
+ * the date rule then runs again for the promoted link under exactly the same
+ * guards: the entry's date has just been put back and re-marked estimated, so
+ * a wire confirmation standing behind a rejected notice dates the entry
+ * itself rather than leaving it on a guess.
  */
 export async function rejectInvestmentDocumentLink(
   ctx: IdentityCtx,
   args: { principal: Principal; linkId: string; reason?: string | null },
-): Promise<{ dateReverted: boolean }> {
+): Promise<{ dateReverted: boolean; dateReplaced: boolean }> {
   const link = await writableLink(ctx, args.principal, args.linkId);
-  if (link.state === "rejected") return { dateReverted: false };
+  if (link.state === "rejected") {
+    return { dateReverted: false, dateReplaced: false };
+  }
   const dateReverted = await revertReplacedDate(ctx, {
     spaceId: link.space_id,
     link,
@@ -1209,10 +1557,19 @@ export async function rejectInvestmentDocumentLink(
       WHERE id = $1 AND space_id = $2`,
     [link.id, link.space_id, args.principal.userId, reason],
   );
-  if (link.entry_id !== null) {
-    await syncEntryDocument(ctx, link.space_id, link.entry_id);
-  }
-  return { dateReverted };
+  if (link.entry_id === null) return { dateReverted, dateReplaced: false };
+  await syncEntryDocument(ctx, link.space_id, link.entry_id);
+  const promoted = await primaryLink(ctx, link.space_id, link.entry_id);
+  const dateReplaced =
+    promoted === null
+      ? false
+      : await replaceEstimatedDate(ctx, {
+          spaceId: link.space_id,
+          linkId: promoted.id,
+          entryId: link.entry_id,
+          replacement: await deriveDateReplacement(ctx, promoted),
+        });
+  return { dateReverted, dateReplaced };
 }
 
 /**
@@ -1222,10 +1579,18 @@ export async function rejectInvestmentDocumentLink(
  * there is exactly one code path that puts a document on an entry and the
  * mirror can never drift from the table.
  *
- * `documentId` null DETACHES: the entry's live link is rejected, with the
- * owner as the decider. Rejected rather than deleted, deliberately -- the
- * owner taking a document off an entry is the clearest statement there is
- * that the two do not go together, and a later sweep must not put it back.
+ * `documentId` NULL DOES NOTHING. It used to detach -- reject the entry's
+ * live link, permanently, and revert the date it had moved -- and that was a
+ * loaded gun pointed at the owner. The drawer sends the whole entry on every
+ * save, so an auto-link landing while the drawer was open (the live feed
+ * refreshes underneath it) turned the next unrelated edit, a note or a
+ * rounded cent, into a permanent rejection of a link he had never seen.
+ *
+ * So detaching is now an explicit act and has its own function:
+ * `rejectInvestmentDocumentLink`. A patch can only ever ADD a document. This
+ * is the asymmetry the reviewer asked for, and it is the right one: the cost
+ * of ignoring a null is one extra click to remove a document, and the cost of
+ * acting on it was a silent permanent decision nobody made.
  */
 export async function setEntryDocument(
   ctx: IdentityCtx,
@@ -1237,28 +1602,6 @@ export async function setEntryDocument(
     document: { id: string; sourceItemId: string } | null;
   },
 ): Promise<void> {
-  const live = await row<LinkDbRow>(
-    ctx,
-    `SELECT ${LINK_COLUMNS} FROM kith.investment_document_links
-      WHERE space_id = $1 AND entry_id = $2 AND state IN ('auto_linked', 'confirmed')
-      LIMIT 1`,
-    [args.spaceId, args.entryId],
-  );
-  if (live && args.document !== null && live.document_id === args.document.id) {
-    return;
-  }
-  if (live) {
-    await revertReplacedDate(ctx, { spaceId: args.spaceId, link: live });
-    await exec(
-      ctx,
-      `UPDATE kith.investment_document_links
-          SET state = 'rejected', decided_by = 'owner',
-              decided_at = transaction_timestamp(), actor_user_id = $3,
-              model = NULL, reason = 'owner_detached'
-        WHERE id = $1 AND space_id = $2`,
-      [live.id, args.spaceId, args.actorUserId],
-    );
-  }
   if (args.document !== null) {
     // An owner's own attachment carries no evidence: he did not read it off a
     // statement, he said so. `investment_document_links_evidence_check` allows

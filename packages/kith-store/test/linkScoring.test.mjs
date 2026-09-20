@@ -191,7 +191,10 @@ test("the cross-currency tolerance is the larger of 1% and $1.00", () => {
 });
 
 test("a USD document scores against a GBP entry through the entry's own rate", () => {
-  // 10,000 GBP at 1.2734 is 12,734.00 USD. Tolerance is 1% = 127.34.
+  // 10,000 GBP at 1.2734 is 12,734.00 USD, and the tolerance is 1% OF THE
+  // DOCUMENT'S own stated amount -- the importer's rule, measured against the
+  // independently stated figure rather than the converted one. That is why
+  // the two edges are not symmetric about 12,734.00.
   const at = (documentAmount) =>
     amountMatches({
       documentAmount,
@@ -201,10 +204,10 @@ test("a USD document scores against a GBP entry through the entry's own rate", (
       entryExchangeRate: "1.2734",
     }).matched;
   assert.equal(at("12734.00"), true);
-  assert.equal(at("12861.34"), true, "exactly at the tolerance");
-  assert.equal(at("12861.35"), false, "one cent past it");
-  assert.equal(at("12606.66"), true, "exactly at the tolerance, below");
-  assert.equal(at("12606.65"), false, "one cent past it, below");
+  assert.equal(at("12862.62"), true, "exactly at the tolerance");
+  assert.equal(at("12862.63"), false, "one cent past it");
+  assert.equal(at("12607.93"), true, "exactly at the tolerance, below");
+  assert.equal(at("12607.92"), false, "one cent past it, below");
 });
 
 test("a non-USD document against a USD entry scores nothing, because no rate exists", () => {

@@ -732,8 +732,17 @@ export function mapLedger(
   return { drafts, skipped };
 }
 
-/** Whether the sheet's own USD figure and the converted one agree. */
-function checkRate(
+/**
+ * Whether the sheet's own USD figure and the converted one agree.
+ *
+ * Exported for `rate-tolerance-parity.test.ts`, which runs this and the
+ * store's `amountMatches` over one shared table of cases. The two are
+ * separate implementations of the same rule -- this module is loaded into the
+ * browser bundle and cannot import `@repo/kith-store` -- and a cross-currency
+ * capital call the importer accepts and the matcher rejects, or the reverse,
+ * is a disagreement about the owner's money that nothing else would catch.
+ */
+export function checkRate(
   sheetUsd: string,
   convertedUsd: string,
 ): NonNullable<LedgerDraft["rateCheck"]> {

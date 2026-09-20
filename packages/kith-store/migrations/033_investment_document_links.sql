@@ -36,16 +36,42 @@
 -- This table. `investment_entries.document_id` stays exactly where it is and
 -- keeps its meaning (the entry's primary citation, which the totals, the
 -- screen and `get_investment` already read), but it is now a MIRROR: it holds
--- the document of the entry's one live link and nothing else.
+-- the document of the entry's PRIMARY link and nothing else.
 --
--- Two things hold the mirror true. `investment_document_links_entry_live_idx`
--- below allows at most one `auto_linked`-or-`confirmed` row per entry, so
--- "the entry's live link" is always a single well-defined row; and one code
--- path in `src/admin/investmentLinks.ts` writes the link and the mirror in the
--- same transaction (`syncEntryDocument`), including for the drawer's own
--- "attach this document" write, which now goes through it as an owner-decided
--- `confirmed` link. `test/investmentLinks.test.mjs` proves the two cannot
--- disagree after every transition.
+-- An entry may have SEVERAL live links. A capital call notice and the wire
+-- confirmation that paid it are both the paper for one payment, and an
+-- earlier draft of this migration allowed only one: the second could never be
+-- confirmed, so it sat as a suggestion nobody could act on, which is noise,
+-- which is a defect. So the rule is not "one live link" but "one PRIMARY
+-- link": the OLDEST live (`auto_linked` or `confirmed`) row for the entry, by
+-- `created_at` then `id`. The mirror follows it, the date replacement rule
+-- follows it, and rejecting it promotes the next one.
+--
+-- `syncEntryDocument` in `src/admin/investmentLinks.ts` is the only writer of
+-- the mirror, and it runs in the same transaction as every link write,
+-- including the drawer's own "attach this document", which goes through it as
+-- an owner-decided `confirmed` link. `test/investmentLinks.test.mjs` runs a
+-- whole-table consistency query after every transition and fails if any
+-- entry's `document_id` is not its primary link's document.
+--
+-- ENTRIES THAT ALREADY CARRY A DOCUMENT
+--
+-- Every drawer attachment made before this migration set `document_id` with
+-- no link row behind it. Left alone, the first matching notice would see no
+-- live link, auto-link over the owner's own choice, and move the mirror
+-- silently -- which is the one unacceptable failure. So the backfill at the
+-- foot of this file adopts each of them as a `confirmed`, `decided_by =
+-- 'owner'` link with `reason = 'legacy_attached'`, dated at the ENTRY's own
+-- `created_at` so it is older than anything a rule can later make and is
+-- therefore the primary.
+--
+-- The same statement is `adoptLegacyEntryDocuments` in
+-- `src/admin/investmentLinks.ts`, reachable from
+-- `scripts/investment-links-adopt.mjs`, because the schema is applied before
+-- the new build deploys and the OLD build goes on writing bare `document_id`
+-- values in that window. Running it again after the deploy adopts those too.
+-- It is idempotent in both places: the id is derived from the entry id, so a
+-- second run conflicts with its own first row and does nothing.
 --
 -- WHY `source_item_id` IS NOT NULL AND `document_id` IS
 --
@@ -126,12 +152,22 @@ CREATE TABLE kith.investment_document_links (
     REFERENCES kith.investments (id, space_id) ON DELETE CASCADE,
   FOREIGN KEY (entry_id, space_id)
     REFERENCES kith.investment_entries (id, space_id) ON DELETE CASCADE,
+  -- `SET NULL (document_id)`, naming the column, not a bare `SET NULL`.
+  --
+  -- A composite foreign key's bare `ON DELETE SET NULL` nulls EVERY column of
+  -- the key, which here means `space_id` as well -- and `space_id` is NOT
+  -- NULL, so deleting a document under a link failed with 23502 instead of
+  -- clearing the link's document. The column list (PostgreSQL 15 and later)
+  -- is what makes the intent expressible: forget the document, keep the
+  -- space, and above all keep the row, because the row is where a remembered
+  -- rejection lives and a re-parse must not take one with it.
   FOREIGN KEY (document_id, space_id)
-    REFERENCES kith.documents (id, space_id) ON DELETE SET NULL,
+    REFERENCES kith.documents (id, space_id) ON DELETE SET NULL (document_id),
   FOREIGN KEY (source_item_id, space_id)
     REFERENCES kith.source_items (id, space_id) ON DELETE CASCADE,
   FOREIGN KEY (date_correction_id, space_id)
-    REFERENCES kith.corrections (id, space_id) ON DELETE SET NULL
+    REFERENCES kith.corrections (id, space_id)
+      ON DELETE SET NULL (date_correction_id)
 );
 
 -- One row per (document identity, investment, entry). This is the remembered
@@ -152,13 +188,12 @@ CREATE UNIQUE INDEX investment_document_links_pair_idx
   ON kith.investment_document_links
      (space_id, source_item_id, investment_id, coalesce(entry_id::text, ''));
 
--- At most one LIVE link per entry. This is what makes
--- `investment_entries.document_id` a well-defined mirror rather than a guess
--- among several. `suggested` and `rejected` rows are deliberately outside the
--- index: an entry may be offered several documents at once, and may have
--- refused any number of them.
-CREATE UNIQUE INDEX investment_document_links_entry_live_idx
-  ON kith.investment_document_links (space_id, entry_id)
+-- There is deliberately NO "one live link per entry" unique index. See the
+-- note at the head of this file: a notice and the wire that paid it are both
+-- live links on one payment, and the mirror follows the PRIMARY link, which
+-- the index below is what makes cheap to find.
+CREATE INDEX investment_document_links_entry_live_idx
+  ON kith.investment_document_links (space_id, entry_id, created_at, id)
   WHERE entry_id IS NOT NULL AND state IN ('auto_linked', 'confirmed');
 
 -- The investment row's expanded documents list, and the per-entry pill.
@@ -205,6 +240,31 @@ CREATE TRIGGER investment_document_links_change_trg
 ALTER TABLE kith.investment_entries
   ADD COLUMN date_is_estimated boolean NOT NULL DEFAULT false;
 
+-- The same `SET NULL (column)` repair, on migration 022's own two composite
+-- keys. This is not new damage; it is older damage the link table's tests
+-- walked into.
+--
+-- `investment_entries.document_id` and `evidence_span_id` were declared with a
+-- bare `ON DELETE SET NULL` on a COMPOSITE key, which nulls every column of
+-- the key -- `space_id` included, and `space_id` is NOT NULL. So deleting a
+-- document that any entry cited failed outright with 23502 rather than
+-- clearing the citation, and a re-parse that removes a document row is
+-- exactly the operation this feature makes routine. Naming the column is the
+-- whole fix.
+--
+-- Cheap: both are re-validated against `investment_entries`, which holds the
+-- owner's few thousand rows at most.
+ALTER TABLE kith.investment_entries
+  DROP CONSTRAINT investment_entries_document_id_space_id_fkey,
+  ADD CONSTRAINT investment_entries_document_id_space_id_fkey
+    FOREIGN KEY (document_id, space_id)
+    REFERENCES kith.documents (id, space_id) ON DELETE SET NULL (document_id),
+  DROP CONSTRAINT investment_entries_evidence_span_id_space_id_fkey,
+  ADD CONSTRAINT investment_entries_evidence_span_id_space_id_fkey
+    FOREIGN KEY (evidence_span_id, space_id)
+    REFERENCES kith.evidence_spans (id, space_id)
+      ON DELETE SET NULL (evidence_span_id);
+
 -- `kith.corrections.target_kind` gains `entry`.
 --
 -- The date replacement is recorded as a RESOLVED corrections row -- old date
@@ -226,3 +286,80 @@ ALTER TABLE kith.corrections
   DROP CONSTRAINT corrections_target_kind_check,
   ADD CONSTRAINT corrections_target_kind_check
     CHECK (target_kind IN ('document', 'field', 'record', 'entry'));
+
+-- ---------------------------------------------------------------------------
+-- The backfill: every document already attached to an entry becomes a link.
+-- ---------------------------------------------------------------------------
+--
+-- Why it is not optional, said once more where the statement is: an entry
+-- whose `document_id` is set and whose links are empty reads to the scorer as
+-- an entry with no document. The first notice that matches it auto-links,
+-- the mirror moves off the owner's own choice, and nothing records that it
+-- did. That is the silent wrong data this whole design exists to refuse.
+--
+-- `md5()` of the entry id, not a fresh id: 32 lowercase hex characters
+-- satisfy `kith.kith_id`, and a DERIVED id is what makes this idempotent.
+-- Run it twice and the second run conflicts with the first run's own row.
+-- The `ON CONFLICT` target is the pair index above, so a row a later
+-- evaluation has already written for the same (document, investment, entry)
+-- also wins over this one -- correctly, because that row was decided with
+-- evidence and this one carries none.
+--
+-- `created_at` and `decided_at` are the ENTRY's `created_at`, not now. The
+-- attachment is at least that old, and dating it there is what makes it the
+-- PRIMARY link: older than anything the rule can go on to make, so the
+-- mirror keeps pointing at the owner's document rather than at the first
+-- notice that scores ten points.
+--
+-- An entry whose document row is gone, or whose document has no source item,
+-- is SKIPPED: the mirror is left exactly as it is and no link is invented.
+-- `source_item_id` is the link's durable identity and there is nothing
+-- truthful to put in it. The count of those rows is raised below rather than
+-- guessed at from a comment.
+INSERT INTO kith.investment_document_links
+  (id, space_id, created_at, investment_id, entry_id, document_id,
+   source_item_id, state, score, signals, evidence, decided_by, decided_at,
+   reason)
+SELECT
+  md5('kith.investment_document_links:legacy_attached:' || e.id),
+  e.space_id,
+  e.created_at,
+  e.investment_id,
+  e.id,
+  e.document_id,
+  d.source_item_id,
+  'confirmed',
+  0,
+  '[]'::jsonb,
+  '[]'::jsonb,
+  'owner',
+  e.created_at,
+  'legacy_attached'
+FROM kith.investment_entries e
+JOIN kith.documents d
+  ON d.id = e.document_id AND d.space_id = e.space_id
+WHERE e.document_id IS NOT NULL
+  AND d.source_item_id IS NOT NULL
+ON CONFLICT (space_id, source_item_id, investment_id,
+             coalesce(entry_id::text, ''))
+DO NOTHING;
+
+DO $$
+DECLARE
+  adopted integer;
+  orphaned integer;
+BEGIN
+  SELECT count(*) INTO adopted
+    FROM kith.investment_document_links
+   WHERE reason = 'legacy_attached';
+  SELECT count(*) INTO orphaned
+    FROM kith.investment_entries e
+    LEFT JOIN kith.documents d
+      ON d.id = e.document_id AND d.space_id = e.space_id
+   WHERE e.document_id IS NOT NULL
+     AND (d.id IS NULL OR d.source_item_id IS NULL);
+  RAISE NOTICE
+    'ADM-8b: % attached documents adopted as links; % entries left with a document that has no source item (mirror untouched, no link invented)',
+    adopted, orphaned;
+END;
+$$;
