@@ -49,7 +49,56 @@ export type PageLine = {
   cutStart: boolean;
   /** The same for the right edge. */
   cutEnd: boolean;
+  /**
+   * The start of the line after this one, and the end of the line before it,
+   * when that end is a real line edge rather than a cut.
+   *
+   * A printed sentence wraps, and a wrap is a real line edge: a letter
+   * states `raised $2.5` and carries `million` onto the next line, and a
+   * prefix-credit ledger prints `CR` at the end of one line and its amount at
+   * the start of the next. Neither is ever read as part of the amount --
+   * assembling a number from two lines is a fabrication -- but the amount
+   * finder refuses one whose wrap token could scale or sign it. Absent when
+   * there is no such line, which is the end of the page.
+   *
+   * A short *lead* rather than one token, because the finder has to see past
+   * what the token is to what follows it: `K Net rental real estate income`
+   * is a form's lettered row and `K` alone is a magnitude, and the two are
+   * the same first token.
+   */
+  previousToken?: string;
+  nextToken?: string;
 };
+
+/**
+ * Characters a reader does not see, removed before the wrap tokens are cut.
+ *
+ * A PDF's text layer emits zero-width spaces and joiners freely, and a soft
+ * hyphen is a hint rather than a character. A line beginning with one of them
+ * begins with whatever comes next, and taking the invisible character as the
+ * whole token hid a `CR` and a `million` from the rule that exists to see
+ * them.
+ */
+const INVISIBLE = /[\u200b\u200c\u200d\u2060\ufeff\u00ad]/g;
+
+/** How much of a neighbouring line the finder is shown. Enough to tell a
+ * lettered row from a lone magnitude letter, and far short of a citation. */
+const WRAP_LEAD_CHARS = 48;
+
+/** The start of a line, and the end of one, with what a reader cannot see
+ * taken out. `undefined` for a line with nothing in it: a blank line is not a
+ * neighbour, and the caller looks past it. */
+function leadOf(text: string): string | undefined {
+  const visible = text.replace(INVISIBLE, "");
+  const trimmed = visible.trim();
+  return trimmed === "" ? undefined : trimmed.slice(0, WRAP_LEAD_CHARS);
+}
+
+function tailOf(text: string): string | undefined {
+  const visible = text.replace(INVISIBLE, "");
+  const trimmed = visible.trim();
+  return trimmed === "" ? undefined : trimmed.slice(-WRAP_LEAD_CHARS);
+}
 
 /** How many lines one citation may name. A label, its amount and one more is
  * as much as a single value ever needs; beyond that it is a region, not a
@@ -111,6 +160,36 @@ export function pageLines(text: string): PageLine[] {
     }
     if (brk < 0) break;
     start = brk + 1;
+  }
+  // The wrap tokens, once the whole page is split. A piece with a cut edge
+  // does not get one: a cut is unknown, which already refuses everything
+  // touching it, and the piece beyond it is the same printed line rather
+  // than the next one.
+  //
+  // A blank line is looked past rather than treated as an edge. A parsed page
+  // puts an empty line between a figure and its marker as readily as it puts
+  // none, and stopping at one offered the unsigned value for a page printing
+  // `45.00`, a blank line, and `CR`.
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    if (!line.cutStart) {
+      for (let at = index - 1; at >= 0; at -= 1) {
+        const tail = tailOf(lines[at]!.text);
+        if (tail !== undefined) {
+          line.previousToken = tail;
+          break;
+        }
+      }
+    }
+    if (!line.cutEnd) {
+      for (let at = index + 1; at < lines.length; at += 1) {
+        const lead = leadOf(lines[at]!.text);
+        if (lead !== undefined) {
+          line.nextToken = lead;
+          break;
+        }
+      }
+    }
   }
   return lines;
 }
