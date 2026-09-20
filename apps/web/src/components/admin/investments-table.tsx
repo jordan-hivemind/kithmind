@@ -435,7 +435,9 @@ export function InvestmentsTable({
             <Detail
               label={
                 <span className="tabular-nums text-gray-500">
-                  x {tableDecimal(row.original.exchangeRate)}
+                  {row.original.exchangeRate === null
+                    ? ""
+                    : `x ${tableDecimal(row.original.exchangeRate)}`}
                 </span>
               }
               detail="Converted at the rate recorded with this entry"
