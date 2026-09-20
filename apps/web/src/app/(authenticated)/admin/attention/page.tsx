@@ -14,7 +14,11 @@ export default async function AdminAttentionPage() {
   if (data === null) redirect("/sign-in");
   return (
     <AttentionTable
-      initial={{ items: data.items, counts: data.counts }}
+      initial={{
+        items: data.items,
+        nextCursor: data.nextCursor,
+        counts: data.counts,
+      }}
       spaceId={data.spaceIds[0] ?? null}
     />
   );

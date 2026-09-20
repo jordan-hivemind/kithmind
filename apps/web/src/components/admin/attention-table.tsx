@@ -2,26 +2,27 @@
 
 // The Needs attention screen (ADM-8a): the first slice of section 5 of
 // docs/plans/2026-09-19-investment-document-matching.md -- the quiet,
-// dismissible queue itself. No matching or detector logic shows up here; the
-// only rows today are typed-extraction gate failures (`severity: 'info'` by
-// default), so an empty table is the common case until a later slice adds a
-// detector that raises one.
+// dismissible queue itself. Low-priority rows appear by default so the owner
+// can discover the working queue, while their `info` severity stays visible.
 //
 // Owner's principle, quoted here because it drove every default below: this
 // is a best-effort personal store; records will be incomplete; do not chase
 // the owner for information he does not have; warnings about holes must
 // never become so noisy that he misses what he cares about. That is why the
-// default view is narrow (open, `attention`/`alert` only) and why "not worth
-// backfilling" is one click with no confirmation on a single row -- the
-// owner already decided, twice over, that this table exists so items leave
-// it quietly.
+// default view keeps severity visible, lets the owner hide info, and lets an
+// item leave quietly when it is not needed.
 
 import * as AlertDialog from "@radix-ui/react-alert-dialog";
 import type { admin } from "@repo/kith-store";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { type ColumnDef } from "@tanstack/react-table";
 import { useCallback, useMemo, useState } from "react";
 
+import { PageHeader } from "@/components/ui/controls";
 import {
   DataTable,
   Detail,
@@ -45,6 +46,7 @@ const WATCHED = { attention: ["corrections", "attention_mutes"] } as const;
 const ATTENTION_KEY = ["attention"];
 
 type Item = admin.AttentionItem;
+type AttentionPage = { items: Item[]; nextCursor: string | null };
 
 const SEVERITY_TONE: Record<Item["severity"], "neutral" | "accent" | "warn"> = {
   info: "neutral",
@@ -58,6 +60,89 @@ const STATE_TONE: Record<Item["state"], "neutral" | "accent" | "warn"> = {
   dismissed: "neutral",
   resolved: "neutral",
 };
+
+const REASON_COPY: Record<string, string> = {
+  quote_not_found: "The quoted evidence could not be found on the cited page.",
+  span_unresolved:
+    "The quoted evidence was found but could not be linked to a precise passage.",
+  unknown_field:
+    "The extraction named a field this document type does not use.",
+  value_not_in_quote:
+    "The extracted value does not appear in the text that was cited for it.",
+  money_unparsable: "The extracted amount is not an exact amount and currency.",
+  date_unparsable: "The extracted date is not a valid calendar date.",
+  date_ambiguous:
+    "The extracted numeric date could be read in more than one order.",
+  number_unparsable: "The extracted number is not an exact numeric value.",
+  line_items_mismatch: "The line items do not add up to the stated total.",
+  input_truncated: "Only part of this document was read during extraction.",
+  extraction_model_refused:
+    "The requested extraction model was unavailable; a default model read the document instead.",
+  malformed_statement:
+    "The extraction returned a value that could not be used.",
+  citation_missing:
+    "The extraction gave no supporting citation for this value.",
+  correction_orphaned:
+    "A previous correction no longer matches the latest extracted line.",
+  line_items_partial: "Some line items could not be verified.",
+  citation_page_unknown:
+    "The extraction cited a page that is not in this document.",
+  citation_out_of_range:
+    "The extraction cited lines that are not in the cited page.",
+  conflicting_values:
+    "The extraction returned conflicting values for the same field.",
+};
+
+function issueLabel(item: Item): string {
+  if (item.detector === "investment_link_date") {
+    return "Investment entry date changed";
+  }
+  if (item.detector !== "extraction") {
+    return `Review ${item.targetKind}`;
+  }
+  const subject = humanize(item.fieldName ?? "this document");
+  const kind = humanize(item.document?.kind ?? item.targetKind);
+  return `Couldn’t verify ${subject} in this ${kind}`;
+}
+
+function issueExplanation(item: Item): string {
+  if (item.detector === "investment_link_date") {
+    return "A linked document changed this investment entry date.";
+  }
+  return (
+    (item.reason === null ? undefined : REASON_COPY[item.reason]) ??
+    "This extraction check needs review."
+  );
+}
+
+function humanize(value: string): string {
+  return value.replaceAll("_", " ");
+}
+
+function attentionParams(
+  showInfo: boolean,
+  showEverything: boolean,
+  cursor?: string,
+): URLSearchParams {
+  const params = new URLSearchParams();
+  params.set("severity", showInfo ? "info,attention,alert" : "attention,alert");
+  if (showEverything) params.set("state", "open,snoozed,dismissed,resolved");
+  if (cursor !== undefined) params.set("cursor", cursor);
+  return params;
+}
+
+async function fetchAttention(
+  showInfo: boolean,
+  showEverything: boolean,
+  cursor?: string,
+): Promise<AttentionPage> {
+  const response = await fetch(
+    `/api/kith/attention?${attentionParams(showInfo, showEverything, cursor).toString()}`,
+    { headers: { "Content-Type": "application/json" }, cache: "no-store" },
+  );
+  if (!response.ok) throw new Error("attention fetch failed");
+  return (await response.json()) as AttentionPage;
+}
 
 function todayPlusDays(days: number): string {
   const date = new Date();
@@ -89,10 +174,9 @@ async function send(
   return response;
 }
 
-/** The read-only detail panel a row click, or its own kebab's "Resolve",
- * opens. There is no value-correction form here yet -- that is the
- * extraction corrections editor the plan expects to reuse once it exists --
- * so this is the evidence side: what fired, on what, and why. */
+/** The read-only detail panel a row click, or its own kebab's "Review",
+ * opens. There is no value-correction form here yet, so the available actions
+ * only defer or remove an item from this queue. */
 function AttentionDrawer({
   item,
   onOpenChange,
@@ -107,33 +191,40 @@ function AttentionDrawer({
   onUndo: () => void;
 }) {
   return (
-    <Drawer open onOpenChange={onOpenChange} title="Attention item">
+    <Drawer open onOpenChange={onOpenChange} title={issueLabel(item)}>
       <div className="flex flex-col gap-2 text-xs text-gray-700">
         <div className="flex items-center gap-2">
           <Tag tone={SEVERITY_TONE[item.severity]}>{item.severity}</Tag>
           <Tag tone={STATE_TONE[item.state]}>{item.state}</Tag>
-          <Tag>{item.detector}</Tag>
+          <Tag>{item.detector === "extraction" ? "extraction" : "check"}</Tag>
         </div>
         <div>
-          <span className="text-gray-400">What</span>{" "}
-          {item.document?.kind ?? item.targetKind}
-          {item.fieldName === null ? "" : ` · ${item.fieldName}`}
+          <span className="text-gray-400">Why</span> {issueExplanation(item)}
         </div>
-        {item.reason === null ? null : (
-          <div>
-            <span className="text-gray-400">Reason</span>{" "}
-            {item.reason.replaceAll("_", " ")}
-          </div>
-        )}
         {item.document === null ? null : (
           <div>
             <span className="text-gray-400">Document</span>{" "}
             {item.document.title ?? item.document.sourceItemId}
           </div>
         )}
-        {item.originalValue === null ? null : (
+        {item.detector === "investment_link_date" ? (
+          <>
+            <div>
+              <span className="text-gray-400">Previous date</span>{" "}
+              <span className="break-all">
+                {JSON.stringify(item.originalValue)}
+              </span>
+            </div>
+            <div>
+              <span className="text-gray-400">Updated date</span>{" "}
+              <span className="break-all">
+                {JSON.stringify(item.correctedValue)}
+              </span>
+            </div>
+          </>
+        ) : item.originalValue === null ? null : (
           <div>
-            <span className="text-gray-400">Reading</span>{" "}
+            <span className="text-gray-400">Model reading</span>{" "}
             <span className="break-all">
               {JSON.stringify(item.originalValue)}
             </span>
@@ -145,14 +236,14 @@ function AttentionDrawer({
           <button type="button" className={buttonClass} onClick={onUndo}>
             Undo
           </button>
-        ) : (
+        ) : item.state === "resolved" ? null : (
           <>
             <button
               type="button"
               className={buttonClass}
               onClick={() => onDismiss("not_worth_backfilling")}
             >
-              Not worth backfilling
+              Mark not needed
             </button>
             {SNOOZE_PRESETS_DAYS.map((days) => (
               <button
@@ -175,7 +266,7 @@ export function AttentionTable({
   initial,
   spaceId,
 }: {
-  initial: { items: Item[]; counts: { attention: number; alert: number } };
+  initial: AttentionPage & { counts: { attention: number; alert: number } };
   /** Where a bulk action or a mute is written. The screen has no space
    * picker: the owner has one household. */
   spaceId: string | null;
@@ -183,7 +274,9 @@ export function AttentionTable({
   useLiveChanges(WATCHED);
   const queryClient = useQueryClient();
   const [toast, setToast] = useState<string | null>(null);
-  const [showInfo, setShowInfo] = useState(false);
+  // Current checks include `info` rows, so a severity-only default would make
+  // the working queue look empty.
+  const [showInfo, setShowInfo] = useState(true);
   const [showEverything, setShowEverything] = useState(false);
   const [detailId, setDetailId] = useState<string | null>(null);
   const [beforeDate, setBeforeDate] = useState("");
@@ -213,29 +306,22 @@ export function AttentionTable({
     () => [...ATTENTION_KEY, { showInfo, showEverything }],
     [showInfo, showEverything],
   );
-  const isDefaultView = !showInfo && !showEverything;
-  const { data } = useQuery({
-    queryKey,
-    queryFn: async (): Promise<Item[]> => {
-      const params = new URLSearchParams();
-      // The store defaults severity to attention/alert when the param is
-      // absent, so "show info too" has to name every severity explicitly
-      // rather than omitting the filter.
-      params.set(
-        "severity",
-        showInfo ? "info,attention,alert" : "attention,alert",
-      );
-      if (showEverything) params.set("state", "open,snoozed,dismissed");
-      const response = await fetch(`/api/kith/attention?${params.toString()}`, {
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-      });
-      if (!response.ok) throw new Error("attention fetch failed");
-      return ((await response.json()) as { items: Item[] }).items;
-    },
-    initialData: isDefaultView ? initial.items : undefined,
-  });
-  const items = data ?? [];
+  const isDefaultView = showInfo && !showEverything;
+  const { data, fetchNextPage, hasNextPage, isFetchingNextPage } =
+    useInfiniteQuery({
+      queryKey,
+      initialPageParam: undefined as string | undefined,
+      queryFn: ({ pageParam }) =>
+        fetchAttention(showInfo, showEverything, pageParam),
+      getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+      initialData: isDefaultView
+        ? {
+            pages: [{ items: initial.items, nextCursor: initial.nextCursor }],
+            pageParams: [undefined],
+          }
+        : undefined,
+    });
+  const items = data?.pages.flatMap((page) => page.items) ?? [];
 
   const fail = useCallback((error: unknown) => {
     setToast(error instanceof Error ? error.message : "Request failed");
@@ -355,30 +441,20 @@ export function AttentionTable({
       },
       {
         id: "what",
-        header: "What",
-        accessorFn: (row) =>
-          `${row.document?.kind ?? row.targetKind}${row.fieldName ? ` ${row.fieldName}` : ""}`,
+        header: "Needs attention",
+        accessorFn: issueLabel,
         cell: ({ row }) => (
           <Detail
-            label={
-              <span>
-                {row.original.document?.kind ?? row.original.targetKind}
-                {row.original.fieldName === null
-                  ? ""
-                  : ` · ${row.original.fieldName}`}
-              </span>
-            }
-            detail={row.original.targetId}
+            label={<span>{issueLabel(row.original)}</span>}
+            detail={issueExplanation(row.original)}
           />
         ),
       },
       {
         id: "reason",
-        header: "Reason",
-        accessorFn: (row) => row.reason ?? "",
-        cell: ({ row }) => (
-          <span>{row.original.reason?.replaceAll("_", " ") ?? ""}</span>
-        ),
+        header: "Check",
+        accessorFn: (row) => row.detector,
+        cell: ({ row }) => <span>{row.original.detector}</span>,
       },
       {
         id: "document",
@@ -422,29 +498,34 @@ export function AttentionTable({
 
   const actions = useMemo<RowAction<Item>[]>(
     () => [
-      { label: "Resolve", onSelect: (item) => setDetailId(item.id) },
+      { label: "Review", onSelect: (item) => setDetailId(item.id) },
       {
-        label: "Not worth backfilling",
-        hidden: (item) => item.state === "dismissed",
+        label: "Mark not needed",
+        hidden: (item) =>
+          item.state === "dismissed" || item.state === "resolved",
         onSelect: (item) => void dismissOne(item.id, "not_worth_backfilling"),
       },
       {
         label: "Snooze 7 days",
-        hidden: (item) => item.state === "dismissed",
+        hidden: (item) =>
+          item.state === "dismissed" || item.state === "resolved",
         onSelect: (item) => void snoozeOne(item.id, todayPlusDays(7)),
       },
       {
         label: "Snooze 30 days",
-        hidden: (item) => item.state === "dismissed",
+        hidden: (item) =>
+          item.state === "dismissed" || item.state === "resolved",
         onSelect: (item) => void snoozeOne(item.id, todayPlusDays(30)),
       },
       {
         label: "Mute this detector",
+        hidden: (item) => item.state === "resolved",
         onSelect: (item) => void mute("detector", item.detector),
       },
       {
         label: "Mute this document kind",
-        hidden: (item) => item.document?.kind == null,
+        hidden: (item) =>
+          item.document?.kind == null || item.state === "resolved",
         onSelect: (item) => void mute("document_kind", item.document!.kind!),
       },
       {
@@ -459,7 +540,7 @@ export function AttentionTable({
   const bulkActions = useMemo<RowAction<Item[]>[]>(
     () => [
       {
-        label: "Not worth backfilling",
+        label: "Mark selected not needed",
         danger: true,
         onSelect: (rows) =>
           void dismissByFilter(
@@ -489,6 +570,7 @@ export function AttentionTable({
 
   return (
     <div className="flex flex-col gap-2">
+      <PageHeader title="Needs attention" />
       <div className="flex items-center gap-2">
         <button
           type="button"
@@ -500,7 +582,7 @@ export function AttentionTable({
               : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"
           }`}
         >
-          Show info
+          {showInfo ? "Hide info" : "Show info"}
         </button>
         <button
           type="button"
@@ -512,7 +594,7 @@ export function AttentionTable({
               : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"
           }`}
         >
-          Show snoozed &amp; dismissed
+          {showEverything ? "Hide history" : "Show history"}
         </button>
         {toast === null ? null : (
           <span
@@ -551,11 +633,24 @@ export function AttentionTable({
               disabled={beforeDate === "" || spaceId === null}
               onClick={() => setConfirmBeforeDate(true)}
             >
-              Documents dated before
+              Mark older items not needed
             </button>
           </>
         }
       />
+
+      {hasNextPage ? (
+        <div>
+          <button
+            type="button"
+            className={buttonClass}
+            disabled={isFetchingNextPage}
+            onClick={() => void fetchNextPage()}
+          >
+            {isFetchingNextPage ? "Loading…" : "Load more"}
+          </button>
+        </div>
+      ) : null}
 
       {detail === null ? null : (
         <AttentionDrawer
@@ -586,15 +681,15 @@ export function AttentionTable({
           <AlertDialog.Overlay className="fixed inset-0 z-50 bg-kith-overlay" />
           <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
             <AlertDialog.Title className="kith-section-title">
-              Dismiss {beforeDateCount ?? "…"} item
+              Mark {beforeDateCount ?? "…"} item
               {beforeDateCount === 1 ? "" : "s"} for documents dated before{" "}
               {beforeDate}?
             </AlertDialog.Title>
             <AlertDialog.Description className="mt-1 text-sm text-kith-text-secondary">
-              This can&apos;t be undone. Every open item for a document dated
-              before this date -- by its own extracted date, or its file's
-              modified date when the document states none -- is marked not worth
-              backfilling.
+              Every open item for a document dated before this date -- by its
+              own extracted date, or its file&apos;s modified date when the
+              document states none -- is marked not needed. You can restore an
+              individual item from the history view.
             </AlertDialog.Description>
             <div className="mt-3 flex justify-end gap-2">
               <AlertDialog.Cancel className={buttonClass}>
@@ -611,7 +706,7 @@ export function AttentionTable({
                 }}
                 className={primaryButtonClass}
               >
-                Dismiss
+                Mark not needed
               </AlertDialog.Action>
             </div>
           </AlertDialog.Content>
