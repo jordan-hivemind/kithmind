@@ -241,6 +241,41 @@ turn a reused span into a missing one. The seal still refuses a foreign span, a
 missing or altered parsed row, and any event version or observation on the
 generation that is not extraction's.
 
+### Orphaned extraction spans (ADM-5j)
+
+The rule above recognises an extraction span by its marker or by what points at
+it, so a span with neither is a foreign span and the generation fails to
+verify. Extraction produced exactly that, twice over: it mints a span per cited
+line before it knows the statement survives, and a re-extraction replaces the
+previous run's observations without removing the spans they cited.
+
+The extraction write path therefore ends with a sweep, in the same transaction
+as the write: every `extraction_v1` span on the document's text version that
+nothing references is deleted. Legacy spans stranded before the marker existed
+are removed once by `kith-extraction-span-cleanup`, which is a dry run by
+default, is bounded and transactional per generation, and reaches only spans on
+a sealed text version whose locator has no kind or the `extraction_v1` kind.
+
+Both halves use one reference whitelist, read off the schema rather than
+inferred. A span named by any of these is never removed:
+
+| Table | Column |
+| --- | --- |
+| `processing_generation_payload_manifests` | `evidence_span_ids` |
+| `observations` | `value_evidence` |
+| `event_versions` | `field_evidence` |
+| `documents` | `evidence_span_ids` |
+| `chunks` | `evidence_span_ids` |
+| `worker_parsed_stages` | `evidence_span_ids` |
+| `investment_entries` | `evidence_span_id` |
+| `document_extractions` | `statements[].evidenceSpanId` |
+
+A span carrying `card_extraction_fingerprints` is the card runner's and is out
+of scope. `corrections` names a document, a field or an observation key and
+holds no span id. A whitelist rather than a foreign-key sweep because
+`investment_entries.evidence_span_id` is `ON DELETE SET NULL`: an over-broad
+delete would blank an investment's evidence silently instead of failing.
+
 ## 12. Extraction knobs (ADM-5d)
 
 The model reads a page as numbered lines and cites line ids rather than
