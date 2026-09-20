@@ -49,7 +49,38 @@ export type PageLine = {
   cutStart: boolean;
   /** The same for the right edge. */
   cutEnd: boolean;
+  /**
+   * The last token of the line before this one, and the first token of the
+   * line after it, when that end is a real line edge rather than a cut.
+   *
+   * A printed sentence wraps, and a wrap is a real line edge: a letter
+   * states `raised $2.5` and carries `million` onto the next line, and a
+   * prefix-credit ledger prints `CR` at the end of one line and its amount at
+   * the start of the next. Neither token is ever read as part of the amount
+   * -- assembling a number from two lines is a fabrication -- but the amount
+   * finder refuses one whose wrap token could scale or sign it. Absent when
+   * there is no such line, which is the end of the page.
+   */
+  previousToken?: string;
+  nextToken?: string;
 };
+
+/** Gaps, including the zero-width characters the amount grammar removes. */
+const TOKEN_GAP = /[\s\u200b\u200c\u200d\u2060\ufeff]+/;
+
+/** The first token of a line, and the last. Whitespace-delimited and capped,
+ * because only the characters facing the line break can matter and a
+ * 2,000-character line with no space in it is a hash. */
+function firstToken(text: string): string | undefined {
+  const token = text.trim().split(TOKEN_GAP)[0];
+  return token ? token.slice(0, 32) : undefined;
+}
+
+function lastToken(text: string): string | undefined {
+  const parts = text.trim().split(TOKEN_GAP);
+  const token = parts[parts.length - 1];
+  return token ? token.slice(-32) : undefined;
+}
 
 /** How many lines one citation may name. A label, its amount and one more is
  * as much as a single value ever needs; beyond that it is a region, not a
@@ -111,6 +142,23 @@ export function pageLines(text: string): PageLine[] {
     }
     if (brk < 0) break;
     start = brk + 1;
+  }
+  // The wrap tokens, once the whole page is split. A piece with a cut edge
+  // does not get one: a cut is unknown, which already refuses everything
+  // touching it, and the piece beyond it is the same printed line rather
+  // than the next one.
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    const before = index > 0 ? lines[index - 1] : undefined;
+    const after = index + 1 < lines.length ? lines[index + 1] : undefined;
+    if (!line.cutStart && before) {
+      const token = lastToken(before.text);
+      if (token !== undefined) line.previousToken = token;
+    }
+    if (!line.cutEnd && after) {
+      const token = firstToken(after.text);
+      if (token !== undefined) line.nextToken = token;
+    }
   }
   return lines;
 }

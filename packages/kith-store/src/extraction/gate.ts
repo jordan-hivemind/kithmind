@@ -131,6 +131,12 @@ export type Candidate = {
   end: number;
   cutStart?: boolean;
   cutEnd?: boolean;
+  /** The last token of the line before this one, and the first token of the
+   * line after it. A printed sentence wraps, and the wrap is a real line
+   * edge rather than a cut, so `raised $2.5` on one line and `million` on the
+   * next used to offer two and a half. See `AmountScanOptions`. */
+  previousToken?: string;
+  nextToken?: string;
 };
 
 /**
@@ -145,6 +151,21 @@ export type AmountScanOptions = {
   cutStart?: boolean;
   cutEnd?: boolean;
   percentIsNeutral?: boolean;
+  /**
+   * The last token of the line before this one and the first token of the
+   * line after it, when those ends are real line edges rather than cuts.
+   *
+   * A line end is not the end of a sentence. A letter prints `raised $2.5`
+   * and wraps `million` onto the next line, and the finder offered two and a
+   * half for a page stating two and a half million; a prefix-credit ledger
+   * prints `CR` at the end of one line and the amount at the start of the
+   * next, and the finder offered a charge. The token is not read as part of
+   * the amount -- assembling a number across two lines is the fabrication
+   * this gate exists to prevent -- it only has to be provably unable to
+   * scale or sign it, exactly as a neighbour on the same line does.
+   */
+  previousToken?: string;
+  nextToken?: string;
 };
 
 /** One cited line, as `pageLines` produced it. Structurally a `PageLine`;
@@ -157,6 +178,8 @@ export type CitedLine = {
   end: number;
   cutStart?: boolean;
   cutEnd?: boolean;
+  previousToken?: string;
+  nextToken?: string;
 };
 
 export type GateSuccess = {
@@ -201,6 +224,18 @@ const CURRENCY_MARK =
   "[$\u20ac\u00a3\u00a5\u20b9\u20a9]|(?<![A-Za-z])[A-Z]{3}(?![A-Za-z])";
 
 /**
+ * The same marker, but only a code this store actually prices.
+ *
+ * `CURRENCY_MARK` reads any three capitals, which is right where a loose
+ * reading can only make the grammar *refuse* more. It is wrong where the
+ * marker licenses a rescue: `closeColumnGaps` closed the gap in `FEE 162. 95`
+ * and `QTY 12. 34` on the strength of three capitals that are an English
+ * word, and the rest of this file has validated a code against
+ * {@link SUPPORTED_CURRENCIES} since it was written.
+ */
+const PRICED_MARK = `[$\u20ac\u00a3\u00a5\u20b9\u20a9]|(?<![A-Za-z])(?:${SUPPORTED_CURRENCIES.join("|")})(?![A-Za-z])`;
+
+/**
  * Letters that may follow a price as a tax or status flag.
  *
  * Deliberately small, and deliberately a list of what IS allowed. `T` is tax,
@@ -241,6 +276,17 @@ const MAGNITUDES: Readonly<Record<string, number>> = {
   bn: 9,
   billion: 9,
   billions: 9,
+  // ADM-5k. Each of these spells one number and no other, so reading it is
+  // strictly better than refusing it: `$2.5 trillion` used to offer two and
+  // a half, and `₹2.5 lakh` and `₹2.5 crore` the same. A lakh is a
+  // hundred thousand and a crore is ten million wherever they are printed,
+  // and neither word has a second meaning to weigh against it.
+  trillion: 12,
+  trillions: 12,
+  lakh: 5,
+  lakhs: 5,
+  crore: 7,
+  crores: 7,
 };
 
 /** Longest alternative first, so `mm` is not read as `m` with an `m` left
@@ -250,8 +296,14 @@ const MAGNITUDE_WORD_LIST = [
   "million",
   "thousands",
   "thousand",
+  "trillions",
+  "trillion",
   "billions",
   "billion",
+  "crores",
+  "crore",
+  "lakhs",
+  "lakh",
   "mm",
   "mn",
   "bn",
@@ -302,10 +354,20 @@ const FRACTION_SLASH = "⁄";
  */
 const ZERO_WIDTH = /[\u200b\u200c\u200d\u2060\ufeff]/g;
 
-/** The enclosed and decorated digit blocks: `①`, `⑴`, `⒈`, `🄀`. NFKC turns
- * each of them into an ASCII digit, which is how `①250.00` read as 1,250 and
- * `⒈250` as 1.25. */
-const ENCLOSED_DIGITS = /[①-⓿\u{1f100}-\u{1f10a}]/u;
+/**
+ * Every digit Unicode files as "other number": `①`, `⑴`, `⒈`, `🄀`, `❶`, `➉`
+ * and `½`.
+ *
+ * NFKC turns most of them into an ASCII digit, which is how `①250.00` read as
+ * 1,250 and `⒈250` as 1.25. The ones it does not fold are no safer: the
+ * dingbat circled digits U+2776 to U+2793 reached review as an unpoisoned
+ * `7.❶ 45`, and a digit a reader can read but the grammar cannot is
+ * exactly the character an amount must not be built from.
+ *
+ * A property rather than a list, because a list is what the last four reviews
+ * kept finding a gap in.
+ */
+const ENCLOSED_DIGITS = /^\p{No}$/u;
 
 /**
  * Whether one character is a digit the amount grammar must not read.
@@ -350,16 +412,85 @@ function foldAmountText(raw: string): string {
 }
 
 /**
- * Magnitude abbreviations that are only ever money.
+ * Scale-bearing words the grammar will not price.
  *
- * A single letter is not one of these: `B`, `K` and `M` a space away from
- * digits are a room, a suite and a metre at least as often as a magnitude.
- * The finder refuses those tokens too rather than offering the bare mantissa
- * -- `Room 12 B` offers nothing now, where it used to offer 12 -- but these
- * are listed because they are not even ambiguous: a line printing `2.5 mil`
- * does not print two and a half.
+ * Every one of them says the number beside it is not the number printed, and
+ * none of them says by how much with the certainty {@link MAGNITUDES}
+ * demands. `mil` is a million and a millilitre and a thousandth of an inch;
+ * `mill` is a million and a property-tax mill; `thou` is a thousand and a
+ * thousandth; `bill` is a billion and an invoice; `grand` is a thousand and
+ * an adjective; `tn` is a trillion and Tennessee. So the word joins the span
+ * and {@link parseAmount} refuses the whole token, which is the answer the
+ * owner asked for: `$2.5 mil` is two and a half million or nothing, never
+ * two and a half.
+ *
+ * Deliberately not a single-letter list: `B`, `K` and `M` a space away from
+ * digits are a room, a suite and a metre at least as often as a magnitude,
+ * and {@link CLOSING_LETTERS} refuses those from the other direction.
  */
-const SPACED_MAGNITUDE_WORDS = new Set(["mm", "mn", "bn", "mil", "mio"]);
+const SPACED_MAGNITUDE_WORDS = new Set([
+  "mm",
+  "mn",
+  "bn",
+  "mil",
+  "mio",
+  // ADM-5k: every one of these offered the unscaled number.
+  "mln",
+  "mill",
+  "mills",
+  "thou",
+  "thous",
+  "grand",
+  "bil",
+  "bill",
+  "bills",
+  "tn",
+  "trn",
+  "tril",
+  "trill",
+  "lac",
+  "lacs",
+]);
+
+/**
+ * Words that change what the number beside them measures.
+ *
+ * A unit is not a scale, so none of these belongs in {@link MAGNITUDES}, and
+ * refusing them is the only reading that cannot be wrong: `45 cents` is not
+ * forty-five dollars and `45.00 percent` is not forty-five of anything a
+ * money field stores. `bps` and `basis` are hundredths of a percent, and
+ * `shares`, `units`, `per`, `each` and `ea` each say the number is a count
+ * or a rate rather than a sum.
+ *
+ * **Only directly after the amount**, which is the one place a unit can
+ * stand. `Cost basis 1,234.56` prints a money value and `basis` is its
+ * label, so the word is neutral on the left; `1,234.56 basis points` is not
+ * a money value at all. Scale words are refused on both sides instead,
+ * because that is the rule the grammar has had since ADM-5g and narrowing it
+ * would be a weakening rather than a fix.
+ *
+ * Neutral for the `number` value type, which is dimensionless by
+ * construction and already reads `12 %` as twelve. See `percentIsNeutral`.
+ */
+const UNIT_WORDS = new Set([
+  "cent",
+  "cents",
+  "percent",
+  "percents",
+  "percentage",
+  "pct",
+  "bp",
+  "bps",
+  "basis",
+  "share",
+  "shares",
+  "unit",
+  "units",
+  "per",
+  "each",
+  "ea",
+  "apiece",
+]);
 
 /** Magnitude *words*, which scale a space away from the digits. */
 const MAGNITUDE_WORDS = new Set<string>(
@@ -972,7 +1103,7 @@ function listOrdinalStart(
  * number or change one. A digit, a letter, a point or a sign each say the run
  * is something other than cents. */
 const AFTER_CENTS =
-  "(?:$|[\\s\\u200b\\u200c\\u200d\\u2060\\ufeff,;!?*\"\\u201d)\\]}|\\u00a6\\u2502\\u2503\\u2551])";
+  "(?:$|[,;!?*\"\\u201d)\\]}|\\u00a6\\u2502\\u2503\\u2551]|[\\s\\u200b\\u200c\\u200d\\u2060\\ufeff](?![\\s\\u200b\\u200c\\u200d\\u2060\\ufeff]*\\p{Ll}))";
 
 /**
  * A parsed receipt prints "$ 165 .00" as readily as "$165.00": the space is a
@@ -1000,22 +1131,20 @@ const AFTER_CENTS =
  * (`€642. 73.-` read as a credit of 642.73). None of those numbers is on
  * the page, and each of them now reads as the ambiguous pair it is.
  */
+const GAP_BEFORE_POINT = new RegExp(
+  `(${PRICED_MARK})([ \\u00a0]*)(\\d+)[ \\u00a0]\\.(?=\\d\\d(?!\\d))`,
+  "gu",
+);
+
+const GAP_AFTER_POINT = new RegExp(
+  `(${PRICED_MARK})([ \\u00a0]*)(\\d+\\.)[ \\u00a0](?=\\d\\d${AFTER_CENTS})`,
+  "gu",
+);
+
 function closeColumnGaps(text: string): string {
   return text
-    .replace(
-      new RegExp(
-        `(${CURRENCY_MARK})([ \\u00a0]*)(\\d+)[ \\u00a0]\\.(?=\\d\\d(?!\\d))`,
-        "g",
-      ),
-      "$1$2$3.",
-    )
-    .replace(
-      new RegExp(
-        `(${CURRENCY_MARK})([ \\u00a0]*)(\\d+\\.)[ \\u00a0](?=\\d\\d${AFTER_CENTS})`,
-        "g",
-      ),
-      "$1$2$3",
-    );
+    .replace(GAP_BEFORE_POINT, "$1$2$3.")
+    .replace(GAP_AFTER_POINT, "$1$2$3");
 }
 
 /**
@@ -1037,6 +1166,14 @@ const GAP_RUN = /[\s​‌‍⁠﻿]+/g;
  * written for one space. */
 function collapseGaps(text: string): string {
   return text.replace(GAP_RUN, " ");
+}
+
+/** The run of digits and separators that ends at `end`: what a span has read
+ * so far, without the currency marker or sign in front of it. */
+function headOfDigits(text: string, end: number): string {
+  let from = end;
+  while (from > 0 && /[\d.,]/.test(text[from - 1]!)) from -= 1;
+  return text.slice(from, end);
 }
 
 /** The nearest non-gap character strictly before `at`, or -1 for the start of
@@ -1227,8 +1364,16 @@ function amountSpanAt(text: string, digit: number): AmountSpan {
       // and a grouping separator is never two spaces wide. Everything this
       // does not settle is refused for the whole region -- `$1  000 000`
       // offers a million or nothing, never the 1 the fourth review found.
+      //
+      // And the head has to be a bare run of digits. A decimal head may never
+      // take space groups: `$12.99 100 200` is a price and two cells, and the
+      // span swallowed all three and offered 12.991002 -- a number with the
+      // cents of one cell and the digits of the others. Only the last
+      // character was checked, so a separator further back went unseen. A
+      // head that does carry one falls through to the neighbour rule, which
+      // pastes the two together, reads 12.991 and refuses both.
       if (
-        !/[.,]/.test(text[end - 1] ?? "") &&
+        !/[.,]/.test(headOfDigits(text, end)) &&
         /^\d{3}(?!\d)/.test(text.slice(afterToken))
       ) {
         let probe = end;
@@ -1326,17 +1471,97 @@ function neighboursAreNeutral(
 ): boolean {
   const left = beforeGap(text, span.start);
   if (left < 0) {
-    if (options?.cutStart) return false;
+    if (!edgeIsNeutral(-1, options)) return false;
   } else if (!neutralNeighbour(text, span, left, -1, options)) {
     return false;
   }
   const right = afterGap(text, span.end);
   if (right >= text.length) {
-    if (options?.cutEnd) return false;
+    if (!edgeIsNeutral(1, options)) return false;
   } else if (!neutralNeighbour(text, span, right, 1, options)) {
     return false;
   }
   return true;
+}
+
+/**
+ * What stands past one end of this text.
+ *
+ * A cut is unknown and refuses outright. A real line edge is a line edge, and
+ * a printed sentence wraps across one: the wrap token is asked the same
+ * question a neighbour on the same line is asked. Nothing beyond the end at
+ * all is the end of the page, which can change no number.
+ */
+function edgeIsNeutral(
+  direction: -1 | 1,
+  options?: AmountScanOptions,
+): boolean {
+  if (direction === -1 ? options?.cutStart : options?.cutEnd) return false;
+  const token =
+    direction === -1 ? options?.previousToken : options?.nextToken;
+  return neutralAcrossTheWrap(token, direction);
+}
+
+/** What a token may open or close with and still be unable to sign or scale
+ * the amount on the line beside it. A sign, a bracket, a percent sign and a
+ * currency symbol each can. */
+const WRAP_SIGNS = new Set([
+  "-",
+  "+",
+  "(",
+  ")",
+  "%",
+  ...CURRENCY_SYMBOL_CHARS,
+]);
+
+/**
+ * Whether the token on the other side of a real line break leaves this
+ * amount alone.
+ *
+ * Only scale and sign are asked about, and deliberately nothing else. A
+ * column receipt prints its amounts one per line, so a digit on the next
+ * line is the ordinary case and refusing it would cost every receipt in the
+ * store; a word is a label for the same reason. What a line break may not
+ * hide is a magnitude, a `CR`, a sign or a bracket -- the wrap of one
+ * printed token, which is the only way the next line can change this
+ * number.
+ *
+ * An absent token is a line with nothing after it, and that is the end of
+ * the page rather than an unknown.
+ */
+function neutralAcrossTheWrap(
+  token: string | undefined,
+  direction: -1 | 1,
+): boolean {
+  if (!token) return true;
+  const folded = foldAmountText(token);
+  if (folded === "") return true;
+  const facing = direction === 1 ? folded[0]! : folded[folded.length - 1]!;
+  if (WRAP_SIGNS.has(facing)) return false;
+  const word =
+    direction === 1 ? /^\p{L}+/u.exec(folded) : /\p{L}+$/u.exec(folded);
+  if (!word) return true;
+  // A letter run glued to digits is an identifier, a form name or half a
+  // wrapped amount, and none of them is a word this rule can clear.
+  const glued =
+    direction === 1
+      ? folded.slice(word[0].length, word[0].length + 1)
+      : folded.slice(
+          folded.length - word[0].length - 1,
+          folded.length - word[0].length,
+        );
+  if (/\d/.test(glued)) return false;
+  // A single letter is refused on the same line because the finder cannot
+  // tell `$2.5 M` from `Room 12 B`. Across a line break it is refused only
+  // when it is one of the letters that carries a scale or a sign, because a
+  // form labels its boxes with the others and a K-1's `L Ending capital
+  // account` would otherwise refuse the box above it. That is the whole of
+  // what this rule was asked to catch: a wrapped magnitude or marker, never
+  // the ordinary next line.
+  if (word[0].length === 1) {
+    return !CLOSING_LETTERS.has(word[0].toLowerCase());
+  }
+  return neutralWord(word[0], direction);
 }
 
 /**
@@ -1376,10 +1601,12 @@ function neutralNeighbour(
   direction: -1 | 1,
   options?: AmountScanOptions,
 ): boolean {
-  /** Whether the text ends in a cut on one side. A cut edge hides the rest
-   * of whatever touches it -- `...$3.0 mill` is a cut `$3.0 million`, and
-   * `...55,390.` is a cut `55,390.38` -- so every scan that reaches an end
-   * asks, not only the ones where the span itself touched it. */
+  /** Whether the end of the text on one side leaves this amount alone. A cut
+   * edge hides the rest of whatever touches it -- `...$3.0 mill` is a cut
+   * `$3.0 million`, and `...55,390.` is a cut `55,390.38` -- and a real line
+   * edge may be a wrap, so every scan that reaches an end asks, not only the
+   * ones where the span itself touched it. */
+  const edge = (side: -1 | 1): boolean => edgeIsNeutral(side, options);
   const cutOn = (side: -1 | 1): boolean =>
     Boolean(side === -1 ? options?.cutStart : options?.cutEnd);
   let at = start;
@@ -1400,16 +1627,38 @@ function neutralNeighbour(
       // A token that runs into a cut is only the part of itself that survived.
       if (token.from <= 0 && cutOn(-1)) return false;
       if (token.to >= text.length && cutOn(1)) return false;
+      // A token the folding poisoned is a token this grammar cannot read, and
+      // an unreadable neighbour is not a *separate* one: `380 3१ 24.5`
+      // (with a Devanagari digit inside the second run) offered 380, because
+      // the run beside it had been cut in half by the poison mark and the two
+      // halves would not paste back into one amount. Unknown is refused, the
+      // same answer a cut edge gets.
+      if (poisonedAround(text, token)) return false;
       if (/\d/.test(text.slice(token.from, token.to))) {
         return !joinsIntoOneAmount(text, span, token);
       }
-      return neutralWord(text.slice(token.from, token.to));
+      const word = text.slice(token.from, token.to);
+      // A currency code that provably introduces the *next* number belongs to
+      // that number and settles nothing about this one: `Column CAD 12 USD 15`
+      // prints twelve Canadian dollars whichever amount the `USD` leads, and
+      // the finder used to refuse the line outright. This is the question
+      // `ownsTrailingMarker` asks, asked from the neighbour rule's side --
+      // and it is only ever asked about a marker the span did not take, so a
+      // marker that *could* be this amount's has already gone into the span.
+      if (
+        direction === 1 &&
+        SUPPORTED_CURRENCY_SET.has(word.toUpperCase()) &&
+        /^\d/.test(text.slice(afterGap(text, token.to)))
+      ) {
+        return true;
+      }
+      return neutralWord(word, direction, options);
     }
     if (unit === "." || unit === ",") {
       // A separator is part of a *number* only when a digit is reachable
       // through it.
       const digits = digitThrough(text, at, direction);
-      if (digits === "edge") return !cutOn(direction);
+      if (digits === "edge") return edge(direction);
       if (digits !== undefined) {
         if (digits.from <= 0 && cutOn(-1)) return false;
         if (digits.to >= text.length && cutOn(1)) return false;
@@ -1432,25 +1681,59 @@ function neutralNeighbour(
       // credit, and `1.<gap>USD-` offered a positive one.
       const beyond =
         direction === -1 ? beforeGap(text, at) : afterGap(text, at + 1);
-      if (beyond < 0) return !cutOn(-1);
-      if (beyond >= text.length) return !cutOn(1);
+      if (beyond < 0) return edge(-1);
+      if (beyond >= text.length) return edge(1);
       at = beyond;
       continue;
     }
-    if (NEUTRAL_PUNCTUATION.has(unit)) return true;
+    // Neutral punctuation is not a wall either. A bar, a semicolon or a quote
+    // mark cannot sign or scale a number, but it cannot hide what stands
+    // behind it: `| Payment | 45.00 | CR |` printed a credit and offered a
+    // charge, `$45.00 | million` offered forty-five, and `-| 45.00` offered a
+    // positive. A pipe-rendered table is how many of this store's parsed
+    // receipts print a column, so the bar still costs nothing when the cell
+    // beyond it is a label or the end of the line -- `| Total | 1,234.56 |`
+    // reads exactly as it did.
+    if (NEUTRAL_PUNCTUATION.has(unit)) {
+      const beyond =
+        direction === -1 ? beforeGap(text, at) : afterGap(text, at + 1);
+      if (beyond < 0) return edge(-1);
+      if (beyond >= text.length) return edge(1);
+      at = beyond;
+      continue;
+    }
     if (CONDITIONAL_JOINERS.has(unit)) {
       const touching =
         direction === -1 ? at === span.start - 1 : at === span.end;
       if (touching) return false;
       const beyond =
         direction === -1 ? beforeGap(text, at) : afterGap(text, at + 1);
-      if (beyond < 0) return !cutOn(-1);
-      if (beyond >= text.length) return !cutOn(1);
+      if (beyond < 0) return edge(-1);
+      if (beyond >= text.length) return edge(1);
       return !/\d/.test(text[beyond]!);
     }
     return false;
   }
   return false;
+}
+
+/**
+ * Whether the token at `token` is a piece of something the folding poisoned.
+ *
+ * {@link foldAmountText} replaces every digit this grammar must not read with
+ * a fraction slash, which is glued to the digits and parses as nothing. An
+ * alphanumeric run stops at that mark, so the neighbour rule was handed half
+ * a token and asked whether it joined -- and half a token joins nothing. The
+ * mark on either side of the run says the run is a fragment of a token the
+ * grammar cannot read, and unknown is refused.
+ */
+function poisonedAround(
+  text: string,
+  token: { from: number; to: number },
+): boolean {
+  return (
+    text[token.from - 1] === FRACTION_SLASH || text[token.to] === FRACTION_SLASH
+  );
 }
 
 /** The whole letters-and-digits run the character at `at` belongs to. */
@@ -1465,10 +1748,20 @@ function alphanumericRun(
   return { from, to };
 }
 
-/** A word that cannot scale or sign the number beside it. A single letter
- * always can -- `M`, `K`, `B`, `C`, `D` and the tax flags are all one letter
- * -- so a single letter is never neutral. */
-function neutralWord(word: string): boolean {
+/**
+ * A word that cannot scale, sign or re-measure the number beside it.
+ *
+ * A single letter always can -- `M`, `K`, `B`, `C`, `D` and the tax flags are
+ * all one letter -- so a single letter is never neutral. A scale word is
+ * refused whichever side it stands on. A unit word is refused only where a
+ * unit can stand, which is after its quantity, and is neutral for the
+ * dimensionless `number` type. See {@link UNIT_WORDS}.
+ */
+function neutralWord(
+  word: string,
+  direction: -1 | 1,
+  options?: AmountScanOptions,
+): boolean {
   if (word.length < 2) return false;
   const lower = word.toLowerCase();
   if (lower === "cr" || lower === "dr") return false;
@@ -1477,6 +1770,9 @@ function neutralWord(word: string): boolean {
     return false;
   }
   if (SUPPORTED_CURRENCY_SET.has(word.toUpperCase())) return false;
+  if (UNIT_WORDS.has(lower)) {
+    return direction === -1 || Boolean(options?.percentIsNeutral);
+  }
   return true;
 }
 
@@ -1530,22 +1826,43 @@ function joinsIntoOneAmount(
   // and it keeps the check linear on a pathological line.
   if (end - start > 512) return true;
   const region = collapseGaps(text.slice(start, end));
-  if (parseAmount(region) !== undefined) return true;
-  // The same region without its currency marker.
+  // Every way the printed text between the two runs could be one token.
   //
-  // "Do these two runs join" is a question about digits and separators, and
-  // the marker can only make the joined reading *harder* to price: a euro
-  // amount refuses `5.123` outright, because a dot is a grouping separator
-  // where euros are printed. Without this, `\u20ac5. 123` read as two
-  // separate cells and offered 5 and 123 for a line that may well print five
-  // point one two three -- while `$5. 123` refused both, which is the answer
-  // a currency cannot be allowed to change.
+  // "Do these two runs join" is a question about digits and separators, and a
+  // reading refused for any *other* reason is no evidence they are separate.
+  // Three things had to be asked besides the region as it stands, and each of
+  // them was a wrong number the finder offered:
   //
-  // Only a marker the region *opens* with. One standing between the two
-  // runs is evidence they are separate -- it introduces the second of them,
-  // which is what `Paid 09/01/2026 $42.00` prints.
-  const bare = region.replace(new RegExp(`^(?:${CURRENCY_MARK})[ ]?`), "");
-  return bare !== region && parseAmount(bare) !== undefined;
+  //   - **Without a currency marker the region opens with.** A marker can
+  //     only make the joined reading harder to price: a euro amount refuses
+  //     `5.123` outright, because a dot is a grouping separator where euros
+  //     are printed. Without this, `\u20ac5. 123` read as two separate cells
+  //     and offered 5 and 123 -- while `$5. 123` refused both, which is the
+  //     answer a currency cannot be allowed to change. Only a marker the
+  //     region *opens* with: one standing between the two runs introduces
+  //     the second of them, which is what `Paid 09/01/2026 $42.00` prints.
+  //   - **With a marker it does not print.** `1, 234K` refuses only because a
+  //     magnitude letter without a currency marker means the token is not an
+  //     amount, and that is a rule about `401K` rather than a proof that the
+  //     `1` stands alone. The finder offered the 1.
+  //   - **Without a tail that belongs to neither run.** The neighbouring
+  //     span swallows a closing letter, and that letter is what made the
+  //     joined reading unreadable: `Refs 1, 234 m` offered the 1, because
+  //     `1,234 m` is a magnitude abbreviation a space away from its digits
+  //     and this grammar refuses those whole.
+  const readings = new Set<string>();
+  const consider = (one: string): void => {
+    readings.add(one);
+    const bare = one.replace(new RegExp(`^(?:${CURRENCY_MARK})[ ]?`), "");
+    readings.add(bare === one ? `$${one}` : bare);
+  };
+  consider(region);
+  const trimmed = region.replace(/[^\d]+$/u, "");
+  if (trimmed !== "" && trimmed !== region) consider(trimmed);
+  for (const reading of readings) {
+    if (parseAmount(reading) !== undefined) return true;
+  }
+  return false;
 }
 
 function nearestDigit(text: string, token: { from: number; to: number }): number {
@@ -1644,6 +1961,8 @@ function amountInQuote(
   return amountsInText(quote.text, {
     cutStart: quote.cutStart,
     cutEnd: quote.cutEnd,
+    previousToken: quote.previousToken,
+    nextToken: quote.nextToken,
     percentIsNeutral,
   }).some((found) => compareDecimals(found, amount) === 0);
 }
@@ -2280,6 +2599,8 @@ export function candidatesFor(
     end: line.end,
     cutStart: line.cutStart,
     cutEnd: line.cutEnd,
+    previousToken: line.previousToken,
+    nextToken: line.nextToken,
   }));
   const textual =
     valueType === "text" ||
@@ -2299,6 +2620,8 @@ export function candidatesFor(
         end: line.end,
         cutStart: previous.cutStart,
         cutEnd: line.cutEnd,
+        previousToken: previous.previousToken,
+        nextToken: line.nextToken,
       });
     }
   }

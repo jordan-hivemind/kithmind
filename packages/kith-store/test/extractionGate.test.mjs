@@ -12,6 +12,7 @@ import {
   checkValue,
   currencyOnPage,
   itemsSumToTotal,
+  pageLines,
   parseAmount,
   seedDocumentTypes,
   STARTER_DOCUMENT_TYPES,
@@ -926,8 +927,21 @@ const QUOTE_SPEC = [
   ["$82. 129961.-", []],
   ["$94. 504. billion", []],
   ["$ 165 .00", ["165"]],
-  ["$82. 12 due", ["82.12"]],
-  ["$94. 50 total", ["94.5"]],
+  // ADM-5k: and the cents may not be followed by a gap and a lowercase word.
+  // `We paid $500. 25 people` is prose with a full stop in it, and the rule
+  // closed the gap and offered 500.25 -- a number no reader of that sentence
+  // would say. A receipt cell and a sentence are the same shape here, so both
+  // readings are refused and these two rows lose their amount with it.
+  ["We paid $500. 25 people", []],
+  ["$82. 12 due", []],
+  ["$94. 50 total", []],
+  ["$82. 12 DUE", ["82.12"]],
+  // ADM-5k: and the marker has to be a currency this store prices. Three
+  // capitals are a word far more often than a code everywhere else in this
+  // file, and the gap-closing rule was reading any of them.
+  ["FEE 162. 95", []],
+  ["QTY 12. 34", []],
+  ["USD 162. 95", ["162.95"]],
   // ADM-5h re-review: and the cents have to end there. A letter after them
   // makes the run a box label or a magnitude, a second point makes it the
   // first half of something longer, and a sign makes it a ledger's own.
@@ -968,7 +982,11 @@ const QUOTE_SPEC = [
   // the model's value still has to be one the line prints, and a bare run of
   // digits can never repair a citation onto a money field (`repairTarget`).
   ["1 Ordinary business income 12,345.", ["1", "12345"]],
-  ["12 Mill Lane", ["12"]],
+  // ADM-5k: `mill` is a million and a property-tax mill, and the finder
+  // cannot tell a street from a fund. The row used to offer 12; refusing it
+  // is what makes `$2.5 mill` refuse too, and that is the reading that
+  // mattered.
+  ["12 Mill Lane", []],
 
   // -------------------------------------------------------------------------
   // ADM-5g round five: every counterexample the four reviews produced.
@@ -1062,10 +1080,114 @@ const QUOTE_SPEC = [
   ["Credit 250.00)", []],
 
   // Recall-only rows from the same review: nothing wrong is offered, and an
-  // amount the page states is simply not read.
+  // amount the page states is simply not read. `(3) 45.00` still is: a
+  // closing parenthesis on the left is a footnote marker or an unbalanced
+  // accounting one, and telling the two apart is a judgment this grammar
+  // does not make.
   ["Note (3) 45.00", []],
-  ["Column CAD 12 USD 15", []],
   ["Total 1 234,56 €", []],
+  // ADM-5k recovers this one, and only this one, because it is mechanical
+  // rather than a judgment: the `USD` has a number after it, so it leads that
+  // number and can say nothing about the twelve behind it. Twelve Canadian
+  // dollars is what the line prints either way. The 15 stays unread -- a code
+  // standing between two numbers provably leads neither, from its left.
+  ["Column CAD 12 USD 15", ["12"]],
+
+  // -------------------------------------------------------------------------
+  // ADM-5k: the nine follow-ups the ADM-5g review left open.
+  // -------------------------------------------------------------------------
+
+  // 1. Scale and unit words are a rule now, not a deny-list. A scale word is
+  // read when it spells one number and nothing else, and refuses the whole
+  // token when it does not -- never the bare mantissa, which is the number
+  // the page did not print.
+  ["Raised $2.5 trillion", ["2500000000000"]],
+  ["Raised 2.5 trillions", ["2500000000000"]],
+  ["Raised ₹2.5 lakh", ["250000"]],
+  ["Raised ₹2.5 crore", ["25000000"]],
+  ["Raised 7 lakh", ["700000"]],
+  ["Raised 3 crores", ["30000000"]],
+  ["Raised $2.5M", ["2500000"]],
+  ["Raised $2.5 mln", []],
+  ["Raised $2.5 mill", []],
+  ["Raised $3 thou", []],
+  ["Raised $2.5 grand", []],
+  ["Raised $2.5 bill", []],
+  ["Raised $2.5 bil", []],
+  ["Raised $2.5 tn", []],
+  ["Raised $2.5 trn", []],
+  ["Raised $2.5 lac", []],
+  ["Raised $2.5tn", []],
+  // A unit changes what the number measures, so a money field may not read
+  // it. `45 cents` is not forty-five dollars and `45.00 percent` is not
+  // forty-five of anything a money field stores.
+  ["Paid 45 cents", []],
+  ["Paid 45 cent", []],
+  ["Rate 45.00 percent", []],
+  ["Rate 100.00 percent", []],
+  ["Rate 45.00 pct", []],
+  ["Rate 45 bps", []],
+  ["Rate 45 basis points", []],
+  ["Holding 100 shares", []],
+  ["Holding 12 units", []],
+  ["Price $5.00 per", []],
+  ["Price $5.00 each", []],
+  ["Price 2 ea", []],
+  // Only directly after the amount, which is the one place a unit can stand.
+  // A unit word in front of a number is that number's label.
+  ["Cost basis 1,234.56", ["1234.56"]],
+  ["Per diem 45.00", ["45"]],
+  ["Percent of total 12.50", ["12.5"]],
+  ["Shares 100 at $5.00", ["100", "5"]],
+  // A scale word is refused on both sides, which is the rule this grammar has
+  // had since ADM-5g. `Grand Total` still reads, because the word next to the
+  // amount is `Total`.
+  ["Grand Total 1,234.56", ["1234.56"]],
+  ["million 42.00", []],
+
+  // 2. Neutral punctuation is not a wall. A bar or a semicolon cannot sign or
+  // scale a number, and it cannot hide what does either. A pipe-rendered
+  // table is how many of this store's parsed receipts print a column, so the
+  // rows that print only a label and a value read exactly as they did.
+  ["| Payment | 45.00 | CR |", []],
+  ["| Payment | 45.00 ; CR", []],
+  ["$45.00 | million", []],
+  ["-| 45.00", []],
+  ["45.00 | M", []],
+  ["| 45.00 | (", []],
+  ["| Total | 1,234.56 |", ["1234.56"]],
+  ["| Item | 20.00 |", ["20"]],
+  ["| Mallet | 8.00 | 0.80 |", ["8", "0.8"]],
+
+  // 3. A digit a reader can read and this grammar cannot poisons its token,
+  // by the property Unicode files it under rather than by a list of blocks.
+  // The dingbat circled digits reached review unpoisoned.
+  ["Line ❶250.00", []],
+  ["Line 250.00❶", []],
+  ["Line ➀250", []],
+  ["Line ➓250", []],
+  ["Total 12➓", []],
+  ["Total 7.❶45", []],
+  // And a run the poison cut in half is a fragment, not a separate token: the
+  // finder read the `380` beside one as a line of its own.
+  ["380 3१24.5", []],
+  ["Total 380 12❶.5", []],
+
+  // 4. The column-gap rule and the tokens beside it. `1, 234K` offered the
+  // leading 1 because the joined reading refuses for want of a currency
+  // marker -- which is a rule about `401K`, not a proof that the two runs are
+  // separate.
+  ["1, 234K", []],
+  ["2. 5M", []],
+  ["Refs 1, 234 m", []],
+
+  // 5. A decimal head may never take space groups. `$12.99 100 200` offered
+  // 12.991002, a number with the cents of one cell and the digits of two
+  // more, because only the last character of the head was checked.
+  ["$12.99 100 200", []],
+  ["$12.99 100 200 300", []],
+  ["$1,234 567 890", []],
+  ["Total $1 000 000", ["1000000"]],
 
   // Known behaviour, documented rather than fixed. A single dot group is a
   // decimal point wherever the token does not carry a currency whose locale
@@ -1082,6 +1204,98 @@ test("a page line offers exactly the amounts the table says", () => {
   for (const [line, expected] of QUOTE_SPEC) {
     assert.deepEqual(amountsInText(line), expected, JSON.stringify(line));
   }
+});
+
+/**
+ * What a page prints across a line break, and what the line below it may do
+ * to the line above.
+ *
+ * ADM-5k. A line end is a real edge and was therefore a *known* one, so
+ * nothing asked what stood past it: a letter printing `raised $2.5` with
+ * `million` wrapped onto the next line offered two and a half, and a ledger
+ * printing `CR` above its amount offered a charge. The wrap token is never
+ * read as part of the amount -- assembling a number out of two lines is the
+ * fabrication this gate exists to prevent -- it only has to be provably
+ * unable to scale or sign it.
+ *
+ * Scale and sign, and deliberately nothing else. A column receipt prints one
+ * amount per line and a form labels its boxes, so a digit or a word on the
+ * next line is the ordinary case: refusing those would cost every receipt and
+ * every K-1 in the store and catch nothing.
+ *
+ * Each row is the text, the wrap tokens `pageLines` carries for it, and what
+ * the line may offer.
+ */
+const WRAP_SPEC = [
+  // The wrap this rule exists for.
+  ["raised $2.5", {}, { nextToken: "million" }, []],
+  ["raised $2.5", {}, { nextToken: "MM" }, []],
+  ["raised $2.5", {}, { nextToken: "M" }, []],
+  ["raised $2.5", {}, { nextToken: "mil" }, []],
+  ["raised $2.5", {}, { nextToken: "trillion" }, []],
+  ["raised $2.5", {}, { nextToken: "per" }, []],
+  ["Balance 45.00", {}, { nextToken: "CR" }, []],
+  ["Balance 45.00", {}, { nextToken: "USD" }, []],
+  ["Balance 45.00", {}, { nextToken: "%" }, []],
+  ["Balance 45.00", {}, { nextToken: ")" }, []],
+  ["Balance 45.00", {}, { nextToken: "-5.00" }, []],
+  // And the mirror: a marker at the end of the line above.
+  ["45.00", { previousToken: "CR" }, {}, []],
+  ["45.00", { previousToken: "DR" }, {}, []],
+  ["45.00", { previousToken: "-" }, {}, []],
+  ["45.00", { previousToken: "(" }, {}, []],
+  ["45.00", { previousToken: "$" }, {}, []],
+  // The ordinary next line, which costs nothing. A column of amounts, a
+  // label, a form's single-letter box name, a page that simply ends.
+  ["Balance 45.00", {}, { nextToken: "1.60" }, ["45"]],
+  ["Balance 45.00", {}, { nextToken: "Paid" }, ["45"]],
+  ["Balance 45.00", {}, { nextToken: "Total" }, ["45"]],
+  ["Balance 45.00", {}, {}, ["45"]],
+  ["(9,999.)", {}, { nextToken: "L" }, ["-9999"]],
+  ["1 Ordinary business income 12,345.", {}, { nextToken: "2" }, ["1", "12345"]],
+  ["45.00", { previousToken: "Subtotal" }, {}, ["45"]],
+  ["45.00", { previousToken: "20.00" }, {}, ["45"]],
+  ["45.00", { previousToken: "|" }, {}, ["45"]],
+  // A cut edge stays unknown whatever the wrap token says: a cut is not a
+  // line break, and the character beyond it is still gone.
+  ["raised $2.5", { cutStart: true }, {}, []],
+  ["raised $2.5", {}, { cutEnd: true }, []],
+
+  // Known behaviour, documented rather than fixed, and the mirror of the
+  // locale rows above. A grouping separator at a line end with digits under
+  // it could be one wrapped number: `Total $1,234,` over `567` offers 1,234.
+  // Refusing every line-final separator with a digit on the next line would
+  // refuse every K-1 box, whose trailing point sits above the next box's
+  // number, and a PDF's text layer does not break a number in half.
+  ["Total $1,234,", {}, { nextToken: "567" }, ["1234"]],
+];
+
+test("a wrap may not hide what scales or signs the line above it", () => {
+  for (const [text, before, after, expected] of WRAP_SPEC) {
+    assert.deepEqual(
+      amountsInText(text, { ...before, ...after }),
+      expected,
+      `${JSON.stringify(text)} with ${JSON.stringify({ ...before, ...after })}`,
+    );
+  }
+});
+
+test("a page's lines carry the tokens their neighbours print", () => {
+  const lines = pageLines("raised $2.5\nmillion from\n21.60");
+  assert.deepEqual(
+    lines.map((line) => [line.text, line.previousToken, line.nextToken]),
+    [
+      ["raised $2.5", undefined, "million"],
+      ["million from", "$2.5", "21.60"],
+      ["21.60", "from", undefined],
+    ],
+  );
+  // A cut is not a line break, so a piece carries no wrap token across one.
+  const long = pageLines(`${"word ".repeat(80)}$2.5 million`);
+  assert.ok(long.length > 1, "the line was split");
+  assert.equal(long[0].cutEnd, true);
+  assert.equal(long[0].nextToken, undefined);
+  assert.equal(long[1].previousToken, undefined);
 });
 
 test("the scaled value is the only one a citation supports", () => {
