@@ -20,6 +20,7 @@ import {
   authButtonClass,
   AuthCard,
   authInputClass,
+  authSecondaryButtonClass,
   linkClass,
 } from "@/components/ui/controls";
 
@@ -37,9 +38,11 @@ function inviteReturnPath(searchParams: URLSearchParams) {
 export function AuthFormShell({
   mode,
   submit,
+  googleOAuthEnabled = false,
 }: {
   mode: AuthMode;
   submit: AuthSubmit;
+  googleOAuthEnabled?: boolean;
 }) {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -48,6 +51,7 @@ export function AuthFormShell({
   const [fragment, setFragment] = useState("");
   const returnPath = inviteReturnPath(searchParams);
   const alternateMode = mode === "signIn" ? "sign-up" : "sign-in";
+  const googleError = searchParams.get("googleError");
 
   useEffect(() => {
     setFragment(window.location.hash);
@@ -59,12 +63,32 @@ export function AuthFormShell({
 
   return (
     <AuthCard
-      title={mode === "signIn" ? "Sign in to Kith Mind" : "Create your Kith Mind"}
+      title={
+        mode === "signIn" ? "Sign in to Kith Mind" : "Create your Kith Mind"
+      }
     >
       {returnPath && (
         <p className="mb-3 text-xs text-gray-600">
           You will return to your invitation after you sign in.
         </p>
+      )}
+      {googleError === "not-connected" && (
+        <p role="alert" className="mb-3 text-xs text-red-700">
+          This Google account is not connected. Sign in with your password, then
+          connect Google in Settings.
+        </p>
+      )}
+      {mode === "signIn" && googleOAuthEnabled && returnPath === null && (
+        <>
+          <a href="/api/auth/google" className={authSecondaryButtonClass}>
+            Continue with Google
+          </a>
+          <div className="my-4 flex items-center gap-3 text-xs text-gray-500">
+            <span className="h-px flex-1 bg-kith-border-subtle" />
+            <span>or use your password</span>
+            <span className="h-px flex-1 bg-kith-border-subtle" />
+          </div>
+        </>
       )}
       <form
         className="flex flex-col gap-3"
@@ -105,7 +129,10 @@ export function AuthFormShell({
           />
         </div>
         <div className="flex flex-col gap-1">
-          <label htmlFor="password" className="text-xs font-medium text-gray-700">
+          <label
+            htmlFor="password"
+            className="text-xs font-medium text-gray-700"
+          >
             Password
           </label>
           <input
@@ -126,11 +153,7 @@ export function AuthFormShell({
             {error}
           </p>
         )}
-        <button
-          type="submit"
-          disabled={loading}
-          className={authButtonClass}
-        >
+        <button type="submit" disabled={loading} className={authButtonClass}>
           {loading
             ? mode === "signIn"
               ? "Signing in..."

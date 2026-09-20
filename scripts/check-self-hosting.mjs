@@ -28,6 +28,11 @@ export const WEB_REQUIRED_VARIABLES = [
 
 /** `apps/web/src/lib/kith/session.ts`'s own floor, restated for the preflight. */
 const MIN_KITH_SESSION_SECRET_LENGTH = 32;
+const GOOGLE_OAUTH_VARIABLES = [
+  "GOOGLE_OAUTH_CLIENT_ID",
+  "GOOGLE_OAUTH_CLIENT_SECRET",
+  "GOOGLE_OAUTH_ORIGIN",
+];
 
 function isAllowedOrigin(value) {
   try {
@@ -58,11 +63,33 @@ function isPostgresConnectionString(value) {
   }
 }
 
+function isHttpsOrigin(value) {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash &&
+      url.pathname === "/" &&
+      value === url.origin
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** `--web`'s validation. Issues carry variable names and never their values. */
 export function validateWebEnvironment(environment) {
   const issues = [];
   for (const name of WEB_REQUIRED_VARIABLES) {
     if (!environment[name]) issues.push({ name, problem: "missing" });
+  }
+  if (GOOGLE_OAUTH_VARIABLES.some((name) => Boolean(environment[name]))) {
+    for (const name of GOOGLE_OAUTH_VARIABLES) {
+      if (!environment[name]) issues.push({ name, problem: "missing" });
+    }
   }
 
   if (
@@ -88,6 +115,12 @@ export function validateWebEnvironment(environment) {
     !BASE64URL_32_BYTES.test(environment.MCP_OAUTH_ENCRYPTION_KEY)
   ) {
     issues.push({ name: "MCP_OAUTH_ENCRYPTION_KEY", problem: "invalid" });
+  }
+  if (
+    environment.GOOGLE_OAUTH_ORIGIN &&
+    !isHttpsOrigin(environment.GOOGLE_OAUTH_ORIGIN)
+  ) {
+    issues.push({ name: "GOOGLE_OAUTH_ORIGIN", problem: "invalid" });
   }
 
   if (
@@ -153,10 +186,7 @@ export function parseArguments(arguments_) {
   }
 
   if (!options.web && !options.worker) options.web = true;
-  if (
-    options.worker &&
-    (options.web || seen.has("--web-env-file"))
-  ) {
+  if (options.worker && (options.web || seen.has("--web-env-file"))) {
     throw new Error(
       "Worker diagnostics cannot be combined with operator checks",
     );

@@ -12,6 +12,7 @@ import test from "node:test";
 
 import {
   clearedSessionCookie,
+  DEVELOPMENT_SESSION_COOKIE_NAME,
   hashPassword,
   parseSessionToken,
   readSessionCookie,
@@ -139,13 +140,48 @@ test("the Set-Cookie value is httpOnly, host-scoped and expiring", () => {
 test("only the session cookie is read out of a Cookie header", () => {
   const value = serializeSessionToken(config, "d".repeat(64));
   assert.equal(
-    readSessionCookie(`theme=dark; ${SESSION_COOKIE_NAME}=${value}; other=1`),
+    readSessionCookie(
+      `theme=dark; ${SESSION_COOKIE_NAME}=${value}; other=1`,
+      config,
+    ),
     value,
   );
   // A cookie whose name merely contains the session cookie's name is not it.
-  assert.equal(readSessionCookie(`not_${SESSION_COOKIE_NAME}=${value}`), null);
-  assert.equal(readSessionCookie(`${SESSION_COOKIE_NAME}x=${value}`), null);
+  assert.equal(
+    readSessionCookie(`not_${SESSION_COOKIE_NAME}=${value}`, config),
+    null,
+  );
+  assert.equal(
+    readSessionCookie(`${SESSION_COOKIE_NAME}x=${value}`, config),
+    null,
+  );
   for (const header of [null, undefined, "", "novalue", "="]) {
-    assert.equal(readSessionCookie(header), null, String(header));
+    assert.equal(readSessionCookie(header, config), null, String(header));
   }
+});
+
+test("plain HTTP development uses a browser-accepted cookie name", () => {
+  const development = { ...config, secure: false };
+  const value = sessionCookie(
+    development,
+    "e".repeat(64),
+    Date.UTC(2035, 0, 1),
+  );
+  assert.ok(value.startsWith(`${DEVELOPMENT_SESSION_COOKIE_NAME}=v1.`));
+  assert.equal(value.includes("Secure"), false);
+  assert.equal(value.includes("__Host-"), false);
+  const header = value.split(";")[0];
+  assert.notEqual(readSessionCookie(header, development), null);
+  // Production never falls back to the development cookie, and development
+  // never accepts a host-prefixed cookie that local HTTP could not set.
+  assert.equal(readSessionCookie(header, config), null);
+  assert.equal(
+    readSessionCookie(`${SESSION_COOKIE_NAME}=forged`, development),
+    null,
+  );
+  assert.ok(
+    clearedSessionCookie(development).startsWith(
+      `${DEVELOPMENT_SESSION_COOKIE_NAME}=;`,
+    ),
+  );
 });

@@ -14,21 +14,20 @@
 //
 // So this is a second implementation of one security check, which is a drift
 // risk and is treated as one. `cookie.test.ts` runs in Node, imports both this
-// module and the real `serializeSessionToken`, `SESSION_COOKIE_NAME` and
-// `SESSION_DURATION_MS` from the store, and asserts that this accepts exactly
-// what the store produces and rejects everything else. The two cannot diverge
-// without that test failing.
+// module and the real serializer and production/development cookie names from
+// the store, and asserts that this accepts exactly what the store produces and
+// rejects everything else. The two cannot diverge without that test failing.
 //
 // `crypto.subtle.verify` rather than recomputing the MAC and comparing strings:
 // it compares in constant time internally, which is the property
 // `timingSafeEqual` supplies on the Node side.
 
 /**
- * The cookie name, restated. `cookie.test.ts` asserts it equals the store's
- * `SESSION_COOKIE_NAME`, so this constant cannot drift from the one the routes
- * actually set.
+ * The cookie names, restated. `cookie.test.ts` asserts that both equal the
+ * store's names, so they cannot drift from what the routes actually set.
  */
 export const KITH_SESSION_COOKIE_NAME = "__Host-kith_session";
+export const KITH_DEVELOPMENT_SESSION_COOKIE_NAME = "kith_session";
 
 /** 32 random bytes as hex, which is what `createSession` issues. */
 const TOKEN = /^[0-9a-f]{64}$/;
@@ -46,12 +45,16 @@ const MAC = /^[A-Za-z0-9_-]{43}$/;
  */
 export function readKithSessionCookie(
   header: string | null | undefined,
+  development = false,
 ): string | null {
   if (typeof header !== "string") return null;
+  const name = development
+    ? KITH_DEVELOPMENT_SESSION_COOKIE_NAME
+    : KITH_SESSION_COOKIE_NAME;
   for (const part of header.split(";")) {
     const separator = part.indexOf("=");
     if (separator < 1) continue;
-    if (part.slice(0, separator).trim() !== KITH_SESSION_COOKIE_NAME) continue;
+    if (part.slice(0, separator).trim() !== name) continue;
     return part.slice(separator + 1).trim();
   }
   return null;

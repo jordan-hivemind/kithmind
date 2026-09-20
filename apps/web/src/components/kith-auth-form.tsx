@@ -17,13 +17,20 @@ import { useRouter } from "next/navigation";
 
 import { AuthFormShell, type AuthMode } from "./auth-form-shell";
 
-export function KithAuthForm({ mode }: { mode: AuthMode }) {
+export function KithAuthForm({
+  mode,
+  googleOAuthEnabled,
+}: {
+  mode: AuthMode;
+  googleOAuthEnabled: boolean;
+}) {
   const router = useRouter();
   const path = mode === "signIn" ? "/api/auth/sign-in" : "/api/auth/sign-up";
 
   return (
     <AuthFormShell
       mode={mode}
+      googleOAuthEnabled={googleOAuthEnabled}
       submit={async (formData, { returnPath, fragment }) => {
         const response = await fetch(path, {
           method: "POST",

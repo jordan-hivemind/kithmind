@@ -4,6 +4,7 @@ import {
   readKithSessionCookie,
   verifyKithSessionCookie,
 } from "@/lib/kith/cookie";
+import { usesLocalSessionCookie } from "@/lib/kith/session";
 import { shouldRewriteMcpRootRequest } from "@/lib/mcp/root-alias";
 
 /**
@@ -30,7 +31,8 @@ function createRouteMatcher(patterns: readonly string[]) {
   return (request: NextRequest) => {
     const pathname = request.nextUrl.pathname.toLowerCase();
     return (
-      exact.has(pathname) || prefixes.some((prefix) => pathname.startsWith(prefix))
+      exact.has(pathname) ||
+      prefixes.some((prefix) => pathname.startsWith(prefix))
     );
   };
 }
@@ -82,7 +84,10 @@ async function isAuthenticated(
   if (typeof secret !== "string") return false;
   const token = await verifyKithSessionCookie(
     secret,
-    readKithSessionCookie(request.headers.get("cookie")),
+    readKithSessionCookie(
+      request.headers.get("cookie"),
+      usesLocalSessionCookie(env),
+    ),
   );
   return token !== null;
 }

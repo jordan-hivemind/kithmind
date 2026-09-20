@@ -27,6 +27,7 @@ import {
 } from "@/components/space-grant-choices";
 import {
   Button,
+  buttonClass,
   ErrorText,
   Field,
   inputClass,
@@ -101,6 +102,9 @@ export function KithSettings({ initial }: { initial: SettingsData }) {
   return (
     <div>
       <PageHeader title="Settings" />
+      {data.googleAuth.enabled && (
+        <AccountSection linked={data.googleAuth.linked} />
+      )}
       <DestinationSection data={data} writableSpaces={writableSpaces} />
       <ApiKeysSection data={data} />
       <SourceAccountsSection
@@ -109,6 +113,28 @@ export function KithSettings({ initial }: { initial: SettingsData }) {
       />
       <ConnectSection />
     </div>
+  );
+}
+
+function AccountSection({ linked }: { linked: boolean }) {
+  return (
+    <Section id="account" title="Account">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-medium text-kith-text">Google sign-in</p>
+          <p className="mt-1 text-xs text-kith-text-muted">
+            {linked
+              ? "Google sign-in is connected to this Kith account."
+              : "Connect a Google account after signing in with your password."}
+          </p>
+        </div>
+        {!linked && (
+          <a href="/api/auth/google?action=link" className={buttonClass()}>
+            Connect Google
+          </a>
+        )}
+      </div>
+    </Section>
   );
 }
 
