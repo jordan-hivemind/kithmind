@@ -2,6 +2,15 @@
 
 Date: 2026-09-19. Status: proposed.
 
+> Amended 2026-09-20: sensitivity re-scoped by the owner, see PR #319.
+> Section 2's identifier predicates now store the full value, not a masked
+> last four, and the `normalizePredicate` unmasked-spelling refusal this
+> section proposed was not built. Section 5's instructions no longer say to
+> store only a masked last four. Sections 6 and 8 no longer describe a
+> restricted value as masked in storage; it is stored and returned in full,
+> labeled `restricted`, and withheld only if the owner has lowered a
+> connection's ceiling, which does not cover facts today (see PR #319).
+
 The owner's complaint is correct and narrow. A stored thought said a family
 member was born on a date, named that person by relationship rather than by
 name, and put a schematizable statement in prose. This plan says what the code
@@ -54,11 +63,14 @@ same shape: space, predicate, label, group, value type, cardinality, history,
 sensitivity, object kind for entity values, example, version, active.
 
 Sensitivity uses the three levels the separate sensitivity work defines:
-normal, sensitive, restricted. Full government identifiers and account numbers
-are never stored. Only a masked last four is, under a predicate ending
-`_last_four`. `normalizePredicate` gains a refusal for the unmasked spellings,
-beside the existing age and credential refusals. History means the old value
-stays reachable after a change; a value that is only ever corrected has none.
+normal, sensitive, restricted (PR #319). A government identifier or account
+number is stored in full, exactly as the owner states it, labeled
+`restricted`. An earlier draft of this section proposed storing only a
+masked last four and refusing the unmasked spelling; the owner rejected that
+design for the sensitivity work generally, and it does not apply here
+either, so `normalizePredicate` gains no such refusal. History means the old
+value stays reachable after a change; a value that is only ever corrected has
+none.
 
 | Predicate                    | Value  | Card. | Hist. | Sens.      | Example              |
 | ---------------------------- | ------ | ----- | ----- | ---------- | -------------------- |
@@ -88,10 +100,10 @@ stays reachable after a change; a value that is only ever corrected has none.
 | `allergy`                    | text   | many  | yes   | sensitive  | one allergen         |
 | `medication`                 | text   | many  | yes   | sensitive  | one medication       |
 | `blood_type`                 | text   | one   | no    | sensitive  | `O+`                 |
-| `ssn_last_four`              | text   | one   | no    | restricted | four digits only     |
-| `passport_number_last_four`  | text   | one   | yes   | restricted | four digits only     |
-| `licence_number_last_four`   | text   | one   | yes   | restricted | four digits only     |
-| `insurance_member_last_four` | text   | one   | yes   | restricted | four digits only     |
+| `ssn`                        | text   | one   | no    | restricted | full value           |
+| `passport_number`            | text   | one   | yes   | restricted | full value           |
+| `licence_number`             | text   | one   | yes   | restricted | full value           |
+| `insurance_member_number`    | text   | one   | yes   | restricted | full value           |
 | `passport_expires_on`        | date   | one   | yes   | sensitive  | `YYYY-MM-DD`         |
 | `licence_expires_on`         | date   | one   | yes   | sensitive  | `YYYY-MM-DD`         |
 | `wedding_anniversary`        | date   | one   | no    | normal     | `YYYY-MM-DD`         |
@@ -180,9 +192,9 @@ Replacement text for the capture paragraph of `SERVER_INSTRUCTIONS`:
 > you do not know the person's name, ask the user for it and store the fact
 > after they answer. Use a predicate from the space's catalog, which get_person
 > returns for a subject and which an unknown predicate's refusal returns in
-> full. Use an entity value for a relationship or a provider. Never store a
-> full government identifier or account number. Store only the masked last
-> four, under the catalog predicate that ends in last_four.
+> full. Use an entity value for a relationship or a provider. Store a
+> government identifier or account number in full, under its catalog
+> predicate, exactly as the owner states it.
 
 Added to `remember_fact`'s description:
 
@@ -216,8 +228,9 @@ Add. Edit opens the existing `FactDrawer`, with its Changed and Was wrong
 control unchanged.
 
 A relationship value links to that person's profile. A restricted value
-renders as a square pill of masked digits. A catalog field with no fact
-renders greyed, with Add in its kebab. A final section lists documents whose
+renders in full, with a square sensitivity pill beside it labeling the
+level; nothing about the value itself is masked. A catalog field with no
+fact renders greyed, with Add in its kebab. A final section lists documents whose
 extraction named this entity. No explanatory prose anywhere.
 
 ## 7. Storage and aggregation
@@ -248,9 +261,13 @@ arrive with their first catalog, not before.
 | `documents`           | document id, kind, date, citation                                       |
 | `notes`               | thought ids and summaries still held as narrative                       |
 
-Restricted values are already masked in storage, so nothing is redacted at
-read time. The level travels with the field so a client can decide not to
-print it.
+Restricted values are stored and returned in full; nothing here is redacted
+at read time or in storage. The level still travels with the field so a
+client can decide not to print it. PR #319's per-connection ceiling does not
+reach `search_facts` today, and `get_person` is a new tool this ceiling was
+not written against; whether a lowered ceiling should withhold a `restricted`
+field from `get_person` is unresolved and needs a decision when this slice
+is built, not an assumption either way.
 
 `recall_context` changes in one place. When the query resolves to exactly one
 person through `resolveLiteralName`, one core slot carries a compact profile
@@ -261,10 +278,10 @@ the result does not grow.
 
 | Slice | Work                                                           | Hours | Testable after                                                      | Second model |
 | ----- | -------------------------------------------------------------- | ----- | -------------------------------------------------------------------- | ------------ |
-| 1     | `kith.predicates`, person seed, catalog check in `rememberFact`, last-four refusal | 3 to 4 | An off catalog predicate is refused and the refusal carries the catalog | Yes, sensitivity |
+| 1     | `kith.predicates`, person seed, catalog check in `rememberFact`     | 3 to 4 | An off catalog predicate is refused and the refusal carries the catalog | Yes, sensitivity |
 | 2     | Relationship label and alias resolution, ask-for-a-name refusal | 4 to 6 | Four spellings reach one entity in a fixture space, an ambiguous label refuses | Yes, identity |
 | 3     | `merged_into`, `kith.entity_merges`, `mergeEntities`            | 3 to 5 | A merge preserves every fact and history link, and the losing id still resolves | Yes, identity |
-| 4     | `get_person`, `recall_context` profile slot                     | 4 to 6 | The tool returns catalog fields and masks nothing twice              | Yes, MCP exposure |
+| 4     | `get_person`, `recall_context` profile slot                     | 4 to 6 | The tool returns catalog fields, including `restricted` ones, in full | Yes, MCP exposure |
 | 5     | People segment, list, profile drawer, relationship links        | 5 to 6 | Profile renders, edit writes through the existing fact path          | No           |
 | 6     | Migration command, four gates, review table, supersede on accept | 5 to 6 | A fixture thought yields a gated proposal, reject leaves it untouched | No           |
 | 7     | Tool descriptions, server instructions, classifier ASK rule     | 3      | The prompt literal tests pin the new lines                           | Yes, MCP exposure |
