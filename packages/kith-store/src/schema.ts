@@ -244,6 +244,18 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "sensitivity: levels on kinds, fields, items and roots, the effective-level views and the opt-in per-credential ceiling (SENS-1)",
     url: new URL("../migrations/032_sensitivity.sql", import.meta.url),
   },
+  // The plan (docs/plans/2026-09-19-investment-document-matching.md) calls
+  // this one 028. It is 033 for the reason the note above gives: a version is
+  // a position in this list, the hosted schema is at 32, and 028 was spent by
+  // ADM-4b. The plan has been corrected rather than the number reserved.
+  {
+    version: 33,
+    name: "investment document links: the link table with its four states and its evidence, the estimated-date marker, and `entry` as a correction target (ADM-8b)",
+    url: new URL(
+      "../migrations/033_investment_document_links.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
