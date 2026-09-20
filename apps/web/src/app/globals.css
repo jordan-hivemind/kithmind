@@ -5,19 +5,21 @@
  * require changing product code. */
 :root {
   color-scheme: light;
-  /* E8 C3 Stonewash. RGB channels keep theme aliases opacity-compatible. */
-  --kith-neutral-50: 247 248 246;
-  --kith-neutral-100: 238 241 238;
-  --kith-neutral-150: 231 234 230;
-  --kith-neutral-200: 156 171 159;
-  --kith-neutral-300: 194 203 198;
-  --kith-neutral-400: 147 160 154;
-  --kith-neutral-500: 102 116 110;
-  --kith-neutral-600: 69 82 77;
-  --kith-neutral-700: 47 61 57;
-  --kith-neutral-800: 30 43 40;
-  --kith-neutral-900: 20 32 30;
-  --kith-neutral-950: 11 21 18;
+  /* Neutral gray, derived from the E8 layout/type/shape system but with the
+   * Stonewash green tint replaced by true (zero-chroma) gray. RGB channels
+   * keep theme aliases opacity-compatible. */
+  --kith-neutral-50: 250 250 250;
+  --kith-neutral-100: 245 245 245;
+  --kith-neutral-150: 238 238 238;
+  --kith-neutral-200: 229 229 229;
+  --kith-neutral-300: 212 212 212;
+  --kith-neutral-400: 163 163 163;
+  --kith-neutral-500: 115 115 115;
+  --kith-neutral-600: 82 82 82;
+  --kith-neutral-700: 64 64 64;
+  --kith-neutral-800: 38 38 38;
+  --kith-neutral-900: 23 23 23;
+  --kith-neutral-950: 10 10 10;
   --kith-danger-50: 254 242 242;
   --kith-danger-100: 254 226 226;
   --kith-danger-200: 254 202 202;
@@ -40,7 +42,7 @@
   --kith-warning-800: 146 64 14;
   --kith-warning-900: 120 53 15;
   --kith-warning-950: 69 26 3;
-  --kith-page: #edf2f7;
+  --kith-page: #ffffff;
   --kith-surface: #ffffff;
   --kith-surface-muted: rgb(var(--kith-neutral-50));
   --kith-surface-subtle: rgb(var(--kith-neutral-100));
@@ -49,11 +51,15 @@
   --kith-text-muted: rgb(var(--kith-neutral-500));
   --kith-border: rgb(var(--kith-neutral-200));
   --kith-border-subtle: rgb(var(--kith-neutral-300));
-  --kith-action: #07312c;
-  --kith-action-hover: #0f5049;
+  /* Blue action ramp, replacing the forest green. Darkest step is the button
+   * fill (8.7:1 on white), the next step up is hover, and the lightest of the
+   * three is the link/focus color -- the same three-step relationship the
+   * forest ramp used, just re-hued. */
+  --kith-action: #1e40af;
+  --kith-action-hover: #1d4ed8;
   --kith-action-ink: #ffffff;
-  --kith-link: #1f5f52;
-  --kith-focus: #1f5f52;
+  --kith-link: #2563eb;
+  --kith-focus: #2563eb;
   --kith-danger: rgb(var(--kith-danger-600));
   --kith-danger-bg: rgb(var(--kith-danger-50));
   --kith-danger-border: rgb(var(--kith-danger-200));
@@ -66,10 +72,15 @@
   --kith-info: #0369a1;
   --kith-info-bg: #f0f9ff;
   --kith-info-border: #bae6fd;
-  --kith-shadow-xs: 0 1px 2px rgb(20 32 30 / 5%);
-  --kith-shadow-sm: 0 1px 3px rgb(20 32 30 / 8%), 0 1px 2px rgb(20 32 30 / 4%);
-  --kith-shadow-md: 0 8px 24px rgb(20 32 30 / 10%);
-  --kith-shadow-lg: 0 16px 44px rgb(20 32 30 / 16%);
+  --kith-shadow-xs: 0 1px 2px rgb(var(--kith-neutral-900) / 5%);
+  --kith-shadow-sm:
+    0 1px 3px rgb(var(--kith-neutral-900) / 8%),
+    0 1px 2px rgb(var(--kith-neutral-900) / 4%);
+  --kith-shadow-md: 0 8px 24px rgb(var(--kith-neutral-900) / 10%);
+  --kith-shadow-lg: 0 16px 44px rgb(var(--kith-neutral-900) / 16%);
+  /* Modal/dialog scrim. A dedicated token so it tracks the neutral ramp
+   * instead of a hard-coded rgb() literal repeated at each overlay. */
+  --kith-overlay: rgb(var(--kith-neutral-900) / 48%);
   --kith-radius-control: 8px;
   --kith-radius-card: 10px;
   --kith-radius-panel: 14px;
@@ -110,6 +121,7 @@
   --color-kith-info: var(--kith-info);
   --color-kith-info-bg: var(--kith-info-bg);
   --color-kith-info-border: var(--kith-info-border);
+  --color-kith-overlay: var(--kith-overlay);
 
   /* Legacy Tailwind names inherit the same E8 ramps as semantic primitives. */
   --color-white: var(--kith-surface);
@@ -173,14 +185,16 @@
   --text-5xl: 42px;
   --text-5xl--line-height: 1.05;
 
-  /* Compatibility aliases for pre-system screen utilities. */
-  --color-accent-50: #ecf5f2;
-  --color-accent-100: #d9eae4;
-  --color-accent-200: #b8d5cc;
-  --color-accent-400: #4f9180;
-  --color-accent-500: #1f5f52;
-  --color-accent-600: #0f5049;
-  --color-accent-700: #07312c;
+  /* Compatibility aliases for pre-system screen utilities. Same blue ramp as
+   * the action/link/focus tokens above, so a legacy `accent-*` class inherits
+   * the current palette instead of freezing the old one. */
+  --color-accent-50: #eff6ff;
+  --color-accent-100: #dbeafe;
+  --color-accent-200: #bfdbfe;
+  --color-accent-400: #60a5fa;
+  --color-accent-500: #2563eb;
+  --color-accent-600: #1d4ed8;
+  --color-accent-700: #1e40af;
 
   /* Compact tables: 36px rows. Declared once so a cell, a header and a
    * skeleton row cannot drift apart. */
@@ -212,7 +226,7 @@ textarea {
   font: inherit;
 }
 ::selection {
-  background: #b8d5cc;
+  background: var(--color-accent-200);
   color: var(--kith-text);
 }
 

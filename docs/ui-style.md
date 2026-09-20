@@ -10,7 +10,7 @@ widths.
 
 | Rule | Detail |
 | --- | --- |
-| Palette | Start from E8 Portal's Stonewash surfaces and forest action color. Consume semantic roles so the palette can change without screen rewrites. |
+| Palette | White page and card surfaces, neutral gray for subtle surfaces, borders and table headers, and a blue action ramp for primary buttons, links, focus rings, selected states and active nav. Semantic status colors (success green, warning amber, danger red, info blue) carry their own meaning and stay separate from the action blue. Consume semantic roles so the palette can change without screen rewrites. |
 | Type | Inter for body and display roles. No Cosmica or ornamented display fonts. |
 | Scale | 14.5px body, 15px reading text, 13.5px table data, 24px page titles and 17.835px section titles. |
 | Tone | Professional, minimal and information-dense. Controls stay compact without making their labels tiny. |
@@ -26,9 +26,9 @@ widths.
 | Feed | 960px maximum, aligned to the page shell's left edge. |
 | Reading | 800px maximum, aligned to the page shell's left edge. |
 
-Pages use the cool Stonewash page ground. Content is grouped into white tiles
-with a border, restrained shadow and consistent header/content padding. Do not
-wrap an entire data-heavy screen in one oversized card.
+Pages use a white ground. Content is grouped into white tiles with a border,
+restrained shadow and consistent header/content padding. Do not wrap an
+entire data-heavy screen in one oversized card.
 
 ## Headings
 

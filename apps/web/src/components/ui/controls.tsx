@@ -1,5 +1,6 @@
-// The form controls and page scaffolding share Kith's semantic Stonewash,
-// forest-action system, compact 32px controls, and visible focus treatment.
+// The form controls and page scaffolding share Kith's semantic white/gray
+// surfaces, blue-action system, compact 32px controls, and visible focus
+// treatment.
 // Class strings let callers make small layout adjustments with `className`.
 
 export const inputClass =
