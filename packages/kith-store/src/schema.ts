@@ -256,6 +256,14 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
       import.meta.url,
     ),
   },
+  {
+    version: 34,
+    name: "investment_link: the deferred-work kind 033 left to the slice that writes the rows (ADM-8c)",
+    url: new URL(
+      "../migrations/034_investment_link_deferred_kind.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

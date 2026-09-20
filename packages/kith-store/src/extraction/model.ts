@@ -38,6 +38,10 @@
 
 import type { ClientBase, Pool } from "pg";
 
+import {
+  scheduleInvestmentLinkForExtraction,
+  withLinkEnqueueSavepoint,
+} from "../admin/investmentLinkWork.js";
 import type {
   DocumentFieldCheck,
   DocumentFieldValueType,
@@ -2335,6 +2339,31 @@ async function store(
       sourceRootId,
     });
   }
+  // ADM-8c, trigger one: the statements this document now states are the
+  // statements the matcher scores, so the job is enqueued here, in the
+  // transaction that replaced them. A re-extraction enqueues it again, which
+  // is the point -- a corrected amount has to be able to turn a suggestion
+  // into a link -- and the dedupe key collapses a burst of re-activations
+  // onto one queued row.
+  //
+  // INSIDE A SAVEPOINT, because an investments feature must never be able to
+  // lose a document: a queue row that cannot be written must not take the
+  // statements, the spans and the corrections down with it. See
+  // `withLinkEnqueueSavepoint` for which triggers get that treatment, which
+  // must not, and why 40001 and 40P01 still propagate.
+  await withLinkEnqueueSavepoint(
+    { client, now },
+    { sourceItemId: loaded.sourceItemId, documentKind },
+    () =>
+      scheduleInvestmentLinkForExtraction(
+        { client, now },
+        {
+          spaceId: loaded.spaceId,
+          sourceItemId: loaded.sourceItemId,
+          kind: documentKind,
+        },
+      ),
+  );
   return {
     sourceItemId: loaded.sourceItemId,
     kind: documentKind,

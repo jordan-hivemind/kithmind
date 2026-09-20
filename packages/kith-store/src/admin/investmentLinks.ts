@@ -45,6 +45,10 @@ import { assertKithId, newKithId } from "../ids.js";
 import type { ObservationValue } from "../records/values.js";
 import { spacePredicate } from "../spaces.js";
 import {
+  scheduleInvestmentLinksFor,
+  scheduleInvestmentLinksForEntry,
+} from "./investmentLinkWork.js";
+import {
   dateInWindow,
   decideLinks,
   type LinkEvidence,
@@ -424,6 +428,102 @@ function toScorableEntry(
 // The evaluation
 // ---------------------------------------------------------------------------
 
+/** The key a decision is about: one investment, and one of its entries or the
+ * investment itself. */
+function pairKey(investmentId: string, entryId: string | null): string {
+  return `${investmentId}\u0000${entryId ?? ""}`;
+}
+
+/** Every row already decided about this document, whoever decided it. */
+async function readSourceItemLinks(
+  ctx: IdentityCtx,
+  spaceId: string,
+  sourceItemId: string,
+): Promise<LinkDbRow[]> {
+  return await rows<LinkDbRow>(
+    ctx,
+    `SELECT ${LINK_COLUMNS} FROM kith.investment_document_links
+      WHERE space_id = $1 AND source_item_id = $2
+      LIMIT $3`,
+    [spaceId, sourceItemId, MAX_LINK_CANDIDATES + MAX_LINK_SUGGESTIONS],
+  );
+}
+
+/**
+ * The stale sweep.
+ *
+ * Two kinds of row go, and the difference is who decided them:
+ *
+ *   * A `suggested` row this pass no longer produces is simply gone. An
+ *     offer nobody acted on is not a decision.
+ *   * A RULE-made `auto_linked` row this pass no longer produces as an
+ *     auto-link has stopped qualifying -- a second identical entry turned
+ *     up, or the document's party or amount was corrected, or it now names
+ *     no investment at all, or the whole document has been re-read as a kind
+ *     this scorer has no rules for. The rule made it, so the rule takes it
+ *     back: the date it moved goes back first, through the same recorded
+ *     correction a rejection uses, and then the row is demoted (the caller's
+ *     upsert has already written `suggested` over it) or deleted.
+ *
+ * An owner-decided row is never swept, whatever the rule now thinks. And a
+ * demotion is NOT a rejection: nothing is remembered, because the owner said
+ * nothing. The document may qualify again tomorrow.
+ *
+ * `keep` is what this pass decided, by pair. An EMPTY map is a legitimate
+ * caller -- it is what "this document decides nothing at all any more"
+ * looks like -- and it is how the non-matchable-kind path above uses this.
+ *
+ * Returns the entries whose mirror the caller must now re-derive.
+ */
+async function sweepStaleLinks(
+  ctx: IdentityCtx,
+  args: {
+    spaceId: string;
+    existing: readonly LinkDbRow[];
+    keep: ReadonlyMap<string, LinkState>;
+  },
+): Promise<Set<string>> {
+  const { spaceId, existing, keep } = args;
+  const touchedEntries = new Set<string>();
+  for (const link of existing) {
+    const key = pairKey(link.investment_id, link.entry_id);
+    const now = keep.get(key);
+    const wasRuleAutoLink =
+      link.state === "auto_linked" && link.decided_by === "rule";
+    const demoted = wasRuleAutoLink && now !== "auto_linked";
+    const dropped = link.state === "suggested" && now === undefined;
+    if (!demoted && !dropped) continue;
+    if (demoted) {
+      await revertReplacedDate(ctx, { spaceId, link });
+    }
+    if (now === undefined) {
+      // The mirror goes first, and it has to. `syncEntryDocument` adopts a
+      // `document_id` that no link accounts for -- that is what protects the
+      // owner's own attachments -- and it cannot tell one of those from a
+      // document this very statement has just unlinked. Clearing it here
+      // leaves nothing to misread.
+      if (link.entry_id !== null && link.document_id !== null) {
+        await exec(
+          ctx,
+          `UPDATE kith.investment_entries
+              SET document_id = NULL, evidence_span_id = NULL
+            WHERE id = $1 AND space_id = $2 AND document_id = $3`,
+          [link.entry_id, spaceId, link.document_id],
+        );
+      }
+      await exec(
+        ctx,
+        `DELETE FROM kith.investment_document_links
+          WHERE id = $1 AND space_id = $2
+            AND state IN ('suggested', 'auto_linked') AND decided_by = 'rule'`,
+        [link.id, spaceId],
+      );
+    }
+    if (link.entry_id !== null) touchedEntries.add(link.entry_id);
+  }
+  return touchedEntries;
+}
+
 export type EvaluateLinksResult = {
   /** False when there was nothing to score. `reason` says why. */
   evaluated: boolean;
@@ -477,7 +577,30 @@ export async function evaluateDocumentLinks(
   const extraction = await readExtraction(ctx, spaceId, sourceItemId);
   if (!extraction) return none("no_extraction", null);
   const kind = matchableKind(extraction.kind);
-  if (!kind) return none("kind_not_matchable", extraction.kind);
+  if (!kind) {
+    // NOT AN EARLY RETURN, and it used to be. A re-extraction can change a
+    // document's kind -- a parser upgrade, a corrected reading -- and a
+    // document that WAS a capital call notice and is now a receipt still
+    // carries the rows the notice earned: an `auto_linked` link, a mirror on
+    // the entry, and a date that link moved. Returning here left all three
+    // standing on evidence the document no longer states, which is exactly
+    // the silent wrong data this design refuses.
+    //
+    // So the pass still runs its sweep, with nothing to keep: every
+    // rule-made row goes and gives its date back, and every owner-decided
+    // row is left alone, through the same code and the same guards a change
+    // of party or amount goes through.
+    const existing = await readSourceItemLinks(ctx, spaceId, sourceItemId);
+    const touched = await sweepStaleLinks(ctx, {
+      spaceId,
+      existing,
+      keep: new Map(),
+    });
+    for (const entryId of touched) {
+      await syncEntryDocument(ctx, spaceId, entryId);
+    }
+    return none("kind_not_matchable", extraction.kind);
+  }
 
   const item = await row<{ uri: string | null }>(
     ctx,
@@ -513,15 +636,7 @@ export async function evaluateDocumentLinks(
   );
 
   // Existing rows for this document: what has already been decided about it.
-  const existing = await rows<LinkDbRow>(
-    ctx,
-    `SELECT ${LINK_COLUMNS} FROM kith.investment_document_links
-      WHERE space_id = $1 AND source_item_id = $2
-      LIMIT $3`,
-    [spaceId, sourceItemId, MAX_LINK_CANDIDATES + MAX_LINK_SUGGESTIONS],
-  );
-  const pairKey = (investmentId: string, entryId: string | null) =>
-    `${investmentId}\u0000${entryId ?? ""}`;
+  const existing = await readSourceItemLinks(ctx, spaceId, sourceItemId);
   /** Pairs the owner has already settled. The rule never revisits either: a
    * `rejected` pair is the remembered rejection, and a `confirmed` pair is a
    * human decision a rule does not get to restate. */
@@ -752,62 +867,15 @@ export async function evaluateDocumentLinks(
     }
   }
 
-  // The stale sweep.
-  //
-  // Two kinds of row go, and the difference is who decided them:
-  //
-  //   * A `suggested` row this pass no longer produces is simply gone. An
-  //     offer nobody acted on is not a decision.
-  //   * A RULE-made `auto_linked` row this pass no longer produces as an
-  //     auto-link has stopped qualifying -- a second identical entry turned
-  //     up, or the document's party or amount was corrected, or it now names
-  //     no investment at all. The rule made it, so the rule takes it back:
-  //     the date it moved goes back first, through the same recorded
-  //     correction a rejection uses, and then the row is demoted (the upsert
-  //     above already wrote `suggested` over it) or deleted.
-  //
-  // An owner-decided row is never swept, whatever the rule now thinks. And a
-  // demotion is NOT a rejection: nothing is remembered, because the owner
-  // said nothing. The document may qualify again tomorrow.
-  const keep = new Map(
-    [...written.entries()].map(([key, entry]) => [key, entry.state]),
-  );
-  for (const link of existing) {
-    const key = pairKey(link.investment_id, link.entry_id);
-    const now = keep.get(key);
-    const wasRuleAutoLink =
-      link.state === "auto_linked" && link.decided_by === "rule";
-    const demoted = wasRuleAutoLink && now !== "auto_linked";
-    const dropped = link.state === "suggested" && now === undefined;
-    if (!demoted && !dropped) continue;
-    if (demoted) {
-      await revertReplacedDate(ctx, { spaceId, link });
-    }
-    if (now === undefined) {
-      // The mirror goes first, and it has to. `syncEntryDocument` adopts a
-      // `document_id` that no link accounts for -- that is what protects the
-      // owner's own attachments -- and it cannot tell one of those from a
-      // document this very statement has just unlinked. Clearing it here
-      // leaves nothing to misread.
-      if (link.entry_id !== null && link.document_id !== null) {
-        await exec(
-          ctx,
-          `UPDATE kith.investment_entries
-              SET document_id = NULL, evidence_span_id = NULL
-            WHERE id = $1 AND space_id = $2 AND document_id = $3`,
-          [link.entry_id, spaceId, link.document_id],
-        );
-      }
-      await exec(
-        ctx,
-        `DELETE FROM kith.investment_document_links
-          WHERE id = $1 AND space_id = $2
-            AND state IN ('suggested', 'auto_linked') AND decided_by = 'rule'`,
-        [link.id, spaceId],
-      );
-    }
-    if (link.entry_id !== null) touchedEntries.add(link.entry_id);
-  }
+  // The stale sweep. See `sweepStaleLinks` for what goes and what never does.
+  const swept = await sweepStaleLinks(ctx, {
+    spaceId,
+    existing,
+    keep: new Map(
+      [...written.entries()].map(([key, entry]) => [key, entry.state]),
+    ),
+  });
+  for (const entryId of swept) touchedEntries.add(entryId);
 
   for (const entryId of touchedEntries) {
     await syncEntryDocument(ctx, spaceId, entryId);
@@ -1630,6 +1698,35 @@ export async function rejectInvestmentDocumentLink(
       WHERE id = $1 AND space_id = $2`,
     [link.id, link.space_id, args.principal.userId, reason],
   );
+  // ADM-8c, trigger three: the owner's no frees something.
+  //
+  // For an entry-level rejection the entry is free again, and the other
+  // documents that score against it -- the ones that lost to this one, or
+  // that never got a hearing because it was already spoken for -- deserve
+  // another pass. For an investment-level one the investment is. The
+  // rejected pair itself is never re-proposed: `evaluateDocumentLinks` skips
+  // a settled pair, and the row stays `rejected` forever. The rejected
+  // DOCUMENT is still enqueued, because it may belong on a different entry of
+  // the same investment.
+  //
+  // Enqueued here, in the rejection's own transaction, before the promotion
+  // below: the job is drained later and reads the state this transaction
+  // commits, whichever order the two statements ran in.
+  if (link.entry_id === null) {
+    await scheduleInvestmentLinksFor(ctx, {
+      spaceId: link.space_id,
+      investmentId: link.investment_id,
+    });
+  } else {
+    // Through the ENTRY, so the freed entry's own amount is one of the
+    // signals that finds the documents worth waking: a wire confirmation
+    // that names no fund the owner has recorded still matches the payment it
+    // paid, and that is the whole case a rejection opens up.
+    await scheduleInvestmentLinksForEntry(ctx, {
+      spaceId: link.space_id,
+      entryId: link.entry_id,
+    });
+  }
   if (link.entry_id === null) return { dateReverted, dateReplaced: false };
   await syncEntryDocument(ctx, link.space_id, link.entry_id);
   const promoted = await primaryLink(ctx, link.space_id, link.entry_id);

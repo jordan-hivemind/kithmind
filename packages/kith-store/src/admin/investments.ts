@@ -34,6 +34,11 @@ import { resolveEntity } from "../memory/entities.js";
 import { spacePredicate } from "../spaces.js";
 import { forgetReplacedDates, setEntryDocument } from "./investmentLinks.js";
 import {
+  scheduleInvestmentLinksFor,
+  scheduleInvestmentLinksForEntry,
+  scheduleInvestmentLinksForEntryDocuments,
+} from "./investmentLinkWork.js";
+import {
   INVESTMENT_ENTRY_TYPES,
   INVESTMENT_STATUSES,
   type InvestmentEntry,
@@ -917,6 +922,9 @@ export async function createInvestment(
     }
     throw error;
   }
+  // ADM-8c, trigger two: a new party name. Documents already in the store may
+  // name it, and until now there was nothing for them to name.
+  await scheduleInvestmentLinksFor(ctx, { spaceId, investmentId: id });
   return id;
 }
 
@@ -1011,6 +1019,21 @@ export async function updateInvestment(
       ],
     ),
   );
+  // ADM-8c, trigger two. Two fields here reach the matcher and the rest do
+  // not: `name` is the party every party signal compares against, and
+  // `signed_on` anchors the `investment_agreement` window. A category, a
+  // status or a note changes no decision, so it wakes nothing.
+  //
+  // `signed_on` is compared by presence rather than by value, because
+  // `writableInvestment` does not read it and reading it to save a job that
+  // writes nothing is the wrong trade: an extra evaluation reaches the same
+  // conclusion and, by slice 1's rule, touches no row.
+  if ((name !== null && name !== target.name) || args.signedOn !== undefined) {
+    await scheduleInvestmentLinksFor(ctx, {
+      spaceId: target.spaceId,
+      investmentId: target.id,
+    });
+  }
 }
 
 /** A rename onto another investment's name is a named denial, not a 500. */
@@ -1055,6 +1078,16 @@ export async function archiveInvestment(
       [target.id, target.spaceId, archived, new Date(ctx.now)],
     ),
   );
+  // ADM-8c, trigger two. Archiving is a party change in the only sense the
+  // matcher cares about: `loadInvestmentNames` excludes an archived
+  // investment, so its documents stop matching it, and an `auto_linked` row
+  // left standing behind that -- with the date it moved still moved -- is
+  // exactly the silent wrong data this slice exists to stop. Restoring is the
+  // same event in reverse.
+  await scheduleInvestmentLinksFor(ctx, {
+    spaceId: target.spaceId,
+    investmentId: target.id,
+  });
 }
 
 /** A document may only be linked when it is in the entry's own space. The
@@ -1169,6 +1202,13 @@ export async function createInvestmentEntry(
         document,
       });
     }
+    // ADM-8c, trigger two: a new entry is a new thing for the paper already
+    // in the store to be about. In this transaction, so an entry that rolls
+    // back leaves no job behind it.
+    await scheduleInvestmentLinksForEntry(ctx, {
+      spaceId: target.spaceId,
+      entryId: inserted.id,
+    });
     return { id: inserted.id, created: true };
   }
   const existing = await row<{ id: string }>(
@@ -1301,6 +1341,35 @@ export async function updateInvestmentEntry(
         ? current.date_is_estimated
         : false
       : boolean(args.dateIsEstimated, "Date is estimated");
+  // ADM-8c, trigger two: does this patch change anything the matcher scores?
+  //
+  // Asked in SQL, against the row as it stands, and asked BEFORE the update
+  // for the obvious reason. Not in JavaScript: the drawer sends the whole
+  // entry on every save, so "the owner touched the amount field" is not the
+  // question -- the question is whether the stored number is different, and
+  // `1000` and `1000.00` are the same stored number. `IS DISTINCT FROM` over
+  // `numeric` answers that exactly, where a string compare would enqueue a
+  // document every time he edited a note.
+  const affects = await row<{ changed: boolean }>(
+    ctx,
+    `SELECT (entry_type IS DISTINCT FROM $3
+             OR entry_date IS DISTINCT FROM coalesce($4::date, entry_date)
+             OR amount IS DISTINCT FROM $5::numeric
+             OR currency IS DISTINCT FROM $6
+             OR exchange_rate IS DISTINCT FROM $7::numeric
+             OR date_is_estimated IS DISTINCT FROM $8) AS changed
+       FROM kith.investment_entries WHERE id = $1 AND space_id = $2`,
+    [
+      target.id,
+      target.spaceId,
+      entryType,
+      args.entryDate === undefined ? null : isoDate(args.entryDate, "Entry date"),
+      amounts.amount,
+      amounts.currency,
+      amounts.exchangeRate,
+      dateIsEstimated,
+    ],
+  );
   await exec(
     ctx,
     `UPDATE kith.investment_entries SET
@@ -1341,6 +1410,16 @@ export async function updateInvestmentEntry(
       document,
     });
   }
+  // After the update, so the fan-out reads the entry the owner just saved
+  // rather than the one he replaced. An attachment counts as a change on its
+  // own: it takes the entry, and the documents that were circling it have to
+  // hear about that.
+  if (affects?.changed === true || document !== null) {
+    await scheduleInvestmentLinksForEntry(ctx, {
+      spaceId: target.spaceId,
+      entryId: target.id,
+    });
+  }
 }
 
 /** An entry is a mistake or it is not, so this one is a real delete. The
@@ -1355,6 +1434,14 @@ export async function deleteInvestmentEntry(
     args.entryId,
     args.investmentId,
   );
+  // Before the delete, because the delete takes the link rows with it
+  // (`ON DELETE CASCADE`, migration 033) and afterwards nothing records which
+  // documents were about this entry. They get one more pass against the
+  // entries that remain.
+  await scheduleInvestmentLinksForEntryDocuments(ctx, {
+    spaceId: target.spaceId,
+    entryId: target.id,
+  });
   await exec(
     ctx,
     "DELETE FROM kith.investment_entries WHERE id = $1 AND space_id = $2",
