@@ -307,14 +307,26 @@ line; only a text field may span two adjacent cited ones, and only a text
 field is matched case- and punctuation-folded. Money, numbers and dates keep
 their exact reading.
 
-**One repair, and only where the page leaves no choice (ADM-5h).** A money or
-number value on none of the cited lines is checked against the rest of the
-cited page. If exactly one line of that page states it, the citation is
-repaired to that line and the value stores with the repaired evidence span. If
-two or more lines state it, or none does, the failure stands. The check is
-still "does a line of this page state this value"; what is relaxed is which
-line, and only when one occurrence means there is nothing to choose between.
-Dates and text are never repaired this way.
+**One repair, one line, and only where the page leaves no choice (ADM-5h).**
+A dense form puts a model one line off its value, so a money or number value
+on none of the cited lines may be stored from a line **next to** one of them.
+This is the only rule in the round that relaxes a check, so it is fenced on
+every side. All eight of these have to hold:
+
+| Condition | Why |
+| --- | --- |
+| The statement cited line ids | The older quote shape has none, so "one line off" means nothing there |
+| The field is money or number | Dates and text are never repaired |
+| A money value carries a decimal point or a currency mark | A bare run of digits is a suite number, a tax year or a page number, and each of those stored a wrong total end to end |
+| No cited line states a value of that type | Then the model contradicted its own citation rather than missing by a line: `Fee 100.00` cited as a total of 250.00 |
+| The target is within one line id of **every** cited line, on the cited page | One off is the miss this exists for; further is a search of the page |
+| Exactly one line of that window states the value | Choosing between two is a guess |
+| No other line of the **whole document** states it | A value printed twice says nothing about which line states it |
+| No other statement of the run was read from that line, and no second statement would repair onto it | One printed number is one field's |
+
+The value stores with the repaired evidence span, so the citation the owner
+sees is the line that prints it. Any condition failing leaves the original
+`value_not_in_quote` correction, with the citation the model gave.
 
 **A blank optional field is a field the document does not state (ADM-5h).** A
 statement whose value is empty, whitespace or null is dropped for an optional
@@ -363,7 +375,18 @@ is the last character of the digits: anything digit-like after it, across any
 gap, makes the point a decimal point instead, and a line printing
 `12,345.   80` offers neither number because it says 12,345.80 as readily as
 it says two cells. For the same reason a rendering space inside a number is
-closed up only when it is a single space; a wider gap is a column boundary.
+closed up only when it is a single space **and only before exactly two
+digits**: cents are two digits and nothing else is, so `$82. 129961` and
+`$94. 504. billion` are the ambiguous pairs they look like rather than minus
+82.129961 and ninety-four and a half billion.
+
+**A list ordinal offers nothing (ADM-5h).** Digits at the start of a line,
+then `.` or `)`, then a space and a word, are a bullet: `1. Rent 500.00`
+offers 500 and not 1. A leading number with no mark after it is a quantity as
+often as a bullet -- `12 Mill Lane` -- so the rule stops where its shape
+stops, and a box number is still offered. The gate is a whitelist and an
+extra candidate costs nothing; a bare run of digits can never repair a
+citation onto a money field either way.
 
 Each entry of a `line_item_list` carries its own citation and is gated on its
 own: its amount must occur within one cited line, its description folds like
@@ -403,7 +426,7 @@ field names only: operators debug extraction without reading the documents.
 | `KITH_EXTRACT_API_KEY` | daemon environment | Falls back to `OPENAI_API_KEY` on the default endpoint. |
 | per-kind model | `document_types.examples`, an element `{"setting": "extraction_model", "value": "<model>"}` | That kind is read with that model. A kind without one uses the default. A model the provider refuses falls back to the default for that run and opens one `extraction_model_refused` item. |
 | per-kind date order | `document_types.examples`, an element `{"setting": "date_order", "value": "MDY"}` or `"DMY"` | How that kind writes an all-numeric date. |
-| per-kind page bound | `document_types.examples`, an element `{"setting": "max_pages", "value": "25"}` | How many pages of a document of that kind the model is shown, in place of the default 12. Capped at 60; a value past the cap, or one that is not a whole number, reads as unset rather than being clamped. |
+| per-kind page bound | `document_types.examples`, an element `{"setting": "max_pages", "value": "25"}` or `{"setting": "max_pages", "value": 25}` | How many pages of a document of that kind the model is shown, in place of the default 12. Capped at 60; a value past the cap, or one that is not a whole number, reads as unset rather than being clamped. |
 | per-kind character bound | `document_types.examples`, an element `{"setting": "max_chars", "value": "120000"}` | The same for characters, in place of the default 60,000. Capped at 400,000. |
 
 A per-kind bound costs the same extra call a per-kind model does, and for the
@@ -430,13 +453,36 @@ event: `occurrence_date` holds a calendar day, so a document whose only date
 is a year stays undated rather than being filed under the first of January.
 
 A partial date is checked against its cited line for exactly the parts it
-claims. A year has to be printed as a year, not as part of a longer number,
-an amount's whole dollars or a figure behind a currency mark. A month and a
-year have to be printed together, adjacent, and a numeric one is read through
-the kind's `date_order` like any other. A two-digit year is refused for a
+claims. A year has to be printed **as a year**: between 1900 and 2100, with a
+digit run of its own, and with nothing glued to its left but a `FY`, `CY` or
+`TY` prefix -- so `98101-2024`, `(206) 555-2024`, `x2024`, `1099-2024` and a
+copyright sign are not years. One space to its left, a currency mark or an
+ISO code makes it money (`$ 2024`, `USD 2024`) and a label such as `Rev.` or
+`Form` makes it a revision or a form number; a street word to its right makes
+it a house number (`2024 Main Street`). A whole date printed on the line
+states its year too, which is the one way a year reads through a slash.
+
+A month and a year have to be printed together, adjacent, and the pair has to
+**open the line or follow a word that introduces a date**, or `Ratio 3/2024`,
+`Pages 3-2024` and `You may 2024` would each file a document under a month
+nobody wrote. A numeric month and year are read through the kind's
+`date_order` like any other date. A two-digit year is refused for a
 partial date, because `March 24` is March 2024 and the twenty-fourth of March
 at once and there is no third part to settle it, and two numbers with no year
 among them (`03/04`) are refused for the same reason.
+
+**A re-extraction never downgrades an exact date (ADM-5h).** Extraction
+replaces a document's observations on every run, and a model reads the same
+page differently from one run to the next. When a run offers only a year or
+only a month and a year for a field that already holds a full day, and the
+stored day begins with what the new run read, the stored day and **its own
+evidence** are kept, and it goes on dating the event. A partial date that
+contradicts the stored one -- a different year, or a different month --
+replaces it, because then the two runs disagree about the document and
+keeping the old day would store a date this run does not support. The kept
+day never borrows the new run's citation: the line the new run cited prints a
+year, and hanging a day off it would be the fabricated citation the gate
+exists to prevent.
 
 An all-numeric date whose first two numbers could both be a month is read only
 when the kind sets `date_order`. `01/02/26` is the first of February or the

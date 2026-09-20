@@ -64,6 +64,7 @@ import { sha256Utf8 } from "../provenance/sql.js";
 import { occurrenceColumns, occurrenceSortKey } from "../records/model.js";
 import {
   addDecimals,
+  SUPPORTED_CURRENCIES,
   type ObservationValue,
   type Occurrence,
 } from "../records/values.js";
@@ -77,6 +78,7 @@ import {
 import { seedDocumentTypes } from "./seed.js";
 import { sweepUnreferencedExtractionSpans } from "./spanSweep.js";
 import {
+  amountsInText,
   candidatesFor,
   checkLineItem,
   foldTextForMatch,
@@ -85,6 +87,7 @@ import {
   valueSignature,
   type Candidate,
   type DateOrder,
+  type GateSuccess,
   isObservationFieldName,
   itemsSumToTotal,
   normalizeForMatch,
@@ -94,6 +97,7 @@ import type {
   ExtractionModel,
   ExtractionRequest,
   ModelReading,
+  ModelStatement as StatementLike,
 } from "./provider.js";
 
 // ---------------------------------------------------------------------------
@@ -338,10 +342,36 @@ export function documentTypeBound(
   name: string,
   ceiling: number,
 ): number | null {
-  const raw = documentTypeSetting(examples, name);
+  const raw = numericSetting(examples, name);
   if (raw === null || !/^[1-9][0-9]{0,6}$/.test(raw)) return null;
   const value = Number(raw);
   return value >= 1 && value <= ceiling ? value : null;
+}
+
+/**
+ * The same setting as {@link documentTypeSetting}, read as a number written
+ * either way.
+ *
+ * JSON has a number type and a string type and this row is hand-edited as
+ * often as it is written by the admin screen, so `{"value": 25}` and
+ * `{"value": "25"}` reach this code interchangeably. Honouring only the
+ * string made a bound the owner had set read as unset, which is the quietest
+ * possible failure: the document comes back truncated and nothing says why.
+ * Whole numbers only -- `25.5` pages is not a setting anybody meant.
+ */
+function numericSetting(examples: unknown, name: string): string | null {
+  if (!Array.isArray(examples)) return null;
+  for (const entry of examples) {
+    if (!entry || typeof entry !== "object") continue;
+    const setting = entry as { setting?: unknown; value?: unknown };
+    if (setting.setting !== name) continue;
+    if (typeof setting.value === "number") {
+      if (Number.isSafeInteger(setting.value)) return String(setting.value);
+      continue;
+    }
+    if (typeof setting.value === "string") return setting.value;
+  }
+  return null;
 }
 
 /** The kind's model override, or null for the configured default. */
@@ -815,34 +845,127 @@ export type StatementCitation = {
   contiguous: boolean;
 };
 
-/**
- * The one line of a page that prints this value, or null.
- *
- * Null when no line does, and null when more than one does. The second is the
- * point: a value printed twice gives no way to say which line states it, and
- * a citation chosen by coin flip is exactly what the gate refuses everywhere
- * else.
- */
-function soleLineCarrying(
+/** One page line as a candidate, **with the edges it really has**. A line
+ * this file builds by hand and hands to the gate without `cutStart` and
+ * `cutEnd` is a line the gate reads more generously than it reads the same
+ * text from `candidatesFor`: that is how a piece cut off before a minus sign
+ * offered a charge for a page printing a credit. */
+function lineCandidate(line: PageLine): Candidate {
+  return {
+    text: line.text,
+    start: line.start,
+    end: line.end,
+    cutStart: line.cutStart,
+    cutEnd: line.cutEnd,
+  };
+}
+
+/** Whether one line, read on its own, states this value. */
+function lineCarries(
   page: LoadedPage,
   valueType: DocumentFieldValueType,
   value: unknown,
-): Candidate | null {
-  let found: Candidate | null = null;
-  for (const line of page.lines) {
-    const candidate = { text: line.text, start: line.start, end: line.end };
-    const checked = checkValue({
-      valueType,
-      value,
-      candidates: [candidate],
-      pageText: page.text,
-      defaultCurrency: "USD",
+  line: PageLine,
+): boolean {
+  return checkValue({
+    valueType,
+    value,
+    candidates: [lineCandidate(line)],
+    pageText: page.text,
+    defaultCurrency: "USD",
+  }).ok;
+}
+
+/** Which of the page's lines a matched range touches. */
+function linesCovered(
+  page: LoadedPage,
+  range: { start: number; end: number },
+): number[] {
+  return page.lines
+    .filter((line) => line.start < range.end && range.start < line.end)
+    .map((line) => line.id);
+}
+
+/**
+ * Whether the value the model copied is printed the way money is printed.
+ *
+ * A decimal point or a currency mark, and nothing else counts. A bare run of
+ * digits is a suite number, a tax year, a page number or a count, and every
+ * one of those sits a line away from a money field on some real document.
+ * Scaled notation is refused by the same rule from the other side: a model
+ * that reads `Raised $2.5M` and writes `2,500,000` has written a number no
+ * line prints, and a bare run of digits is what that looks like.
+ */
+function isMoneyShaped(value: unknown): boolean {
+  const text = String(value ?? "").normalize("NFKC");
+  if (/\d\.|\.\d/.test(text)) return true;
+  if (/[$¢£¥₩€₹]/.test(text)) return true;
+  const upper = text.toUpperCase();
+  return SUPPORTED_CURRENCIES.some((code) => upper.includes(code));
+}
+
+/**
+ * The one line a citation may be moved to, or null.
+ *
+ * A K-1's dense boxes put the model one line off its value seven times in
+ * the backfill, and each of those readings was right about the number. This
+ * is the only rule in this file that **relaxes** a check, so every condition
+ * below is a refusal and all six have to fail before a citation moves.
+ *
+ * - The statement cited no line ids. The legacy quote path has no ids, so
+ *   "one line off" means nothing there.
+ * - A money value with no decimal point and no currency mark. `Suite 400`,
+ *   `Tax year 2024` and `Page 2 of 5` each stored a total end to end.
+ * - Any cited line states a value of this type. Then the model did not miss
+ *   by a line, it contradicted the line it pointed at: a page printing
+ *   `Fee 100.00` and `Total 250.00` stored a total of 100.
+ * - The line is more than one id away from any cited line, or on another
+ *   page. One off is the miss this exists for; two off is a search.
+ * - More than one line of that window states the value. Choosing between
+ *   them is a guess.
+ * - Any other line of the whole document states it. A value printed twice
+ *   gives no way to say which line states it, on this page or the next.
+ *
+ * The caller adds the two conditions that need the rest of the reply: a line
+ * another accepted statement already points at, and a line two statements
+ * would repair onto at once.
+ */
+function repairTarget(
+  loaded: Loaded,
+  page: LoadedPage,
+  cited: readonly PageLine[],
+  valueType: DocumentFieldValueType,
+  value: unknown,
+  citedCandidates: readonly Candidate[],
+): PageLine | null {
+  if (cited.length === 0) return null;
+  if (valueType === "money" && !isMoneyShaped(value)) return null;
+  const scan = valueType === "number" ? { percentIsNeutral: true } : {};
+  for (const candidate of citedCandidates) {
+    const printed = amountsInText(candidate.text, {
+      ...scan,
+      ...(candidate.cutStart ? { cutStart: true } : {}),
+      ...(candidate.cutEnd ? { cutEnd: true } : {}),
     });
-    if (!checked.ok) continue;
-    if (found) return null;
-    found = candidate;
+    if (printed.length > 0) return null;
   }
-  return found;
+  const carrying = page.lines.filter(
+    (line) =>
+      cited.every((one) => Math.abs(line.id - one.id) <= 1) &&
+      lineCarries(page, valueType, value, line),
+  );
+  if (carrying.length !== 1) return null;
+  const target = carrying[0]!;
+  for (const other of loaded.pages) {
+    for (const line of other.lines) {
+      if (other.shown === page.shown && line.id === target.id) continue;
+      // A line with no digit on it can state no amount, and skipping it
+      // keeps this scan off every word of a long document.
+      if (!/\d/.test(line.text)) continue;
+      if (lineCarries(other, valueType, value, line)) return null;
+    }
+  }
+  return target;
 }
 
 /**
@@ -1240,6 +1363,77 @@ async function prepare(
     currencyAssumed?: true;
   };
   const accepted: Accepted[] = [];
+  /** `page|line` for every line an accepted statement's value was read from.
+   * A repair may not land on one: two fields reading the same line is how a
+   * fee becomes a total. */
+  const occupied = new Set<string>();
+  /** Citations that may be one line off, held until the whole reply is
+   * known. See `repairTarget` for the conditions already checked, and the
+   * loop below for the two that need every other statement. */
+  type Repair = {
+    field: TypeField;
+    statement: StatementLike;
+    page: LoadedPage;
+    citation: StatementCitation;
+    target: PageLine;
+  };
+  const repairs: Repair[] = [];
+
+  /**
+   * One gated reading becomes spans and an accepted entry.
+   *
+   * Shared by the ordinary path and the repaired one, so a statement whose
+   * citation moved is stored by exactly the same code as every other, and
+   * the lines it was read from are recorded either way.
+   */
+  const accept = async (
+    field: TypeField,
+    page: LoadedPage,
+    statement: StatementLike,
+    citation: StatementCitation,
+    candidateSet: Candidate[],
+    gated: GateSuccess,
+  ): Promise<void> => {
+    // One span per line that supported a value, so an observation cites the
+    // line that prints it rather than the region it was found in.
+    const spanIds: string[] = [];
+    for (const index of gated.support) {
+      const spanId = await findOrCreateSpan(
+        client,
+        loaded,
+        page,
+        candidateSet[index]!,
+      );
+      if (!spanId) {
+        prepared.failures.push({
+          field: field.name,
+          reason: "span_unresolved",
+          reading: statement.value,
+          citation,
+        });
+        return;
+      }
+      spanIds.push(spanId);
+    }
+    for (const index of gated.support) {
+      for (const id of linesCovered(page, candidateSet[index]!)) {
+        occupied.add(`${page.shown}|${id}`);
+      }
+    }
+    accepted.push({
+      field,
+      page: statement.page,
+      quote: candidateSet[gated.support[0] ?? 0]?.text ?? "",
+      lines: [...(statement.lines ?? [])],
+      citation,
+      spanIds,
+      values: gated.values,
+      ...(gated.itemsTotal === undefined
+        ? {}
+        : { itemsTotal: gated.itemsTotal }),
+      ...(gated.currencyAssumed ? { currencyAssumed: true as const } : {}),
+    });
+  };
 
   for (const statement of reading.statements.slice(
     0,
@@ -1386,82 +1580,84 @@ async function prepare(
       defaultCurrency: "USD",
       ...(type?.dateOrder ? { dateOrder: type.dateOrder } : {}),
     });
-    let resolved = gated;
-    let candidateSet = candidates;
-    if (
-      !resolved.ok &&
-      resolved.reason === "value_not_in_quote" &&
-      (field.valueType === "money" || field.valueType === "number")
-    ) {
-      // The value is not on any line the model cited. If the page prints it
-      // on exactly one line, that line is the citation.
-      //
-      // The safety argument, and it is the whole of it: the check is still
-      // "does a line of this page state this value", unchanged. What is
-      // relaxed is only *which* line, and only when the page leaves no
-      // choice -- one occurrence means there is exactly one line that could
-      // be meant, so nothing is being picked between. Two occurrences keep
-      // the failure, because then choosing would be guessing. A K-1's dense
-      // boxes put the model one line off seven times in the backfill; none
-      // of those readings was wrong about the number.
-      const unique = soleLineCarrying(page, field.valueType, statement.value);
-      if (unique) {
-        candidateSet = [unique];
-        resolved = checkValue({
-          valueType: field.valueType,
-          value: statement.value,
-          candidates: candidateSet,
-          pageText: page.text,
+    if (!gated.ok) {
+      // The value is not on any line the model cited. It may still be one
+      // line off a line that states it -- `repairTarget` holds the six
+      // conditions that decide. A repair is only *proposed* here: whether it
+      // stands depends on what the rest of the reply points at, and that is
+      // not known until this loop ends.
+      const target =
+        gated.reason === "value_not_in_quote" &&
+        (field.valueType === "money" || field.valueType === "number")
+          ? repairTarget(
+              loaded,
+              page,
+              located.cited,
+              field.valueType,
+              statement.value,
+              candidates,
+            )
+          : null;
+      if (target) {
+        repairs.push({ field, statement, page, citation, target });
+        continue;
+      }
+      prepared.failures.push({
+        field: field.name,
+        reason: gated.reason,
+        reading: statement.value,
+        citation,
+      });
+      continue;
+    }
+    await accept(field, page, statement, citation, candidates, gated);
+  }
+
+  // The repairs, now that the whole reply is known.
+  //
+  // Two refusals belong here and nowhere else, because each is about the run
+  // rather than about one statement: a line another accepted statement was
+  // already read from, and a line two statements would both move onto. Both
+  // are the same fault -- a document with one value and two fields claiming
+  // it -- and on a receipt printing `Subtotal`, `Tax` and `Total` above a
+  // single amount it stored all three from that one line.
+  for (const repair of repairs) {
+    const key = `${repair.page.shown}|${repair.target.id}`;
+    const contested =
+      occupied.has(key) ||
+      repairs.some(
+        (other) =>
+          other !== repair &&
+          `${other.page.shown}|${other.target.id}` === key,
+      );
+    const candidates = [lineCandidate(repair.target)];
+    const gated = contested
+      ? null
+      : checkValue({
+          valueType: repair.field.valueType,
+          value: repair.statement.value,
+          candidates,
+          pageText: repair.page.text,
           defaultCurrency: "USD",
           ...(type?.dateOrder ? { dateOrder: type.dateOrder } : {}),
         });
-      }
-    }
-    if (!resolved.ok) {
+    if (!gated || !gated.ok) {
       prepared.failures.push({
-        field: field.name,
-        reason: resolved.reason,
-        reading: statement.value,
-        citation,
+        field: repair.field.name,
+        reason: gated && !gated.ok ? gated.reason : "value_not_in_quote",
+        reading: repair.statement.value,
+        citation: repair.citation,
       });
       continue;
     }
-    const gatedOk = resolved;
-    // One span per line that supported a value, so an observation cites the
-    // line that prints it rather than the region it was found in.
-    const spanIds: string[] = [];
-    let spanFailed = false;
-    for (const index of gatedOk.support) {
-      const candidate = candidateSet[index]!;
-      const spanId = await findOrCreateSpan(client, loaded, page, candidate);
-      if (!spanId) {
-        spanFailed = true;
-        break;
-      }
-      spanIds.push(spanId);
-    }
-    if (spanFailed) {
-      prepared.failures.push({
-        field: field.name,
-        reason: "span_unresolved",
-        reading: statement.value,
-        citation,
-      });
-      continue;
-    }
-    accepted.push({
-      field,
-      page: statement.page,
-      quote: candidateSet[gatedOk.support[0] ?? 0]?.text ?? "",
-      lines: [...(statement.lines ?? [])],
-      citation,
-      spanIds,
-      values: gatedOk.values,
-      ...(gatedOk.itemsTotal === undefined
-        ? {}
-        : { itemsTotal: gatedOk.itemsTotal }),
-      ...(gatedOk.currencyAssumed ? { currencyAssumed: true as const } : {}),
-    });
+    await accept(
+      repair.field,
+      repair.page,
+      repair.statement,
+      repair.citation,
+      candidates,
+      gated,
+    );
   }
 
   if (prepared.unusable > 0) {
@@ -1612,6 +1808,85 @@ async function prepare(
   return prepared;
 }
 
+/**
+ * An exact date already stored is not downgraded to a partial one.
+ *
+ * The rule, in full: **when a run offers only a year or only a month and a
+ * year for a field that already holds a full day, and the day it holds
+ * begins with what the new run read, the stored day and its evidence are
+ * kept.** A contradiction -- a different year, or a different month --
+ * replaces it, because then the two readings disagree about the document and
+ * keeping the old day would be storing a date this run does not support.
+ *
+ * Why it is needed at all: extraction replaces a document's observations
+ * wholesale on every run, and a model reads the same page differently from
+ * one run to the next. Without this, a re-extraction that happened to copy
+ * "2024" off a cover page turned a stored `2024-03-18` into `2024`, an
+ * event's `occurrence_date` into null, and a document that was on the
+ * timeline into one that is not. Nothing said anything had changed.
+ *
+ * The old value keeps its **own** evidence, never the new run's. The line
+ * the new run cited prints a year and not a day, and attaching a day to it
+ * would be the one failure this whole gate exists to prevent. Only rows from
+ * the same text version qualify, because a span is an offset into the text
+ * it was cut from and a reparse moves every one of them.
+ */
+async function keepExactDates(
+  client: ClientBase,
+  loaded: Loaded,
+  eventId: string,
+  prepared: Prepared,
+): Promise<void> {
+  const partial = prepared.observations.filter(
+    (observation) =>
+      observation.value.type === "date" &&
+      observation.value.precision !== undefined,
+  );
+  if (partial.length === 0) return;
+  const stored = await client.query<{
+    observation_key: string;
+    value: ObservationValue;
+    value_evidence: string[];
+  }>(
+    `SELECT observation_key, value, value_evidence FROM kith.observations
+      WHERE event_id = $1 AND space_id = $2 AND source_text_version_id = $3`,
+    [eventId, loaded.spaceId, loaded.sourceTextVersionId],
+  );
+  const exact = new Map<string, { value: ObservationValue; evidence: string[] }>();
+  for (const row of stored.rows) {
+    const value = row.value;
+    if (
+      value &&
+      value.type === "date" &&
+      value.precision === undefined &&
+      Array.isArray(row.value_evidence) &&
+      row.value_evidence.length > 0
+    ) {
+      exact.set(row.observation_key, { value, evidence: row.value_evidence });
+    }
+  }
+  if (exact.size === 0) return;
+  for (const observation of partial) {
+    const previous = exact.get(observation.key);
+    if (!previous || previous.value.type !== "date") continue;
+    const read = observation.value as { type: "date"; value: string };
+    // Consistent, which for a prefix of an ISO date is exactly what it looks
+    // like: `2024-03-18` begins with `2024` and with `2024-03`, and with
+    // neither `2025` nor `2024-04`.
+    if (!previous.value.value.startsWith(read.value)) continue;
+    observation.value = previous.value;
+    observation.evidence = previous.evidence;
+    // And it dates the event again. A day kept as a day that left the
+    // timeline anyway would be half a fix.
+    if (prepared.occurrence.precision === "unknown") {
+      prepared.occurrence = {
+        precision: "date",
+        date: previous.value.value,
+      };
+    }
+  }
+}
+
 async function placeholderEntityId(
   client: ClientBase,
   spaceId: string,
@@ -1709,6 +1984,10 @@ async function store(
     loaded.userId,
   );
   const eventId = await stableEventId(client, loaded);
+
+  // Before anything is deleted: a date this document already stated in full
+  // is not lost to a run that read less of it.
+  await keepExactDates(client, loaded, eventId, prepared);
 
   // Replace, atomically. Observations first: they reference the version.
   await client.query(

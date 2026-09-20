@@ -918,6 +918,35 @@ const QUOTE_SPEC = [
   ["Item 5. 25 units", []],
   ["Total 5. 25", []],
 
+  // ADM-5h review: the column-gap rule closes a one-space gap beside a
+  // currency mark only before **exactly two digits**, because cents are two
+  // digits and nothing else is. Without that, a trailing point made
+  // `$82. 129961.-` read as minus 82.129961 and `$94. 504. billion` as
+  // ninety-four and a half billion, and the page prints neither.
+  ["$82. 129961.-", []],
+  ["$94. 504. billion", []],
+  ["$ 165 .00", ["165"]],
+  ["$82. 12 due", ["82.12"]],
+  ["$94. 50 total", ["94.5"]],
+
+  // A list ordinal counts nothing and is worth nothing. Digits at the very
+  // start of a line, then `.` or `)`, then a space and a word, are a bullet,
+  // and a bullet that can be stored as a money field is a number on the page
+  // that nobody wrote as one.
+  ["1. Rent 500.00", ["500"]],
+  ["3) Repairs 42.00", ["42"]],
+  ["10. Interest 5.", ["5"]],
+  ["12. Nothing else", []],
+  ["2. 50", []],
+  // Without the mark after the digits, a leading number is a quantity as
+  // often as a bullet -- "12 Mill Lane", "5 units of stock" -- so the rule
+  // stops where its own shape stops and a K-1's box number is still offered.
+  // The gate is a whitelist and an extra candidate on the line costs nothing:
+  // the model's value still has to be one the line prints, and a bare run of
+  // digits can never repair a citation onto a money field (`repairTarget`).
+  ["1 Ordinary business income 12,345.", ["1", "12345"]],
+  ["12 Mill Lane", ["12"]],
+
   // -------------------------------------------------------------------------
   // ADM-5g round five: every counterexample the four reviews produced.
   //

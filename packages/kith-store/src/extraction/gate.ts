@@ -843,6 +843,7 @@ export function amountsInText(
   options?: AmountScanOptions,
 ): string[] {
   const normalized = closeColumnGaps(foldAmountText(text));
+  const ordinal = listOrdinalStart(normalized, options);
   const found: string[] = [];
   let at = 0;
   while (at < normalized.length) {
@@ -851,6 +852,12 @@ export function amountsInText(
       continue;
     }
     const span = amountSpanAt(normalized, at);
+    // A list ordinal counts nothing and is worth nothing. See
+    // {@link listOrdinalStart}.
+    if (span.start === ordinal) {
+      at = Math.max(span.end, at + 1);
+      continue;
+    }
     if (!span.ambiguous && neighboursAreNeutral(normalized, span, options)) {
       const amount = parseAmount(
         collapseGaps(normalized.slice(span.start, span.parseEnd)),
@@ -869,32 +876,62 @@ export function amountsInText(
   return found;
 }
 
+/** A numbered list's ordinal: digits at the very start of a line, then `.`
+ * or `)`, then a space and a word. `1. Rent 500.00` and `3) Repairs 42.00`
+ * both print it, and every form with numbered boxes prints dozens. */
+const LIST_ORDINAL = /^([ \t\u00a0]*)(\d{1,3})[.)][ \u00a0]+\p{L}/u;
+
+/**
+ * Where a line's leading list ordinal begins, or -1.
+ *
+ * An ordinal is a position in a list, never a quantity and never an amount,
+ * so the finder offers it nothing. It reached review as `1. Rent 500.00`
+ * offering both 1 and 500: the 1 is a bullet, and a bullet that can be
+ * stored as a money field is a number on a page that nobody wrote as one.
+ *
+ * Only at the start of a real line. A piece cut out of a longer line has no
+ * start to speak of -- whatever stood to its left is gone -- and the amount
+ * finder refuses everything touching that edge anyway.
+ */
+function listOrdinalStart(
+  text: string,
+  options?: AmountScanOptions,
+): number {
+  if (options?.cutStart) return -1;
+  const match = LIST_ORDINAL.exec(text);
+  return match ? match[1]!.length : -1;
+}
+
 /**
  * A parsed receipt prints "$ 165 .00" as readily as "$165.00": the space is a
  * rendering artifact of the column the amount sat in, not a separator. Closed
  * up only next to a currency mark, because a bare gap between two numbers is
  * two numbers -- "APPLES 12 .99" is a quantity beside a price.
  *
- * **One space**, by the same rule every other gap in this file is read by: a
- * gap inside one printed number is one space wide and a wider one is a column
- * boundary. ADM-5h, which made a trailing point a whole dollar, is what
- * forced the point: `\u00a35.<nbsp><nbsp>61` was closed up into 5.61, and
+ * **One space, and exactly two digits after the point.** Both halves were
+ * forced by review. The width goes by the rule every other gap in this file
+ * is read by: a gap inside one printed number is one space wide, and a wider
+ * one is a column boundary. ADM-5h, which made a trailing point a whole
+ * dollar, is what forced the point: `\u00a35.<nbsp><nbsp>61` was closed up into 5.61, and
  * `\u20ac546.<six spaces>82138K` into minus five hundred and forty-six
- * thousand -- each of them a number the page does not print. Those two now
- * read as the ambiguous pair they are, and the finder offers neither side.
+ * thousand -- each of them a number the page does not print. The digit
+ * count, because cents are two digits and nothing else is: `$82. 129961.-`
+ * is not minus 82.129961 and `$94. 504. billion` is not ninety-four and a
+ * half billion. Every one of those now reads as the ambiguous pair it is,
+ * and the finder offers neither side.
  */
 function closeColumnGaps(text: string): string {
   return text
     .replace(
       new RegExp(
-        `(${CURRENCY_MARK})([ \\u00a0]*)(\\d+)[ \\u00a0]\\.(?=\\d)`,
+        `(${CURRENCY_MARK})([ \\u00a0]*)(\\d+)[ \\u00a0]\\.(?=\\d\\d(?!\\d))`,
         "g",
       ),
       "$1$2$3.",
     )
     .replace(
       new RegExp(
-        `(${CURRENCY_MARK})([ \\u00a0]*)(\\d+\\.)[ \\u00a0](?=\\d)`,
+        `(${CURRENCY_MARK})([ \\u00a0]*)(\\d+\\.)[ \\u00a0](?=\\d\\d(?!\\d))`,
         "g",
       ),
       "$1$2$3",
@@ -1403,7 +1440,23 @@ function joinsIntoOneAmount(
   // A region this wide is not one printed amount; refusing is the safe answer
   // and it keeps the check linear on a pathological line.
   if (end - start > 512) return true;
-  return parseAmount(collapseGaps(text.slice(start, end))) !== undefined;
+  const region = collapseGaps(text.slice(start, end));
+  if (parseAmount(region) !== undefined) return true;
+  // The same region without its currency marker.
+  //
+  // "Do these two runs join" is a question about digits and separators, and
+  // the marker can only make the joined reading *harder* to price: a euro
+  // amount refuses `5.123` outright, because a dot is a grouping separator
+  // where euros are printed. Without this, `\u20ac5. 123` read as two
+  // separate cells and offered 5 and 123 for a line that may well print five
+  // point one two three -- while `$5. 123` refused both, which is the answer
+  // a currency cannot be allowed to change.
+  //
+  // Only a marker the region *opens* with. One standing between the two
+  // runs is evidence they are separate -- it introduces the second of them,
+  // which is what `Paid 09/01/2026 $42.00` prints.
+  const bare = region.replace(new RegExp(`^(?:${CURRENCY_MARK})[ ]?`), "");
+  return bare !== region && parseAmount(bare) !== undefined;
 }
 
 function nearestDigit(text: string, token: { from: number; to: number }): number {
@@ -1785,7 +1838,7 @@ function dateInQuote(
   // nothing it does not. It gets its own check rather than the day rule's
   // fast path below, because `includes("2024")` is true of a line printing
   // an account number ending 120245 and of one printing $2,024.00.
-  if (precision === "year") return printsYear(text, iso);
+  if (precision === "year") return printsYear(text, iso, order);
   if (precision === "month") return printsMonthAndYear(text, iso, order);
 
   if (text.includes(iso)) return true;
@@ -1836,14 +1889,106 @@ function dateInQuote(
  * has eight digits in a fixed order and a coincidence is vanishingly
  * unlikely; a year has four and a page of numbers is full of them.
  */
-function printsYear(text: string, year: string): boolean {
+function printsYear(text: string, year: string, order?: DateOrder): boolean {
+  const number = Number(year);
+  if (number < EARLIEST_YEAR || number > LATEST_YEAR) return false;
   for (const match of text.matchAll(/\d+(?:[.,]\d+)*/g)) {
     if (match[0] !== year) continue;
-    const before = text[(match.index ?? 0) - 1] ?? "";
-    if (CURRENCY_SYMBOL_CHARS.has(before)) continue;
+    const at = match.index ?? 0;
+    if (!leftOfYearIsClear(text, at)) continue;
+    // `2024 Main Street` is a house number. A year names no address, and a
+    // document's address block is full of four-digit runs.
+    if (STREET_AFTER_NUMBER.test(text.slice(at + year.length))) continue;
     return true;
   }
-  return false;
+  // A whole date printed on the line states its year as plainly as a bare
+  // run does, and this is the only way one reads: `09/18/2024` has a slash
+  // glued to its left, and the rule above refuses that on purpose.
+  return printedDateYears(text, order).has(year);
+}
+
+/** The bounds of a year a document states. Outside them a four-digit run is
+ * a form number, a quantity or a code: `Form 1040` is not the year 1040. */
+const EARLIEST_YEAR = 1900;
+const LATEST_YEAR = 2100;
+
+/** The only letters that may be glued to the left of a year and leave it a
+ * year. A fiscal, calendar or tax year prefix, and nothing else: `x2024` is
+ * not a year, and nothing mechanical tells it from `FY2024` but this list. */
+const YEAR_PREFIXES = new Set(["fy", "cy", "ty"]);
+
+/** Words that, standing to the left, say the number after them is something
+ * else that happens to fall between 1900 and 2100: a revision, a form, a
+ * reference, a room. */
+const NOT_A_YEAR_LABELS = new Set([
+  "rev", "revised", "revision", "ver", "version", "form", "no", "num",
+  "number", "ref", "reference", "acct", "account", "invoice", "suite", "ste",
+  "apt", "unit", "box", "room", "rm", "page", "pg", "line", "id", "pin",
+  "policy", "claim", "order", "check", "cheque", "serial", "model", "lot",
+  "permit", "license", "licence", "ext", "extension",
+]);
+
+/** A street name following a number, which makes the number a house number.
+ * Up to three words between, so `2024 North Main Street` reads. */
+const STREET_AFTER_NUMBER =
+  /^[ \u00a0]+(?:[A-Za-z][A-Za-z.'-]*[ \u00a0]+){0,3}(?:street|st|avenue|ave|road|rd|lane|ln|drive|dr|boulevard|blvd|way|court|ct|place|pl|terrace|ter|highway|hwy|parkway|pkwy|circle|cir|square|sq|trail|trl)\b/i;
+
+/**
+ * Whether what stands to the left of a four-digit run leaves it a year.
+ *
+ * Glued, nothing survives but a year prefix: a letter, a digit, a dash, a
+ * hash, a slash, a currency mark or a symbol all say the run is part of
+ * something longer -- `98101-2024` is a postcode, `(206) 555-2024` a
+ * telephone number, `1099-2024` a form, `x2024` an extension, a copyright
+ * sign a copyright.
+ *
+ * One space away, a currency mark or an ISO code makes it money (`$ 2024`,
+ * `USD 2024`) and a label from {@link NOT_A_YEAR_LABELS} makes it a
+ * revision or a reference (`Rev. 2023`). Every other word is left alone,
+ * because `for the tax year 2024` is exactly the shape a year is printed in.
+ */
+function leftOfYearIsClear(text: string, at: number): boolean {
+  const before = text.slice(0, at);
+  if (before === "") return true;
+  const glued = before.slice(-1);
+  if (!/[\s\u00a0]/.test(glued)) {
+    const word = /([A-Za-z]+)$/.exec(before);
+    return word !== null && YEAR_PREFIXES.has(word[1]!.toLowerCase());
+  }
+  const trimmed = before.replace(/[\s\u00a0]+$/, "");
+  if (trimmed === "") return true;
+  const word = /([A-Za-z]+)\.?$/.exec(trimmed);
+  if (word) {
+    if (SUPPORTED_CURRENCY_SET.has(word[1]!.toUpperCase())) return false;
+    return !NOT_A_YEAR_LABELS.has(word[1]!.toLowerCase());
+  }
+  const mark = trimmed.slice(-1);
+  if (CURRENCY_SYMBOL_CHARS.has(mark)) return false;
+  return mark !== "-" && mark !== "#" && mark !== "/";
+}
+
+/** Every year a whole date on this line prints. */
+function printedDateYears(text: string, order?: DateOrder): Set<string> {
+  const years = new Set<string>();
+  for (const window of text.match(NUMERIC_DATE) ?? []) {
+    const read = readPrintedDate(window, order);
+    if (read.kind === "date" && read.precision === "day") {
+      years.add(read.iso.slice(0, 4));
+    }
+  }
+  for (const [pattern, position] of [
+    [MONTH_FIRST_DATE, "month"],
+    [DAY_FIRST_DATE, "day"],
+  ] as const) {
+    pattern.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(text)) !== null) {
+      const word = position === "month" ? match[1]! : match[2]!;
+      if (monthNumber(word) === undefined) continue;
+      years.add(String(namedYear(match[3]!)));
+    }
+  }
+  return years;
 }
 
 /** A month name pressed against a year, with no day between them:
@@ -1908,7 +2053,8 @@ function printsMonthAndYear(
   MONTH_NAME_AND_YEAR.lastIndex = 0;
   let named: RegExpExecArray | null;
   while ((named = MONTH_NAME_AND_YEAR.exec(text)) !== null) {
-    if (namesMonth(number, named[1]!) && named[2] === year) return true;
+    if (!namesMonth(number, named[1]!) || named[2] !== year) continue;
+    if (isDated(text, named.index)) return true;
   }
   NUMERIC_MONTH_AND_YEAR.lastIndex = 0;
   let numeric: RegExpExecArray | null;
@@ -1916,9 +2062,39 @@ function printsMonthAndYear(
     const [printedMonth, printedYear] = numeric[1]
       ? [numeric[1], numeric[2]!]
       : [numeric[4]!, numeric[3]!];
-    if (Number(printedMonth) === number && printedYear === year) return true;
+    if (Number(printedMonth) !== number || printedYear !== year) continue;
+    if (isDated(text, numeric.index)) return true;
   }
   return false;
+}
+
+/**
+ * Words after which a bare month and year is a date rather than two numbers
+ * that happen to sit next to each other.
+ */
+const DATE_LABELS = new Set([
+  "period", "periods", "date", "dated", "dates", "month", "months",
+  "statement", "for", "of", "as", "through", "thru", "to", "from", "ending",
+  "ended", "end", "beginning", "began", "begins", "effective", "issued",
+  "filed", "due", "paid", "posted", "closing", "closed", "cycle", "year",
+  "fy", "billing", "service", "coverage", "term", "since", "until",
+  "starting", "covering", "between", "on", "in", "by", "quarter", "week",
+]);
+
+/**
+ * Whether a month-and-year token at `at` is printed as a date.
+ *
+ * Two digits beside four are a date only where a date is what the line is
+ * saying. `Ratio 3/2024` is a ratio, `Pages 3-2024` a page range and
+ * `You may 2024` a sentence, and reading any of them as March 2024 would
+ * file a document under a month nobody wrote. So the token has to open the
+ * line or follow a word that introduces a date.
+ */
+function isDated(text: string, at: number): boolean {
+  const before = text.slice(0, at);
+  if (before.trim() === "") return true;
+  const word = /([A-Za-z]+)[.,:;]?[\s\u00a0]*$/.exec(before);
+  return word !== null && DATE_LABELS.has(word[1]!.toLowerCase());
 }
 
 /** One entry of a list, read or refused on its own. */
