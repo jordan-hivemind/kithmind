@@ -370,6 +370,10 @@ export async function grantProofAppRole(
   // the one trap `kith.sensitivity_rank` fell into below.
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.investment_document_links TO "${appRole}"`);
+  // The owner's overrides of a finance account's name, last four, type and
+  // closed flag (ADM-2b, migration 035).
+  await owner.query(`GRANT INSERT, UPDATE, DELETE ON
+    kith.finance_account_overrides TO "${appRole}"`);
   // The change feed (migration 023) is deliberately not in the list above.
   //
   // Nothing in the application writes `kith.changes`: rows arrive only through

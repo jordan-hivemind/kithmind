@@ -3,7 +3,7 @@
 // The one table every admin screen uses.
 //
 // The owner's decision, in one component: compact rows (36px), sortable
-// headers, column filters as chips, a search box that filters as you type,
+// headers, a Filters dropdown with a checklist per column, a search box that filters as you type,
 // optional grouped and expandable rows, drag-resizable columns, a clickable
 // row, a kebab column, tooltips for detail, square tags, no explanatory
 // prose.
@@ -39,7 +39,7 @@ import { buttonClass } from "@/components/ui/drawer";
 import { archiveDate, label, tableDecimal, tableInteger } from "@/lib/kith/format";
 import {
   columnChipOptions,
-  matchesChipFilter,
+  matchesFilter,
   rowMatchesSearch,
 } from "@/lib/kith/table-filters";
 import {
@@ -84,7 +84,7 @@ export type RowAction<T> = {
 export type DataTableProps<T> = {
   data: T[];
   columns: ColumnDef<T, unknown>[];
-  /** Column ids offered as filter chips, in the order the chips appear. */
+  /** Column ids offered in the Filters dropdown, in the order the sections appear. */
   filterColumns?: readonly string[];
   /** The order the table opens in. Without one, rows arrive in the order the
    * read returned them, which for a keyed read is id order and means nothing
@@ -104,6 +104,13 @@ export type DataTableProps<T> = {
    */
   getSubRows?: (row: T) => T[] | undefined;
   /**
+   * With `getSubRows`: what a parent row shows in place of its first
+   * `labelSpan` cells, so the parent's name sits on the row like a group
+   * header instead of reserving a column of its own.
+   */
+  parentLabel?: (row: T) => React.ReactNode;
+  labelSpan?: number;
+  /**
    * Whether a row has children at all, independent of whether they have been
    * loaded. Without it a row whose children arrive on expansion could never be
    * expanded: TanStack decides from `getSubRows`, which is empty until the
@@ -122,7 +129,7 @@ export type DataTableProps<T> = {
   searchPlaceholder?: string;
   /** Rendered in place of the rows when there are none. */
   empty?: React.ReactNode;
-  /** Extra controls at the end of the toolbar, after the chips. */
+  /** Extra controls at the end of the toolbar, after the Filters button. */
   toolbar?: React.ReactNode;
   /** When set, the search box reports to the caller, which searches on the
    * server and passes the matching rows back in `data`; the table then does
@@ -303,6 +310,8 @@ export function DataTable<T>({
   initialSorting = [],
   groupBy,
   getSubRows,
+  parentLabel,
+  labelSpan = 1,
   canExpand,
   onExpandChange,
   actions = [],
@@ -319,7 +328,7 @@ export function DataTable<T>({
 }: DataTableProps<T>) {
   const [sorting, setSorting] = useState<SortingState>(initialSorting);
   const [search, setSearch] = useState("");
-  const [chips, setChips] = useState<Record<string, string[]>>({});
+  const [unchecked, setUnchecked] = useState<Record<string, string[]>>({});
   const [expanded, setExpanded] = useState<ExpandedState>({});
   const [columnSizing, setColumnSizing] = useState<ColumnSizingState>(() =>
     loadColumnSizing(id),
@@ -394,8 +403,8 @@ export function DataTable<T>({
     autoResetAll: false,
   });
 
-  // Chips come from the whole data set, not the filtered rows: a chip that
-  // disappeared as soon as another chip excluded it could never be unselected.
+  // Options come from the whole data set, not the filtered rows: an option that
+  // disappeared as soon as another filter excluded it could never be rechecked.
   const chipOptions = useMemo(
     () =>
       filterColumns.map((columnId) => ({
@@ -407,7 +416,7 @@ export function DataTable<T>({
     [data, filterColumns],
   );
 
-  // Chips apply to top-level rows. A `getSubRows` child is shown or hidden
+  // Filters apply to top-level rows. A `getSubRows` child is shown or hidden
   // with its parent -- the row model emits children right after the parent
   // they were expanded from, so a parent a chip excluded would otherwise leave
   // its children on screen with nothing above them. Without `getSubRows` every
@@ -417,9 +426,9 @@ export function DataTable<T>({
     if (row.getIsGrouped()) return true;
     if (row.depth > 0) return !hiddenParents.has(row.parentId ?? "");
     const kept = filterColumns.every((columnId) =>
-      matchesChipFilter(
+      matchesFilter(
         (row.original as Record<string, unknown>)[columnId],
-        chips[columnId] ?? [],
+        unchecked[columnId] ?? [],
       ),
     );
     if (!kept) hiddenParents.add(row.id);
@@ -428,7 +437,7 @@ export function DataTable<T>({
 
   // The current filtered view's ids, in display order: what "select all"
   // selects, what a shift-click ranges over, and what a stale selection is
-  // pruned against when a search or chip filter changes what's in view.
+  // pruned against when a search or filter changes what's in view.
   const rowIdList = useMemo(
     () => (selectable ? rows.map((row) => getRowId(row.original)) : []),
     [selectable, rows, getRowId],
@@ -448,17 +457,12 @@ export function DataTable<T>({
     [selectable, rows, selected, getRowId],
   );
 
-  const toggleChip = (columnId: string, value: string) => {
-    setChips((current) => {
-      const selected = current[columnId] ?? [];
-      return {
-        ...current,
-        [columnId]: selected.includes(value)
-          ? selected.filter((item) => item !== value)
-          : [...selected, value],
-      };
-    });
-  };
+  const setUncheckedFor = (columnId: string, values: string[]) =>
+    setUnchecked((current) => ({ ...current, [columnId]: values }));
+  const activeFilterCount = Object.values(unchecked).reduce(
+    (total, values) => total + values.length,
+    0,
+  );
 
   const kebabWidth = actions.length > 0 ? 32 : 0;
   const selectWidth = selectable ? 28 : 0;
@@ -482,27 +486,97 @@ export function DataTable<T>({
                 className="h-8 w-full rounded-control border border-kith-border-subtle bg-kith-surface px-2.5 text-sm outline-none focus:border-kith-action focus:ring-1 focus:ring-kith-action sm:w-56"
               />
             ) : null}
-            {chipOptions.map(({ columnId, options }) =>
-              options.map((option) => {
-                const selected = (chips[columnId] ?? []).includes(option.value);
-                return (
-                  <button
-                    key={`${columnId}:${option.value}`}
-                    type="button"
-                    aria-pressed={selected}
-                    onClick={() => toggleChip(columnId, option.value)}
-                    className={`rounded-tag border px-1.5 py-0.5 text-xs leading-none ${
-                      selected
-                        ? "border-accent-600 bg-accent-600 text-white"
-                        : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"
-                    }`}
+            {chipOptions.length > 0 ? (
+              <DropdownMenu.Root>
+                <DropdownMenu.Trigger className="flex h-8 items-center gap-1.5 rounded-control border border-kith-border-subtle bg-kith-surface px-2.5 text-sm text-kith-text-secondary hover:bg-kith-surface-muted data-[state=open]:bg-kith-surface-muted">
+                  <svg
+                    aria-hidden
+                    viewBox="0 0 16 16"
+                    className="h-3.5 w-3.5"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.5"
                   >
-                    {label(option.value)}
-                    <span className="ml-1 opacity-60">{option.count}</span>
-                  </button>
-                );
-              }),
-            )}
+                    <path d="M2 3h12L9.5 8.5V13l-3-1.5V8.5L2 3Z" strokeLinejoin="round" />
+                  </svg>
+                  Filters
+                  {activeFilterCount > 0 ? (
+                    <span className="rounded-tag bg-accent-600 px-1.5 py-0.5 text-xs leading-none text-white">
+                      {activeFilterCount}
+                    </span>
+                  ) : null}
+                </DropdownMenu.Trigger>
+                <DropdownMenu.Portal>
+                  <DropdownMenu.Content
+                    align="start"
+                    sideOffset={4}
+                    className="z-50 max-h-[70vh] min-w-56 overflow-y-auto rounded-control border border-kith-border-subtle bg-kith-surface px-2 py-1 text-sm shadow-[var(--kith-shadow-md)]"
+                  >
+                    {chipOptions.map(({ columnId, options }, sectionIndex) => {
+                      const header = table.getColumn(columnId)?.columnDef.header;
+                      const values = options.map((option) => option.value);
+                      const hidden = unchecked[columnId] ?? [];
+                      return (
+                        <div key={columnId}>
+                          {sectionIndex > 0 ? (
+                            <DropdownMenu.Separator className="my-1 h-px bg-kith-border-subtle" />
+                          ) : null}
+                          <div className="flex items-center justify-between px-1 pt-1.5 pb-1 text-xs font-medium tracking-wide text-kith-text-muted uppercase">
+                            <span>{typeof header === "string" ? header : label(columnId)}</span>
+                            <span className="normal-case">
+                              <button
+                                type="button"
+                                onClick={() => setUncheckedFor(columnId, [])}
+                                className="text-accent-700 hover:underline"
+                              >
+                                All
+                              </button>
+                              <span aria-hidden className="mx-1 text-kith-text-muted">
+                                /
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => setUncheckedFor(columnId, values)}
+                                className="text-accent-700 hover:underline"
+                              >
+                                None
+                              </button>
+                            </span>
+                          </div>
+                          {options.map((option) => (
+                            <DropdownMenu.CheckboxItem
+                              key={option.value}
+                              checked={!hidden.includes(option.value)}
+                              onSelect={(event) => event.preventDefault()}
+                              onCheckedChange={(checked) =>
+                                setUncheckedFor(
+                                  columnId,
+                                  checked
+                                    ? hidden.filter((value) => value !== option.value)
+                                    : [...hidden, option.value],
+                                )
+                              }
+                              className="group flex cursor-default items-center gap-2 rounded-control px-1 py-1 outline-none data-[highlighted]:bg-accent-50"
+                            >
+                              <span
+                                aria-hidden
+                                className="flex h-3.5 w-3.5 items-center justify-center rounded-[3px] border border-gray-300 bg-white text-[10px] leading-none text-white group-data-[state=checked]:border-accent-600 group-data-[state=checked]:bg-accent-600"
+                              >
+                                <span className="hidden group-data-[state=checked]:block">✓</span>
+                              </span>
+                              <span className="flex-1">{label(option.value)}</span>
+                              <span className="text-xs text-kith-text-muted tabular-nums">
+                                {option.count}
+                              </span>
+                            </DropdownMenu.CheckboxItem>
+                          ))}
+                        </div>
+                      );
+                    })}
+                  </DropdownMenu.Content>
+                </DropdownMenu.Portal>
+              </DropdownMenu.Root>
+            ) : null}
             {selectable && selected.size > 0 ? (
               <>
                 <Tag tone="accent">{selected.size} selected</Tag>
@@ -713,9 +787,16 @@ export function DataTable<T>({
                           />
                         </td>
                       ) : null}
-                      {row.getVisibleCells().map((cell, cellIndex) => (
+                      {row.getVisibleCells().map((cell, cellIndex) => {
+                        const spansLabel =
+                          parentLabel !== undefined && row.getCanExpand();
+                        if (spansLabel && cellIndex > 0 && cellIndex < labelSpan) {
+                          return null;
+                        }
+                        return (
                         <td
                           key={cell.id}
+                          colSpan={spansLabel && cellIndex === 0 ? labelSpan : undefined}
                           style={{ width: cell.column.getSize() }}
                           className={`h-row px-2 align-middle ${
                             cell.column.columnDef.meta?.nowrap === true
@@ -759,6 +840,8 @@ export function DataTable<T>({
                               {flexRender(cell.column.columnDef.cell, cell.getContext())}
                               <span className="text-gray-400">({row.subRows.length})</span>
                             </button>
+                          ) : spansLabel && cellIndex === 0 ? (
+                            parentLabel(row.original)
                           ) : (groupBy !== undefined && cell.getIsAggregated()) ||
                             cell.getIsPlaceholder() ? null : (
                             // `getIsAggregated` is true for any row that has
@@ -772,7 +855,8 @@ export function DataTable<T>({
                             )
                           )}
                         </td>
-                      ))}
+                        );
+                      })}
                       {actions.length > 0 ? (
                         <td className="sticky right-0 h-row border-l border-gray-100 bg-inherit px-1 text-right align-middle">
                           {row.getIsGrouped() ||

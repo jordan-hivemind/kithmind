@@ -264,6 +264,18 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
       import.meta.url,
     ),
   },
+  // This one was written as 034 while main was at 033. ADM-8c (#337) landed
+  // its own 034 first, so it moved *up* to 035 rather than into a gap: the
+  // hosted schema is already at 34, and the runner refuses anything that is
+  // not exactly one past the recorded version.
+  {
+    version: 35,
+    name: "finance account overrides: the owner's name, last four, type and closed flag over the archive's (ADM-2b)",
+    url: new URL(
+      "../migrations/035_finance_account_overrides.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

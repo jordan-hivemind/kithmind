@@ -1,5 +1,5 @@
 // The two pieces of table behaviour that are this repo's rather than TanStack
-// Table's: how a search box matches a row, and what a column's filter chips
+// Table's: how a search box matches a row, and what a column's filter options
 // offer.
 //
 // Sorting, column filtering and row expansion come from TanStack Table's own
@@ -63,14 +63,13 @@ export function columnChipOptions(values: readonly unknown[]): ChipOption[] {
 }
 
 /**
- * The chip filter itself: no selection means every row, and a selection means
- * the row's value is one of the selected ones. Multi-select rather than
- * single, because "show me folders and institutions" is one thought.
+ * The filter itself: every option starts checked, and a row is shown unless
+ * its value is one the reader unchecked. Empty cells have no option to
+ * uncheck, so they always show.
  */
-export function matchesChipFilter(
+export function matchesFilter(
   value: unknown,
-  selected: readonly string[],
+  unchecked: readonly string[],
 ): boolean {
-  if (selected.length === 0) return true;
-  return selected.includes(String(value ?? ""));
+  return !unchecked.includes(String(value ?? ""));
 }

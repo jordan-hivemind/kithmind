@@ -38,6 +38,7 @@ import {
   canonicalizeFinanceDecimal,
   type FinanceAccountId,
   type FinanceAccountDescriptor,
+  type FinanceAccountCurrentValue,
   type FinanceAccountInventoryRecord,
   type FinanceAggregateRecord,
   type FinanceBalanceRecord,
@@ -1145,7 +1146,99 @@ type AccountInventoryRow = AccountDescriptorRow & {
   activity_to: string | null;
   latest_snapshot_as_of: string | null;
   open_review_count: string;
+  balance_as_of: string | null;
+  balance_value: string | null;
+  balance_currency: string | null;
+  balance_count: string;
+  holdings_as_of: string | null;
+  holdings_value: string | null;
+  holdings_missing: string;
+  holdings_currency_count: string;
+  holdings_currency: string | null;
+  holdings_not_marked: string;
 };
+
+function statedValue(
+  rawAmount: string | null,
+  rawCurrency: string | null,
+  asOf: string,
+  source: FinanceAccountCurrentValue["source"],
+  scope: ReadScope,
+): FinanceAccountCurrentValue | null {
+  const decimal = decimalOrNull(rawAmount, scope);
+  const currency = currencyOrNull(rawCurrency, scope);
+  if (decimal === null || currency === null) return null;
+  return { value: { decimal, currency }, asOf, source };
+}
+
+/**
+ * The one figure this operation reports, or nothing.
+ *
+ * Nothing is the safe answer and it is chosen on every doubt. A screen and an
+ * assistant both read this as "what the account is worth", so a number that is
+ * a fragment, a mixture or a guess is worse here than a blank -- an absent
+ * value asks a question and a wrong one answers it.
+ *
+ * | The account has | Reported |
+ * | --- | --- |
+ * | one balance carrying a total on its latest such date | that total, dated by that balance |
+ * | two or more balances on that date | nothing: which one is the account's total is not stated |
+ * | a latest balance with no total, and an older one with a total | the older one, dated by itself |
+ * | no balance with a total, and holdings that pass every test below | their sum, dated by that holdings date |
+ * | anything else | nothing |
+ *
+ * A balance always wins, and is never replaced by later holdings. A balance is
+ * the account's own stated total; positions are its securities, which is a
+ * different and usually smaller thing -- a cash sleeve is in the first and not
+ * the second. Preferring a later holdings date reported a single $5 position
+ * as a $1,000,000 account.
+ *
+ * Holdings answer only when the archive states the whole of that date:
+ *
+ *   * every position on the date carries a market value (`missing = 0`). A sum
+ *     over the rows that happen to have one is a partial total, and
+ *     `get_holdings_snapshot` already calls that mix `incomplete`.
+ *   * every position on the date is in one currency, counted over all of the
+ *     date's rows and not only the valued ones. Nothing is ever summed across
+ *     currencies, and an unvalued row in another currency still means the date
+ *     is not in one currency.
+ *   * every position on the date states `valuation_basis = 'market_price'`.
+ *     `cost`, `last_round` and `reported_nav` are not what the holding is
+ *     worth, an unstated basis does not say which it is, and adding any of
+ *     them to a marked security is the mix `pgSchema.ts` warns about.
+ *     `financeHoldingRecord` above already refuses a record on the same
+ *     grounds.
+ */
+function currentValueOf(
+  row: AccountInventoryRow,
+  scope: ReadScope,
+): FinanceAccountCurrentValue | null {
+  if (row.balance_as_of !== null) {
+    if (row.balance_count !== "1") return null;
+    return statedValue(
+      row.balance_value,
+      row.balance_currency,
+      row.balance_as_of,
+      "balance",
+      scope,
+    );
+  }
+  if (
+    row.holdings_as_of === null ||
+    row.holdings_value === null ||
+    row.holdings_missing !== "0" ||
+    row.holdings_currency_count !== "1" ||
+    row.holdings_not_marked !== "0"
+  )
+    return null;
+  return statedValue(
+    row.holdings_value,
+    row.holdings_currency,
+    row.holdings_as_of,
+    "positions",
+    scope,
+  );
+}
 
 /**
  * ADM-2: one page of per-account inventory counts.
@@ -1154,13 +1247,21 @@ type AccountInventoryRow = AccountDescriptorRow & {
  * unchanged, so an account is identified and disclosed here exactly as
  * `list_accounts` identifies and discloses it, and the last-four rules are not
  * reimplemented. What is added is five aggregates, and nothing else about the
- * account's contents: no amount, no instrument, no description. An inventory
- * screen asks how much is held, not what is in it.
+ * account's contents: no instrument, no description, and one figure, its
+ * current value. An inventory screen asks how much is held and worth, not what
+ * is in it.
  *
  * `activity_from`/`activity_to` span all three record kinds because a cash
  * account has balances and no positions and a brokerage account has both, and
  * an inventory row that reported only one kind's range would say an account was
  * emptier than it is.
+ *
+ * `currentValue` is the account's stated balance total, and only when it has
+ * none is it the sum of a fully stated holdings date; `currentValueOf` below
+ * holds the whole rule and the reasons. Every doubt reports nothing.
+ * ponytail: several balances on the latest dated total, or holdings in more
+ * than one currency, give no value rather than a pick or a crossed total.
+ * Upgrade path if that turns up in real data: report a value per currency.
  *
  * ponytail: correlated subqueries, one set per account row on the page, rather
  * than five grouped joins. The page is at most 100 accounts and each subquery
@@ -1197,8 +1298,46 @@ async function listAccountInventory(
               WHERE p.account_id = d.account_id)::text AS latest_snapshot_as_of,
             (SELECT count(*) FROM review_items r
               WHERE r.account_id = d.account_id
-                AND r.status = 'open')::text AS open_review_count
+                AND r.status = 'open')::text AS open_review_count,
+            lb.as_of::text AS balance_as_of,
+            lb.total_value::text AS balance_value,
+            lb.currency::text AS balance_currency,
+            coalesce(lb.n, 0)::text AS balance_count,
+            hv.as_of::text AS holdings_as_of,
+            hv.value::text AS holdings_value,
+            coalesce(hv.missing, 0)::text AS holdings_missing,
+            coalesce(hv.currency_count, 0)::text AS holdings_currency_count,
+            hv.currency::text AS holdings_currency,
+            coalesce(hv.not_marked, 0)::text AS holdings_not_marked
        FROM account_descriptors d
+       LEFT JOIN LATERAL (
+         SELECT b.as_of, count(*) AS n, min(b.total_value) AS total_value,
+                min(b.currency::text) AS currency
+           FROM balances b
+          WHERE b.account_id = d.account_id AND b.total_value IS NOT NULL
+            AND b.as_of = (SELECT max(x.as_of) FROM balances x
+                            WHERE x.account_id = d.account_id
+                              AND x.total_value IS NOT NULL)
+          GROUP BY b.as_of
+       ) lb ON true
+       -- Every position on the account's latest holdings date, valued or not.
+       -- Filtering the unvalued ones out here is what made the sum a fragment
+       -- and hid their currencies from the count: the counts below have to see
+       -- the whole date to be able to refuse it.
+       LEFT JOIN LATERAL (
+         SELECT max(p.as_of) AS as_of,
+                sum(p.market_value) AS value,
+                count(*) FILTER (WHERE p.market_value IS NULL) AS missing,
+                count(DISTINCT p.currency) AS currency_count,
+                min(p.currency::text) AS currency,
+                count(*) FILTER (
+                  WHERE p.valuation_basis IS DISTINCT FROM 'market_price'
+                ) AS not_marked
+           FROM positions p
+          WHERE p.account_id = d.account_id
+            AND p.as_of = (SELECT max(q.as_of) FROM positions q
+                            WHERE q.account_id = d.account_id)
+       ) hv ON true
       WHERE ($1::text IS NULL OR d.account_id > $1)
       ORDER BY d.account_id
       LIMIT $2`,
@@ -1210,6 +1349,7 @@ async function listAccountInventory(
     // account with rows of one kind only still has both, and an account with
     // no rows at all has neither.
     const ranged = row.activity_from !== null && row.activity_to !== null;
+    const currentValue = currentValueOf(row, scope);
     return {
       account: accountDescriptorOf(row, scope),
       statementCount: Number(row.statement_count),
@@ -1221,6 +1361,7 @@ async function listAccountInventory(
       ...(ranged && row.latest_snapshot_as_of !== null
         ? { latestSnapshotAsOf: row.latest_snapshot_as_of }
         : {}),
+      ...(currentValue === null ? {} : { currentValue }),
     };
   });
   const truncated = result.rows.length > request.limit;

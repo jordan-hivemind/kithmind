@@ -12,8 +12,9 @@
 // MCP gateway -- `resolveFinanceArchive` plus `readFinanceArchive`, which
 // re-authorizes the request against the archive's own pinned space -- and
 // never by widening the kith pool's credentials. `readAccountInventory` below
-// is the only new call, and it is a read of counts: no amount, no instrument,
-// no description, and no full account number exists in the archive to return.
+// is the only new call, and it is a read of counts and one figure per account,
+// its current value: no instrument, no description, and no full account number
+// exists in the archive to return.
 
 import {
   type FinanceAccountInventoryRecord,
@@ -106,6 +107,63 @@ async function readAccountInventory(
     };
   }
   return { state: "read", records, truncated };
+}
+
+/**
+ * Whether the archive holds this account id, for the one caller that has to
+ * know before it writes: the override route (ADM-2b).
+ *
+ * `kith.finance_account_overrides.finance_account_id` is not a foreign key --
+ * the archive is a different database -- so nothing in the schema stops a row
+ * from naming an account that does not exist. This is that check, and it is
+ * deliberately a read of the same inventory the screen shows rather than a new
+ * archive operation: an override is only ever reachable from a row the screen
+ * listed, so an id that is not in the inventory is not an id the owner can
+ * have been editing.
+ *
+ * `"unavailable"` rather than `false` when the archive will not answer. They
+ * are not the same: refusing the write is right for both, but calling an
+ * outage "not found" would tell the owner his account is gone.
+ *
+ * Pages the same bounded way `readAccountInventory` does and stops at the
+ * first page that carries the id, so the common case is one page.
+ */
+export async function archiveHoldsAccount(
+  archive: FinanceArchiveAccess,
+  principal: Principal,
+  authorizedSpaceIds: readonly string[],
+  accountId: string,
+): Promise<boolean | "unavailable"> {
+  const trusted = {
+    principalId: `web:${principal.userId}`,
+    authorizedSpaceIds,
+  };
+  let cursor: string | undefined;
+  try {
+    for (let page = 0; page < MAX_ARCHIVE_PAGES; page += 1) {
+      const response = await readFinanceArchive(
+        archive,
+        {
+          contractVersion: 1,
+          operation: "list_account_inventory",
+          spaceId: archive.spaceId,
+          limit: ARCHIVE_PAGE,
+          ...(cursor === undefined ? {} : { cursor }),
+        },
+        trusted,
+      );
+      if (response.operation !== "list_account_inventory") return "unavailable";
+      if (response.items.some((item) => item.account.accountId === accountId))
+        return true;
+      if (response.nextCursor === undefined) return false;
+      cursor = response.nextCursor;
+    }
+  } catch {
+    return "unavailable";
+  }
+  // The page bound was reached with a cursor still in hand. The id was not on
+  // any page read, and there are pages nobody read, so this is not a "no".
+  return "unavailable";
 }
 
 /**
@@ -209,17 +267,28 @@ export async function loadInstitutions(
 ): Promise<InstitutionsPageData | null> {
   const loaded = await loadAuthenticatedPage(
     cookieHeader,
-    async ({ ctx, principal }) => ({
-      principal,
-      spaces: await administeredSpaces(ctx, principal),
-    }),
+    async ({ ctx, principal }) => {
+      const spaces = await administeredSpaces(ctx, principal);
+      // The owner's edits to account names and the like live beside the
+      // archive, in the archive's own space.
+      const archiveSpace = resolveFinanceArchive()?.spaceId;
+      const overrides =
+        archiveSpace !== undefined && spaces.includes(archiveSpace)
+          ? await admin.listAccountOverrides(ctx, { spaceId: archiveSpace })
+          : [];
+      return { principal, spaces, overrides };
+    },
   );
   if (loaded === null) return null;
   const inventory = await archiveInventory(loaded.principal, loaded.spaces);
   return {
     institutions:
       inventory.state === "read"
-        ? groupInstitutions(inventory.records, now)
+        ? groupInstitutions(
+            inventory.records,
+            now,
+            new Map(loaded.overrides.map((item) => [item.accountId, item])),
+          )
         : [],
     state: inventory.state,
     reason: inventory.state === "unavailable" ? inventory.reason : null,

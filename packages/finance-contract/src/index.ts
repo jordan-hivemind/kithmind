@@ -418,6 +418,39 @@ export type FinanceAccountInventoryRecord = {
   latestSnapshotAsOf?: string;
   /** `review_items` for this account still in the `open` status. */
   openReviewCount: number;
+  /**
+   * The account's latest stated value, in the currency it was stated in; no
+   * figure ever crosses currencies. Absent whenever the archive will not
+   * stand behind a single figure, which it treats as the safe answer: see
+   * `FinanceAccountCurrentValue`.
+   */
+  currentValue?: FinanceAccountCurrentValue;
+};
+
+/**
+ * What the archive states an account is worth, never what it infers.
+ *
+ * `balance` is the account's own stated total (`balances.total_value`) on the
+ * latest date it has one, and it is what is reported whenever the account has
+ * one at all. `positions` is the sum of `positions.market_value` on the latest
+ * holdings date, used only when no balance carries a total, and only when that
+ * date is entirely valued, in one currency and marked at market price.
+ *
+ * A later holdings date never replaces a balance: a balance is the whole
+ * account, positions are its securities, and the difference is the cash.
+ *
+ * `asOf` is the date of the figure itself, so a closed account's last value
+ * reads as last, not current. A consumer must show it: the number alone is
+ * not a claim about today.
+ *
+ * Absent means the archive would not state one, which is not zero and not an
+ * error. See `listAccountInventory` in the archive's `pgRead.ts` for the whole
+ * rule and the reasons behind each refusal.
+ */
+export type FinanceAccountCurrentValue = {
+  value: FinanceMoney;
+  asOf: string;
+  source: "balance" | "positions";
 };
 
 export type FinanceCoverageRecord = {
@@ -2465,7 +2498,7 @@ function accountInventoryRecord(
   exact(
     input,
     ["account", "statementCount", "recordCount", "openReviewCount"],
-    ["activityFrom", "activityTo", "latestSnapshotAsOf"],
+    ["activityFrom", "activityTo", "latestSnapshotAsOf", "currentValue"],
     "invalid_response",
   );
   const count = (raw: unknown) =>
@@ -2494,11 +2527,26 @@ function accountInventoryRecord(
         latestSnapshotAsOf > activityTo))
   )
     fail("invalid_response");
+  let currentValue: FinanceAccountCurrentValue | undefined;
+  if (input.currentValue !== undefined) {
+    const raw = object(input.currentValue, "invalid_response");
+    exact(raw, ["value", "asOf", "source"], [], "invalid_response");
+    currentValue = {
+      value: money(raw.value, "invalid_response"),
+      asOf: isoDate(raw.asOf, "invalid_response"),
+      source: oneOf(
+        raw.source,
+        ["balance", "positions"] as const,
+        "invalid_response",
+      ),
+    };
+  }
   return {
     account: accountDescriptor(input.account),
     statementCount: count(input.statementCount),
     recordCount: count(input.recordCount),
     openReviewCount: count(input.openReviewCount),
+    ...(currentValue === undefined ? {} : { currentValue }),
     ...(activityFrom === undefined ? {} : { activityFrom }),
     ...(activityTo === undefined ? {} : { activityTo }),
     ...(latestSnapshotAsOf === undefined ? {} : { latestSnapshotAsOf }),

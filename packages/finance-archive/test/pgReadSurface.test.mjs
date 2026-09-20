@@ -2364,6 +2364,324 @@ test(
 
 // --- ADM-2: list_account_inventory -----------------------------------------
 
+/**
+ * Replaces one account's money rows with exactly the scenario named, so a
+ * `currentValue` assertion is about the rule under test and nothing else.
+ *
+ * `balances` are `[asOf, totalValue, currency]` and `positions` are
+ * `[asOf, marketValue, currency, valuationBasis]`, both with `null` allowed
+ * wherever the column is nullable, which is the whole point: an archive whose
+ * every column is populated is not the archive this rule exists for.
+ */
+async function moneyRows(owner, accountId, { balances = [], positions = [] }) {
+  await owner.query("DELETE FROM positions WHERE account_id = $1", [accountId]);
+  await owner.query("DELETE FROM balances WHERE account_id = $1", [accountId]);
+  let index = 0;
+  for (const [asOf, totalValue, currency] of balances) {
+    index += 1;
+    await owner.query(
+      `INSERT INTO balances (id, account_id, as_of, total_value, currency)
+       VALUES ($1, $2, $3::date, $4::numeric, $5)`,
+      [`cv-balance-${index}`, accountId, asOf, totalValue, currency],
+    );
+  }
+  index = 0;
+  for (const [asOf, marketValue, currency, basis = "market_price"] of positions) {
+    index += 1;
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, market_value, currency, valuation_basis)
+       VALUES ($1, $2, $3::date, $4::numeric, $5, $6)`,
+      [`cv-position-${index}`, accountId, asOf, marketValue, currency, basis],
+    );
+  }
+}
+
+test(
+  "list_account_inventory withholds a holdings value when any position on the date has no market value (ADM-2)",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const accountId = seeded.settled.accountIds[0];
+    const inventory = async () =>
+      (
+        await serve(r, { operation: "list_account_inventory", limit: 100 })
+      ).items.find((item) => item.account.accountId === accountId);
+
+    // The reviewer's fixture: a valued USD position beside two unvalued ones,
+    // one of them in another currency, and no balance to fall back on. Summing
+    // what happens to carry a market value would report 100 as the account's
+    // value and would never notice the EUR row at all.
+    await moneyRows(owner, accountId, {
+      positions: [
+        ["2026-03-31", "100", "USD"],
+        ["2026-03-31", null, "USD"],
+        ["2026-03-31", null, "EUR"],
+      ],
+    });
+    assert.equal((await inventory()).currentValue, undefined);
+
+    // One unvalued row in the same currency is still a hole in the total.
+    await moneyRows(owner, accountId, {
+      positions: [
+        ["2026-03-31", "100", "USD"],
+        ["2026-03-31", null, "USD"],
+      ],
+    });
+    assert.equal((await inventory()).currentValue, undefined);
+
+    // Mixed currencies with every row valued: still no single figure.
+    await moneyRows(owner, accountId, {
+      positions: [
+        ["2026-03-31", "100", "USD"],
+        ["2026-03-31", "80", "EUR"],
+      ],
+    });
+    assert.equal((await inventory()).currentValue, undefined);
+
+    // The positive control: every row on the date valued, one currency.
+    await moneyRows(owner, accountId, {
+      positions: [
+        ["2026-03-31", "100", "USD"],
+        ["2026-03-31", "80", "USD"],
+      ],
+    });
+    assert.deepEqual((await inventory()).currentValue, {
+      value: { decimal: "180", currency: "USD" },
+      asOf: "2026-03-31",
+      source: "positions",
+    });
+
+    // An earlier date's hole says nothing about the date being reported.
+    await moneyRows(owner, accountId, {
+      positions: [
+        ["2026-01-31", null, "USD"],
+        ["2026-03-31", "100", "USD"],
+      ],
+    });
+    assert.deepEqual((await inventory()).currentValue, {
+      value: { decimal: "100", currency: "USD" },
+      asOf: "2026-03-31",
+      source: "positions",
+    });
+  },
+);
+
+test(
+  "list_account_inventory prefers a balance's own total over later holdings, dated by the balance (ADM-2)",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const accountId = seeded.settled.accountIds[0];
+    const inventory = async () =>
+      (
+        await serve(r, { operation: "list_account_inventory", limit: 100 })
+      ).items.find((item) => item.account.accountId === accountId);
+
+    // A single later position is a fragment of the account, not the account.
+    await moneyRows(owner, accountId, {
+      balances: [["2026-02-28", "1000000", "USD"]],
+      positions: [["2026-03-15", "5", "USD"]],
+    });
+    assert.deepEqual((await inventory()).currentValue, {
+      value: { decimal: "1000000", currency: "USD" },
+      asOf: "2026-02-28",
+      source: "balance",
+    });
+
+    // The same rule with a plausible-looking pair: the balance includes cash
+    // the holdings do not, so 101 is not this account's value.
+    await moneyRows(owner, accountId, {
+      balances: [["2026-02-28", "1000", "USD"]],
+      positions: [["2026-03-31", "101", "USD"]],
+    });
+    assert.deepEqual((await inventory()).currentValue, {
+      value: { decimal: "1000", currency: "USD" },
+      asOf: "2026-02-28",
+      source: "balance",
+    });
+
+    // And across currencies: the later USD holdings never replace the balance.
+    await moneyRows(owner, accountId, {
+      balances: [["2026-02-28", "1000", "EUR"]],
+      positions: [["2026-03-31", "100", "USD"]],
+    });
+    assert.deepEqual((await inventory()).currentValue, {
+      value: { decimal: "1000", currency: "EUR" },
+      asOf: "2026-02-28",
+      source: "balance",
+    });
+
+    // Two balances on the latest dated total: ambiguous, and the holdings do
+    // not get to answer in their place.
+    await moneyRows(owner, accountId, {
+      balances: [
+        ["2026-02-28", "1000", "USD"],
+        ["2026-02-28", "900", "EUR"],
+      ],
+      positions: [["2026-03-31", "100", "USD"]],
+    });
+    assert.equal((await inventory()).currentValue, undefined);
+
+    // A latest balance with no total falls back to the last balance that has
+    // one, dated by that older row rather than by the empty newer one.
+    await moneyRows(owner, accountId, {
+      balances: [
+        ["2026-01-31", "700", "USD"],
+        ["2026-02-28", null, "USD"],
+      ],
+    });
+    assert.deepEqual((await inventory()).currentValue, {
+      value: { decimal: "700", currency: "USD" },
+      asOf: "2026-01-31",
+      source: "balance",
+    });
+
+    // Positions answer only when no balance anywhere carries a total.
+    await moneyRows(owner, accountId, {
+      balances: [["2026-02-28", null, "USD"]],
+      positions: [["2026-03-31", "101", "USD"]],
+    });
+    assert.deepEqual((await inventory()).currentValue, {
+      value: { decimal: "101", currency: "USD" },
+      asOf: "2026-03-31",
+      source: "positions",
+    });
+  },
+);
+
+test(
+  "list_account_inventory withholds a holdings value unless every position is marked at market price (ADM-2)",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const accountId = seeded.settled.accountIds[0];
+    const inventory = async () =>
+      (
+        await serve(r, { operation: "list_account_inventory", limit: 100 })
+      ).items.find((item) => item.account.accountId === accountId);
+
+    // The reviewer's fixture: 5100 is a marked security added to something
+    // carried at cost, which is the mix `pgSchema.ts` warns about.
+    await moneyRows(owner, accountId, {
+      positions: [
+        ["2026-03-31", "100", "USD", "market_price"],
+        ["2026-03-31", "5000", "USD", "cost"],
+      ],
+    });
+    assert.equal((await inventory()).currentValue, undefined);
+
+    // Cost alone is no better: it is not what the account is worth.
+    await moneyRows(owner, accountId, {
+      positions: [["2026-03-31", "5000", "USD", "cost"]],
+    });
+    assert.equal((await inventory()).currentValue, undefined);
+
+    // Nor is any other basis in the vocabulary, alone or mixed.
+    for (const basis of ["last_round", "reported_nav"]) {
+      await moneyRows(owner, accountId, {
+        positions: [["2026-03-31", "5000", "USD", basis]],
+      });
+      assert.equal((await inventory()).currentValue, undefined, basis);
+      await moneyRows(owner, accountId, {
+        positions: [
+          ["2026-03-31", "100", "USD", "market_price"],
+          ["2026-03-31", "5000", "USD", basis],
+        ],
+      });
+      assert.equal((await inventory()).currentValue, undefined, `${basis} mixed`);
+    }
+
+    // An unstated basis is the same refusal `financeHoldingRecord` already
+    // makes: without it there is no telling a marked security from one at
+    // cost, so there is no total either.
+    await moneyRows(owner, accountId, {
+      positions: [["2026-03-31", "100", "USD", null]],
+    });
+    assert.equal((await inventory()).currentValue, undefined);
+
+    await moneyRows(owner, accountId, {
+      positions: [
+        ["2026-03-31", "100", "USD", "market_price"],
+        ["2026-03-31", "80", "USD", null],
+      ],
+    });
+    assert.equal((await inventory()).currentValue, undefined);
+
+    // The positive control, once more with the basis stated on every row.
+    await moneyRows(owner, accountId, {
+      positions: [
+        ["2026-03-31", "100", "USD", "market_price"],
+        ["2026-03-31", "80", "USD", "market_price"],
+      ],
+    });
+    assert.deepEqual((await inventory()).currentValue, {
+      value: { decimal: "180", currency: "USD" },
+      asOf: "2026-03-31",
+      source: "positions",
+    });
+  },
+);
+
+test(
+  "list_account_inventory reports a current value from the latest balance or holdings, never across currencies (ADM-2)",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const snapshot = await citedSnapshot(owner, seeded);
+    const inventory = async () =>
+      (
+        await serve(r, { operation: "list_account_inventory", limit: 100 })
+      ).items.find((item) => item.account.accountId === snapshot.accountId);
+
+    // The cited snapshot has two balances on its date (one per currency) and
+    // holdings in two currencies: no single figure the archive can stand
+    // behind, from either side.
+    assert.equal((await inventory()).currentValue, undefined);
+
+    // Dropping the EUR positions does not help while the two balances stand:
+    // a balance with a total is what answers, and there are two of them.
+    await owner.query("DELETE FROM positions WHERE currency = 'EUR'");
+    assert.equal((await inventory()).currentValue, undefined);
+
+    // One balance left, and it answers with its own date -- not the holdings'.
+    await owner.query("DELETE FROM balances WHERE currency = 'EUR'");
+    const stated = await inventory();
+    assert.equal(stated.currentValue.source, "balance");
+    assert.equal(stated.currentValue.asOf, snapshot.asOf);
+    assert.deepEqual(stated.currentValue.value, {
+      decimal: "205",
+      currency: "USD",
+    });
+
+    // A later balance is the latest figure the archive has.
+    await owner.query(
+      `INSERT INTO balances (id, account_id, as_of, total_value, currency)
+       VALUES ('balance-later', $1, $2::date + 30, '999', 'USD')`,
+      [snapshot.accountId, snapshot.asOf],
+    );
+    const later = await inventory();
+    assert.equal(later.currentValue.source, "balance");
+    assert.deepEqual(later.currentValue.value, {
+      decimal: "999",
+      currency: "USD",
+    });
+
+    // With every balance gone the cited holdings answer, summed on their own
+    // latest date and in their own currency.
+    await owner.query("DELETE FROM balances WHERE account_id = $1", [
+      snapshot.accountId,
+    ]);
+    const held = await inventory();
+    assert.equal(held.currentValue.source, "positions");
+    assert.equal(held.currentValue.asOf, snapshot.asOf);
+    assert.deepEqual(held.currentValue.value, {
+      decimal: "200",
+      currency: "USD",
+    });
+  },
+);
+
 test(
   "list_account_inventory reports one row per account, with the counts and dates the archive actually holds (ADM-2)",
   { skip },

@@ -48,3 +48,12 @@ export function tableDecimal(value: string): string {
   const [, sign = "", whole = "", fraction = ""] = match;
   return `${sign}${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}${fraction}`;
 }
+
+/** Whole units in the amount's own currency; no figure is converted. */
+export function tableMoney(amount: number, currency: string): string {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency,
+    maximumFractionDigits: 0,
+  }).format(amount);
+}

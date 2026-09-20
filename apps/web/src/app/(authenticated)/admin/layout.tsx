@@ -23,6 +23,7 @@ import { headers } from "next/headers";
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 
+import { AdminShell } from "@/components/admin/admin-shell";
 import { AttentionBadge } from "@/components/admin/attention-badge";
 import { QueryProvider } from "@/components/query-provider";
 import { loadAttentionCounts } from "@/lib/kith/attention-data";
@@ -55,39 +56,42 @@ export default async function AdminLayout({
 
   return (
     <QueryProvider>
-      <div className="flex min-h-[70vh] flex-col gap-5 md:flex-row md:gap-6">
-        <nav
-          aria-label="Admin"
-          className="border-b border-kith-border-subtle pb-3 md:w-48 md:shrink-0 md:border-r md:border-b-0 md:pr-4 md:pb-0"
-        >
-          <ul className="flex flex-wrap gap-1 text-sm md:flex-col">
-            {SCREENS.map((screen) =>
-              screen.ready ? (
-                <li key={screen.href}>
-                  <Link
-                    href={screen.href}
-                    className="flex items-center rounded-control px-3 py-2 text-kith-text-secondary hover:bg-accent-50 hover:text-accent-700"
+      <AdminShell
+        nav={
+          <nav
+            aria-label="Admin"
+            className="border-b border-kith-border-subtle pb-3 md:h-full md:border-r md:border-b-0 md:pr-2 md:pb-0"
+          >
+            <ul className="flex flex-wrap gap-1 text-sm md:flex-col">
+              {SCREENS.map((screen) =>
+                screen.ready ? (
+                  <li key={screen.href}>
+                    <Link
+                      href={screen.href}
+                      className="flex items-center rounded-control px-3 py-2 text-kith-text-secondary hover:bg-accent-50 hover:text-accent-700"
+                    >
+                      {screen.label}
+                      {screen.href === "/admin/attention" ? (
+                        <AttentionBadge initial={attentionCounts} />
+                      ) : null}
+                    </Link>
+                  </li>
+                ) : (
+                  <li
+                    key={screen.href}
+                    aria-disabled="true"
+                    className="block px-3 py-2 text-kith-text-muted"
                   >
                     {screen.label}
-                    {screen.href === "/admin/attention" ? (
-                      <AttentionBadge initial={attentionCounts} />
-                    ) : null}
-                  </Link>
-                </li>
-              ) : (
-                <li
-                  key={screen.href}
-                  aria-disabled="true"
-                  className="block px-3 py-2 text-kith-text-muted"
-                >
-                  {screen.label}
-                </li>
-              ),
-            )}
-          </ul>
-        </nav>
-        <section className="min-w-0 flex-1">{children}</section>
-      </div>
+                  </li>
+                ),
+              )}
+            </ul>
+          </nav>
+        }
+      >
+        {children}
+      </AdminShell>
     </QueryProvider>
   );
 }

@@ -6,6 +6,7 @@
 // `investmentLinkWork.ts` for the deferred kind, the triggers and the
 // backfill that drive it (ADM-8c).
 
+export * from "./accountOverrides.js";
 export * from "./areas.js";
 export * from "./attention.js";
 export * from "./changes.js";
