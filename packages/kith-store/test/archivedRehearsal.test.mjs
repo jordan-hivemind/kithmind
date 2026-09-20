@@ -26,6 +26,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { createKithPool, newKithId } from "../dist/index.js";
+import { sweepUnreferencedExtractionSpans } from "../dist/extraction/index.js";
 import {
   addRehearsalRoot,
   installFakeDropbox,
@@ -514,6 +515,104 @@ test(
     ).rows[0]?.counts;
     assert.deepEqual(counts?.notReadyReasons ?? {}, {});
     assert.equal(counts?.unavailable ?? 0, 0);
+
+    // ADM-5j. Re-extraction, which is what actually happens on the owner's
+    // machine: the model reads the document again and one statement that
+    // survived last time now fails its gate. The previous run's span for it
+    // is referenced by nothing after the replace, and before this branch it
+    // stayed for ever -- one more unreferenced span per re-extraction per
+    // document, which is how 68 of 91 ready generations came to carry one.
+    //
+    // Still hand-written for the reason above, and still mirroring `store`
+    // in `src/extraction/model.ts`: observations replaced, then the sweep, in
+    // one transaction.
+    const secondSpan = newKithId();
+    await f.client.query(
+      `INSERT INTO kith.evidence_spans
+         (id, space_id, created_at, source_revision_id, source_text_version_id,
+          source_page_id, ordinal, "start", "end", quote_hash, locator)
+       VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,98,0,1,$6,
+               jsonb_build_object('kind', 'extraction_v1'))`,
+      [
+        secondSpan,
+        targetText.space_id,
+        targetText.source_revision_id,
+        targetText.source_text_version_id,
+        targetPage.id,
+        "f".repeat(64),
+      ],
+    );
+    await f.client.query(
+      `INSERT INTO kith.observations
+         (id,space_id,created_at,source_account_id,source_item_id,
+          source_revision_id,source_text_version_id,processing_generation_id,
+          event_id,event_version_id,entity_id,event_type,occurrence,
+          occurrence_date,occurrence_instant,occurrence_sort_key,
+          observation_key,observation_type,schema_version,value,value_evidence,
+          bound_entity_id,user_id)
+       VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,$10,
+               'document_statement','{"precision":"unknown"}'::jsonb,
+               NULL,NULL,NULL,'total','total',1,
+               '{"type":"money","amount":"1.00","currency":"USD"}'::jsonb,
+               $11,NULL,$12)`,
+      [
+        newKithId(),
+        ...chain,
+        extractionEvent,
+        extractionVersion,
+        extractionEntity,
+        JSON.stringify([secondSpan]),
+        f.userId,
+      ],
+    );
+
+    // The re-extraction: `total` fails its gate this time, so only `vendor`
+    // comes back, and `secondSpan` is left pointing at nothing.
+    await f.client.query("BEGIN");
+    await f.client.query(
+      `DELETE FROM kith.observations
+        WHERE event_id = $1 AND observation_key = 'total'`,
+      [extractionEvent],
+    );
+    const swept = await sweepUnreferencedExtractionSpans(f.client, {
+      spaceId: targetText.space_id,
+      sourceTextVersionId: targetText.source_text_version_id,
+    });
+    await f.client.query("COMMIT");
+    assert.equal(swept, 1, "the abandoned statement's span was removed");
+    assert.equal(
+      (
+        await f.client.query(
+          "SELECT count(*)::int AS count FROM kith.evidence_spans WHERE id = $1",
+          [secondSpan],
+        )
+      ).rows[0].count,
+      0,
+    );
+    // The statement that survived keeps its span, because an observation
+    // still cites it. A sweep that took this one would be far worse than the
+    // orphans it exists to remove.
+    assert.equal(
+      (
+        await f.client.query(
+          "SELECT count(*)::int AS count FROM kith.evidence_spans WHERE id = $1",
+          [extractionSpan],
+        )
+      ).rows[0].count,
+      1,
+    );
+
+    await rehearsalUntilSettled(pass(profileB));
+    assert.equal(await assessment(f), "complete");
+    const afterReextraction = (
+      await f.client.query(
+        `SELECT counts FROM kith.worker_processing_assessments
+          WHERE source_account_id = $1 ORDER BY created_at DESC LIMIT 1`,
+        [f.sourceAccountId],
+      )
+    ).rows[0]?.counts;
+    assert.deepEqual(afterReextraction?.notReadyReasons ?? {}, {});
+    assert.equal(afterReextraction?.unavailable ?? 0, 0);
 
     const kept = await withRehearsalCatalog(
       pass(profileB).config,

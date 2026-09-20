@@ -9,9 +9,10 @@ import test from "node:test";
 
 import { digestParsedMappingManifest } from "@repo/worker-protocol";
 
-import { applyKithSchema, newKithId } from "../dist/index.js";
+import { applyKithSchema, createKithPool, newKithId } from "../dist/index.js";
 import * as provenance from "../dist/provenance/index.js";
 import * as documents from "../dist/documents/index.js";
+import * as extraction from "../dist/extraction/index.js";
 
 import { connect, skip, throwawayDatabase } from "./helpers/pgDatabase.mjs";
 
@@ -1045,6 +1046,351 @@ test(
     // simply is not found -- `forget_epoch` is part of its identity.
     const noAck = await provenance.loadArchiveDeletionAck(client, receipt, item2, forgotten + 1);
     assert.equal(noAck, null);
+  },
+);
+
+/**
+ * ADM-5j. A sealed one-page generation, without the digest assertions the
+ * test above makes about it -- everything here cares about is that the
+ * manifest exists and the seal verifies.
+ */
+async function sealedGeneration(client) {
+  const spaceId = seedSpace();
+  const sourceAccountId = await seedSourceAccount(client, spaceId);
+  const userId = await seedUser(client);
+  const actorCredentialId = await seedApiKey(client, userId);
+  const item = await provenance.createOrGetSourceItem(client, {
+    spaceId,
+    sourceAccountId,
+    externalId: "fixture/orphans.pdf",
+  });
+  const revision = await provenance.createOrGetArchivedRevision(client, {
+    spaceId,
+    sourceItemId: item.id,
+    contentHash: await sha256Utf8("binary-bytes"),
+    byteLength: 1024,
+    mediaType: "application/pdf",
+    capturedAt: new Date(),
+    userId,
+  });
+  const parserArtifact = await provenance.createOrGetParserArtifact(client, {
+    spaceId,
+    sourceAccountId,
+    sourceItemId: item.id,
+    sourceRevisionId: revision.id,
+    clientArtifactId: cryptoRandomUuid(),
+    parserFingerprint: "parser-v1",
+    outputHash: await sha256Utf8("parsed-output"),
+    outputByteLength: 256,
+    outputMediaType: "application/x-parsed-pages",
+    userId,
+    actorCredentialId,
+    createdAt: new Date(),
+  });
+  const pageText = "AB";
+  const pageTextHash = await sha256Utf8(pageText);
+  const pageInputs = [{ ordinal: 0, start: 0, end: 2, text: pageText, textHash: pageTextHash }];
+  const evidenceInputs = [
+    {
+      ordinal: 0,
+      pageOrdinal: 0,
+      start: 0,
+      end: 1,
+      quoteHash: await sha256Utf8("A"),
+      locator: { kind: "parser_page_v1", pageNumber: 1, pageTextHash },
+    },
+    {
+      ordinal: 1,
+      pageOrdinal: 0,
+      start: 1,
+      end: 2,
+      quoteHash: await sha256Utf8("B"),
+      locator: { kind: "parser_page_v1", pageNumber: 1, pageTextHash },
+    },
+  ];
+  const mappingManifestHash = await digestParsedMappingManifest(pageInputs, evidenceInputs);
+  const textVersion = await provenance.createOrGetParsedTextVersion(client, {
+    spaceId,
+    sourceRevisionId: revision.id,
+    parserArtifactId: parserArtifact.id,
+    extractionFingerprint: "extract-v1",
+    textHash: pageTextHash,
+    byteLength: 2,
+    utf16Length: 2,
+    pageCount: 1,
+    mappingManifestHash,
+  });
+  const counts = {
+    expectedPageCount: 1,
+    expectedEvidenceSpanCount: 2,
+    expectedDocumentCount: 1,
+    expectedChunkCount: 2,
+  };
+  const generationId = await seedGeneration(client, {
+    spaceId,
+    sourceAccountId,
+    sourceItemId: item.id,
+    sourceRevisionId: revision.id,
+    sourceTextVersionId: textVersion.id,
+    parserArtifactId: parserArtifact.id,
+    mappingManifestHash,
+    desiredProcessingEpoch: 0,
+    ...counts,
+  });
+  const ingestJobId = await seedIngestJob(client, spaceId, sourceAccountId, item.id, revision.id, generationId);
+  const discoveryWorkId = await seedDiscoveryWork(client, {
+    spaceId,
+    sourceAccountId,
+    sourceItemId: item.id,
+    userId,
+    credentialId: actorCredentialId,
+  });
+  const stage = await seedWorkerParsedStage(client, {
+    spaceId,
+    sourceAccountId,
+    sourceItemId: item.id,
+    discoveryWorkId,
+    ingestJobId,
+    processingGenerationId: generationId,
+    sourceRevisionId: revision.id,
+    sourceTextVersionId: textVersion.id,
+    parserArtifactId: parserArtifact.id,
+    mappingManifestHash,
+    ...counts,
+  });
+  const pageInsert = await provenance.insertParsedPages(client, stage, pageInputs);
+  stage.pageIds = pageInsert.ids;
+  stage.pageBytes = pageInsert.bytes;
+  const evidenceInsert = await provenance.insertParsedEvidence(client, stage, evidenceInputs);
+  stage.evidenceSpanIds = evidenceInsert.ids;
+  stage.evidenceBytes = evidenceInsert.bytes;
+  const documentInsert = await provenance.insertParsedDocuments(client, stage, [
+    {
+      documentKey: "doc-1",
+      title: "Fixture document",
+      docType: "note",
+      capturedAt: capturedAtMs,
+      evidence: [
+        { pageOrdinal: 0, evidenceOrdinal: 0 },
+        { pageOrdinal: 0, evidenceOrdinal: 1 },
+      ],
+    },
+  ]);
+  stage.documentIds = documentInsert.ids;
+  stage.documentBytes = documentInsert.bytes;
+  const chunkInsert = await provenance.insertParsedChunks(client, stage, [
+    { documentKey: "doc-1", ordinal: 0, start: 0, end: 1, text: "A", evidence: [{ pageOrdinal: 0, evidenceOrdinal: 0 }] },
+    { documentKey: "doc-1", ordinal: 1, start: 1, end: 2, text: "B", evidence: [{ pageOrdinal: 0, evidenceOrdinal: 1 }] },
+  ]);
+  stage.chunkIds = chunkInsert.ids;
+  stage.chunkBytes = chunkInsert.bytes;
+  await provenance.sealParsedPayload(client, stage, new Date());
+  await client.query(
+    `INSERT INTO kith.spaces (id, kind, name, created_by)
+     VALUES ($1,'personal','Synthetic',$2) ON CONFLICT (id) DO NOTHING`,
+    [spaceId, userId],
+  );
+  const generation = provenance.camelizeProcessingGeneration(
+    (await client.query("SELECT * FROM kith.processing_generations WHERE id = $1", [generationId])).rows[0],
+  );
+  const pageId = (
+    await client.query("SELECT id FROM kith.source_pages WHERE source_text_version_id = $1 LIMIT 1", [textVersion.id])
+  ).rows[0].id;
+  return {
+    spaceId,
+    sourceAccountId,
+    userId,
+    item,
+    revision,
+    textVersion,
+    generation,
+    generationId,
+    manifestSpanIds: stage.evidenceSpanIds,
+    pageId,
+  };
+}
+
+/**
+ * One `document_statement` event version and observation, citing the spans
+ * given -- what the extraction writer leaves behind, built by hand so this
+ * test does not need a model.
+ */
+async function citeSpans(client, fixture, spanIds) {
+  const entityId = newKithId();
+  const eventId = newKithId();
+  const versionId = newKithId();
+  await client.query(
+    `INSERT INTO kith.entities
+       (id, space_id, created_at, user_id, key, kind, canonical_name,
+        normalized_name, aliases, normalized_aliases)
+     VALUES ($1,$2,transaction_timestamp(),$3,'other:document','other',
+             'Document','document','[]'::jsonb,'[]'::jsonb)`,
+    [entityId, fixture.spaceId, fixture.userId],
+  );
+  await client.query(
+    `INSERT INTO kith.events
+       (id, space_id, created_at, source_account_id, source_item_id,
+        event_key, created_by)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,'document_statement:v1',$5)`,
+    [eventId, fixture.spaceId, fixture.sourceAccountId, fixture.item.id, fixture.userId],
+  );
+  const chain = [
+    fixture.spaceId,
+    fixture.sourceAccountId,
+    fixture.item.id,
+    fixture.revision.id,
+    fixture.textVersion.id,
+    fixture.generationId,
+  ];
+  await client.query(
+    `INSERT INTO kith.event_versions
+       (id,space_id,created_at,source_account_id,source_item_id,
+        source_revision_id,source_text_version_id,processing_generation_id,
+        event_id,entity_id,event_type,schema_version,occurrence,
+        field_evidence,user_id)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,
+             'document_statement',1,'{"precision":"unknown"}'::jsonb,$10,$11)`,
+    [
+      versionId,
+      ...chain,
+      eventId,
+      entityId,
+      JSON.stringify({ occurrence: spanIds, entity: spanIds, eventType: spanIds }),
+      fixture.userId,
+    ],
+  );
+  await client.query(
+    `INSERT INTO kith.observations
+       (id,space_id,created_at,source_account_id,source_item_id,
+        source_revision_id,source_text_version_id,processing_generation_id,
+        event_id,event_version_id,entity_id,event_type,occurrence,
+        observation_key,observation_type,schema_version,value,value_evidence,
+        user_id)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,$10,
+             'document_statement','{"precision":"unknown"}'::jsonb,
+             'vendor','vendor',1,'{"type":"text","value":"X"}'::jsonb,$11,$12)`,
+    [newKithId(), ...chain, eventId, versionId, entityId, JSON.stringify(spanIds), fixture.userId],
+  );
+}
+
+test(
+  "the span cleanup removes exactly the orphan, and the seal verifies again",
+  { skip },
+  async (t) => {
+    // ADM-5j. The live residue after ADM-5i: 68 of the owner's 91 ready
+    // generations still carried an evidence span that is outside the
+    // manifest, carries no locator kind and is referenced by nothing, so the
+    // seal refused the generation and the health screen stayed red.
+    //
+    // Everything about this test is the *exactness* of the selection. Four
+    // spans that look like the orphan from one angle each have to survive.
+    const database = await throwawayDatabase(t);
+    const client = await connect(database);
+    await applyKithSchema(client);
+    const f = await sealedGeneration(client);
+    const pool = createKithPool(database.url);
+    pool.on("error", () => {});
+    t.after(() => pool.end());
+
+    const span = async (ordinal, columns = {}) => {
+      const id = newKithId();
+      await client.query(
+        `INSERT INTO kith.evidence_spans
+           (id, space_id, created_at, source_revision_id, source_text_version_id,
+            source_page_id, ordinal, "start", "end", quote_hash, locator,
+            card_extraction_fingerprints)
+         VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,0,1,$7,$8,$9)`,
+        [
+          id,
+          f.spaceId,
+          f.revision.id,
+          f.textVersion.id,
+          f.pageId,
+          ordinal,
+          await sha256Utf8("A"),
+          columns.locator ?? null,
+          columns.card ?? null,
+        ],
+      );
+      return id;
+    };
+
+    const extractionSpanId = await span(900, {
+      locator: JSON.stringify({ kind: "extraction_v1" }),
+    });
+    // A span written before the marker existed, adopted by an observation.
+    // Every one of the owner's surviving legacy spans is this shape.
+    const legacySpanId = await span(901);
+    await citeSpans(client, f, [extractionSpanId, legacySpanId]);
+    // The card runner's, which `sweepCardEvidenceSpans` owns.
+    const cardSpanId = await span(902, { card: JSON.stringify(["card-v1"]) });
+    // Somebody else's, named by its locator. Unreferenced, and still not ours.
+    const foreignSpanId = await span(903, {
+      locator: JSON.stringify({ kind: "parser_page_v1", pageNumber: 1 }),
+    });
+    const orphanSpanId = await span(904);
+
+    // The live symptom, first: one unmarked unadopted span and the whole
+    // generation fails to verify.
+    const refused = [];
+    await assert.rejects(
+      provenance.verifySealedParsedPayload(client, f.generation, (named) => refused.push(named)),
+      /scan_conflict/,
+    );
+    assert.deepEqual(refused, ["id_sets"]);
+
+    // Dry run is the default and deletes nothing.
+    const dry = await extraction.cleanupOrphanedExtractionSpans(pool, { apply: false });
+    assert.equal(dry.applied, false);
+    assert.equal(dry.generationsAffected, 1);
+    assert.equal(dry.spans, 1);
+    assert.equal(
+      (
+        await client.query("SELECT count(*)::int AS count FROM kith.evidence_spans WHERE source_text_version_id = $1", [
+          f.textVersion.id,
+        ])
+      ).rows[0].count,
+      f.manifestSpanIds.length + 5,
+    );
+
+    const applied = await extraction.cleanupOrphanedExtractionSpans(pool, { apply: true });
+    assert.equal(applied.applied, true);
+    assert.equal(applied.spans, 1);
+
+    const survivors = new Set(
+      (
+        await client.query("SELECT id FROM kith.evidence_spans WHERE source_text_version_id = $1", [f.textVersion.id])
+      ).rows.map((row) => row.id),
+    );
+    assert.equal(survivors.has(orphanSpanId), false, "the orphan survived");
+    for (const [name, id] of [
+      ["the marked extraction span", extractionSpanId],
+      ["the adopted legacy span", legacySpanId],
+      ["the card span", cardSpanId],
+      ["the foreign parser span", foreignSpanId],
+      ...f.manifestSpanIds.map((id, index) => [`manifest span ${index}`, id]),
+    ]) {
+      assert.ok(survivors.has(id), `${name} was deleted`);
+    }
+
+    // Idempotent: a second apply finds nothing, so a scheduled run is safe.
+    const again = await extraction.cleanupOrphanedExtractionSpans(pool, { apply: true });
+    assert.equal(again.spans, 0);
+    assert.equal(again.generationsAffected, 0);
+
+    // The point of the exercise: with the orphan gone the generation
+    // verifies again, so the watcher can report a complete pass.
+    //
+    // The foreign span goes first, and that is not a loophole: a span with
+    // somebody else's locator kind is one the seal is *right* to refuse, and
+    // the cleanup is right to leave alone. Removing it here separates "the
+    // cleanup fixed the orphan" from "the seal stopped checking", which is
+    // the failure this whole line of work has to avoid.
+    await client.query("DELETE FROM kith.evidence_spans WHERE id = $1", [foreignSpanId]);
+    assert.equal(
+      (await provenance.verifySealedParsedPayload(client, f.generation)).actualEvidenceSpanCount,
+      f.manifestSpanIds.length,
+    );
   },
 );
 
