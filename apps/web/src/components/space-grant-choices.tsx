@@ -95,7 +95,7 @@ export function SensitivityControl({
             <Tooltip.Portal>
               <Tooltip.Content
                 sideOffset={4}
-                className="z-50 max-w-xs rounded-tag border border-gray-200 bg-white px-2 py-1 text-xs text-gray-700 shadow-md"
+                className="z-50 max-w-xs rounded-control border border-kith-border-subtle bg-kith-surface px-3 py-2 text-sm text-kith-text-secondary shadow-[var(--kith-shadow-md)]"
               >
                 {option.detail}
               </Tooltip.Content>

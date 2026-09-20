@@ -583,14 +583,14 @@ export function AttentionTable({
         onOpenChange={setConfirmBeforeDate}
       >
         <AlertDialog.Portal>
-          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-gray-900/20" />
-          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-tag border border-gray-200 bg-white p-4 shadow-xl">
-            <AlertDialog.Title className="text-sm font-medium text-gray-900">
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-kith-overlay" />
+          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
+            <AlertDialog.Title className="kith-section-title">
               Dismiss {beforeDateCount ?? "…"} item
               {beforeDateCount === 1 ? "" : "s"} for documents dated before{" "}
               {beforeDate}?
             </AlertDialog.Title>
-            <AlertDialog.Description className="mt-1 text-xs text-gray-600">
+            <AlertDialog.Description className="mt-1 text-sm text-kith-text-secondary">
               This can&apos;t be undone. Every open item for a document dated
               before this date -- by its own extracted date, or its file's
               modified date when the document states none -- is marked not worth

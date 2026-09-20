@@ -53,7 +53,7 @@ export function Drawer({
         }}
       >
         <Dialog.Portal>
-          <Dialog.Overlay className="fixed inset-0 z-40 bg-[rgb(20_32_30_/_48%)]" />
+          <Dialog.Overlay className="fixed inset-0 z-40 bg-kith-overlay" />
           <Dialog.Content
             onEscapeKeyDown={(event) => {
               if (dirty) {
@@ -92,7 +92,7 @@ export function Drawer({
         onOpenChange={setConfirmingClose}
       >
         <AlertDialog.Portal>
-          <AlertDialog.Overlay className="fixed inset-0 z-[60] bg-[rgb(20_32_30_/_48%)]" />
+          <AlertDialog.Overlay className="fixed inset-0 z-[60] bg-kith-overlay" />
           <AlertDialog.Content className="fixed top-1/2 left-1/2 z-[60] w-full max-w-xs -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
             <AlertDialog.Title className="kith-section-title">
               Discard changes?

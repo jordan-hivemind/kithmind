@@ -837,7 +837,7 @@ export function DataTable<T>({
         }}
       >
         <AlertDialog.Portal>
-          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-[rgb(20_32_30_/_48%)]" />
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-kith-overlay" />
           <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
             <AlertDialog.Title className="kith-section-title">
               {confirming?.action.label}?
@@ -868,7 +868,7 @@ export function DataTable<T>({
         }}
       >
         <AlertDialog.Portal>
-          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-[rgb(20_32_30_/_48%)]" />
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-kith-overlay" />
           <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
             <AlertDialog.Title className="kith-section-title">
               {confirmingBulk?.action.label}?
