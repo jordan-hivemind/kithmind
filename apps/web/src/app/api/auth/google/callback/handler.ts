@@ -6,7 +6,7 @@ import {
   linkGoogleAccount,
   requireWebSession,
   sessionCookie,
-  signInWithGoogle,
+  signInOrAutoLinkGoogle,
 } from "@repo/kith-store/identity";
 
 import {
@@ -66,7 +66,7 @@ export async function handleGoogleOAuthCallback(
   let oauth: GoogleOAuthConfig;
   let sessionConfig: ReturnType<typeof kithSessionConfig>;
   try {
-    oauth = googleOAuthConfig(request.url, env);
+    oauth = googleOAuthConfig(request.url, env, request.headers.get("host"));
     sessionConfig = kithSessionConfig(env);
   } catch (error) {
     const unavailable = error instanceof GoogleOAuthError;
@@ -151,8 +151,12 @@ export async function handleGoogleOAuthCallback(
   try {
     const opened = await withKithTransaction(kithPool(), async (client) => {
       const ctx = identityCtx(client);
-      const signedIn = await signInWithGoogle(ctx, {
+      const signedIn = await signInOrAutoLinkGoogle(ctx, {
         providerAccountId: identity.subject,
+        verifiedEmail: identity.verifiedEmail,
+        hostedDomain: identity.hostedDomain,
+        allowedHostedDomain: oauth.allowedHostedDomain,
+        autoLinkUserId: oauth.autoLinkUserId,
       });
       await ensurePersonalSpace(ctx, signedIn.userId);
       return signedIn;

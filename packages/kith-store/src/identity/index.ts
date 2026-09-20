@@ -78,6 +78,7 @@ export {
   sessionCookie,
   sessionCookieName,
   signIn,
+  signInOrAutoLinkGoogle,
   signInWithGoogle,
   signOut,
   signUp,
