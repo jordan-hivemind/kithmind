@@ -222,6 +222,64 @@ const MAGNITUDE_WORD_LIST = [
   "b",
 ] as const;
 
+/**
+ * The characters a document prints as a minus sign, other than the hyphen
+ * they all fold to here: U+2212, the typographic minus a PDF's text layer
+ * carries, and the en and em dashes an export substitutes for it.
+ *
+ * Folding them is not the same as reading them as a sign. A minus is a sign
+ * only where a sign can stand -- pressed against the digits, with nothing
+ * alphanumeric before it -- so a dash between two numbers stays what it is,
+ * a range, and the token carrying it is refused whole.
+ */
+const MINUS_SIGNS = /[−–—]/g;
+
+/**
+ * Superscripts and subscripts, folded to a character no amount survives.
+ *
+ * NFKC turns `²` into `2`, which read `$2.5m²` as two and a half million
+ * (square metres) and `12.99²` as 12.992 (a footnote marker). Dropping them
+ * instead would read the square metres as a magnitude, so neither reading is
+ * offered: they fold to the fraction slash, which is glued to the digits and
+ * parses as nothing. NFKC folds `½` to `1⁄2` for the same reason -- twelve
+ * and a half is not 121 and 2.
+ */
+const SUPERSCRIPTS = /[²³¹⁰-₟]/g;
+const FRACTION_SLASH = "⁄";
+
+/**
+ * The one folding both the scanner and the finder read through.
+ *
+ * Every printed minus becomes a minus: U+2212 is what a PDF's text layer
+ * carries, and an en or em dash stands in for it in exported statements.
+ * Dropping the character dropped the sign, and a printed `−$5` was stored as
+ * a charge. A dash *between* two numbers is a range, and the grammar refuses
+ * that token whichever character it is written with.
+ */
+function foldAmountText(raw: string): string {
+  return raw
+    .replace(SUPERSCRIPTS, FRACTION_SLASH)
+    .normalize("NFKC")
+    .replace(MINUS_SIGNS, "-");
+}
+
+/**
+ * Magnitude abbreviations that are only ever money.
+ *
+ * A single letter is not one of these: `B`, `K` and `M` a space away from
+ * digits are a room, a suite and a metre at least as often as a magnitude.
+ * The finder refuses those tokens too rather than offering the bare mantissa
+ * -- `Room 12 B` offers nothing now, where it used to offer 12 -- but these
+ * are listed because they are not even ambiguous: a line printing `2.5 mil`
+ * does not print two and a half.
+ */
+const SPACED_MAGNITUDE_WORDS = new Set(["mm", "mn", "bn", "mil", "mio"]);
+
+/** Magnitude *words*, which scale a space away from the digits. */
+const MAGNITUDE_WORDS = new Set<string>(
+  MAGNITUDE_WORD_LIST.filter((word) => word.length > 2),
+);
+
 const CURRENCY_SYMBOL_CHARS = new Set([
   "$",
   "\u20ac",
@@ -349,7 +407,7 @@ function magnitudeAt(
  * 12 and `1099-K` as -1099.
  */
 export function parseAmount(raw: string): string | undefined {
-  let text = raw.normalize("NFKC").trim();
+  let text = foldAmountText(raw).trim();
   if (!text) return undefined;
   let negative = false;
 
@@ -370,22 +428,32 @@ export function parseAmount(raw: string): string | undefined {
   };
   let currency = false;
 
-  if (text[at] === "-" || text[at] === "+") {
+  // One sign, on whichever side of the currency the document prints it:
+  // `-$42.00` and `$-42.00` are both minus forty-two. Two of them are not a
+  // second negation -- `--5` is not five and `-+5` is not anything -- so the
+  // token is refused rather than read as one of the ways to resolve it.
+  let signed = false;
+  let twiceSigned = false;
+  const sign = (): void => {
+    if (text[at] !== "-" && text[at] !== "+") return;
+    if (signed) {
+      twiceSigned = true;
+      return;
+    }
+    signed = true;
     if (text[at] === "-") negative = !negative;
     at += 1;
     space();
-  }
+  };
+  sign();
   const leading = currencyAt(text, at);
   if (leading) {
     currency = true;
     at += leading;
     space();
   }
-  if (text[at] === "-" || text[at] === "+") {
-    if (text[at] === "-") negative = !negative;
-    at += 1;
-    space();
-  }
+  sign();
+  if (twiceSigned) return undefined;
 
   // The digit core. Whitespace inside it is a rendering artifact of the
   // column the amount sat in ("$ 165 .00"), never a separator: by the time a
@@ -497,6 +565,12 @@ export function parseAmount(raw: string): string | undefined {
  */
 function readDigits(raw: string): string | undefined {
   let text = raw;
+  // `1000,000` is a thousand under a decimal comma and a million under an
+  // English grouping comma, and nothing in the string settles it: four or
+  // more digits before a comma are not a group, and a group of exactly three
+  // after one is not a decimal. It used to read as 1000, which is the wrong
+  // number by three orders of magnitude if the writer meant the other.
+  if (/^\d{4,},\d{3}$/.test(text)) return undefined;
   if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(text)) text = text.split(",").join("");
   else if (
     /^\d{1,3}(\.\d{3}){2,}$/.test(text) ||
@@ -504,7 +578,13 @@ function readDigits(raw: string): string | undefined {
   ) {
     text = text.split(".").join("").replace(",", ".");
   } else if (/^\d+,\d+$/.test(text)) text = text.replace(",", ".");
-  return /^\d+(\.\d+)?$/.test(text) ? text : undefined;
+  if (!/^\d+(\.\d+)?$/.test(text)) return undefined;
+  // A zero in front of more digits is padding, and padding is an identifier:
+  // a check number, an invoice number, the `000123` in a wire reference. It
+  // is never how a document prints an amount, and reading it as one put 123
+  // on the page beside the total it was competing with.
+  if (/^0\d/.test(text)) return undefined;
+  return text;
 }
 
 /**
@@ -542,117 +622,284 @@ function realIsoDate(value: string): boolean {
 }
 
 /**
- * Every number the quote prints, as exact decimals, with the sign the quote
- * gives it.
+ * Every amount the text prints, as exact decimals, with the sign it prints
+ * beside them.
  *
- * The digit runs are taken greedily (`1,234.56` is one token, not three) and
- * each is parsed by the same function that parses the value itself, so the
- * quote and the value are read under one set of rules. A token that does not
- * parse is dropped rather than reported: the quote is prose, and prose
- * contains things like `4471` that are not amounts.
+ * A **candidate finder**, not a second grammar. It decides where one printed
+ * token starts and ends, hands that whole span to `parseAmount`, and offers
+ * that one value or nothing at all. A span the scanner refuses is dropped
+ * whole and its digits are never re-read in pieces, because a fragment of a
+ * token the grammar could not read is the shape every wrong number in this
+ * file's history has had: `$2.5 M` offering 2.5, `$2.5m²` offering two and a
+ * half million for a token that ends in a digit, `(206) 555-0134` offering
+ * -206, `$1 000 000` offering 0.
  *
- * The sign lives around the token, not in it, because that is where a document
- * puts it. Reading it is what lets the caller refuse `-42.00` cited to
- * "Payment 42.00".
+ * Two rules are the finder's own, because the scanner reads a token and the
+ * finder reads a line:
  *
- * A hyphen is the hard case, because a document uses it as a separator far
- * more often than as a minus: "Total - 42.00", "Invoice 12-42.00" and
- * "Item 1 - 42.00" are all positive forty-two. So a leading minus counts only
- * when it is pressed against the digits -- at most one currency symbol may sit
- * between them, and no whitespace -- and only when what precedes it is not
- * alphanumeric. A trailing minus counts only immediately after the digits and
- * only when no digit follows it, which is the same rule read from the other
- * side. Parentheses and `CR` keep their whitespace tolerance: neither is ever
- * a separator.
+ *   * **Where a token ends.** Whitespace ends it, unless a currency marker
+ *     proves the gap is the column the amount sat in. Letters, a glued
+ *     hyphen, and the digits after either, do not end it: `1099-K`,
+ *     `INV-0012`, `5-10`, `$1M1` and `(206) 555-0134` are each one span, and
+ *     each is refused whole.
+ *   * **`CR`**, the one sign that is not part of the number and so cannot
+ *     reach the scanner. Parentheses, a leading minus and a trailing minus
+ *     are deliberately *not* read here: they go into the span and the
+ *     scanner reads them, which is why `(-5)` is refused on both sides
+ *     rather than read as -5 on one.
+ *
+ * Where the finder cannot tell where a token ends -- `1 000 000` and
+ * `APPLES 12 990` are the same shape and two different readings -- it offers
+ * nothing for the whole region rather than picking one of them.
  */
 export function amountsInText(text: string): string[] {
-  // A parsed receipt prints "$ 165 .00" as readily as "$165.00": the space is
-  // a rendering artifact of the column the amount sat in, not a separator.
-  // Closed up only next to a currency mark, because a bare gap between two
-  // numbers is two numbers -- "APPLES 12 .99" is a quantity beside a price.
-  const normalized = text
-    .normalize("NFKC")
-    .replace(
-      new RegExp(`(${CURRENCY_MARK})([ \\u00a0]*)(\\d+)[ \\u00a0]+\\.(?=\\d)`, "g"),
-      "$1$2$3.",
-    )
-    .replace(
-      new RegExp(`(${CURRENCY_MARK})([ \\u00a0]*)(\\d+\\.)[ \\u00a0]+(?=\\d)`, "g"),
-      "$1$2$3",
-    );
+  const normalized = closeColumnGaps(foldAmountText(text));
   const found: string[] = [];
-  const runs = /\d[\d.,]*/g;
-  let match: RegExpExecArray | null;
-  while ((match = runs.exec(normalized)) !== null) {
-    const start = match.index;
-    let end = start + match[0].length;
-
-    // Everything glued to the digits belongs to the token and is validated
-    // with it. A magnitude abbreviation, a currency code, a tax flag, a
-    // hyphen-letter form like `1099-K`: each is read by `parseAmount` or the
-    // token is not an amount. Letting unglued letters fall away is what read
-    // `qty3` as 3 and `1099-K` as minus one thousand and ninety-nine.
-    while (/[A-Za-z$\u20ac\u00a3\u00a5\u20b9\u20a9-]/.test(normalized[end] ?? "")) {
-      end += 1;
+  let at = 0;
+  while (at < normalized.length) {
+    if (!/\d/.test(normalized[at]!)) {
+      at += 1;
+      continue;
     }
-    // A magnitude *word* may be one space away; an abbreviation may not.
-    const worded = /^[ \u00a0](millions?|thousands?|billions?)(?![A-Za-z0-9])/i.exec(
-      normalized.slice(end),
-    );
-    if (worded) end += worded[0].length;
-
-    // And a currency marker immediately before the digits is part of the
-    // token too, which is what makes `$2.5M` scale and `2.5M` refuse.
-    let from = start;
-    while (
-      from > 0 &&
-      /[A-Za-z$\u20ac\u00a3\u00a5\u20b9\u20a9]/.test(normalized[from - 1] ?? "")
-    ) {
-      from -= 1;
+    const span = amountSpanAt(normalized, at);
+    if (!span.ambiguous) {
+      const amount = parseAmount(normalized.slice(span.start, span.end));
+      if (amount !== undefined) {
+        // `CR` says the amount is a credit, not that its sign flips: a line
+        // printing "(1,234.56) CR" says the same thing twice, and negating
+        // twice made it a charge.
+        found.push(span.credit ? negative(amount) : amount);
+      }
     }
-    const spacedCurrency = /([A-Z]{3}|[$\u20ac\u00a3\u00a5\u20b9\u20a9])[ \u00a0]$/.exec(
-      normalized.slice(Math.max(0, from - 4), from),
-    );
-    const literalStart = spacedCurrency
-      ? from - spacedCurrency[0].length
-      : from;
-
-    // A trailing separator belongs to the prose, not the number: "refs 1, 234"
-    // is three references, and the comma is punctuation.
-    const literal = normalized
-      .slice(literalStart, end)
-      .replace(/[.,]+(?=[A-Za-z]*$)/, "");
-    const amount = parseAmount(literal);
-    if (amount === undefined) continue;
-
-    const signAt = literalStart;
-    let signIndex = signAt - 1;
-    if (signIndex >= 0 && CURRENCY_SYMBOL_CHARS.has(normalized[signIndex]!)) {
-      signIndex -= 1;
-    }
-    const leadingMinus =
-      signIndex >= 0 &&
-      normalized[signIndex] === "-" &&
-      (signIndex === 0 || !/[A-Za-z0-9]/.test(normalized[signIndex - 1]!));
-    const trailingMinus =
-      normalized[end] === "-" && !/\d/.test(normalized[end + 1] ?? "");
-    // `CR` is a credit marker on the amount, not a column somewhere to the
-    // right of it. A twelve-character window let "Item 12.00      CR 45.00"
-    // flip the sign of a number that had nothing to do with it.
-    const credit = /^[ \u00a0]?CR(?![A-Za-z0-9])/i.test(normalized.slice(end));
-    const negative =
-      leadingMinus ||
-      trailingMinus ||
-      /^[ \u00a0]?\)/.test(normalized.slice(end)) ||
-      credit;
-    found.push(negative ? negate(amount) : amount);
+    // Past the whole span, parsed or not. Re-entering a span that failed is
+    // exactly how a fragment gets offered.
+    at = Math.max(span.end, at + 1);
   }
   return found;
 }
 
-function negate(decimal: string): string {
+/**
+ * A parsed receipt prints "$ 165 .00" as readily as "$165.00": the space is a
+ * rendering artifact of the column the amount sat in, not a separator. Closed
+ * up only next to a currency mark, because a bare gap between two numbers is
+ * two numbers -- "APPLES 12 .99" is a quantity beside a price.
+ */
+function closeColumnGaps(text: string): string {
+  return text
+    .replace(
+      new RegExp(
+        `(${CURRENCY_MARK})([ \\u00a0]*)(\\d+)[ \\u00a0]+\\.(?=\\d)`,
+        "g",
+      ),
+      "$1$2$3.",
+    )
+    .replace(
+      new RegExp(
+        `(${CURRENCY_MARK})([ \\u00a0]*)(\\d+\\.)[ \\u00a0]+(?=\\d)`,
+        "g",
+      ),
+      "$1$2$3",
+    );
+}
+
+/** One candidate token: what the scanner is asked to read, and the one sign
+ * that sits outside it. `ambiguous` means the finder could not tell where the
+ * token ends, and nothing at all is offered for the region. */
+type AmountSpan = {
+  start: number;
+  end: number;
+  credit: boolean;
+  ambiguous: boolean;
+};
+
+/** Glued to the digits and part of the token: a currency, the letters that
+ * make `qty3` an identifier, the fraction slash a folded `½` or `²` leaves
+ * behind, and -- on the left -- the separator that makes `.99` a fragment of
+ * a number rather than ninety-nine, and the `#` that makes `#1234` an order
+ * number. */
+const GLUED_CHARS = /[A-Za-z$€£¥₹₩⁄]/;
+const GLUED_LEFT_CHARS = /[A-Za-z$€£¥₹₩⁄.,#]/;
+
+/**
+ * Single letters that end an amount rather than sitting beside one.
+ *
+ * `k`, `m` and `b` are magnitudes, `c` and `d` are credit and debit. A
+ * document that prints `$2.5 M`, `Room 12 B` or `45.00 C` may mean two and a
+ * half million, twelve, or minus forty-five, and the finder cannot tell
+ * which, so it offers none of them. Every other letter is left where it is:
+ * `12.99 T` is a tax flag the scanner drops and `42.00 a month` is
+ * forty-two.
+ */
+const CLOSING_LETTERS = new Set(["k", "m", "b", "c", "d"]);
+
+/**
+ * The span around one digit: everything a printed amount could carry, and
+ * nothing the line merely puts near it.
+ */
+function amountSpanAt(text: string, digit: number): AmountSpan {
+  let start = digit;
+  for (;;) {
+    const before = text[start - 1] ?? "";
+    if (start > 0 && GLUED_LEFT_CHARS.test(before)) {
+      start -= 1;
+      continue;
+    }
+    // A hyphen with a letter before it is an identifier, not a sign:
+    // `INV-0012` is one token and not twelve. (A hyphen with a *digit*
+    // before it is reached from the other side, where the span starts at
+    // those digits and swallows the hyphen going right.)
+    if (start > 0 && before === "-" && /[A-Za-z]/.test(text[start - 2] ?? "")) {
+      start -= 1;
+      continue;
+    }
+    break;
+  }
+  start = withSpacedCurrency(text, start);
+  // The sign, and only where a sign can stand: pressed against what follows
+  // it, with nothing alphanumeric before it. "Total - 42.00" is a separator
+  // and forty-two; "-$42.00" is minus forty-two. More than one is not a
+  // second negation, so the whole run goes into the span and the scanner
+  // refuses it: `--5` is not five.
+  let signs = start;
+  while (signs > 0 && (text[signs - 1] === "-" || text[signs - 1] === "+")) {
+    signs -= 1;
+  }
+  if (signs < start && !/[A-Za-z0-9]/.test(text[signs - 1] ?? "")) {
+    start = signs;
+    while (start > 0 && GLUED_CHARS.test(text[start - 1]!)) start -= 1;
+    start = withSpacedCurrency(text, start);
+  }
+
+  // Accounting parentheses may be printed a space away from the digits.
+  let open = start > 0 && text[start - 1] === "(";
+  if (!open && text[start - 1] === " " && text[start - 2] === "(") {
+    open = true;
+    start -= 1;
+  }
+  let end = digit;
+  let credit = false;
+  let ambiguous = false;
+  scan: for (;;) {
+    // The token itself: digits, the separators between them, letters, a
+    // glued hyphen -- and then digits again, because `$1M1` ends in one and
+    // `1099-K`, `5-10` and `20260918-000123` are one token each.
+    for (;;) {
+      const from = end;
+      while (end < text.length && /[\d.,]/.test(text[end]!)) end += 1;
+      while (end < text.length && GLUED_CHARS.test(text[end]!)) end += 1;
+      if (end < text.length && text[end] === "-") end += 1;
+      // A slash between two digit runs is a date or a fraction, never an
+      // amount: `09/01/2026` used to offer 9, 1 and 2026 beside the total.
+      // A slash before a word is the `/mo` on a subscription line, and the
+      // amount before it still reads.
+      if (text[end] === "/" && /\d/.test(text[end + 1] ?? "")) end += 1;
+      if (end === from) break;
+    }
+    // Accounting parentheses wrap the whole token, so they go to the scanner
+    // with it. A digit right after the closing one says they were never
+    // accounting parentheses: `(206) 555-0134` is a phone number, and reading
+    // its area code as a negative amount is how it competed with a total.
+    const closing = open ? /^ ?\)/.exec(text.slice(end)) : null;
+    if (closing) {
+      open = false;
+      start -= 1;
+      end += closing[0].length;
+      const glued = /^ ?\d/.exec(text.slice(end));
+      if (glued) {
+        end += glued[0].length - 1;
+        continue scan;
+      }
+    }
+    // A fraction after the digits makes them a whole part, not a number:
+    // "101 1/2" is a bond price, and a hundred and one is the wrong one.
+    const fraction = /^ \d+\/\d+/.exec(text.slice(end));
+    if (fraction) {
+      ambiguous = true;
+      end += fraction[0].length;
+      continue scan;
+    }
+    // A single gap before a group of exactly three digits is either the
+    // grouping of one number or the space between two of them. A currency
+    // marker settles it; without one, nothing is offered for either reading.
+    const grouped = /^ (\d{3})(?!\d)/.exec(text.slice(end));
+    if (grouped && !/[.,]/.test(text[end - 1] ?? "")) {
+      if (!carriesCurrency(text.slice(start, end))) ambiguous = true;
+      end += grouped[0].length;
+      continue scan;
+    }
+    // One word after the token, and only one space before it.
+    const worded = /^ ([A-Za-z]+)/.exec(text.slice(end));
+    if (!worded) break;
+    const word = worded[1]!.toLowerCase();
+    const glued = /\d/.test(text[end + worded[0].length] ?? "");
+    if (!glued && (word === "cr" || word === "dr")) {
+      // `CR` is a credit marker on the amount beside it, not a column
+      // somewhere to its right: "Item 12.00      CR 45.00" needs the wide gap
+      // to belong to the 45.00, and it does, because one space is the rule.
+      //
+      // The marker stays *outside* the span: it is a sign, not part of the
+      // number, and the scanner refuses a token carrying it.
+      credit = word === "cr";
+      break;
+    }
+    if (
+      glued ||
+      (word.length === 1 && CLOSING_LETTERS.has(word)) ||
+      SPACED_MAGNITUDE_WORDS.has(word) ||
+      MAGNITUDE_WORDS.has(word) ||
+      SUPPORTED_CURRENCY_SET.has(word.toUpperCase())
+    ) {
+      // Each of these belongs to the token, and the scanner decides what it
+      // makes of it: a magnitude word scales, a currency code names the
+      // money, a tax flag drops, and a magnitude abbreviation a space away
+      // refuses the token whole -- which is the point. `$2.5 M` used to offer
+      // two and a half.
+      end += worded[0].length;
+      continue scan;
+    }
+    break;
+  }
+  // A trailing separator belongs to the prose, not to the number: "refs 1,
+  // 234" is three references and the comma is punctuation.
+  while (end > digit && /[.,]/.test(text[end - 1]!)) end -= 1;
+  return { start, end, credit, ambiguous };
+}
+
+/** A currency marker one space to the left of the token, which is how a
+ * column prints one. Only a code this store supports counts, or "TAX 1.30"
+ * would take `TAX` for a currency and refuse the line's only amount. */
+function withSpacedCurrency(text: string, start: number): number {
+  const spaced = /([A-Z]{3}|[$€£¥₹₩]) $/.exec(
+    text.slice(Math.max(0, start - 4), start),
+  );
+  if (!spaced) return start;
+  const marker = spaced[1]!;
+  if (marker.length === 3 && !SUPPORTED_CURRENCY_SET.has(marker)) return start;
+  const from = start - spaced[0].length;
+  if (/[A-Za-z]/.test(text[from - 1] ?? "")) return start;
+  return from;
+}
+
+/** Whether the span so far carries a currency marker -- a symbol, or a code
+ * standing as its own word. */
+function carriesCurrency(token: string): boolean {
+  for (let at = 0; at < token.length; at += 1) {
+    if (CURRENCY_SYMBOL_CHARS.has(token[at]!)) return true;
+    if (
+      !/[A-Za-z]/.test(token[at - 1] ?? "") &&
+      currencyCodeAt(token, at) > 0
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** A credit is negative, however many ways the line says so. Not a toggle:
+ * "(1,234.56) CR" prints the sign twice and means it once. */
+function negative(decimal: string): string {
   if (compareDecimals(decimal, "0") === 0) return decimal;
-  return decimal.startsWith("-") ? decimal.slice(1) : `-${decimal}`;
+  return decimal.startsWith("-") ? decimal : `-${decimal}`;
 }
 
 /**

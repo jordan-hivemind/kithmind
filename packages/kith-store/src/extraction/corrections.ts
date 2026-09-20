@@ -255,7 +255,7 @@ export async function applyCorrection(
         JSON.stringify(original ?? null),
       ],
     );
-    await writeThrough(client, input);
+    await orphanIfUnapplied(client, input, await writeThrough(client, input));
     return existing.id;
   }
   const id = newKithId();
@@ -276,8 +276,45 @@ export async function applyCorrection(
       at,
     ],
   );
-  await writeThrough(client, input);
+  await orphanIfUnapplied(client, input, await writeThrough(client, input));
   return id;
+}
+
+/**
+ * Tells the owner when the fix he just made lands nowhere.
+ *
+ * `writeThrough` returns -1 when a line key names a line the newest run no
+ * longer cites. The correction row is written and the screen shows it
+ * `resolved`, so without this the owner has every reason to believe the
+ * number is fixed while `sum_money` goes on totalling the model's -- the
+ * same two-halves-disagreeing failure the write-through exists to prevent,
+ * one step further along.
+ *
+ * Keyed on the **list field**, never on the line key. A line key carries the
+ * evidence hash of the line the run cited, so it changes whenever the run
+ * cites a different one; an item keyed on it could be dismissed and would
+ * still come back under a new id on the next run, which is exactly the
+ * un-actionable noise the attention queue is supposed not to have.
+ */
+async function orphanIfUnapplied(
+  client: ClientBase,
+  input: { spaceId: string; sourceItemId: string; fieldName: string },
+  wrote: number,
+): Promise<void> {
+  if (wrote >= 0) return;
+  await openCorrection(client, {
+    spaceId: input.spaceId,
+    sourceItemId: input.sourceItemId,
+    fieldName: listFieldName(input.fieldName),
+    reason: "correction_orphaned",
+    reading: null,
+  });
+}
+
+/** The field a line key belongs to: `line_items:7-a3f1b2c-0` is one line of
+ * `line_items`. */
+function listFieldName(fieldName: string): string {
+  return fieldName.split(":")[0]!;
 }
 
 /**
@@ -520,15 +557,10 @@ export async function reapplyCorrections(
       correctedValue,
     });
     if (wrote < 0) {
-      // One attention item naming the field, so the owner can re-make the
-      // correction against the line this run cited.
-      await openCorrection(client, {
-        spaceId: input.spaceId,
-        sourceItemId: input.sourceItemId,
-        fieldName,
-        reason: "correction_orphaned",
-        reading: null,
-      });
+      // One attention item naming the list, so the owner can re-make the
+      // correction against the line this run cited -- and so a dismissal of
+      // it holds, which it cannot when the key is the line's own.
+      await orphanIfUnapplied(client, { ...input, fieldName }, wrote);
       continue;
     }
     applied += wrote;

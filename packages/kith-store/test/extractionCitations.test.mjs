@@ -282,7 +282,10 @@ test("a rendering space closes only next to a currency mark", () => {
   // Must NOT read. Each of these was joined into one fabricated amount by the
   // first version of the repair, which is a value the page never stated under
   // a citation that looked right.
-  assert.deepEqual(amountsInText("APPLES   12    .99"), ["12", "99"]);
+  // ADM-5g: the ".99" is gone too. A separator pressed against the digits is
+  // part of the token, and ".99" is a fragment of a number rather than
+  // ninety-nine -- the same rule that stops ".5" reading as five.
+  assert.deepEqual(amountsInText("APPLES   12    .99"), ["12"]);
   assert.deepEqual(amountsInText("Invoice refs 1, 234, 567"), [
     "1",
     "234",
@@ -1998,5 +2001,58 @@ test("a correction with no line left to land on is not duplicated", { skip }, as
     (row) => row.reason === "correction_orphaned",
   );
   assert.ok(orphan, "the owner is told the correction no longer lands");
-  assert.equal(orphan.field_name, item.observation_key);
+  // ADM-5g: keyed on the list field, not on the line key. A line key carries
+  // the evidence hash of the line the run cited, so an item keyed on it comes
+  // back under a new id on every run and a dismissal never holds.
+  assert.equal(orphan.field_name, "line_items");
+  assert.equal(
+    (await f.corrections()).filter(
+      (row) => row.reason === "correction_orphaned",
+    ).length,
+    1,
+  );
+});
+
+test("a correction that lands on nothing says so as it is made", { skip }, async (t) => {
+  // ADM-5g: the same orphan, one step earlier. `applyCorrection` writes the
+  // row and pushes the value through to the observation; when the key names
+  // no observation, the push returns -1 and used to be discarded. The screen
+  // then showed `resolved` while `sum_money` and `latest_observation` never
+  // saw the owner's number -- the two halves of the store disagreeing about
+  // the same fact, which is what the write-through exists to prevent.
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-orphan-on-apply");
+  const page = ["BRACKEN TOOLS", "Chisel 12.99"].join("\n");
+  await repaginate(f, ids, [[0, page]]);
+  await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("line_items", null, [2], {
+          line_items: [{ description: "Chisel", amount: "12.99", lines: [2] }],
+        }),
+      ],
+    }),
+    ids,
+  );
+  const stale = "line_items:9-0000000-0";
+  await withKithTransaction(f.pool, (client) =>
+    applyCorrection(client, {
+      spaceId: f.spaceId,
+      sourceItemId: ids.sourceItemId,
+      fieldName: stale,
+      correctedValue: { type: "money", amount: "13.99", currency: "USD" },
+      actorUserId: f.userId,
+      now: NOW + 3_000,
+    }),
+  );
+  // The item the run did store is untouched: a correction that lands nowhere
+  // must not land on a neighbour.
+  assert.equal((await f.stored())[0].value.amount, "12.99");
+  const orphan = (await f.corrections()).find(
+    (row) => row.reason === "correction_orphaned",
+  );
+  assert.ok(orphan, "the owner is told the correction never reached the sum");
+  assert.equal(orphan.field_name, "line_items");
 });
