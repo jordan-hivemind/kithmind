@@ -137,27 +137,27 @@ test("the quote's sign has to agree with the value's", () => {
 });
 
 test("a separator hyphen is not a minus sign", () => {
-  // A document uses a hyphen as a separator far more often than as a sign.
+  // A document uses a hyphen as a separator far more often than as a sign --
+  // and a dash a gap away from the digits could be either, so ADM-5g's fifth
+  // round offers neither reading. Both of these open a correction row now.
   for (const quote of ["Total - 42.00", "Item 1 - 42.00"]) {
-    assert.deepEqual(
-      gate({ valueType: "money", value: "-42.00", quote }),
-      { ok: false, reason: "value_not_in_quote" },
-      quote,
-    );
-    assert.equal(
-      gate({ valueType: "money", value: "42.00", quote }).ok,
-      true,
-      quote,
-    );
+    for (const value of ["-42.00", "42.00"]) {
+      assert.deepEqual(
+        gate({ valueType: "money", value, quote }),
+        { ok: false, reason: "value_not_in_quote" },
+        `${quote} / ${value}`,
+      );
+    }
   }
   // Pressed against the digits, it still is a sign.
   assert.deepEqual(amountsInText("-$42.00"), ["-42"]);
   assert.deepEqual(amountsInText("$-42.00"), ["-42"]);
   assert.deepEqual(amountsInText("USD 42.00-"), ["-42"]);
   assert.deepEqual(amountsInText("Refund -42.00"), ["-42"]);
-  // And a separator is not, from either side.
-  assert.deepEqual(amountsInText("Total - 42.00"), ["42"]);
-  assert.deepEqual(amountsInText("Item 1 - 42.00"), ["1", "42"]);
+  // And a separator is not, from either side. ADM-5g: nor is the number
+  // beside it, because a dash is exactly as likely to be its sign.
+  assert.deepEqual(amountsInText("Total - 42.00"), []);
+  assert.deepEqual(amountsInText("Item 1 - 42.00"), []);
   // ADM-5g: a hyphen with digits on both sides of it and no space is neither.
   // "12-42.00" is one token -- a reference, a range, a phone number -- and
   // one token that does not parse offers nothing at all, in either sign.
@@ -701,15 +701,20 @@ const AMOUNT_SPEC = [
   ["12.5T", undefined],
   ["1299T", undefined],
   ["12.99TX", undefined],
-  // Two tokens on one line, which is a line the finder reads as two and a
-  // value the scanner refuses as one.
-  ["12.99 T 3.00", undefined, ["12.99", "3"]],
+  // A flag a space away belongs to the token, so the finder reads the flagged
+  // price and stops; the 3.00 past it has a lone letter on its left and is
+  // refused.
+  ["12.99 T 3.00", undefined, ["12.99"]],
   ["2024A", undefined],
   // A lone C is a credit marker. Dropping it would lose a sign.
   ["45.00 C", undefined],
   // Any other single letter beside a number is prose, and the number reads.
   ["42.00 a month", undefined, ["42"]],
-  ["5 x 3.00", undefined, ["5", "3"]],
+  // ADM-5g: a single letter beside a number is a magnitude, a credit marker
+  // or a flag at least as often as it is prose, and the finder cannot tell.
+  // `5 x` is not a flagged price (a flag has two decimals) and the 3.00 has
+  // the same lone letter on its left, so the line offers nothing.
+  ["5 x 3.00", undefined, []],
 
   // Letters glued to digits are a currency this grammar knows, a magnitude,
   // or a flag -- or the token is not an amount. `[A-Z]{3}` under an `i` flag
@@ -726,7 +731,11 @@ const AMOUNT_SPEC = [
   ["12.99x2", undefined],
   // A percentage is a number the line prints, and `number` values reach the
   // gate as "3,5%". The sign of the percentage is the `%`, not part of it.
-  ["12.99%", undefined, ["12.99"]],
+  // A percent sign scales what it follows, so it is not neutral beside a
+  // money amount. The `number` value type passes `percentIsNeutral`, because
+  // a `number` is dimensionless and can never be money; see the gate test
+  // "a percentage keeps its decimal comma".
+  ["12.99%", undefined, []],
   ["A12.99", undefined],
   ["1.2e3", undefined],
   ["about ten dollars", undefined],
@@ -807,8 +816,14 @@ const QUOTE_SPEC = [
   // right -- and it says the amount is a credit, not that its sign flips, so
   // a line that prints the sign twice still means it once.
   ["Balance 21.60 CR", ["-21.6"]],
-  ["Item 12.00          CR 45.00", ["12", "45"]],
-  ["Item 12.00 CR 45.00", ["-12", "45"]],
+  // ADM-5g: a far `CR` now makes the finder refuse both sides. ADM-5f made
+  // the wide gap mean "the marker is not mine", which read the 12.00 as a
+  // charge on a line that may well have printed a credit; and the 45.00 has
+  // a `CR` on its *left*, which is how a prefix-CR ledger signs a credit.
+  ["Item 12.00          CR 45.00", []],
+  ["Item 12.00 CR 45.00", ["-12"]],
+  ["CR 12.00", []],
+  ["DR 12.00", []],
   ["Balance $2.5M CR", ["-2500000"]],
   ["Credit (1,234.56) CR", ["-1234.56"]],
   ["Total 42.00 DR", ["42"]],
@@ -847,21 +862,133 @@ const QUOTE_SPEC = [
   ["ABC 42.00", ["42"]],
   ["Tax 13.20 USD", ["13.2"]],
   // A percentage is a number the line prints.
-  ["Rate 12.99% on $1,000.00", ["12.99", "1000"]],
+  ["Rate 12.99% on $1,000.00", ["1000"]],
   // Prose beside an amount leaves it alone.
   ["Paid 42.00 a month", ["42"]],
-  ["Total 42.00 i owe", ["42"]],
-  ["Qty 5 x 3.00", ["5", "3"]],
+  ["Total 42.00 i owe", []],
+  ["Qty 5 x 3.00", []],
   ["Refund 45.00 C", []],
   // The column artifacts ADM-5f closed, unchanged.
   ["Subtotal $ 165 .00", ["165"]],
   // ADM-5g: the ".99" is a fragment, not ninety-nine.
-  ["APPLES   12    .99", ["12"]],
-  ["Invoice refs 1, 234, 567", ["1", "234", "567"]],
-  ["3. 12 Pack Soda   5.99", ["3", "12", "5.99"]],
-  ["Total 10. 80", ["10", "80"]],
+  // ADM-5g: each of these four is a pair the separator between them joins
+  // into one readable amount -- 12.99, 1,234, 3.12, 10.80 -- so neither side
+  // is offered. The receipt column below is the mirror case: nothing joins
+  // `20.00` to `1.60`, so all three read, which is the recall this rule had
+  // to keep.
+  ["APPLES   12    .99", []],
+  ["Invoice refs 1, 234, 567", []],
+  ["3. 12 Pack Soda   5.99", ["5.99"]],
+  ["Total 10. 80", []],
   ["20.00      1.60   21.60", ["20", "1.6", "21.6"]],
   ["Total 12.99", ["12.99"]],
+
+  // -------------------------------------------------------------------------
+  // ADM-5g round five: every counterexample the four reviews produced.
+  //
+  // Each of these was an input where the finder offered a number the document
+  // does not print, and each of them died to the same change: the finder no
+  // longer enumerates the surroundings that make a number unreadable, it
+  // requires both neighbours to be provably harmless. The comment on each
+  // group names the review finding it came from.
+  // -------------------------------------------------------------------------
+
+  // Fourth review 1: only a single U+0020 counted as the gap, so every one of
+  // these dropped its suffix or its sign and offered the bare number. The
+  // span now extends across the whole gap run and `parseAmount` decides.
+  ["Fund size $2.5  million", ["2500000"]],
+  ["Fund size $2.5\tmillion", ["2500000"]],
+  ["Fund size $2.5  million", ["2500000"]],
+  ["Fund size $2.5 million", ["2500000"]],
+  ["Fund size $2.5 ⁠ million", ["2500000"]],
+  ["Fund size $2.5  M", []],
+  ["Fund size $3  k", []],
+  ["Fund size $2.5  bn", []],
+  ["Balance 45.00  CR", []],
+  ["Balance 45.00 CR", ["-45"]],
+  ["Credit (   1,234)", ["-1234"]],
+  ["Credit (1,234  )", ["-1234"]],
+  // A grouping separator is one space wide. Two is a column, and a column of
+  // three-digit cells is not one number, so the region offers nothing rather
+  // than the leading 1 the fourth review found.
+  ["Total $1  000  000", []],
+  ["Total $1 000 000", ["1000000"]],
+  // A zero-width space is invisible, so the page prints "$2.5million".
+  ["Fund size $2.5​million", ["2500000"]],
+
+  // Fourth review 3: a sign-bearing close after a spaced symbol or flag.
+  ["Credit (5,79 €)", ["-5.79"]],
+  ["Balance 0,64 € CR", ["-0.64"]],
+  ["Line (0.51 A)", ["-0.51"]],
+  ["Line 12.99 T CR", ["-12.99"]],
+  ["Line 4.56 T-", []],
+  ["Rate (12.5%)", []],
+
+  // Fourth review 4: the Unicode dashes that were not folded. The first five
+  // offered a positive number for a printed minus; the rest re-opened the
+  // identifier and range holes the ASCII hyphen rules had closed.
+  ["Refund ‐1,234", ["-1234"]],
+  ["Refund ‑1,234", ["-1234"]],
+  ["Refund ‒1,234", ["-1234"]],
+  ["Refund ―1,234", ["-1234"]],
+  ["Refund ˗1,234", ["-1234"]],
+  ["Refund －1,234", ["-1234"]],
+  ["Refund ﹣1,234", ["-1234"]],
+  ["Form 1099‐K box 1a", []],
+  ["Range 5‑10", []],
+  ["Due 2026‒11‒02", []],
+
+  // Fourth review 5: fragments across other joiners, and digits that are not
+  // digits until NFKC makes them look like one.
+  ["Amount CHF 1'234.56", []],
+  ["Meeting at 12:30", []],
+  ["Line 45.00(1)", []],
+  ["Plan 401(k) balance", []],
+  ["Line ①250.00", []],
+  ["Line 250.00①", []],
+  ["Line ⒈250", []],
+  ["Line \u{1F100}250", []],
+  // A zero-width character has no width, so the page prints "1234.56" and
+  // that is what reads. Treating it as a boundary instead offered the two
+  // fragments the review found and, far worse, hid a zero-width space inside
+  // the word `million` from the magnitude rule, which would have offered a
+  // millionth of the truth.
+  ["Line 1​234.56", ["1234.56"]],
+  ["Fund size $2.5 mill​ion", ["2500000"]],
+  // A label's colon is not a joiner, and the amount still reads. Nor is the
+  // bar of a pipe-rendered table, which is how several parsed receipts here
+  // print a column.
+  ["Subtotal: 42.00", ["42"]],
+  ["Total | 21.60", ["21.6"]],
+  ["Chisel | 12.00 | 1.20", ["12", "1.2"]],
+
+  // Fourth review 6 and its residues: the grouping a currency's own locale
+  // reads the other way, and the parentheses that never closed.
+  ["Total 12.345 €", []],
+  ["Total €12.345", []],
+  ["Total 12,345 €", []],
+  ["Total 12.345 EUR", []],
+  ["Total $12.345", ["12.345"]],
+  ["Total $1,234", ["1234"]],
+  ["Holding $5 250 shares", []],
+  ["Credit (250.00", []],
+  ["Credit 250.00)", []],
+
+  // Recall-only rows from the same review: nothing wrong is offered, and an
+  // amount the page states is simply not read.
+  ["Note (3) 45.00", []],
+  ["Column CAD 12 USD 15", []],
+  ["Total 1 234,56 €", []],
+
+  // Known behaviour, documented rather than fixed. A single dot group is a
+  // decimal point wherever the token does not carry a currency whose locale
+  // says otherwise: `3.499` is three and a half here, and `Rp 12.000` is
+  // twelve, because `Rp` is not a currency this grammar knows and nothing
+  // else in the token settles the separator. Refusing these would mean
+  // refusing `3.499`, `1.075` and `0.125` as well, which the table above has
+  // asserted since the grammar was written.
+  ["Total 3.499", ["3.499"]],
+  ["Total Rp 12.000", ["12"]],
 ];
 
 test("a page line offers exactly the amounts the table says", () => {

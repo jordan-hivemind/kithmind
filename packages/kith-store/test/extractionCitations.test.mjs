@@ -282,22 +282,22 @@ test("a rendering space closes only next to a currency mark", () => {
   // Must NOT read. Each of these was joined into one fabricated amount by the
   // first version of the repair, which is a value the page never stated under
   // a citation that looked right.
-  // ADM-5g: the ".99" is gone too. A separator pressed against the digits is
-  // part of the token, and ".99" is a fragment of a number rather than
-  // ninety-nine -- the same rule that stops ".5" reading as five.
-  assert.deepEqual(amountsInText("APPLES   12    .99"), ["12"]);
-  assert.deepEqual(amountsInText("Invoice refs 1, 234, 567"), [
-    "1",
-    "234",
-    "567",
-  ]);
-  assert.deepEqual(amountsInText("3. 12 Pack Soda   5.99"), ["3", "12", "5.99"]);
+  // ADM-5g round five: the bare number beside the fragment is gone as well.
+  // A separator with a digit reachable through it is settled by pasting the
+  // two halves back together and asking `parseAmount`: "12    .99" reads as
+  // 12.99, "1, 234" as 1,234 and "3. 12" as 3.12, so neither side of any of
+  // them may be offered. The earlier round offered the left-hand number,
+  // which is the right answer only if the column gap was not a separator --
+  // and nothing on the line says which it was.
+  assert.deepEqual(amountsInText("APPLES   12    .99"), []);
+  assert.deepEqual(amountsInText("Invoice refs 1, 234, 567"), []);
+  assert.deepEqual(amountsInText("3. 12 Pack Soda   5.99"), ["5.99"]);
   // ADM-5g: `5L` is digits with a letter glued to them that is neither a
-  // currency, a magnitude nor a flag, so the token is not an amount at all.
+  // currency, a magnitude nor a flag, so the token is not an amount at all --
+  // and "2. 5L" does not read as 2.5 either, so the 2 stands on its own.
   assert.deepEqual(amountsInText("Milk 2. 5L"), ["2"]);
-  // A bare column gap is two numbers, and becomes a correction rather than
-  // a guess.
-  assert.deepEqual(amountsInText("Total 10. 80"), ["10", "80"]);
+  // A bare column gap is two numbers or one, and the page does not say which.
+  assert.deepEqual(amountsInText("Total 10. 80"), []);
 
   // A genuine pair of column amounts stays a pair.
   assert.deepEqual(amountsInText("20.00      1.60   21.60"), [
@@ -1417,6 +1417,82 @@ test("a long line is never cut through a number or a date", () => {
     // than being abandoned whole.
     assert.ok(pieces.length > 1, `${name}: still split`);
   }
+});
+
+test("a cut edge is unknown, so no piece offers what the line does not", () => {
+  // ADM-5g round five. The fourth review cut `...$2.5 million` down to
+  // `$2.5`, `( 1,234 )` down to `( 1,234` and `45.00 CR` down to `45.00`, and
+  // each survivor was then shown to the model as a line of its own, cited in
+  // good faith, and stored as a number the page never printed -- the 10^6,
+  // sign-flip and lost-parenthesis errors, arriving through the splitter
+  // rather than through the finder.
+  //
+  // Two things close it, and the test checks both at once. The splitter no
+  // longer cuts beside a digit, a currency mark, a parenthesis, a sign, a
+  // magnitude word or a `CR`; and where it does cut, the piece carries
+  // `cutStart`/`cutEnd`, which makes the amount finder treat the edge as
+  // unknown and refuse anything touching it. The invariant is the same one
+  // the oracle fuzzer asserts: **no piece may offer a value the whole line
+  // does not.**
+  const tails = [
+    "$2.5 million",
+    "$2.5  million",
+    "$2.5 M",
+    "( 1,234 )",
+    "(1,234)",
+    "45.00 CR",
+    "$1 000 000",
+    "1,234.56",
+    "12.99T",
+    "$2.5M",
+    "(1,234.56) CR",
+    "USD 13.20",
+    "13.20 USD",
+    "-$42.00",
+    "250.00-",
+  ];
+  for (const tail of tails) {
+    const whole = new Set(amountsInText(`Consulting services ${tail} paid`));
+    // Every offset around the 240-character bound, so the cut lands before,
+    // inside and after the amount in turn.
+    for (let pad = 180; pad < 300; pad += 1) {
+      const line = `${"word ".repeat(Math.ceil(pad / 5)).slice(0, pad)}${tail} paid`;
+      const pieces = pageLines(line);
+      assert.equal(
+        pieces.map((piece) => piece.text).join(""),
+        line,
+        `${tail} at ${pad}: exact cover`,
+      );
+      for (const piece of pieces) {
+        assert.equal(line.slice(piece.start, piece.end), piece.text);
+        const offered = amountsInText(piece.text, {
+          cutStart: piece.cutStart,
+          cutEnd: piece.cutEnd,
+        });
+        for (const value of offered) {
+          assert.ok(
+            whole.has(value),
+            `${JSON.stringify(tail)} at ${pad}: piece ${JSON.stringify(piece.text.slice(-40))} offered ${value}, which the line does not print (${[...whole].join(", ") || "nothing"})`,
+          );
+        }
+      }
+    }
+  }
+});
+
+test("a cut edge refuses the amount that touches it", () => {
+  // The rule on its own, without the splitter: the same text, read once as a
+  // whole line and once as a piece with an unknown edge.
+  assert.deepEqual(amountsInText("Fund size $2.5"), ["2.5"]);
+  assert.deepEqual(amountsInText("Fund size $2.5", { cutEnd: true }), []);
+  assert.deepEqual(amountsInText("$2.5 mill", { cutEnd: true }), []);
+  assert.deepEqual(amountsInText("55390.", { cutEnd: true }), []);
+  assert.deepEqual(amountsInText("12:", { cutEnd: true }), []);
+  assert.deepEqual(amountsInText("1,234 total", { cutStart: true }), []);
+  // A cut on the other side leaves the amount alone.
+  assert.deepEqual(amountsInText("Fund size $2.5", { cutStart: true }), ["2.5"]);
+  // And a real line edge is not a cut.
+  assert.deepEqual(amountsInText("total 1,234"), ["1234"]);
 });
 
 test("a value cut in half cannot be stored", { skip }, async (t) => {
