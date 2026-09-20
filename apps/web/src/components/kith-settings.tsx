@@ -35,19 +35,36 @@ import {
   Section,
 } from "@/components/ui/controls";
 import { CopyButton } from "@/components/ui/copy-button";
-import { DataTable, Detail, type RowAction, Tag } from "@/components/ui/data-table";
+import {
+  DataTable,
+  Detail,
+  type RowAction,
+  Tag,
+} from "@/components/ui/data-table";
 import { useToast } from "@/components/ui/toast";
 import { sourceAccountGrantsForCapabilities } from "@/lib/api-key-scopes";
 import { PLUGIN_COMMANDS, PROMPTS } from "@/lib/kith/connect-guide";
 import { shortDate, tableInteger } from "@/lib/kith/format";
-import { isPendingId, mutateJson, pendingId, requestJson } from "@/lib/kith/optimistic";
+import {
+  isPendingId,
+  mutateJson,
+  pendingId,
+  requestJson,
+} from "@/lib/kith/optimistic";
 import type { SettingsData } from "@/lib/kith/settings-data";
-import { useOptimisticMutation, useServerData } from "@/lib/kith/use-server-data";
+import {
+  useOptimisticMutation,
+  useServerData,
+} from "@/lib/kith/use-server-data";
 
 const KEY = ["settings"] as const;
 const LIVE_TABLES = ["source_accounts"] as const;
 
-const settingsCapabilities: readonly KeyCapability[] = ["read", "write", "ingest"];
+const settingsCapabilities: readonly KeyCapability[] = [
+  "read",
+  "write",
+  "ingest",
+];
 
 const sourceKinds = { "mcp-client": "MCP client", fs: "Filesystem" } as const;
 
@@ -58,13 +75,20 @@ function sourceKindLabel(connector: string) {
 const MAX_FRESHNESS_MINUTES = 525_600;
 
 function validFreshness(minutes: number): boolean {
-  return Number.isSafeInteger(minutes) && minutes >= 1 && minutes <= MAX_FRESHNESS_MINUTES;
+  return (
+    Number.isSafeInteger(minutes) &&
+    minutes >= 1 &&
+    minutes <= MAX_FRESHNESS_MINUTES
+  );
 }
 
 type ApiKeyRow = SettingsData["apiKeys"]["page"][number];
 type SourceAccountRow = SettingsData["sourceAccounts"][number];
 /** A source account with the derived columns chips and search read by name. */
-type SourceView = SourceAccountRow & { kind: string; status: "enabled" | "disabled" };
+type SourceView = SourceAccountRow & {
+  kind: string;
+  status: "enabled" | "disabled";
+};
 
 export function KithSettings({ initial }: { initial: SettingsData }) {
   const data = useServerData<SettingsData>(KEY, initial, LIVE_TABLES);
@@ -139,7 +163,9 @@ function DestinationSection({
         {unavailable && (
           <div role="alert" className="flex items-center gap-2">
             <Tag tone="warn">no longer writable</Tag>
-            <Button onClick={() => change.mutate(null)}>Reset to Personal</Button>
+            <Button onClick={() => change.mutate(null)}>
+              Reset to Personal
+            </Button>
           </div>
         )}
       </div>
@@ -173,7 +199,10 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
   const create = useOptimisticMutation<SettingsData, NewKey>({
     queryKey: KEY,
     mutationFn: ({ body }) =>
-      mutateJson("/api/kith/api-keys", { method: "POST", body: JSON.stringify(body) }),
+      mutateJson("/api/kith/api-keys", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
     apply: (current, { row }) => ({
       ...current,
       apiKeys: { ...current.apiKeys, page: [row, ...current.apiKeys.page] },
@@ -183,7 +212,8 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
 
   const revoke = useOptimisticMutation<SettingsData, string>({
     queryKey: KEY,
-    mutationFn: (id) => mutateJson(`/api/kith/api-keys/${id}`, { method: "DELETE" }),
+    mutationFn: (id) =>
+      mutateJson(`/api/kith/api-keys/${id}`, { method: "DELETE" }),
     apply: (current, id) => ({
       ...current,
       apiKeys: {
@@ -255,8 +285,10 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
         accessorKey: "keyPrefix",
         header: "Key",
         cell: ({ row }) => (
-          <code className="font-mono text-[11px] text-gray-700">
-            {isPendingId(row.original.id) ? "creating" : `${row.original.keyPrefix}...`}
+          <code className="font-mono text-data text-gray-700">
+            {isPendingId(row.original.id)
+              ? "creating"
+              : `${row.original.keyPrefix}...`}
           </code>
         ),
       },
@@ -297,7 +329,9 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
         meta: { nowrap: true },
         cell: ({ row }) => (
           <span className="text-gray-600 tabular-nums">
-            {row.original.lastUsedAt ? shortDate(row.original.lastUsedAt) : "never"}
+            {row.original.lastUsedAt
+              ? shortDate(row.original.lastUsedAt)
+              : "never"}
           </span>
         ),
       },
@@ -307,7 +341,9 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
         header: "Created",
         meta: { nowrap: true },
         cell: ({ row }) => (
-          <span className="text-gray-600 tabular-nums">{shortDate(row.original.createdAt)}</span>
+          <span className="text-gray-600 tabular-nums">
+            {shortDate(row.original.createdAt)}
+          </span>
         ),
       },
     ],
@@ -376,7 +412,7 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
             Save this key now. It won&apos;t be shown again.
           </div>
           <div className="flex items-center gap-2">
-            <code className="flex-1 rounded-tag border border-accent-200 bg-white px-2 py-1 font-mono text-[11px] break-all">
+            <code className="flex-1 rounded-tag border border-accent-200 bg-white px-2 py-1 font-mono text-data break-all">
               {newRawKey}
             </code>
             <CopyButton text={newRawKey} />
@@ -395,7 +431,11 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
         empty="No API keys"
       />
       {!data.apiKeys.isDone && (
-        <Button className="mt-2" onClick={() => void loadMore()} disabled={loadingMore}>
+        <Button
+          className="mt-2"
+          onClick={() => void loadMore()}
+          disabled={loadingMore}
+        >
           {loadingMore ? "Loading..." : "Load more"}
         </Button>
       )}
@@ -429,7 +469,9 @@ function NewKeyForm({
   }));
   const scopedSourceAccounts = sourceAccounts.filter(
     (account) =>
-      spaceIds.includes(account.spaceId) && account.enabled && !isPendingId(account.id),
+      spaceIds.includes(account.spaceId) &&
+      account.enabled &&
+      !isPendingId(account.id),
   );
   const needsSource = capabilities.includes("ingest");
 
@@ -441,7 +483,10 @@ function NewKeyForm({
       setError("Choose at least one source account for an ingest key.");
       return;
     }
-    const grantedSources = sourceAccountGrantsForCapabilities(capabilities, sourceAccountIds);
+    const grantedSources = sourceAccountGrantsForCapabilities(
+      capabilities,
+      sourceAccountIds,
+    );
     onSubmit({
       row: {
         id: pendingId(),
@@ -489,7 +534,7 @@ function NewKeyForm({
         />
         {needsSource && (
           <fieldset className="my-3 rounded-tag border border-gray-200 p-3 text-xs">
-            <legend className="px-1 text-[11px] font-medium text-gray-600">
+            <legend className="px-1 text-sm font-medium text-gray-600">
               Ingest source accounts
             </legend>
             {scopedSourceAccounts.length === 0 ? (
@@ -566,7 +611,11 @@ function SourceAccountsSection({
   const [draft, setDraft] = useState<SourceDraft | null>(null);
   const [error, setError] = useState("");
 
-  const patchRow = (current: SettingsData, id: string, patch: Partial<SourceAccountRow>) => ({
+  const patchRow = (
+    current: SettingsData,
+    id: string,
+    patch: Partial<SourceAccountRow>,
+  ) => ({
     ...current,
     sourceAccounts: current.sourceAccounts.map((account) =>
       account.id === id ? { ...account, ...patch } : account,
@@ -611,7 +660,9 @@ function SourceAccountsSection({
     const minutes = Number(draft.freshnessMinutes);
     const name = draft.name.trim();
     if (!name || !validFreshness(minutes)) {
-      setError("Enter a source name and freshness between one minute and one year.");
+      setError(
+        "Enter a source name and freshness between one minute and one year.",
+      );
       return;
     }
     setError("");
@@ -628,7 +679,10 @@ function SourceAccountsSection({
         enabled: true,
       });
     } else {
-      update.mutate({ id: draft.id, patch: { name, freshnessMs: minutes * 60_000 } });
+      update.mutate({
+        id: draft.id,
+        patch: { name, freshnessMs: minutes * 60_000 },
+      });
     }
     setDraft(null);
   }
@@ -647,7 +701,9 @@ function SourceAccountsSection({
         accessorKey: "accountId",
         header: "Account ID",
         cell: ({ row }) => (
-          <code className="font-mono text-[11px] text-gray-700">{row.original.accountId}</code>
+          <code className="font-mono text-data text-gray-700">
+            {row.original.accountId}
+          </code>
         ),
       },
       {
@@ -667,7 +723,9 @@ function SourceAccountsSection({
         header: "Status",
         meta: { nowrap: true },
         cell: ({ row }) => (
-          <Tag tone={row.original.enabled ? "accent" : "neutral"}>{row.original.status}</Tag>
+          <Tag tone={row.original.enabled ? "accent" : "neutral"}>
+            {row.original.status}
+          </Tag>
         ),
       },
       {
@@ -718,7 +776,10 @@ function SourceAccountsSection({
         label: "Enable or disable",
         disabled: (account) => isPendingId(account.id),
         onSelect: (account) =>
-          update.mutate({ id: account.id, patch: { enabled: !account.enabled } }),
+          update.mutate({
+            id: account.id,
+            patch: { enabled: !account.enabled },
+          }),
       },
     ],
     [openEdit, update],
@@ -752,7 +813,8 @@ function SourceAccountsSection({
                     onChange={(event) =>
                       setDraft({
                         ...draft,
-                        connector: event.target.value as keyof typeof sourceKinds,
+                        connector: event.target
+                          .value as keyof typeof sourceKinds,
                       })
                     }
                     className={inputClass}
@@ -768,7 +830,9 @@ function SourceAccountsSection({
                   <select
                     id="source-space"
                     value={draft.spaceId}
-                    onChange={(event) => setDraft({ ...draft, spaceId: event.target.value })}
+                    onChange={(event) =>
+                      setDraft({ ...draft, spaceId: event.target.value })
+                    }
                     disabled={spaces.length === 0}
                     className={inputClass}
                   >
@@ -786,7 +850,9 @@ function SourceAccountsSection({
               <input
                 id="source-name"
                 value={draft.name}
-                onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+                onChange={(event) =>
+                  setDraft({ ...draft, name: event.target.value })
+                }
                 placeholder="Cursor desktop"
                 required
                 maxLength={200}
@@ -798,7 +864,9 @@ function SourceAccountsSection({
                 <input
                   id="source-account-id"
                   value={draft.accountId}
-                  onChange={(event) => setDraft({ ...draft, accountId: event.target.value })}
+                  onChange={(event) =>
+                    setDraft({ ...draft, accountId: event.target.value })
+                  }
                   placeholder="desktop-capture"
                   required
                   maxLength={512}
@@ -826,7 +894,8 @@ function SourceAccountsSection({
               variant="primary"
               disabled={
                 !draft.name.trim() ||
-                (draft.id === null && (!draft.spaceId || !draft.accountId.trim()))
+                (draft.id === null &&
+                  (!draft.spaceId || !draft.accountId.trim()))
               }
             >
               {draft.id === null ? "Add source account" : "Save"}
@@ -864,7 +933,8 @@ function ConnectSection() {
         id: "mcp-url",
         name: "MCP URL",
         value: origin ? `${origin}/api/mcp` : "",
-        detail: "Claude Desktop, Cowork and Cursor: add a custom MCP server with this URL",
+        detail:
+          "Claude Desktop, Cowork and Cursor: add a custom MCP server with this URL",
       },
       ...PLUGIN_COMMANDS.map((command) => ({
         id: command.name,
@@ -888,7 +958,9 @@ function ConnectSection() {
         id: "name",
         accessorKey: "name",
         header: "Item",
-        cell: ({ row }) => <Detail label={row.original.name} detail={row.original.detail} />,
+        cell: ({ row }) => (
+          <Detail label={row.original.name} detail={row.original.detail} />
+        ),
       },
       {
         id: "value",
@@ -896,7 +968,7 @@ function ConnectSection() {
         header: "Value",
         enableSorting: false,
         cell: ({ row }) => (
-          <code className="line-clamp-1 max-w-xl font-mono text-[11px] text-gray-700">
+          <code className="line-clamp-1 max-w-xl font-mono text-data text-gray-700">
             {row.original.value}
           </code>
         ),

@@ -95,7 +95,7 @@ export function SensitivityControl({
             <Tooltip.Portal>
               <Tooltip.Content
                 sideOffset={4}
-                className="z-50 max-w-xs rounded-tag border border-gray-200 bg-white px-2 py-1 text-xs text-gray-700 shadow-md"
+                className="z-50 max-w-xs rounded-control border border-kith-border-subtle bg-kith-surface px-3 py-2 text-sm text-kith-text-secondary shadow-[var(--kith-shadow-md)]"
               >
                 {option.detail}
               </Tooltip.Content>
@@ -164,7 +164,7 @@ export function SpaceGrantChoices({
 
   return (
     <fieldset className="my-3 rounded-tag border border-gray-200 p-3 text-xs">
-      <legend className="px-1 text-[11px] font-medium text-gray-600">
+      <legend className="px-1 text-sm font-medium text-gray-600">
         Client access
       </legend>
       <p className="mb-2 text-gray-700">
@@ -192,7 +192,8 @@ export function SpaceGrantChoices({
               }
             />
             <span>
-              {space.name} ({space.kind === "personal" ? "Personal" : space.role})
+              {space.name} (
+              {space.kind === "personal" ? "Personal" : space.role})
               {space.role === "reader" && " · read only"}
             </span>
           </label>
@@ -217,13 +218,14 @@ export function SpaceGrantChoices({
           </label>
         ))}
       </div>
-      <div className="mt-3 border-t border-gray-100 pt-3">
+      <div className="mt-3 border-t border-kith-border-subtle pt-3">
         <SensitivityControl
           value={maxSensitivity}
           onChange={onMaxSensitivityChange}
         />
       </div>
-      <p className="mt-3 text-[11px] text-gray-600">
+      <p className="mt-3 text-xs text-kith-text-secondary">
+
         Access follows your current membership. Removing access to a space also
         removes this client’s access. Narrative memory capture needs both read
         and write access to check existing memories.

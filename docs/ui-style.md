@@ -1,16 +1,40 @@
 # UI style
 
 The owner's rules for every screen. They are requirements, not suggestions.
+The implementation lives in `apps/web/src/app/globals.css` and the shared
+primitives in `apps/web/src/components/ui`. Screen components consume semantic
+tokens and primitives rather than restating colors, type sizes, radii or page
+widths.
 
 ## Look
 
 | Rule | Detail |
 | --- | --- |
-| Palette | White, gray and blue. No khaki or cream backgrounds, no green accent. |
-| Type | Inter. No ornamented or display fonts. |
-| Tone | Professional and minimal. No cushioned or oversized buttons. |
-| Pills | Square corners. |
+| Palette | White page and card surfaces, neutral gray for subtle surfaces, borders and table headers, and a blue action ramp for primary buttons, links, focus rings, selected states and active nav. Semantic status colors (success green, warning amber, danger red, info blue) carry their own meaning and stay separate from the action blue. Consume semantic roles so the palette can change without screen rewrites. |
+| Type | Inter for body and display roles. No Cosmica or ornamented display fonts. |
+| Scale | 14.5px body, 15px reading text, 13.5px table data, 24px page titles and 17.835px section titles. |
+| Tone | Professional, minimal and information-dense. Controls stay compact without making their labels tiny. |
+| Shape | 8px controls, 10px cards and 14px overlay panels. Tags remain compact rather than fully pill-shaped. |
 | Text | No explanatory sentences in the UI. Detail goes in a hover tooltip. |
+
+## Layout
+
+| Role | Width |
+| --- | --- |
+| Page shell | 1360px maximum with a responsive 16–24px gutter. |
+| Workflow | 1200px maximum, aligned to the page shell's left edge. |
+| Feed | 960px maximum, aligned to the page shell's left edge. |
+| Reading | 800px maximum, aligned to the page shell's left edge. |
+
+Pages use a white ground. Content is grouped into white tiles with a border,
+restrained shadow and consistent header/content padding. Do not wrap an
+entire data-heavy screen in one oversized card.
+
+## Headings
+
+Use one `PageHeader` per screen. Sections use `Section` or the matching
+semantic heading role. Heading levels describe document structure; visual size
+comes from the shared role rather than a locally chosen utility class.
 
 ## Tables
 

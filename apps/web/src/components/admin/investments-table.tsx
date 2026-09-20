@@ -656,7 +656,7 @@ export function InvestmentsTable({
         {toast === null ? null : (
           <span
             role="status"
-            className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] text-amber-800"
+            className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-meta text-amber-800"
           >
             {toast}
           </span>

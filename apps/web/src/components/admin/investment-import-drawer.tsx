@@ -234,10 +234,10 @@ export function ImportDrawer({
             {/* The rule the mapping applied, and what a re-import does. Shown
                 because the operator is being asked to approve them, not merely
                 told afterwards. */}
-            <p className="rounded-tag border border-gray-200 bg-gray-50 p-2 text-[11px] text-gray-600">
+            <p className="rounded-tag border border-gray-200 bg-gray-50 p-2 text-data text-gray-600">
               {IMPORT_RULE}
             </p>
-            <p className="rounded-tag border border-gray-200 bg-gray-50 p-2 text-[11px] text-gray-600">
+            <p className="rounded-tag border border-gray-200 bg-gray-50 p-2 text-data text-gray-600">
               {IMPORT_REIMPORT_NOTE}
             </p>
 
@@ -251,7 +251,7 @@ export function ImportDrawer({
 
             {preview.topLineCheck === null ? null : (
               <div className="flex flex-col gap-1">
-                <p className="text-[11px] text-gray-500">
+                <p className="text-xs text-kith-text-muted">
                   The sheet&apos;s own Total row, line{" "}
                   {tableInteger(preview.topLineCheck.line)}
                 </p>
@@ -267,13 +267,13 @@ export function ImportDrawer({
 
             {preview.ledgerOnlyInvestments.length === 0 ? null : (
               <div className="flex flex-col gap-0.5">
-                <p className="text-[11px] font-medium text-gray-700">
+                <p className="text-sm font-medium text-gray-700">
                   In the Ledger but not the Summary
                 </p>
                 {preview.ledgerOnlyInvestments.map((name) => (
                   <p
                     key={name}
-                    className="rounded-tag border border-gray-200 px-1.5 py-0.5 text-[11px] text-gray-500"
+                    className="rounded-tag border border-gray-200 px-1.5 py-0.5 text-meta text-gray-500"
                   >
                     {name} — created with no commitment
                   </p>
@@ -283,13 +283,13 @@ export function ImportDrawer({
 
             {preview.sentWithNoLedgerRows.length === 0 ? null : (
               <div className="flex flex-col gap-0.5">
-                <p className="text-[11px] font-medium text-gray-700">
+                <p className="text-sm font-medium text-gray-700">
                   Sent amount has no Ledger rows
                 </p>
                 {preview.sentWithNoLedgerRows.map((row) => (
                   <p
                     key={row.investmentName}
-                    className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] text-amber-800"
+                    className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-meta text-amber-800"
                   >
                     {row.line}: {row.investmentName} — sheet says sent{" "}
                     {row.amount} USD
@@ -301,7 +301,7 @@ export function ImportDrawer({
             {preview.reconciliation.map((row) => (
               <p
                 key={`${row.investmentName}:${row.field}`}
-                className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] text-amber-800"
+                className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-meta text-amber-800"
               >
                 {row.label}
               </p>
@@ -310,7 +310,7 @@ export function ImportDrawer({
             {preview.suspectRates.map((row) => (
               <p
                 key={row.importKey}
-                className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] text-amber-800"
+                className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-meta text-amber-800"
               >
                 {row.line}: {row.investmentName} {row.amount} {row.currency} x{" "}
                 {row.exchangeRate} = {row.rateCheck?.convertedUsd}, the sheet
@@ -321,7 +321,7 @@ export function ImportDrawer({
             {plan.invalid.map((row) => (
               <p
                 key={row.key}
-                className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] text-amber-800"
+                className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-meta text-amber-800"
               >
                 {row.label} — {row.reason}
               </p>
@@ -330,7 +330,7 @@ export function ImportDrawer({
             {preview.skipped.map((row) => (
               <p
                 key={`${row.line}:${row.reason}`}
-                className="truncate rounded-tag border border-gray-200 px-1.5 py-0.5 text-[11px] text-gray-500"
+                className="truncate rounded-tag border border-gray-200 px-1.5 py-0.5 text-meta text-gray-500"
                 title={row.raw}
               >
                 {row.line} · {row.reason}
@@ -341,7 +341,7 @@ export function ImportDrawer({
               {preview.ledger.map((row, index) => (
                 <li
                   key={row.importKey}
-                  className="flex items-center gap-1 text-[11px]"
+                  className="flex items-center gap-1 text-data"
                 >
                   <span className="w-20 shrink-0 tabular-nums text-gray-500">
                     {archiveDate(row.entryDate)}
@@ -377,7 +377,7 @@ export function ImportDrawer({
             </ul>
 
             {needsAcknowledgement ? (
-              <label className="flex items-center gap-1.5 text-[11px] text-gray-700">
+              <label className="flex items-center gap-1.5 text-sm text-gray-700">
                 <input
                   type="checkbox"
                   checked={acknowledged}
@@ -390,7 +390,7 @@ export function ImportDrawer({
         )}
 
         {outcome === null ? null : (
-          <div className="flex flex-col gap-0.5 text-[11px]">
+          <div className="flex flex-col gap-0.5 text-data">
             <p className="text-gray-700">
               {outcome.investmentsCreated} investments ·{" "}
               {outcome.entriesCreated} entries ·{" "}

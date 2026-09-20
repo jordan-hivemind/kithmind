@@ -2,7 +2,7 @@
 
 // The one table every admin screen uses.
 //
-// The owner's decision, in one component: compact rows (34px), sortable
+// The owner's decision, in one component: compact rows (36px), sortable
 // headers, column filters as chips, a search box that filters as you type,
 // optional grouped and expandable rows, drag-resizable columns, a clickable
 // row, a kebab column, tooltips for detail, square tags, no explanatory
@@ -191,7 +191,7 @@ export function Tag({
   return (
     <span
       title={title}
-      className={`inline-flex items-center rounded-tag border px-1.5 py-0.5 text-[11px] leading-none ${tones[tone]}`}
+      className={`inline-flex items-center rounded-tag border px-1.5 py-0.5 text-xs leading-none ${tones[tone]}`}
     >
       {displayChildren}
     </span>
@@ -210,14 +210,14 @@ export function Detail({
   return (
     <Tooltip.Root>
       <Tooltip.Trigger asChild>
-        <span className="cursor-default underline decoration-gray-300 decoration-dotted underline-offset-2">
+        <span className="cursor-default underline decoration-kith-border-subtle decoration-dotted underline-offset-2">
           {label}
         </span>
       </Tooltip.Trigger>
       <Tooltip.Portal>
         <Tooltip.Content
           sideOffset={4}
-          className="z-50 max-w-sm rounded-tag border border-gray-200 bg-white px-2 py-1 text-xs text-gray-700 shadow-md"
+          className="z-50 max-w-sm rounded-control border border-kith-border-subtle bg-kith-surface px-3 py-2 text-sm text-kith-text-secondary shadow-[var(--kith-shadow-md)]"
         >
           {detail}
         </Tooltip.Content>
@@ -479,7 +479,7 @@ export function DataTable<T>({
                 }}
                 placeholder={searchPlaceholder}
                 aria-label={searchPlaceholder}
-                className="h-7 w-56 rounded-tag border border-gray-300 px-2 text-xs outline-none focus:border-accent-500"
+                className="h-8 w-full rounded-control border border-kith-border-subtle bg-kith-surface px-2.5 text-sm outline-none focus:border-kith-action focus:ring-1 focus:ring-kith-action sm:w-56"
               />
             ) : null}
             {chipOptions.map(({ columnId, options }) =>
@@ -491,7 +491,7 @@ export function DataTable<T>({
                     type="button"
                     aria-pressed={selected}
                     onClick={() => toggleChip(columnId, option.value)}
-                    className={`rounded-tag border px-1.5 py-0.5 text-[11px] leading-none ${
+                    className={`rounded-tag border px-1.5 py-0.5 text-xs leading-none ${
                       selected
                         ? "border-accent-600 bg-accent-600 text-white"
                         : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"
@@ -509,7 +509,7 @@ export function DataTable<T>({
                 <button
                   type="button"
                   onClick={() => setSelected(new Set())}
-                  className="text-[11px] text-gray-500 hover:text-gray-700"
+                  className="text-xs text-kith-text-muted hover:text-kith-text-secondary"
                 >
                   Clear
                 </button>
@@ -527,7 +527,7 @@ export function DataTable<T>({
                       }
                       className={
                         action.danger
-                          ? "h-7 rounded-tag border border-red-200 px-2 text-xs text-red-600 hover:border-red-400 disabled:text-gray-300"
+                          ? "h-8 rounded-control border border-kith-danger-border px-3 text-sm text-kith-danger hover:bg-kith-danger-bg disabled:text-kith-text-muted"
                           : buttonClass
                       }
                     >
@@ -542,14 +542,17 @@ export function DataTable<T>({
 
         <div className="overflow-x-auto">
           <table
-            style={{ width: table.getTotalSize() + kebabWidth + selectWidth }}
-            className="table-fixed border-collapse text-xs"
+            style={{
+              width: "100%",
+              minWidth: table.getTotalSize() + kebabWidth + selectWidth,
+            }}
+            className="kith-table-text w-full table-fixed border-collapse text-kith-text"
           >
             <thead>
               {table.getHeaderGroups().map((headerGroup) => (
                 <tr
                   key={headerGroup.id}
-                  className="border-b border-gray-300 bg-gray-50"
+                  className="border-b border-kith-border-subtle bg-kith-surface-muted"
                 >
                   {selectable ? (
                     <th className="h-row w-7 px-1 align-middle">
@@ -571,7 +574,7 @@ export function DataTable<T>({
                         key={header.id}
                         scope="col"
                         style={{ width: header.getSize() }}
-                        className="relative h-row border-r border-gray-200 px-2 text-left align-middle font-medium text-gray-600 last:border-r-0"
+                        className="relative h-row border-r border-kith-border px-2 text-left align-middle text-xs font-medium text-kith-text-secondary last:border-r-0"
                       >
                         {header.isPlaceholder ? null : header.column.getCanSort() ? (
                           <button
@@ -584,7 +587,7 @@ export function DataTable<T>({
                                   ? "descending"
                                   : "none"
                             }
-                            className="flex items-center gap-1 hover:text-gray-900"
+                            className="flex items-center gap-1 hover:text-kith-text"
                           >
                             {flexRender(
                               header.column.columnDef.header,
@@ -607,7 +610,7 @@ export function DataTable<T>({
                             role="separator"
                             aria-orientation="vertical"
                             aria-label="Resize column"
-                            className="absolute inset-y-1 right-0 w-1.5 cursor-col-resize touch-none select-none border-r border-gray-300 hover:border-accent-500"
+                            className="absolute inset-y-1 right-0 w-1.5 cursor-col-resize touch-none select-none border-r border-kith-border-subtle hover:border-kith-action"
                           />
                         ) : null}
                       </th>
@@ -622,9 +625,11 @@ export function DataTable<T>({
                 <tr>
                   <td
                     colSpan={table.getAllLeafColumns().length + extraColumns}
-                    className="h-row px-2 text-gray-500"
+                    className="h-36 px-4 text-center align-middle"
                   >
-                    {empty}
+                    <div role="status" className="text-sm text-kith-text-muted">
+                      {empty}
+                    </div>
                   </td>
                 </tr>
               ) : (
@@ -669,12 +674,12 @@ export function DataTable<T>({
                             }
                           : undefined
                       }
-                      className={`border-b border-gray-200 hover:bg-accent-50/60 ${
+                      className={`border-b border-kith-border-subtle hover:bg-accent-50/60 ${
                         row.getCanExpand()
                           ? "border-l-2 border-l-accent-500 bg-accent-50/70 font-medium"
                           : row.depth > 0
-                            ? "bg-white text-gray-600"
-                            : "bg-white"
+                            ? "bg-kith-surface text-kith-text-secondary"
+                            : "bg-kith-surface"
                       } ${
                         intent === "none"
                           ? ""
@@ -779,7 +784,7 @@ export function DataTable<T>({
                                 aria-label="Row actions"
                                 data-row-click-ignore
                                 onClick={(event) => event.stopPropagation()}
-                                className="rounded-tag px-1.5 py-0.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
+                                className="rounded-control px-2 py-1 text-kith-text-muted hover:bg-kith-surface-muted hover:text-kith-text"
                               >
                                 &#8942;
                               </DropdownMenu.Trigger>
@@ -787,7 +792,7 @@ export function DataTable<T>({
                                 <DropdownMenu.Content
                                   align="end"
                                   sideOffset={2}
-                                  className="z-50 min-w-36 rounded-tag border border-gray-200 bg-white py-1 text-xs shadow-md"
+                                  className="z-50 min-w-36 rounded-control border border-kith-border-subtle bg-kith-surface py-1 text-sm shadow-[var(--kith-shadow-md)]"
                                 >
                                   {actions
                                     .filter(
@@ -804,7 +809,7 @@ export function DataTable<T>({
                                             : action.onSelect(row.original)
                                         }
                                         className={`cursor-default px-2 py-1 outline-none data-[disabled]:text-gray-300 data-[highlighted]:bg-accent-50 ${
-                                          action.danger ? "text-red-600" : ""
+                                          action.danger ? "text-kith-danger" : ""
                                         }`}
                                       >
                                         {action.label}
@@ -832,12 +837,12 @@ export function DataTable<T>({
         }}
       >
         <AlertDialog.Portal>
-          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-gray-900/20" />
-          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-tag border border-gray-200 bg-white p-4 shadow-xl">
-            <AlertDialog.Title className="text-sm font-medium text-gray-900">
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-kith-overlay" />
+          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
+            <AlertDialog.Title className="kith-section-title">
               {confirming?.action.label}?
             </AlertDialog.Title>
-            <AlertDialog.Description className="mt-1 text-xs text-gray-600">
+            <AlertDialog.Description className="mt-1 text-sm text-kith-text-secondary">
               This can&apos;t be undone.
             </AlertDialog.Description>
             <div className="mt-3 flex justify-end gap-2">
@@ -847,7 +852,7 @@ export function DataTable<T>({
                   if (confirming) confirming.action.onSelect(confirming.row);
                   setConfirming(null);
                 }}
-                className="h-7 rounded-tag border border-red-600 bg-red-600 px-2 text-xs text-white hover:bg-red-700"
+                className="h-8 rounded-control border border-kith-danger bg-kith-danger px-3 text-sm text-white hover:bg-red-700"
               >
                 {confirming?.action.label}
               </AlertDialog.Action>
@@ -863,12 +868,12 @@ export function DataTable<T>({
         }}
       >
         <AlertDialog.Portal>
-          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-gray-900/20" />
-          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-tag border border-gray-200 bg-white p-4 shadow-xl">
-            <AlertDialog.Title className="text-sm font-medium text-gray-900">
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-kith-overlay" />
+          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
+            <AlertDialog.Title className="kith-section-title">
               {confirmingBulk?.action.label}?
             </AlertDialog.Title>
-            <AlertDialog.Description className="mt-1 text-xs text-gray-600">
+            <AlertDialog.Description className="mt-1 text-sm text-kith-text-secondary">
               This can&apos;t be undone. Affects {confirmingBulk?.rows.length ?? 0}{" "}
               item{confirmingBulk?.rows.length === 1 ? "" : "s"}.
             </AlertDialog.Description>
@@ -880,7 +885,7 @@ export function DataTable<T>({
                   setConfirmingBulk(null);
                   setSelected(new Set());
                 }}
-                className="h-7 rounded-tag border border-red-600 bg-red-600 px-2 text-xs text-white hover:bg-red-700"
+                className="h-8 rounded-control border border-kith-danger bg-kith-danger px-3 text-sm text-white hover:bg-red-700"
               >
                 {confirmingBulk?.action.label}
               </AlertDialog.Action>

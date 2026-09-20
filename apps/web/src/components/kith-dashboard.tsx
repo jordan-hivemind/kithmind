@@ -85,11 +85,11 @@ const DASHBOARD_KEY = ["dashboard"];
 
 function Stat({ value, name }: { value: number; name: string }) {
   return (
-    <div className="min-w-24 rounded-tag border border-gray-200 px-3 py-2">
+    <div className="kith-tile min-w-28 px-4 py-3">
       <div className="text-lg leading-6 font-semibold tabular-nums">
         {value}
       </div>
-      <div className="text-[11px] text-gray-600">{name}</div>
+      <div className="text-sm text-kith-text-secondary">{name}</div>
     </div>
   );
 }
@@ -245,18 +245,24 @@ export function KithDashboard({ stats, recent }: DashboardData) {
         ))}
       </div>
       <KithQuickCapture />
-      <h2 className="mt-6 mb-2 text-sm font-semibold">Recent thoughts</h2>
-      <DataTable
-        id="dashboard-recent-thoughts"
-        data={rows}
-        columns={columns}
-        filterColumns={["type"]}
-        initialSorting={[{ id: "createdAt", desc: true }]}
-        actions={actions}
-        onRowClick={openEdit}
-        searchPlaceholder="Search thoughts"
-        empty="No thoughts"
-      />
+      <section className="kith-tile mt-6 overflow-hidden">
+        <div className="kith-tile-header px-4 py-2">
+          <h2 className="kith-section-title">Recent thoughts</h2>
+        </div>
+        <div className="p-4">
+          <DataTable
+            id="dashboard-recent-thoughts"
+            data={rows}
+            columns={columns}
+            filterColumns={["type"]}
+            initialSorting={[{ id: "createdAt", desc: true }]}
+            actions={actions}
+            onRowClick={openEdit}
+            searchPlaceholder="Search thoughts"
+            empty="No thoughts"
+          />
+        </div>
+      </section>
 
       {editing === null ? null : (
         <ThoughtDrawer

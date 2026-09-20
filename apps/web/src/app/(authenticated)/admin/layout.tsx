@@ -55,15 +55,18 @@ export default async function AdminLayout({
 
   return (
     <QueryProvider>
-      <div className="flex min-h-[70vh] gap-6">
-        <nav aria-label="Admin" className="w-44 shrink-0 border-r border-gray-200 pr-3">
-          <ul className="flex flex-col gap-0.5 text-xs">
+      <div className="flex min-h-[70vh] flex-col gap-5 md:flex-row md:gap-6">
+        <nav
+          aria-label="Admin"
+          className="border-b border-kith-border-subtle pb-3 md:w-48 md:shrink-0 md:border-r md:border-b-0 md:pr-4 md:pb-0"
+        >
+          <ul className="flex flex-wrap gap-1 text-sm md:flex-col">
             {SCREENS.map((screen) =>
               screen.ready ? (
                 <li key={screen.href}>
                   <Link
                     href={screen.href}
-                    className="flex items-center rounded-tag px-2 py-1.5 text-gray-700 hover:bg-accent-50 hover:text-accent-700"
+                    className="flex items-center rounded-control px-3 py-2 text-kith-text-secondary hover:bg-accent-50 hover:text-accent-700"
                   >
                     {screen.label}
                     {screen.href === "/admin/attention" ? (
@@ -75,7 +78,7 @@ export default async function AdminLayout({
                 <li
                   key={screen.href}
                   aria-disabled="true"
-                  className="block px-2 py-1.5 text-gray-300"
+                  className="block px-3 py-2 text-kith-text-muted"
                 >
                   {screen.label}
                 </li>
