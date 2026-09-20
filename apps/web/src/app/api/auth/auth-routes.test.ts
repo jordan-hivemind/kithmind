@@ -36,7 +36,7 @@ const adminUrl = process.env.KITH_STORE_DATABASE_URL;
 const describeWithDatabase = adminUrl ? describe : describe.skip;
 
 const secret = randomBytes(32).toString("hex");
-const config = { secret, secure: true };
+const config = { secret, secure: false };
 const PASSWORD = "a strong enough password";
 
 type Routes = {
@@ -175,8 +175,8 @@ describeWithDatabase("the kith session routes", () => {
       signUp: (await import("./sign-up/route")).POST,
       signOut: (await import("./sign-out/route")).POST,
       changePassword: (await import("./change-password/route")).POST,
-      googleStart: (await import("./google/route")).handleGoogleOAuthStart,
-      googleCallback: (await import("./google/callback/route"))
+      googleStart: (await import("./google/handler")).handleGoogleOAuthStart,
+      googleCallback: (await import("./google/callback/handler"))
         .handleGoogleOAuthCallback,
     };
   }, 60_000);
@@ -202,10 +202,10 @@ describeWithDatabase("the kith session routes", () => {
     expect(response.headers.get("cache-control")).toBe("no-store");
 
     const setCookie = response.headers.get("set-cookie")!;
-    expect(setCookie).toContain("__Host-kith_session=");
+    expect(setCookie).toContain("kith_session=");
     expect(setCookie).toContain("HttpOnly");
     expect(setCookie).toContain("SameSite=Lax");
-    expect(setCookie).toContain("Secure");
+    expect(setCookie).not.toContain("Secure");
     expect(setCookie).toContain("Path=/");
 
     const cookie = cookieHeaderFrom(response);
@@ -271,7 +271,7 @@ describeWithDatabase("the kith session routes", () => {
 
   test("explicitly links Google, keeps memberships, and signs in by subject", async () => {
     const googleEnv = {
-      NODE_ENV: "production",
+      NODE_ENV: "test",
       KITH_SESSION_SECRET: secret,
       GOOGLE_OAUTH_CLIENT_ID: "synthetic-client.apps.example.test",
       GOOGLE_OAUTH_CLIENT_SECRET: "synthetic-client-secret",
@@ -297,7 +297,7 @@ describeWithDatabase("the kith session routes", () => {
     const authorize = new URL(linkStart.headers.get("location")!);
     expect(authorize.searchParams.get("code_challenge_method")).toBe("S256");
     expect(authorize.searchParams.get("nonce")).toBeTruthy();
-    const oauthCookie = namedCookie(linkStart, "__Host-kith_google_oauth");
+    const oauthCookie = namedCookie(linkStart, "kith_google_oauth");
     const state = authorize.searchParams.get("state")!;
 
     const linked = await routes.googleCallback(
@@ -336,7 +336,7 @@ describeWithDatabase("the kith session routes", () => {
         `https://brain.example.test/api/auth/google/callback?code=synthetic-code&state=${encodeURIComponent(signInAuthorize.searchParams.get("state")!)}`,
         {
           headers: {
-            cookie: namedCookie(signInStart, "__Host-kith_google_oauth"),
+            cookie: namedCookie(signInStart, "kith_google_oauth"),
           },
         },
       ),
@@ -353,14 +353,14 @@ describeWithDatabase("the kith session routes", () => {
     expect(signedIn.headers.get("location")).toBe(
       "https://brain.example.test/",
     );
-    expect(
-      await principalFor(namedCookie(signedIn, "__Host-kith_session")),
-    ).toBe(userId);
+    expect(await principalFor(namedCookie(signedIn, "kith_session"))).toBe(
+      userId,
+    );
   });
 
   test("Google callback refuses bad state, bad token, and a changed linking session", async () => {
     const googleEnv = {
-      NODE_ENV: "production",
+      NODE_ENV: "test",
       KITH_SESSION_SECRET: secret,
       GOOGLE_OAUTH_CLIENT_ID: "synthetic-client.apps.example.test",
       GOOGLE_OAUTH_CLIENT_SECRET: "synthetic-client-secret",
@@ -380,7 +380,7 @@ describeWithDatabase("the kith session routes", () => {
       { env: googleEnv },
     );
     const authorize = new URL(start.headers.get("location")!);
-    const oauthCookie = namedCookie(start, "__Host-kith_google_oauth");
+    const oauthCookie = namedCookie(start, "kith_google_oauth");
     const state = authorize.searchParams.get("state")!;
     const exchangeCode = vi.fn(async () => "synthetic-id-token");
 

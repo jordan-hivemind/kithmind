@@ -15,6 +15,10 @@ const DEVELOPMENT_ENV = {
   KITH_SESSION_SECRET: secret,
   NODE_ENV: "development",
 } as const;
+const TEST_ENV = {
+  KITH_SESSION_SECRET: secret,
+  NODE_ENV: "test",
+} as const;
 
 function request(pathname: string, method = "GET", cookieHeader?: string) {
   return new NextRequest(`https://brain.example.test${pathname}`, {
@@ -47,11 +51,26 @@ describe("web authentication middleware", () => {
     );
     expect(hostPrefixed?.status).toBe(307);
 
+    expect(
+      await handleMiddlewareRequest(
+        request("/settings", "GET", signedInLocally()),
+        { env: TEST_ENV },
+      ),
+    ).toBeUndefined();
+
     const developmentInProduction = await handleMiddlewareRequest(
       request("/settings", "GET", signedInLocally()),
       { env: ENV },
     );
     expect(developmentInProduction?.status).toBe(307);
+
+    const developmentInUnknownMode = await handleMiddlewareRequest(
+      request("/settings", "GET", signedInLocally()),
+      {
+        env: { KITH_SESSION_SECRET: secret, NODE_ENV: "preview" },
+      },
+    );
+    expect(developmentInUnknownMode?.status).toBe(307);
   });
   test.each(["/api/ingest", "/api/worker"])(
     "lets the exact bearer endpoint %s reach its route handler",

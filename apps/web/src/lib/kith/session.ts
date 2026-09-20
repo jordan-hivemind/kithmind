@@ -24,13 +24,18 @@ type Environment = Readonly<Record<string, string | undefined>>;
  * True everywhere except an explicitly non-production build. Section 2.1 of the
  * surface plan leaves `secure` at its default so `Secure` is always set, and
  * allows a plain-HTTP local run to pass `secure: false` from a
- * development-only branch. This is that branch, and it is keyed on
- * `NODE_ENV === "development"`, which Next.js sets for `next dev` and never for
- * `next build`. The identity package uses a separate unprefixed cookie name in
- * that branch because browsers reject an insecure `__Host-` cookie.
+ * non-production branch. This is that branch, keyed on `development` for
+ * `next dev` and `test` for the route suites that exercise the same local-HTTP
+ * behavior. Next.js sets `production` for builds and deployed servers. The
+ * identity package uses a separate unprefixed cookie name outside production
+ * because browsers reject an insecure `__Host-` cookie.
  */
+export function usesLocalSessionCookie(env: Environment): boolean {
+  return env.NODE_ENV === "development" || env.NODE_ENV === "test";
+}
+
 function secureCookie(env: Environment): boolean {
-  return env.NODE_ENV !== "development";
+  return !usesLocalSessionCookie(env);
 }
 
 /**

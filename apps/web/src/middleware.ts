@@ -4,6 +4,7 @@ import {
   readKithSessionCookie,
   verifyKithSessionCookie,
 } from "@/lib/kith/cookie";
+import { usesLocalSessionCookie } from "@/lib/kith/session";
 import { shouldRewriteMcpRootRequest } from "@/lib/mcp/root-alias";
 
 /**
@@ -85,7 +86,7 @@ async function isAuthenticated(
     secret,
     readKithSessionCookie(
       request.headers.get("cookie"),
-      env.NODE_ENV === "development",
+      usesLocalSessionCookie(env),
     ),
   );
   return token !== null;
