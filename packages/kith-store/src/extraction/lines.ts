@@ -31,6 +31,8 @@
 // The old `quote` shape still reads, because the non-schema fallback path has
 // no way to require the new one.
 
+import { SUPPORTED_CURRENCIES } from "../records/values.js";
+
 /** One line of a page, with the offsets its text occupies in that page. */
 export type PageLine = {
   /** 1-based, because it is shown to a model and counting from one is what a
@@ -39,6 +41,14 @@ export type PageLine = {
   start: number;
   end: number;
   text: string;
+  /** True when this piece's left edge is a cut {@link splitLongLine} made
+   * inside a longer line, rather than a newline or the start of the page.
+   * The amount finder treats a cut edge as *unknown*: whatever stood beyond
+   * it -- a magnitude letter, a `CR`, an open parenthesis, the rest of a
+   * number -- is no longer visible, so an amount touching it is refused. */
+  cutStart: boolean;
+  /** The same for the right edge. */
+  cutEnd: boolean;
 };
 
 /** How many lines one citation may name. A label, its amount and one more is
@@ -87,8 +97,16 @@ export function pageLines(text: string): PageLine[] {
   for (;;) {
     const brk = text.indexOf("\n", start);
     const end = brk < 0 ? text.length : brk;
-    for (const piece of splitLongLine(text, start, end)) {
-      lines.push({ id, ...piece, text: text.slice(piece.start, piece.end) });
+    const pieces = splitLongLine(text, start, end);
+    for (let index = 0; index < pieces.length; index += 1) {
+      const piece = pieces[index]!;
+      lines.push({
+        id,
+        ...piece,
+        text: text.slice(piece.start, piece.end),
+        cutStart: index > 0,
+        cutEnd: index < pieces.length - 1,
+      });
       id += 1;
     }
     if (brk < 0) break;
@@ -105,9 +123,35 @@ const MAX_LINE_OVERFLOW = 64;
  * both sides is a cut through the middle of a value. */
 const TOKEN_CHAR = /[0-9.,:/'-]/;
 
+/** Whitespace, and the zero-width characters that are not whitespace and are
+ * not a boundary either. The amount grammar removes them outright, so a cut
+ * that treats one as a gap cuts a token the grammar sees as whole. */
+const GAP_CHAR = /[\s\u200b\u200c\u200d\u2060\ufeff]/;
+
 /** What may stand immediately before a number and belong to it. Separating
  * `(` from its digits turns a credit into a charge. */
 const OPENERS = new Set(["(", "$", "\u20ac", "\u00a3", "\u00a5", "\u20b9", "\u20a9", "+", "-"]);
+
+/** The currency symbols the amount grammar knows. Cutting one away from its
+ * digits loses the marker that decides whether `$2.5M` scales at all. */
+const CURRENCY_MARKS = new Set([
+  "$",
+  "\u20ac",
+  "\u00a3",
+  "\u00a5",
+  "\u20b9",
+  "\u20a9",
+]);
+
+/** Words that sign or scale the number they stand beside, so a cut must never
+ * fall between them and it. `CR` and `DR` are the sign; the rest are the
+ * magnitude, in every spelling the grammar reads. */
+const MODIFIER_WORDS =
+  /^(cr|dr|k|m|b|mm|mn|bn|mil|mio|thousand|thousands|million|millions|billion|billions)$/i;
+
+/** ISO codes the store supports, which mark the digits beside them as money
+ * exactly as a symbol does. */
+const CURRENCY_CODES = new Set<string>(SUPPORTED_CURRENCIES);
 
 /**
  * Positions covered by filler rather than by a value.
@@ -150,6 +194,19 @@ function fillerPositions(text: string, from: number, to: number): Set<number> {
  * to {@link MAX_LINE_OVERFLOW}; a single token longer than that leaves the
  * line unsplit, because one long citation is a weak check and a wrong number
  * is a wrong number.
+ *
+ * ADM-5g widens "inside a token" to look **through the gap**. The fourth
+ * review cut `...$2.5 million` down to `$2.5`, `( 1,234 )` down to
+ * `( 1,234`, `45.00 CR` down to `45.00` and `$1 000 000` down to `$1 000`,
+ * and every survivor read as a number the page does not print: a magnitude
+ * lost, a sign lost, a digit group lost. Whitespace between the two halves
+ * changed none of that, so the whitespace is looked through, and a cut beside
+ * a digit, a currency mark, a parenthesis, a sign, a magnitude word or a
+ * `CR`/`DR` is treated exactly like a cut through the middle of `1,234.56`.
+ *
+ * Where a cut is made anyway, the piece carries it: see `cutStart`/`cutEnd`
+ * on {@link PageLine}. Avoiding the cut is what keeps the amount readable;
+ * marking it is what keeps a bad cut from ever being read.
  */
 function splitLongLine(
   text: string,
@@ -161,13 +218,99 @@ function splitLongLine(
   const tokenAt = (at: number): boolean =>
     at >= start && at < end && TOKEN_CHAR.test(text[at]!) && !filler.has(at);
 
-  /** Whether a cut here would separate a value from part of itself. */
+  /** The nearest non-space position before `cut`, and at or after it. A cut
+   * lands between two tokens as often as inside one, and the whitespace
+   * between them is exactly what hides the fact. */
+  const backOf = (cut: number): number => {
+    let at = cut - 1;
+    while (at >= start && GAP_CHAR.test(text[at]!)) at -= 1;
+    return at;
+  };
+  const forwardOf = (cut: number): number => {
+    let at = cut;
+    while (at < end && GAP_CHAR.test(text[at]!)) at += 1;
+    return at;
+  };
+
+  /** The word that begins at `at`, if any. */
+  const wordAt = (at: number): string => {
+    const word = /^[A-Za-z]+/.exec(text.slice(at, Math.min(end, at + 12)));
+    return word ? word[0] : "";
+  };
+  /** The word that ends at `at` (exclusive), if any. */
+  const wordEndingAt = (at: number): string => {
+    let from = at;
+    while (from > start && /[A-Za-z]/.test(text[from - 1]!)) from -= 1;
+    return text.slice(from, at);
+  };
+
+  /** Something a number *before* the cut would take as its own. */
+  const modifiesLeft = (at: number): boolean => {
+    if (at >= end) return false;
+    const unit = text[at]!;
+    if (unit === "-" || unit === "+" || unit === "%" || unit === ")") return true;
+    if (CURRENCY_MARKS.has(unit)) return true;
+    const word = wordAt(at);
+    return (
+      word.length > 0 &&
+      (MODIFIER_WORDS.test(word) || CURRENCY_CODES.has(word.toUpperCase()))
+    );
+  };
+  /** Something a number *after* the cut would take as its own. */
+  const modifiesRight = (at: number): boolean => {
+    if (at < start) return false;
+    const unit = text[at]!;
+    if (unit === "(" || unit === "-" || unit === "+") return true;
+    if (CURRENCY_MARKS.has(unit)) return true;
+    const word = wordEndingAt(at + 1);
+    return (
+      word.length > 0 &&
+      (MODIFIER_WORDS.test(word) || CURRENCY_CODES.has(word.toUpperCase()))
+    );
+  };
+
+  /**
+   * Whether a cut here would separate a value from part of itself.
+   *
+   * Adjacency is the old half: `1,234.56` cut into `1,` and `234.56` is the
+   * fabricated value this file was written to stop. The rest is ADM-5g's:
+   * the fourth review cut `...$2.5 million` down to `$2.5`, `( 1,234 )` down
+   * to `( 1,234` and `45.00 CR` down to `45.00`, and each survivor read as a
+   * number the page did not print. Whitespace between the two halves changed
+   * nothing about that, so the gap is looked through here.
+   */
   const insideToken = (cut: number): boolean => {
     if (cut <= start || cut >= end) return false;
     const before = text[cut - 1]!;
     if (tokenAt(cut - 1) && tokenAt(cut)) return true;
     if (OPENERS.has(before) && tokenAt(cut)) return true;
     if (tokenAt(cut - 1) && text[cut] === ")") return true;
+    const back = backOf(cut);
+    const forward = forwardOf(cut);
+    // Never inside a word: splitting `CR` into `C` and `R` leaves a credit
+    // marker that is a magnitude letter instead, and splitting `million`
+    // leaves an amount that reads a millionth of what the line says. Looked
+    // at through the zero-width characters a text layer sprinkles between
+    // letters, which is how `mill<U+FEFF>ion` was cut in half.
+    if (
+      back >= start &&
+      /[A-Za-z]/.test(text[back]!) &&
+      forward < end &&
+      /[A-Za-z]/.test(text[forward]!) &&
+      !/\s/.test(text.slice(back, forward + 1))
+    ) {
+      return true;
+    }
+    if (back >= start && /[\d)]/.test(text[back]!) && modifiesLeft(forward)) {
+      return true;
+    }
+    if (
+      forward < end &&
+      /[\d(]/.test(text[forward]!) &&
+      modifiesRight(back)
+    ) {
+      return true;
+    }
     return false;
   };
 
@@ -175,12 +318,6 @@ function splitLongLine(
   const clear = (cut: number): number => {
     let at = cut;
     while (at < end && insideToken(at)) at += 1;
-    // A trailing `CR` belongs to the amount before it: leaving it behind
-    // turns a credit into a charge just as a lost parenthesis does.
-    if (at < end && (tokenAt(at - 1) || text[at - 1] === ")")) {
-      const trailing = /^(\s*)CR(?![A-Za-z])/i.exec(text.slice(at, at + 5));
-      if (trailing) at += trailing[0].length;
-    }
     return at;
   };
 
