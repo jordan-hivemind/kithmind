@@ -307,6 +307,22 @@ line; only a text field may span two adjacent cited ones, and only a text
 field is matched case- and punctuation-folded. Money, numbers and dates keep
 their exact reading.
 
+**One repair, and only where the page leaves no choice (ADM-5h).** A money or
+number value on none of the cited lines is checked against the rest of the
+cited page. If exactly one line of that page states it, the citation is
+repaired to that line and the value stores with the repaired evidence span. If
+two or more lines state it, or none does, the failure stands. The check is
+still "does a line of this page state this value"; what is relaxed is which
+line, and only when one occurrence means there is nothing to choose between.
+Dates and text are never repaired this way.
+
+**A blank optional field is a field the document does not state (ADM-5h).** A
+statement whose value is empty, whitespace or null is dropped for an optional
+field and opens no item, because that is what leaving the field out would have
+meant. A required field still opens one. Anything the box actually prints is a
+reading and goes to the gate: `0` and `0.00` are amounts, and `-` and `N/A`
+are refused rather than read as zero.
+
 The amount grammar is one explicit rule, written out in
 `packages/kith-store/src/extraction/gate.ts` and pinned by a table in
 `test/extractionGate.test.mjs` that holds every adversarial input the reviews
@@ -339,6 +355,15 @@ A tax or status flag is a separate rule: one letter from a small documented
 set, exactly two decimal places, and nothing after it. `K`, `M` and `B` are
 not in that set, and a lone `C` is refused rather than dropped, because a
 credit marker silently removed loses a sign.
+
+**A whole dollar may print its decimal point with no cents after it
+(ADM-5h).** A tax form prints every filled box that way, so `5.`, `12,345.`
+and `(9,999.)` read as 5, 12345 and -9999. The point is dropped only when it
+is the last character of the digits: anything digit-like after it, across any
+gap, makes the point a decimal point instead, and a line printing
+`12,345.   80` offers neither number because it says 12,345.80 as readily as
+it says two cells. For the same reason a rendering space inside a number is
+closed up only when it is a single space; a wider gap is a column boundary.
 
 Each entry of a `line_item_list` carries its own citation and is gated on its
 own: its amount must occur within one cited line, its description folds like
@@ -378,6 +403,14 @@ field names only: operators debug extraction without reading the documents.
 | `KITH_EXTRACT_API_KEY` | daemon environment | Falls back to `OPENAI_API_KEY` on the default endpoint. |
 | per-kind model | `document_types.examples`, an element `{"setting": "extraction_model", "value": "<model>"}` | That kind is read with that model. A kind without one uses the default. A model the provider refuses falls back to the default for that run and opens one `extraction_model_refused` item. |
 | per-kind date order | `document_types.examples`, an element `{"setting": "date_order", "value": "MDY"}` or `"DMY"` | How that kind writes an all-numeric date. |
+| per-kind page bound | `document_types.examples`, an element `{"setting": "max_pages", "value": "25"}` | How many pages of a document of that kind the model is shown, in place of the default 12. Capped at 60; a value past the cap, or one that is not a whole number, reads as unset rather than being clamped. |
+| per-kind character bound | `document_types.examples`, an element `{"setting": "max_chars", "value": "120000"}` | The same for characters, in place of the default 60,000. Capped at 400,000. |
+
+A per-kind bound costs the same extra call a per-kind model does, and for the
+same reason: the kind is not known until the reply names it, so a first pass
+that was cut short is read again with the wider bound. Both passes and the
+stored result see the same page list, so a citation to a page the model was
+shown always resolves.
 
 A per-kind override costs one extra call the first time a document is read,
 because the kind is not known until the reply names it; a re-extraction knows
@@ -385,6 +418,25 @@ the kind already and costs one call. Nothing here picks a model.
 
 Two-digit years in a printed date expand 00-69 to the 2000s and 70-99 to the
 1900s.
+
+**A date the document only half prints is stored as half a date (ADM-5h).** A
+tax letter that states `2024`, and a cover letter that states `March 2024`,
+used to lose their date entirely to `date_unparsable`. Both now store, with
+the precision they were printed at: a year keeps `YYYY`, a month keeps
+`YYYY-MM`, and `precision` on the stored value says which. **Nothing is
+padded.** A full day keeps exactly the shape every stored date has had, with
+no `precision` key, so no existing reader changes. A partial date dates no
+event: `occurrence_date` holds a calendar day, so a document whose only date
+is a year stays undated rather than being filed under the first of January.
+
+A partial date is checked against its cited line for exactly the parts it
+claims. A year has to be printed as a year, not as part of a longer number,
+an amount's whole dollars or a figure behind a currency mark. A month and a
+year have to be printed together, adjacent, and a numeric one is read through
+the kind's `date_order` like any other. A two-digit year is refused for a
+partial date, because `March 24` is March 2024 and the twenty-fourth of March
+at once and there is no third part to settle it, and two numbers with no year
+among them (`03/04`) are refused for the same reason.
 
 An all-numeric date whose first two numbers could both be a month is read only
 when the kind sets `date_order`. `01/02/26` is the first of February or the
@@ -396,6 +448,7 @@ overwhelmingly US, so `MDY` is the likely setting, but it is the owner's to
 make per kind.
 
 A space inside a number is closed up only next to a currency symbol or an ISO
-code, so `$ 165 .00` reads as one amount while `APPLES 12 .99` stays a quantity
-beside a price. A column-rendered amount with no currency mark beside it opens
-a correction instead, which is the cheaper of the two errors.
+code, and only one space, so `$ 165 .00` reads as one amount while
+`APPLES 12 .99` stays a quantity beside a price. A column-rendered amount with
+no currency mark beside it opens a correction instead, which is the cheaper of
+the two errors.

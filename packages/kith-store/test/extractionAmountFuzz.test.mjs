@@ -373,6 +373,23 @@ function makeAmount(random) {
       : random.pick(["", " ", random.pick(GAPS)])
     : "";
 
+  // ADM-5h: a whole dollar printed with the point still there and no cents
+  // after it -- `5.`, `12,345.`, `(9,999.)`. Every box of a tax form prints
+  // this way. The point is typography and not a fraction, so the value the
+  // oracle computed above is the same with it or without it: `truthOf` is
+  // never told about it, which is what makes this generated form a test of
+  // the grammar rather than a copy of it.
+  //
+  // Only where the point can be the last character of the number. A
+  // magnitude, a fraction or a flag after it would print a token no reader
+  // would price the way the oracle does.
+  const trailingDot =
+    fractionLength === 0 &&
+    magnitudeKind === "none" &&
+    !flag &&
+    random.chance(0.14);
+  const printedDigits = trailingDot ? `${digits}.` : digits;
+
   // The sign, in every shape a ledger prints one.
   const signKind = random.pick([
     "none",
@@ -407,7 +424,7 @@ function makeAmount(random) {
   // A magnitude letter is pressed against the digits; a word may be a gap
   // away. Either way it is part of the number, and the currency marker goes
   // outside both.
-  let core = digits;
+  let core = printedDigits;
   if (magnitudeKind === "letter") core = `${digits}${suffix}`;
   else if (magnitudeKind === "word") core = `${digits}${suffixGap}${suffix}`;
   // A magnitude word and a trailing currency code need something between
@@ -437,7 +454,15 @@ function makeAmount(random) {
   }
 
   const value = truthOf({ whole, fraction, magnitude, negative });
-  return { text, value, currencyName, grouping, signKind, magnitudeKind };
+  return {
+    text,
+    value,
+    currencyName,
+    grouping,
+    signKind,
+    magnitudeKind,
+    trailingDot,
+  };
 }
 
 /** `1234567` as `1,234,567`: the last groups are three digits and the first

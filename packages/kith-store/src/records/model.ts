@@ -490,8 +490,20 @@ function requireObservationValue(
       );
       break;
     case "text":
-    case "date":
       requireExactKeys(value, ["type", "value"], "Stored observation value");
+      break;
+    case "date":
+      // A full date keeps the shape every stored date has had, with no
+      // `precision` key. A partial one -- a document that printed only a
+      // year, or only a month and a year -- carries how much it knows, so a
+      // reader can never mistake it for a day. See `ObservationValue`.
+      requireExactKeys(
+        value,
+        typed.precision === undefined
+          ? ["type", "value"]
+          : ["type", "value", "precision"],
+        "Stored observation value",
+      );
       break;
     case "boolean":
       requireExactKeys(value, ["type", "value"], "Stored observation value");

@@ -24,6 +24,20 @@ test("observation values canonicalize and enforce registries", () => {
   assert.throws(() => canonicalizeObservationValue({ type: "decimal", value: "1", unitCode: "miles" }), /Unsupported UCUM unit/);
   assert.deepEqual(canonicalizeObservationValue({ type: "decimal", value: "1", unitCode: "m[IU]/L" }), { type: "decimal", value: "1", unitCode: "m[IU]/L" });
   assert.throws(() => canonicalizeObservationValue({ type: "date", value: "2023-02-29" }), /real calendar date/);
+  // ADM-5h: a document that printed only a year, or only a month and a year,
+  // stores what it printed and says so. A full day keeps the shape it always
+  // had, with no `precision` key, so nothing already written changes.
+  assert.deepEqual(canonicalizeObservationValue({ type: "date", value: "2024", precision: "year" }), { type: "date", value: "2024", precision: "year" });
+  assert.deepEqual(canonicalizeObservationValue({ type: "date", value: "2024-03", precision: "month" }), { type: "date", value: "2024-03", precision: "month" });
+  assert.deepEqual(canonicalizeObservationValue({ type: "date", value: "2024-02-29", precision: "day" }), { type: "date", value: "2024-02-29" });
+  // One value, one shape. A year that claims to be a month, a month with a
+  // day glued to it, and a month that is not a month are each refused rather
+  // than trimmed into something storable.
+  assert.throws(() => canonicalizeObservationValue({ type: "date", value: "2024-03", precision: "year" }), /YYYY/);
+  assert.throws(() => canonicalizeObservationValue({ type: "date", value: "2024", precision: "month" }), /YYYY-MM/);
+  assert.throws(() => canonicalizeObservationValue({ type: "date", value: "2024-03-18", precision: "month" }), /YYYY-MM/);
+  assert.throws(() => canonicalizeObservationValue({ type: "date", value: "2024-13", precision: "month" }), /real month/);
+  assert.throws(() => canonicalizeObservationValue({ type: "date", value: "2024", precision: "day" }), /Observation date/);
 });
 
 test("occurrence helpers preserve precision, offsets, ordering, and latest selection", () => {
