@@ -47,6 +47,27 @@ that surfaced it.
 Never commit, publish, or ask contributors to supply `docs/private/`; use a
 public issue or plan for work that others can take on.
 
+## Parallel lanes
+
+Several agents may work in this repository at once, each in its own worktree
+and its own conversation. One of them is the orchestrator. The rest are side
+lanes, started by the owner for out-of-band work such as UI polish, docs or
+cleanup. Every agent reads this section before starting.
+
+| Rule | Detail |
+| --- | --- |
+| One lane, one branch, one PR | Never commit to `main`. Open a draft PR early and list the files you expect to touch. That is your claim. |
+| Look before you start | Run `gh pr list` and read open PRs. Do not edit a file another open PR is changing. Ask the owner if you must. |
+| Only the orchestrator merges, migrates and deploys | A merge does not deploy. Migrations are positions in a list and the schema runner rejects gaps, so they go in series through one agent. |
+| Side lanes stay out of | `packages/kith-store/migrations`, `packages/pipeline`, `packages/worker-protocol`, `packages/kith-store/src/workers`, `packages/kith-store/src/identity`, `apps/web/src/lib/mcp`, auth and MCP routes, `docs/private`. Need a change there? Say so in your PR and stop. |
+| Shared UI components have one owner at a time | `apps/web/src/components/ui/*` is shared by every screen. Only one open PR may change it. Keep changes backward compatible. |
+| Finish cleanly | Run the four checks. Remove containers and your own scratch files. Tell the owner the PR is ready. The orchestrator removes your worktree and branch at merge. |
+| Do not read the owner's data | No document text, database values or files under the watched folders. Counts, enums and booleans only. Use synthetic fixtures. |
+
+To get a side-lane PR shipped, the owner tells the orchestrator "ship PR <n>".
+
+UI work follows [`docs/ui-style.md`](docs/ui-style.md).
+
 ## Cross-workstream coordination
 
 Mainline and the financial archive workstream coordinate through
