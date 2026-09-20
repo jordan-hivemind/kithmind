@@ -62,7 +62,11 @@ import {
 } from "./lines.js";
 import { sha256Utf8 } from "../provenance/sql.js";
 import { occurrenceColumns, occurrenceSortKey } from "../records/model.js";
-import type { ObservationValue, Occurrence } from "../records/values.js";
+import {
+  addDecimals,
+  type ObservationValue,
+  type Occurrence,
+} from "../records/values.js";
 import { withKithTransaction } from "../schema.js";
 import {
   openCorrection,
@@ -74,7 +78,11 @@ import { seedDocumentTypes } from "./seed.js";
 import { sweepUnreferencedExtractionSpans } from "./spanSweep.js";
 import {
   candidatesFor,
+  checkLineItem,
+  foldTextForMatch,
   checkValue,
+  readLineItems,
+  valueSignature,
   type Candidate,
   type DateOrder,
   isObservationFieldName,
@@ -609,13 +617,15 @@ Rules:
 - Only use fields listed under the kind you chose. Omit a field the document does not state.
 - Copy a value exactly as the line prints it, including the currency symbol. Dates may be copied as printed.
 - A line_item_list field puts its lines in "line_items" and sets "value" to null. Every other field puts its value in "value" and sets "line_items" to null.
+- Each entry of "line_items" has its own "lines". Items sit on different lines; cite the line each one is printed on.
+- An amount is the decimal string the line prints, with its decimal point: "12.99", never "1299" and never rounded. A trailing tax letter such as "12.99T" may be kept or dropped.
 - Names, diagnoses and descriptions are copied as written. Do not normalize them.
 
 Worked example. Given this page:
 1| Bracken Tools
 2| 2 Apr 2026
-3| Chisel            12.00
-4| Mallet             8.00
+3| Chisel            12.00 T
+4| Mallet              8.00
 5| Subtotal
 6| Tax
 7| Total
@@ -629,7 +639,8 @@ the reply is:
    {"field": "vendor", "value": "Bracken Tools", "line_items": null, "page": 1, "lines": [1]},
    {"field": "purchase_date", "value": "2 Apr 2026", "line_items": null, "page": 1, "lines": [2]},
    {"field": "line_items", "value": null, "page": 1, "lines": [3, 4],
-    "line_items": [{"description": "Chisel", "amount": "12.00"}, {"description": "Mallet", "amount": "8.00"}]},
+    "line_items": [{"description": "Chisel", "amount": "12.00", "lines": [3]},
+                   {"description": "Mallet", "amount": "8.00", "lines": [4]}]},
    {"field": "subtotal", "value": "20.00", "line_items": null, "page": 1, "lines": [5, 8]},
    {"field": "tax", "value": "1.60", "line_items": null, "page": 1, "lines": [6, 9]},
    {"field": "total", "value": "21.60", "line_items": null, "page": 1, "lines": [7, 10]}]}
@@ -774,7 +785,9 @@ function resolveCitation(
     return { cited };
   }
   if (!quoted.trim()) {
-    return { cited: [], reason: "quote_not_found" };
+    // No lines and no quote: the statement cited nothing at all, which is a
+    // different fault from a quote that is not on the page.
+    return { cited: [], reason: "citation_missing" };
   }
   const located = locateCardQuote(page.text, quoted);
   if (
@@ -860,6 +873,194 @@ async function findOrCreateSpan(
 }
 
 /**
+ * A short, stable tag for one line item.
+ *
+ * The cited line the amount sits on, plus a fold of the description. Position
+ * in the surviving array was what this used to be, and it moved under the
+ * owner's feet: an entry failing, or the model listing the same receipt in a
+ * different order, shifted every later key by one and landed a correction
+ * made on one line onto another.
+ *
+ * ponytail: a 32-bit FNV-1a of the folded description, not a cryptographic
+ * hash -- this is a key, not a commitment. Two entries with the same folded
+ * description *and* the same amount line still collide, and a key still moves
+ * if the page is re-parsed into different lines. Upgrade path if either
+ * matters: carry the item's own span id into the key.
+ */
+function lineItemKey(
+  lineId: number,
+  description: string,
+  withinLine: number,
+): string {
+  let hash = 0x811c9dc5;
+  for (const unit of foldTextForMatch(description)) {
+    hash ^= unit.codePointAt(0)!;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  // The ordinal within its own line separates two entries that are genuinely
+  // the same words and the same amount on the same line -- a receipt listing
+  // one item twice. Without it they share a key, and correcting one corrects
+  // both.
+  return `${lineId}-${hash.toString(36).padStart(7, "0").slice(-7)}-${withinLine}`;
+}
+
+type GatedLineItems = {
+  values: ObservationValue[];
+  spanIds: string[];
+  valueKeys: string[];
+  /** The sum of the entries that passed. A partial list must not be compared
+   * against a stated total, so the caller only carries this when nothing
+   * failed. */
+  itemsTotal?: string;
+  currencyAssumed?: true;
+  quote: string;
+  failed: number;
+  total: number;
+  /**
+   * The shape of each entry that failed, and why.
+   *
+   * Signatures, not content: letters folded to `a` and digits to `9`, the
+   * same projection the diagnostic prints. The owner's count stays a count;
+   * this is what lets an operator see that the amounts arrived without their
+   * decimal point without anyone opening the receipt.
+   */
+  failedShapes: Array<{
+    amount: string;
+    description: string;
+    lines: number[];
+    reason: CorrectionReason;
+  }>;
+};
+
+/**
+ * Every entry of a list, gated on its own citation and stored on its own.
+ *
+ * A failing entry no longer takes the list down with it. A receipt with six
+ * good lines and one the model garbled used to store nothing, which is how a
+ * strong model still lost every line item on both trial documents; now the
+ * six store and one correction says one is missing.
+ *
+ * `itemsTotal` is deliberately absent when anything failed. The sum of some of
+ * the lines is not the sum of the lines, and comparing a partial sum against
+ * the document's stated total would raise a mismatch that says nothing.
+ */
+async function gateLineItems(
+  client: ClientBase,
+  loaded: Loaded,
+  page: LoadedPage,
+  input: {
+    field: TypeField;
+    /** What the model put in `line_items`, already parsed off the wire. */
+    value: unknown;
+    cited: readonly PageLine[];
+    defaultCurrency: string;
+  },
+): Promise<GatedLineItems> {
+  const empty: GatedLineItems = {
+    values: [],
+    spanIds: [],
+    valueKeys: [],
+    quote: "",
+    failed: 1,
+    total: 1,
+    failedShapes: [
+      {
+        amount: valueSignature(input.value),
+        description: "",
+        lines: [],
+        reason: "malformed_statement",
+      },
+    ],
+  };
+  const entries = readLineItems(input.value);
+  if (!entries) return empty;
+
+  const values: ObservationValue[] = [];
+  const spanIds: string[] = [];
+  const valueKeys: string[] = [];
+  const perLine = new Map<number, number>();
+  let itemsTotal = "0";
+  let currencyAssumed: true | undefined;
+  let quote = "";
+  let failed = 0;
+  const failedShapes: GatedLineItems["failedShapes"] = [];
+  const note = (
+    item: { amount?: unknown; description?: unknown; lines?: number[] },
+    reason: CorrectionReason,
+  ): void => {
+    failed += 1;
+    if (failedShapes.length < 32) {
+      failedShapes.push({
+        amount: valueSignature(item.amount),
+        description: valueSignature(item.description),
+        lines: item.lines ?? [],
+        reason,
+      });
+    }
+  };
+
+  for (const entry of entries) {
+    if (!entry.ok) {
+      note({}, entry.reason);
+      continue;
+    }
+    // The entry's own lines when it gave any. The statement's stand in only
+    // when they name exactly one line: on a multi-line citation there is no
+    // way to say which of them this entry is about, and falling back to all
+    // of them let an item's description on one line pair with a different
+    // item's amount on another -- the cross-item validation per-entry
+    // citations exist to remove.
+    const own =
+      entry.item.lines.length > 0
+        ? citedLines(page.lines, entry.item.lines)
+        : input.cited.length === 1
+          ? [...input.cited]
+          : null;
+    if (!own || own.length === 0) {
+      note(entry.item, "citation_missing");
+      continue;
+    }
+    const checked = checkLineItem({
+      item: entry.item,
+      cited: own,
+      pageText: page.text,
+      defaultCurrency: input.defaultCurrency,
+    });
+    if (!checked.ok) {
+      note(entry.item, checked.reason);
+      continue;
+    }
+    const spanId = await findOrCreateSpan(client, loaded, page, checked.span);
+    if (!spanId) {
+      note(entry.item, "span_unresolved");
+      continue;
+    }
+    values.push(checked.value);
+    spanIds.push(spanId);
+    const seenOnLine = perLine.get(checked.lineId) ?? 0;
+    perLine.set(checked.lineId, seenOnLine + 1);
+    valueKeys.push(
+      lineItemKey(checked.lineId, entry.item.description, seenOnLine),
+    );
+    itemsTotal = addDecimals(itemsTotal, checked.amount);
+    if (checked.currencyAssumed) currencyAssumed = true;
+    if (!quote) quote = checked.span.text;
+  }
+
+  return {
+    values,
+    spanIds,
+    valueKeys,
+    ...(failed === 0 ? { itemsTotal } : {}),
+    ...(currencyAssumed ? { currencyAssumed } : {}),
+    quote,
+    failed,
+    total: entries.length,
+    failedShapes,
+  };
+}
+
+/**
  * Runs every statement through its gate and turns the survivors into
  * observations. A failure is recorded, never stored as a weaker fact.
  */
@@ -898,6 +1099,11 @@ async function prepare(
     /** One per value, aligned with `values`: the span for the line that
      * supported it. */
     spanIds: string[];
+    /** One per value: the suffix its observation key takes. A list keys by
+     * the entry's own evidence rather than by its position, so a correction
+     * made on one line does not land on another when the model reorders the
+     * list on the next run. */
+    valueKeys?: string[];
     values: ObservationValue[];
     itemsTotal?: string;
     currencyAssumed?: true;
@@ -945,6 +1151,73 @@ async function prepare(
         reading: statement.value,
         citation,
       });
+      continue;
+    }
+    // A list is gated entry by entry, each against its own cited lines.
+    if (field.valueType === "line_item_list") {
+      // On the legacy quote path there are no line ids, so the located range
+      // stands in as the one line every entry is checked against.
+      const fallback: PageLine[] =
+        located.cited.length > 0
+          ? [...located.cited]
+          : located.legacy
+            ? [
+                {
+                  id: 0,
+                  ...located.legacy,
+                  text: page.text.slice(
+                    located.legacy.start,
+                    located.legacy.end,
+                  ),
+                  // Not cut edges, deliberately and in the same way the
+                  // non-list legacy branch below leaves them unset. The model
+                  // chose where this quote began and ended, so an edge here
+                  // is neither a printed boundary nor a cut this file made,
+                  // and ADM-5g does not change what the legacy shape reads.
+                  // The line-id path, which every current kind uses, cites
+                  // whole lines and carries real edges.
+                  cutStart: false,
+                  cutEnd: false,
+                },
+              ]
+            : [];
+      const listed = await gateLineItems(client, loaded, page, {
+        field,
+        value: statement.value,
+        cited: fallback,
+        defaultCurrency: "USD",
+      });
+      if (listed.failed > 0) {
+        prepared.failures.push({
+          field: field.name,
+          reason:
+            listed.values.length === 0
+              ? "value_not_in_quote"
+              : "line_items_partial",
+          // Counts only. Which entries failed is the diagnostic's business,
+          // and the owner's question is "how much of this list is missing".
+          reading: {
+            failedItems: listed.failed,
+            totalItems: listed.total,
+            failedShapes: listed.failedShapes,
+          },
+          citation,
+        });
+      }
+      if (listed.values.length > 0) {
+        accepted.push({
+          field,
+          page: statement.page,
+          quote: listed.quote,
+          lines: [...(statement.lines ?? [])],
+          citation,
+          spanIds: listed.spanIds,
+          valueKeys: listed.valueKeys,
+          values: listed.values,
+          itemsTotal: listed.itemsTotal,
+          ...(listed.currencyAssumed ? { currencyAssumed: true as const } : {}),
+        });
+      }
       continue;
     }
     // Each cited line on its own, and for a text field each adjacent pair.
@@ -1076,7 +1349,13 @@ async function prepare(
     const name = entry.field.name;
     const keys: string[] = [];
     entry.values.forEach((value, index) => {
-      const key = entry.values.length > 1 ? `${name}:${index}` : name;
+      // A list always keys by evidence, even when it has one entry today: a
+      // one-item list keyed `line_items` orphans the owner's correction the
+      // moment next week's receipt has two.
+      const key =
+        entry.field.valueType === "line_item_list" || entry.values.length > 1
+          ? `${name}:${entry.valueKeys?.[index] ?? index}`
+          : name;
       keys.push(key);
       prepared.observations.push({
         key,
@@ -1405,6 +1684,19 @@ async function store(
     sourceTextVersionId: loaded.sourceTextVersionId,
   });
 
+  // The previous run's open items go before this run's are written, so the
+  // queue shows what is wrong now rather than everything that has ever been
+  // wrong. A failure that recurs is re-opened a line below; one that no longer
+  // applies simply is not.
+  //
+  // Before the re-apply below, not after: re-applying can itself open an item
+  // (a correction whose line this run no longer cites), and clearing after
+  // would delete the one row telling the owner their fix no longer lands.
+  await supersedeOpenCorrections(client, {
+    spaceId: loaded.spaceId,
+    sourceItemId: loaded.sourceItemId,
+  });
+
   // A human fix outlives this replace. The observations above are the model's
   // newest reading of every field, including fields the owner has already
   // corrected, so without this line a re-extraction silently reverts a
@@ -1413,15 +1705,6 @@ async function store(
   // showing the owner's. Re-applied inside the same transaction as the
   // replace, so no reader ever sees the reverted state.
   await reapplyCorrections(client, {
-    spaceId: loaded.spaceId,
-    sourceItemId: loaded.sourceItemId,
-  });
-
-  // The previous run's open items go before this run's are written, so the
-  // queue shows what is wrong now rather than everything that has ever been
-  // wrong. A failure that recurs is re-opened a line below; one that no longer
-  // applies simply is not.
-  await supersedeOpenCorrections(client, {
     spaceId: loaded.spaceId,
     sourceItemId: loaded.sourceItemId,
   });

@@ -7,6 +7,8 @@ import test from "node:test";
 
 import {
   amountsInText,
+  checkLineItem,
+  readLineItems,
   checkValue,
   currencyOnPage,
   itemsSumToTotal,
@@ -135,31 +137,37 @@ test("the quote's sign has to agree with the value's", () => {
 });
 
 test("a separator hyphen is not a minus sign", () => {
-  // A document uses a hyphen as a separator far more often than as a sign.
-  for (const quote of [
-    "Total - 42.00",
-    "Invoice 12-42.00",
-    "Item 1 - 42.00",
-  ]) {
-    assert.deepEqual(
-      gate({ valueType: "money", value: "-42.00", quote }),
-      { ok: false, reason: "value_not_in_quote" },
-      quote,
-    );
-    assert.equal(
-      gate({ valueType: "money", value: "42.00", quote }).ok,
-      true,
-      quote,
-    );
+  // A document uses a hyphen as a separator far more often than as a sign --
+  // and a dash a gap away from the digits could be either, so ADM-5g's fifth
+  // round offers neither reading. Both of these open a correction row now.
+  for (const quote of ["Total - 42.00", "Item 1 - 42.00"]) {
+    for (const value of ["-42.00", "42.00"]) {
+      assert.deepEqual(
+        gate({ valueType: "money", value, quote }),
+        { ok: false, reason: "value_not_in_quote" },
+        `${quote} / ${value}`,
+      );
+    }
   }
   // Pressed against the digits, it still is a sign.
   assert.deepEqual(amountsInText("-$42.00"), ["-42"]);
   assert.deepEqual(amountsInText("$-42.00"), ["-42"]);
   assert.deepEqual(amountsInText("USD 42.00-"), ["-42"]);
   assert.deepEqual(amountsInText("Refund -42.00"), ["-42"]);
-  // And a separator is not, from either side.
-  assert.deepEqual(amountsInText("Total - 42.00"), ["42"]);
-  assert.deepEqual(amountsInText("Item 1 - 42.00"), ["1", "42"]);
+  // And a separator is not, from either side. ADM-5g: nor is the number
+  // beside it, because a dash is exactly as likely to be its sign.
+  assert.deepEqual(amountsInText("Total - 42.00"), []);
+  assert.deepEqual(amountsInText("Item 1 - 42.00"), []);
+  // ADM-5g: a hyphen with digits on both sides of it and no space is neither.
+  // "12-42.00" is one token -- a reference, a range, a phone number -- and
+  // one token that does not parse offers nothing at all, in either sign.
+  for (const value of ["42.00", "-42.00", "12"]) {
+    assert.deepEqual(
+      gate({ valueType: "money", value, quote: "Invoice 12-42.00" }),
+      { ok: false, reason: "value_not_in_quote" },
+      value,
+    );
+  }
 });
 
 test("a date needs its month as well as its year and day", () => {
@@ -389,36 +397,96 @@ test("a name must appear inside the quote that supports it", () => {
   );
 });
 
-test("line items become one money value each and carry their own sum", () => {
-  const result = gate({
-    valueType: "line_item_list",
-    value: [
-      { description: "Hammer", amount: "$10.00" },
-      { description: "Nails", amount: "$5.50" },
-    ],
-    quote: "Hammer $10.00 Nails $5.50",
-  });
-  assert.equal(result.ok, true);
-  assert.equal(result.values.length, 2);
-  assert.equal(result.itemsTotal, "15.5");
-  assert.equal(itemsSumToTotal(result.itemsTotal, "15.50"), true);
-  // The canonical form drops a trailing zero; the comparison is by value.
-  assert.equal(itemsSumToTotal(result.itemsTotal, "15.5"), true);
-  // Tolerance zero, by design.
-  assert.equal(itemsSumToTotal(result.itemsTotal, "15.51"), false);
+/** One cited line, as the per-item gate takes them. */
+function citedLine(id, text) {
+  return { id, text, start: 0, end: text.length };
+}
 
-  assert.deepEqual(
-    gate({ valueType: "line_item_list", value: "Hammer, Nails" }),
-    { ok: false, reason: "malformed_statement" },
+test("a line item is gated on its own citation", () => {
+  const page = "Hammer\n  $10.00\nNails\n  $5.50";
+  const item = (description, amount, lines) => ({
+    item: { description, amount, lines: [] },
+    cited: lines,
+    pageText: page,
+    defaultCurrency: "USD",
+  });
+  // The amount on one cited line, the description on another: both are
+  // checked, and the span is the line that prints the amount.
+  const hammer = checkLineItem(
+    item("Hammer", "$10.00", [citedLine(1, "Hammer"), citedLine(2, "  $10.00")]),
   );
+  assert.equal(hammer.ok, true);
+  assert.equal(hammer.amount, "10");
+  assert.equal(hammer.span.text, "  $10.00");
+
+  // ADM-5g: a trailing tax or status letter is a flag, not a digit.
+  for (const printed of ["12.99T", "12.99 A", "1,234.56F"]) {
+    const flagged = checkLineItem(
+      item("Widget", printed, [citedLine(1, `Widget ${printed}`)]),
+    );
+    assert.equal(flagged.ok, true, printed);
+  }
+  assert.equal(
+    checkLineItem(item("Widget", "12.99T", [citedLine(1, "Widget 12.99T")]))
+      .amount,
+    "12.99",
+  );
+  // But an amount with its decimal point dropped is that number, not cents.
   assert.deepEqual(
-    gate({
-      valueType: "line_item_list",
-      value: [{ description: "Hammer", amount: "ten" }],
-      quote: "Hammer ten",
-    }),
+    checkLineItem(item("Widget", "1299", [citedLine(1, "Widget 12.99")])),
+    { ok: false, reason: "value_not_in_quote" },
+  );
+  assert.equal(
+    checkLineItem(item("Widget", "1299", [citedLine(1, "Widget 1299")])).amount,
+    "1299",
+  );
+
+  // A description the cited lines do not print is refused, like any name.
+  assert.deepEqual(
+    checkLineItem(item("Chisel", "$10.00", [citedLine(2, "  $10.00")])),
+    { ok: false, reason: "value_not_in_quote" },
+  );
+  // An unparsable amount is its own reason.
+  assert.deepEqual(
+    checkLineItem(item("Hammer", "ten", [citedLine(1, "Hammer ten")])),
     { ok: false, reason: "money_unparsable" },
   );
+  // And an entry that cites nothing says so.
+  assert.deepEqual(checkLineItem(item("Hammer", "$10.00", [])), {
+    ok: false,
+    reason: "citation_missing",
+  });
+});
+
+test("one bad entry does not take the list down", () => {
+  // `readLineItems` reads per entry, so a garbled line is one refused line.
+  const read = readLineItems([
+    { description: "Hammer", amount: "10.00", lines: [1] },
+    "Nails 5.50",
+    { description: "", amount: "5.50", lines: [2] },
+    { description: "Screws", amount: 7.25, lines: [3] },
+  ]);
+  assert.equal(read.length, 4);
+  assert.deepEqual(
+    read.map((entry) => entry.ok),
+    [true, false, false, true],
+  );
+  assert.deepEqual(read[0].item, {
+    description: "Hammer",
+    amount: "10.00",
+    lines: [1],
+  });
+  // A number amount is read as its decimal string, not rounded.
+  assert.equal(read[3].item.amount, "7.25");
+  // The whole value being the wrong shape is still the whole list failing.
+  assert.equal(readLineItems("Hammer, Nails"), undefined);
+  assert.equal(readLineItems([]), undefined);
+});
+
+test("the sum of the entries still has zero tolerance", () => {
+  assert.equal(itemsSumToTotal("15.5", "15.50"), true);
+  assert.equal(itemsSumToTotal("15.5", "15.5"), true);
+  assert.equal(itemsSumToTotal("15.5", "15.51"), false);
 });
 
 test("the starter set is well formed and every field name is usable", () => {
@@ -438,4 +506,515 @@ test("the starter set is well formed and every field name is usable", () => {
   }
   assert.ok(kinds.has("receipt"));
   assert.ok(kinds.has("schedule_k1"));
+});
+
+// ---------------------------------------------------------------------------
+// The amount grammar, as one table.
+//
+// Every adversarial input the reviews of #298, #312, #320 and #323 turned up,
+// with what it must read as or that it must refuse. This table is the spec:
+// a change to `parseAmount` that moves a row here is a change to what the
+// system believes a document says, and should be argued for as one.
+// ---------------------------------------------------------------------------
+
+/**
+ * `undefined` means the grammar must refuse the input.
+ *
+ * A third element is what `amountsInText` must offer for the same input when
+ * that is *not* simply `[value]` or `[]` -- the only places the finder and
+ * the scanner are allowed to differ, each one a rule the finder has and the
+ * scanner cannot: a sign printed beside the number rather than in it, a
+ * separator that is prose, or a line that holds two tokens rather than one.
+ * Every other row is checked both ways by the property test below, so the
+ * two can never drift apart unnoticed.
+ */
+const AMOUNT_SPEC = [
+  // Plain amounts.
+  ["12.99", "12.99"],
+  ["1,234.56", "1234.56"],
+  ["1,234,567.89", "1234567.89"],
+  ["USD 42", "42"],
+  ["USD13.20", "13.2"],
+  ["13.20 USD", "13.2"],
+  ["15.50 CHF", "15.5"],
+  ["42", "42"],
+  ["-0.00", "0"],
+
+  // Signs, in every shape a ledger prints one.
+  ["-12.00", "-12"],
+  ["-$42.00", "-42"],
+  ["$-42.00", "-42"],
+  ["250.00-", "-250"],
+  ["5USD-", "-5"],
+  ["(250.00)", "-250"],
+  ["(1,234.56)", "-1234.56"],
+  ["(-5)", undefined],
+  ["(+5)", undefined],
+  // Parentheses printed a space away from the digits are still parentheses.
+  // This one used to lose the sign: the finder offered a positive 250 for a
+  // line the scanner read as minus 250.
+  ["( 250.00 )", "-250"],
+  // Every character a document prints as a minus is a minus. U+2212 is what
+  // a PDF's text layer carries; an en or em dash is what an export leaves.
+  ["−$5.00", "-5"],
+  ["–$5.00", "-5"],
+  ["—$5.00", "-5"],
+  ["5.00−", "-5"],
+  // A dash between two numbers is a range, whichever character it is.
+  ["5-10", undefined],
+  ["5–10", undefined],
+  ["$5.00–$10.00", undefined],
+  ["2026–2027", undefined],
+  // One sign. Two is not a second negation, in either order.
+  ["--5", undefined],
+  ["−−5", undefined],
+  ["-+5", undefined],
+  ["+-5", undefined],
+  // `CR` and `DR` are signs the *line* prints beside the number, so they are
+  // the finder's to read and not part of any value.
+  ["12.00 CR", undefined, ["-12"]],
+  ["12.00 DR", undefined, ["12"]],
+  ["$2.5M CR", undefined, ["-2500000"]],
+
+  // Grouping. A single dot group is a decimal point; two or more, or a
+  // decimal comma after them, make it grouping.
+  ["3.499", "3.499"],
+  ["$3.499", "3.499"],
+  ["0.125", "0.125"],
+  ["1.075", "1.075"],
+  ["1.234.567", "1234567"],
+  ["1.234.567,89", "1234567.89"],
+  ["178,20", "178.2"],
+  // Grouping this grammar does not claim to read, refused rather than guessed.
+  ["1,23,456.00", undefined],
+  [".5", undefined],
+  // A trailing separator is punctuation the line put after the number, so
+  // the finder drops it and reads the number. The scanner is stricter about
+  // a *value*, and ADM-5h moves these two rows to `5` and `12345`.
+  ["5.", undefined, ["5"]],
+  ["12,345.", undefined, ["12345"]],
+  ["١٫٥", undefined],
+  ["１２．９９", "12.99"],
+  ["＄12.99", "12.99"],
+  ["1" + "0".repeat(40), undefined],
+  // Four or more digits before a comma are not a group, and three after one
+  // are not a decimal: `1000,000` is a thousand and a million at once.
+  ["1000,000", undefined],
+  ["12345,67", "12345.67"],
+  // A zero in front of more digits is padding, and padding is an identifier:
+  // a check number, an invoice number, the `000123` in a wire reference.
+  ["0012", undefined],
+  ["000123", undefined],
+  ["00.50", undefined],
+  ["0.50", "0.5"],
+  ["0", "0"],
+
+  // Whitespace inside one value is a rendering artifact of its column.
+  ["$ 165 .00", "165"],
+  ["$ 10 .80", "10.8"],
+  ["USD 13 .20", "13.2"],
+  ["$1 000 000", "1000000"],
+  // Without a currency marker the same six characters are one number or two,
+  // and the finder cannot tell `1 000 000` from `APPLES 12 990`. The scanner
+  // is reading one value and has no such doubt; the finder offers nothing.
+  ["1 000 000", "1000000", []],
+
+  // A digit run tied to another by a hyphen or a slash is an identifier, a
+  // date or a range -- one token, and not an amount.
+  ["INV-0012", undefined],
+  ["20260918-000123", undefined],
+  ["(206) 555-0134", undefined],
+  ["1234-5678-9012-3456", undefined],
+  ["09/01/2026", undefined],
+  ["2026-09-01", undefined],
+  ["1/2", undefined],
+  ["#1234", undefined],
+  // A fraction after the digits makes them a whole part: "101 1/2" is a bond
+  // price and a hundred and one is the wrong number.
+  ["101 1/2", undefined],
+
+  // What NFKC folds. A superscript is a footnote marker or a unit, never a
+  // digit: `12.99²` is not 12.992 and `$2.5m²` is not two and a half
+  // million. `½` folds to `1⁄2`, which is not 121 and 2 either.
+  ["$2.5m²", undefined],
+  ["12.99²", undefined],
+  ["12½", undefined],
+  ["$2.5㎡", undefined],
+  ["$1M1", undefined],
+  ["$1MM1", undefined],
+  ["$1M2.5", undefined],
+
+  // A magnitude abbreviation scales only beside a currency marker, and only
+  // pressed against the digits.
+  ["$2.5M", "2500000"],
+  ["USD 2.5M", "2500000"],
+  ["2.5M USD", "2500000"],
+  ["£1.2k", "1200"],
+  ["($2.5M)", "-2500000"],
+  ["$2.5MM", "2500000"],
+  ["$1,250K", "1250000"],
+  ["$0.75bn", "750000000"],
+  ["$1.2345M", "1234500"],
+  ["$3.4B", "3400000000"],
+  ["$2.5mn", "2500000"],
+  // Without a currency marker it is a plan name, a form name, a unit or a
+  // room. Not an amount at all -- and not the bare number either, or "401K"
+  // would quietly become 401.
+  ["2.5M", undefined],
+  ["401K", undefined],
+  ["10K", undefined],
+  ["5K run", undefined],
+  ["12.99 mm", undefined],
+  ["2024 M", undefined],
+  ["1.5Kg", undefined],
+  ["2.5Mbps", undefined],
+  ["1.2345678M", undefined],
+  ["-2.5M-", undefined],
+  // An abbreviation a space away is not a magnitude even with a currency --
+  // and it is not the mantissa either. Each of these offered the unscaled
+  // number, which is the 10^6 error this whole line of work exists to stop.
+  ["$2.5 M", undefined],
+  ["2.5 mil", undefined],
+  ["$2.5 bn", undefined],
+  ["$3 k", undefined],
+  ["EUR 4 m", undefined],
+  ["$2.5 MM", undefined],
+  // A symbol with a letter glued in front of it is not a currency marker
+  // this grammar knows. Refused, rather than read without the letter.
+  ["C$2.5M", undefined],
+  ["A$1.2k", undefined],
+  ["US$2.5M", undefined],
+  // Words are unambiguous and scale with or without a currency marker.
+  ["2.5 million", "2500000"],
+  ["3 billion", "3000000000"],
+  ["40 thousand", "40000"],
+  ["1.5 billions", "1500000000"],
+  ["$2.5billion", "2500000000"],
+
+  // A tax or status flag: an allowed letter, exactly two decimals, and
+  // nothing after it.
+  ["12.99T", "12.99"],
+  ["12.99 A", "12.99"],
+  ["1,234.56F", "1234.56"],
+  ["0.50X", "0.5"],
+  ["9.00N", "9"],
+  ["12.5T", undefined],
+  ["1299T", undefined],
+  ["12.99TX", undefined],
+  // A flag a space away belongs to the token, so the finder reads the flagged
+  // price and stops; the 3.00 past it has a lone letter on its left and is
+  // refused.
+  ["12.99 T 3.00", undefined, ["12.99"]],
+  ["2024A", undefined],
+  // A lone C is a credit marker. Dropping it would lose a sign.
+  ["45.00 C", undefined],
+  // Any other single letter beside a number is prose, and the number reads.
+  ["42.00 a month", undefined, ["42"]],
+  // ADM-5g: a single letter beside a number is a magnitude, a credit marker
+  // or a flag at least as often as it is prose, and the finder cannot tell.
+  // `5 x` is not a flagged price (a flag has two decimals) and the 3.00 has
+  // the same lone letter on its left, so the line offers nothing.
+  ["5 x 3.00", undefined, []],
+
+  // Letters glued to digits are a currency this grammar knows, a magnitude,
+  // or a flag -- or the token is not an amount. `[A-Z]{3}` under an `i` flag
+  // matched any three letters, and each of these read as a number.
+  ["qty3", undefined],
+  ["abc12.00", undefined],
+  ["Tax12.99", undefined],
+  ["xyz2.5M", undefined],
+  ["1099-K", undefined],
+  ["1E5", undefined],
+  ["12.99E5", undefined],
+  ["12.99Total", undefined],
+  ["12.99kg", undefined],
+  ["12.99x2", undefined],
+  // A percentage is a number the line prints, and `number` values reach the
+  // gate as "3,5%". The sign of the percentage is the `%`, not part of it.
+  // A percent sign scales what it follows, so it is not neutral beside a
+  // money amount. The `number` value type passes `percentIsNeutral`, because
+  // a `number` is dimensionless and can never be money; see the gate test
+  // "a percentage keeps its decimal comma".
+  ["12.99%", undefined, []],
+  ["A12.99", undefined],
+  ["1.2e3", undefined],
+  ["about ten dollars", undefined],
+  ["", undefined],
+];
+
+test("the amount grammar reads exactly what the table says", () => {
+  for (const [input, expected] of AMOUNT_SPEC) {
+    assert.equal(
+      parseAmount(input),
+      expected,
+      JSON.stringify(input) +
+        " must " +
+        (expected === undefined ? "refuse" : "read as " + expected),
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ADM-5g: the finder and the scanner are one grammar.
+//
+// `amountsInText` used to carry a second implementation of this table, and
+// the two disagreed: `$2.5M CR` read as -2500000 on one side and refused on
+// the other, `$1 000 000` offered ["1","0","0"] where the scanner read a
+// million. A disagreement here is not a style question -- the finder is the
+// whitelist the gate matches the model's value against, so a token it reads
+// differently is a wrong number stored under a citation that looks right.
+//
+// The finder now delegates every span to the scanner, so the only rows that
+// may differ are the ones that carry a third element, each of which is a
+// rule about the *line* rather than the number.
+// ---------------------------------------------------------------------------
+test("the finder offers exactly what the scanner reads, and nothing else", () => {
+  for (const [input, expected, line] of AMOUNT_SPEC) {
+    const offered = line ?? (expected === undefined ? [] : [expected]);
+    assert.deepEqual(
+      amountsInText(" " + input + " "),
+      offered,
+      JSON.stringify(input) + ", on its own",
+    );
+    assert.deepEqual(
+      amountsInText("Line total " + input + " on the statement"),
+      offered,
+      JSON.stringify(input) + ", in a sentence",
+    );
+  }
+});
+
+/** What a page line must offer, and must not. */
+const QUOTE_SPEC = [
+  // A magnitude token has exactly one value, the scaled one.
+  ["Fund size $2.5M", ["2500000"]],
+  ["$2.5M", ["2500000"]],
+  ["Committed $1.2K total", ["1200"]],
+  ["Raised 40 million", ["40000000"]],
+  ["Loss ($2.5M)", ["-2500000"]],
+  // ADM-5g: a magnitude letter a space away from the digits offers *nothing*,
+  // with or without a currency marker. These five rows used to offer the bare
+  // number, and the finder cannot tell "Room 12 B" from a printed "$12 B":
+  // the room number is worth less than a billion-dollar reading is dangerous.
+  ["Room 12 B suite", []],
+  ["Apt 4 B rent 1,200.00", ["1200"]],
+  ["Suite 3 K", []],
+  ["2 m cable $19.99", ["19.99"]],
+  ["Serving 250 m l", []],
+  ["Fund size $2.5 M", []],
+  ["Raised 2.5 mil", []],
+  ["Committed $3 k", []],
+  ["EUR 4 m committed", []],
+  ["Fund size $2.5 MM", []],
+  ["Fund C$2.5M", []],
+  ["Fund A$1.2k", []],
+  ["Fund US$2.5M", []],
+  ["401K plan balance $12,345.67", ["12345.67"]],
+  ["1099-K box 1a 12,345.67", ["12345.67"]],
+  ["Line qty3 total 3.00", ["3"]],
+  // A credit marker belongs to the amount beside it, not to a column to its
+  // right -- and it says the amount is a credit, not that its sign flips, so
+  // a line that prints the sign twice still means it once.
+  ["Balance 21.60 CR", ["-21.6"]],
+  // ADM-5g: a far `CR` now makes the finder refuse both sides. ADM-5f made
+  // the wide gap mean "the marker is not mine", which read the 12.00 as a
+  // charge on a line that may well have printed a credit; and the 45.00 has
+  // a `CR` on its *left*, which is how a prefix-CR ledger signs a credit.
+  ["Item 12.00          CR 45.00", []],
+  ["Item 12.00 CR 45.00", ["-12"]],
+  ["CR 12.00", []],
+  ["DR 12.00", []],
+  ["Balance $2.5M CR", ["-2500000"]],
+  ["Credit (1,234.56) CR", ["-1234.56"]],
+  ["Total 42.00 DR", ["42"]],
+  // Every character a document prints as a minus, and the one place a dash
+  // between two numbers can only be a range.
+  ["Refund −$5.00", ["-5"]],
+  ["Refund –$5.00", ["-5"]],
+  ["Band $5.00–$10.00", []],
+  ["Term 2026–2027", []],
+  ["Refund ( 250.00 )", ["-250"]],
+  // An identifier, a date, a phone number and an account number are each one
+  // token that is not an amount. Every one of these used to offer a number
+  // that competed with the line's real total, several of them negative.
+  ["Ref INV-0012 total 42.00", ["42"]],
+  ["Wire 20260918-000123 amount 42.00", ["42"]],
+  ["Call (206) 555-0134 for $12.00", ["12"]],
+  ["Invoice 12-42.00", []],
+  ["Order #1234 $9.99", ["9.99"]],
+  ["Check 000123 for 45.00", ["45"]],
+  ["Paid 09/01/2026 $42.00", ["42"]],
+  ["Due 2026-11-02", []],
+  ["Acct 1234-5678-9012-3456 balance $50.00", ["50"]],
+  // A gap inside a number, and the same gap between two of them.
+  ["Total $1 000 000", ["1000000"]],
+  ["Total 1 000 000", []],
+  ["APPLES 12 990", []],
+  ["Bond at 101 1/2", []],
+  // What NFKC folds: a footnote marker, a unit, a vulgar fraction.
+  ["Note 12.99² in the margin", []],
+  ["Area $2.5m²", []],
+  ["Half 12½", []],
+  ["Lot $1M1", []],
+  // Three capitals are a word far more often than a currency, so only a code
+  // this store supports takes the digits beside it.
+  ["TAX 1.30", ["1.3"]],
+  ["ABC 42.00", ["42"]],
+  ["Tax 13.20 USD", ["13.2"]],
+  // A percentage is a number the line prints.
+  ["Rate 12.99% on $1,000.00", ["1000"]],
+  // Prose beside an amount leaves it alone.
+  ["Paid 42.00 a month", ["42"]],
+  ["Total 42.00 i owe", []],
+  ["Qty 5 x 3.00", []],
+  ["Refund 45.00 C", []],
+  // The column artifacts ADM-5f closed, unchanged.
+  ["Subtotal $ 165 .00", ["165"]],
+  // ADM-5g: the ".99" is a fragment, not ninety-nine.
+  // ADM-5g: each of these four is a pair the separator between them joins
+  // into one readable amount -- 12.99, 1,234, 3.12, 10.80 -- so neither side
+  // is offered. The receipt column below is the mirror case: nothing joins
+  // `20.00` to `1.60`, so all three read, which is the recall this rule had
+  // to keep.
+  ["APPLES   12    .99", []],
+  ["Invoice refs 1, 234, 567", []],
+  ["3. 12 Pack Soda   5.99", ["5.99"]],
+  ["Total 10. 80", []],
+  ["20.00      1.60   21.60", ["20", "1.6", "21.6"]],
+  ["Total 12.99", ["12.99"]],
+
+  // -------------------------------------------------------------------------
+  // ADM-5g round five: every counterexample the four reviews produced.
+  //
+  // Each of these was an input where the finder offered a number the document
+  // does not print, and each of them died to the same change: the finder no
+  // longer enumerates the surroundings that make a number unreadable, it
+  // requires both neighbours to be provably harmless. The comment on each
+  // group names the review finding it came from.
+  // -------------------------------------------------------------------------
+
+  // Fourth review 1: only a single U+0020 counted as the gap, so every one of
+  // these dropped its suffix or its sign and offered the bare number. The
+  // span now extends across the whole gap run and `parseAmount` decides.
+  ["Fund size $2.5  million", ["2500000"]],
+  ["Fund size $2.5\tmillion", ["2500000"]],
+  ["Fund size $2.5  million", ["2500000"]],
+  ["Fund size $2.5 million", ["2500000"]],
+  ["Fund size $2.5 ⁠ million", ["2500000"]],
+  ["Fund size $2.5  M", []],
+  ["Fund size $3  k", []],
+  ["Fund size $2.5  bn", []],
+  ["Balance 45.00  CR", []],
+  ["Balance 45.00 CR", ["-45"]],
+  ["Credit (   1,234)", ["-1234"]],
+  ["Credit (1,234  )", ["-1234"]],
+  // A grouping separator is one space wide. Two is a column, and a column of
+  // three-digit cells is not one number, so the region offers nothing rather
+  // than the leading 1 the fourth review found.
+  ["Total $1  000  000", []],
+  ["Total $1 000 000", ["1000000"]],
+  // A zero-width space is invisible, so the page prints "$2.5million".
+  ["Fund size $2.5​million", ["2500000"]],
+
+  // Fourth review 3: a sign-bearing close after a spaced symbol or flag.
+  ["Credit (5,79 €)", ["-5.79"]],
+  ["Balance 0,64 € CR", ["-0.64"]],
+  ["Line (0.51 A)", ["-0.51"]],
+  ["Line 12.99 T CR", ["-12.99"]],
+  ["Line 4.56 T-", []],
+  ["Rate (12.5%)", []],
+
+  // Fourth review 4: the Unicode dashes that were not folded. The first five
+  // offered a positive number for a printed minus; the rest re-opened the
+  // identifier and range holes the ASCII hyphen rules had closed.
+  ["Refund ‐1,234", ["-1234"]],
+  ["Refund ‑1,234", ["-1234"]],
+  ["Refund ‒1,234", ["-1234"]],
+  ["Refund ―1,234", ["-1234"]],
+  ["Refund ˗1,234", ["-1234"]],
+  ["Refund －1,234", ["-1234"]],
+  ["Refund ﹣1,234", ["-1234"]],
+  ["Form 1099‐K box 1a", []],
+  ["Range 5‑10", []],
+  ["Due 2026‒11‒02", []],
+
+  // Fourth review 5: fragments across other joiners, and digits that are not
+  // digits until NFKC makes them look like one.
+  ["Amount CHF 1'234.56", []],
+  ["Meeting at 12:30", []],
+  ["Line 45.00(1)", []],
+  ["Plan 401(k) balance", []],
+  ["Line ①250.00", []],
+  ["Line 250.00①", []],
+  ["Line ⒈250", []],
+  ["Line \u{1F100}250", []],
+  // A zero-width character has no width, so the page prints "1234.56" and
+  // that is what reads. Treating it as a boundary instead offered the two
+  // fragments the review found and, far worse, hid a zero-width space inside
+  // the word `million` from the magnitude rule, which would have offered a
+  // millionth of the truth.
+  ["Line 1​234.56", ["1234.56"]],
+  ["Fund size $2.5 mill​ion", ["2500000"]],
+  // A label's colon is not a joiner, and the amount still reads. Nor is the
+  // bar of a pipe-rendered table, which is how several parsed receipts here
+  // print a column.
+  ["Subtotal: 42.00", ["42"]],
+  ["Total | 21.60", ["21.6"]],
+  ["Chisel | 12.00 | 1.20", ["12", "1.2"]],
+
+  // Fourth review 6 and its residues: the grouping a currency's own locale
+  // reads the other way, and the parentheses that never closed.
+  ["Total 12.345 €", []],
+  ["Total €12.345", []],
+  ["Total 12,345 €", []],
+  ["Total 12.345 EUR", []],
+  ["Total $12.345", ["12.345"]],
+  ["Total $1,234", ["1234"]],
+  ["Holding $5 250 shares", []],
+  ["Credit (250.00", []],
+  ["Credit 250.00)", []],
+
+  // Recall-only rows from the same review: nothing wrong is offered, and an
+  // amount the page states is simply not read.
+  ["Note (3) 45.00", []],
+  ["Column CAD 12 USD 15", []],
+  ["Total 1 234,56 €", []],
+
+  // Known behaviour, documented rather than fixed. A single dot group is a
+  // decimal point wherever the token does not carry a currency whose locale
+  // says otherwise: `3.499` is three and a half here, and `Rp 12.000` is
+  // twelve, because `Rp` is not a currency this grammar knows and nothing
+  // else in the token settles the separator. Refusing these would mean
+  // refusing `3.499`, `1.075` and `0.125` as well, which the table above has
+  // asserted since the grammar was written.
+  ["Total 3.499", ["3.499"]],
+  ["Total Rp 12.000", ["12"]],
+];
+
+test("a page line offers exactly the amounts the table says", () => {
+  for (const [line, expected] of QUOTE_SPEC) {
+    assert.deepEqual(amountsInText(line), expected, JSON.stringify(line));
+  }
+});
+
+test("the scaled value is the only one a citation supports", () => {
+  const gateMoney = (value, quote) =>
+    checkValue({
+      valueType: "money",
+      value,
+      candidates: asCandidates(quote),
+      pageText: quote,
+      defaultCurrency: "USD",
+    });
+  // The mirror pair: neither reading may borrow the other's citation.
+  assert.equal(gateMoney("2500000", "Fund size $2.5M").ok, true);
+  assert.deepEqual(gateMoney("2.5", "Fund size $2.5M"), {
+    ok: false,
+    reason: "value_not_in_quote",
+  });
+  assert.equal(gateMoney("2.5", "Fund size $2.5").ok, true);
+  assert.deepEqual(gateMoney("2500000", "Fund size $2.5"), {
+    ok: false,
+    reason: "value_not_in_quote",
+  });
 });

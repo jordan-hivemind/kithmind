@@ -236,7 +236,10 @@ export function extractionSchema(request: ExtractionRequest): unknown {
              */
             lines: {
               type: "array",
+              minItems: 1,
               items: { type: "integer", minimum: 1 },
+              description:
+                "The 1-based line numbers on that page that print this value. At least one.",
             },
             /** The value of every field except a `line_item_list` one, which
              * passes null here and fills `line_items` instead. */
@@ -246,10 +249,30 @@ export function extractionSchema(request: ExtractionRequest): unknown {
               items: {
                 type: "object",
                 additionalProperties: false,
-                required: ["description", "amount"],
+                // Each entry carries its own citation. Items sit on different
+                // lines of a receipt, so one citation shared by the list
+                // cannot be right for more than one of them -- which is how a
+                // strong model still lost every line item on both trial
+                // documents.
+                required: ["description", "amount", "lines"],
                 properties: {
-                  description: { type: "string" },
-                  amount: { type: "string" },
+                  description: {
+                    type: "string",
+                    description:
+                      "The item's description, copied from the line that prints it.",
+                  },
+                  amount: {
+                    type: "string",
+                    description:
+                      "The amount exactly as the line prints it, keeping its decimal point: \"12.99\", not \"1299\". Never cents, never rounded. A trailing tax letter may be included or left off.",
+                  },
+                  lines: {
+                    type: "array",
+                    minItems: 1,
+                    items: { type: "integer", minimum: 1 },
+                    description:
+                      "The line numbers that print this item. At least one.",
+                  },
                 },
               },
             },

@@ -197,8 +197,7 @@ export async function openCorrection(
  *
  * `fieldName` names **one observation**, not a group of them. For a scalar
  * field the two are the same word: `total`'s observation key is `total`. A
- * `line_item_list` field has one observation per line, keyed `line_items:0`,
- * `line_items:1`, and a correction must name the line it fixes. Naming the
+ * `line_item_list` field has one observation per line, keyed by their own evidence, and a correction must name the line it fixes. Naming the
  * bare list field is refused with `correction_target_is_a_list_field` rather
  * than accepted and then silently matching nothing, which is what it did
  * before: the row was written, the screen showed the fix, and every reader of
@@ -256,7 +255,7 @@ export async function applyCorrection(
         JSON.stringify(original ?? null),
       ],
     );
-    await writeThrough(client, input);
+    await orphanIfUnapplied(client, input, await writeThrough(client, input));
     return existing.id;
   }
   const id = newKithId();
@@ -277,16 +276,53 @@ export async function applyCorrection(
       at,
     ],
   );
-  await writeThrough(client, input);
+  await orphanIfUnapplied(client, input, await writeThrough(client, input));
   return id;
+}
+
+/**
+ * Tells the owner when the fix he just made lands nowhere.
+ *
+ * `writeThrough` returns -1 when a line key names a line the newest run no
+ * longer cites. The correction row is written and the screen shows it
+ * `resolved`, so without this the owner has every reason to believe the
+ * number is fixed while `sum_money` goes on totalling the model's -- the
+ * same two-halves-disagreeing failure the write-through exists to prevent,
+ * one step further along.
+ *
+ * Keyed on the **list field**, never on the line key. A line key carries the
+ * evidence hash of the line the run cited, so it changes whenever the run
+ * cites a different one; an item keyed on it could be dismissed and would
+ * still come back under a new id on the next run, which is exactly the
+ * un-actionable noise the attention queue is supposed not to have.
+ */
+async function orphanIfUnapplied(
+  client: ClientBase,
+  input: { spaceId: string; sourceItemId: string; fieldName: string },
+  wrote: number,
+): Promise<void> {
+  if (wrote >= 0) return;
+  await openCorrection(client, {
+    spaceId: input.spaceId,
+    sourceItemId: input.sourceItemId,
+    fieldName: listFieldName(input.fieldName),
+    reason: "correction_orphaned",
+    reading: null,
+  });
+}
+
+/** The field a line key belongs to: `line_items:7-a3f1b2c-0` is one line of
+ * `line_items`. */
+function listFieldName(fieldName: string): string {
+  return fieldName.split(":")[0]!;
 }
 
 /**
  * Refuses a correction that names a group of observations rather than one.
  *
  * A field with no observation of its own key, but observations carrying its
- * name as their type, is a list: `line_items` with `line_items:0` and
- * `line_items:1` under it. Correcting "the line items" has no single meaning,
+ * name as their type, is a list: `line_items` with keys like
+ * `line_items:7-a3f1b2c-0` under it. Correcting "the line items" has no single meaning,
  * so it is an error the caller sees rather than a write that lands nowhere.
  * A field with no observations at all is allowed through: it is an ordinary
  * correction of something the gate refused, and the value is stored for when
@@ -361,7 +397,7 @@ async function writeThrough(
   }
   // `observation_key`, not `observation_type`. A single-value field's key is
   // its own name, so the two are the same there; a `line_item_list` field has
-  // one observation per item keyed `line_items:0`, `line_items:1`, and
+  // one observation per item keyed `line_items:<line>-<hash>-<n>`, and
   // matching on the type would overwrite every line of the receipt with the
   // correction meant for one of them.
   const updated = await client.query(
@@ -371,11 +407,17 @@ async function writeThrough(
     [input.spaceId, input.sourceItemId, input.fieldName, JSON.stringify(value)],
   );
   if (updated.rowCount) return updated.rowCount;
-  // Nothing to update: the run that produced this document gated that field
-  // out, so the owner's value is the only reading there is. Without the insert
-  // below `get_document` would show it (it reads the correction row) while
-  // `sum_money` and `latest_observation` would not see it at all -- and a
-  // corrected field is the one the owner is most certain about.
+  // A line item's key names one line of one list. When no row matches it, the
+  // newest run cited a different, equally valid line for that item -- and
+  // inserting the corrected value under the old key would put the item in the
+  // list twice, so every sum over it would double count, silently. The
+  // correction stands, unapplied, and says so.
+  if (input.fieldName.includes(":")) return -1;
+  // Nothing to update on a scalar field: the run that produced this document
+  // gated it out, so the owner's value is the only reading there is. Without
+  // the insert below `get_document` would show it (it reads the correction
+  // row) while `sum_money` and `latest_observation` would not see it at all --
+  // and a corrected field is the one the owner is most certain about.
   return await insertCorrected(client, input, value);
 }
 
@@ -509,11 +551,19 @@ export async function reapplyCorrections(
     input.spaceId,
     input.sourceItemId,
   )) {
-    applied += await writeThrough(client, {
+    const wrote = await writeThrough(client, {
       ...input,
       fieldName,
       correctedValue,
     });
+    if (wrote < 0) {
+      // One attention item naming the list, so the owner can re-make the
+      // correction against the line this run cited -- and so a dismissal of
+      // it holds, which it cannot when the key is the line's own.
+      await orphanIfUnapplied(client, { ...input, fieldName }, wrote);
+      continue;
+    }
+    applied += wrote;
   }
   return applied;
 }

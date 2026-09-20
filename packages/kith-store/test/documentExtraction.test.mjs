@@ -309,8 +309,17 @@ test("a clean reading becomes cited observations that query_records can read", {
     [f.spaceId],
   );
   assert.deepEqual(
-    observations.map((row) => row.observation_key),
-    ["line_items:0", "line_items:1", "purchase_date", "total", "vendor"],
+    observations
+      .map((row) => row.observation_key)
+      .filter((key) => !key.startsWith("line_items:")),
+    // ADM-5g: an item's key follows its evidence, not its position, so the
+    // list is counted rather than named.
+    ["purchase_date", "total", "vendor"],
+  );
+  assert.equal(
+    observations.filter((row) => row.observation_key.startsWith("line_items:"))
+      .length,
+    2,
   );
   const total = observations.find((row) => row.observation_key === "total");
   assert.deepEqual(total.value, {
@@ -994,12 +1003,26 @@ test("correcting one line item leaves the others alone", { skip }, async (t) => 
     ingested.sourceItemId,
     ingested.generationId,
   );
+  // ADM-5g: keys follow evidence, so the item is found by what it says
+  // rather than by where it sits.
+  const lineItemKeys = (
+    await f.rows(
+      `SELECT observation_key, value FROM kith.observations
+        WHERE space_id = $1 AND observation_type = 'line_items'`,
+      [f.spaceId],
+    )
+  )
+    .sort((left, right) =>
+      Number(left.value.amount) - Number(right.value.amount),
+    )
+    .map((row) => row.observation_key);
   await withKithTransaction(f.pool, (client) =>
     applyCorrection(client, {
       spaceId: f.spaceId,
       sourceItemId: ingested.sourceItemId,
-      // The observation key of one item, not the field name.
-      fieldName: "line_items:1",
+      // The observation key of one item, not the field name. ADM-5g keys an
+      // item by its own evidence, so the key is read rather than assumed.
+      fieldName: lineItemKeys[0],
       correctedValue: { type: "money", amount: "6.50", currency: "USD" },
       actorUserId: f.userId,
       now: NOW + 4_000,
@@ -1012,11 +1035,8 @@ test("correcting one line item leaves the others alone", { skip }, async (t) => 
     [f.spaceId],
   );
   assert.deepEqual(
-    items.map((row) => [row.observation_key, row.value.amount]),
-    [
-      ["line_items:0", "10"],
-      ["line_items:1", "6.5"],
-    ],
+    items.map((row) => row.value.amount).sort(),
+    ["10", "6.5"].sort(),
   );
 });
 
@@ -1050,12 +1070,20 @@ test("a correction must name one observation, not a list of them", { skip }, asy
       .length,
     0,
   );
-  // One line is fine, and the document read shows it in place.
+  // One line is fine, and the document read shows it in place. ADM-5g keys an
+  // item by its own evidence, so the key is read rather than assumed.
+  const firstItemKey = (
+    await f.rows(
+      `SELECT observation_key, value FROM kith.observations
+        WHERE space_id = $1 AND observation_type = 'line_items'`,
+      [f.spaceId],
+    )
+  ).find((row) => row.value.amount === "10").observation_key;
   await withKithTransaction(f.pool, (client) =>
     applyCorrection(client, {
       spaceId: f.spaceId,
       sourceItemId: ingested.sourceItemId,
-      fieldName: "line_items:0",
+      fieldName: firstItemKey,
       correctedValue: { type: "money", amount: "11.00", currency: "USD" },
       actorUserId: f.userId,
       now: NOW + 5_000,

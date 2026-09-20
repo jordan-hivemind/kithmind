@@ -1,0 +1,767 @@
+// The amount finder against an oracle that does not know it exists.
+//
+// Four reviews of ADM-5g each found an input where `amountsInText` offered a
+// number the document does not print, and each one was found by a person
+// reading the code and thinking of a case it had not enumerated. A fifth
+// reviewer would have found a sixth case. So this file replaces the reviewer
+// with a generator and a check that runs on every suite.
+//
+// ## How it is independent
+//
+// Nothing here imports the grammar's rules. A case is built from *pieces* --
+// a sign, a currency marker, digit groups, a separator, a magnitude, a flag,
+// a credit marker, parentheses, gaps -- and the value it must have is
+// computed from those pieces with `BigInt`, by moving a decimal point, in
+// `truthOf` below. The generator is what printed the token, so it is the only
+// thing in this repository that knows what the token says without asking the
+// code under test.
+//
+// The three invariants, in the order they matter:
+//
+//   (a) **Never a number the page does not print.** Every value the finder
+//       offers for a string must be the oracle's exact value of one whole
+//       printed token in that string. A fragment, a dropped magnitude, a lost
+//       sign and a swallowed digit group all fail this, because none of them
+//       equals a whole token's value.
+//   (b) **The finder and the scanner are one grammar.** For a string that is
+//       exactly one printed token, the finder offers `[parseAmount(token)]`
+//       or nothing. It may never offer a third thing.
+//   (c) **Sign, scale and grouping.** No offered value may be the negation of
+//       a token's value, that value times a power of ten, or that value with
+//       a digit group added or dropped, unless it is itself some token's
+//       exact value. This is (a) sharpened: it says *how* a wrong number
+//       would be wrong, so a failure report names the fault.
+//
+// Refusing is always allowed. An empty result can never be a wrong number,
+// and this file never asserts that anything *is* offered; the spec tables in
+// `extractionGate.test.mjs` own recall.
+//
+// ## Running it harder
+//
+// The suite runs about 50,000 cases from a fixed seed, which is a few
+// seconds. `KITH_AMOUNT_FUZZ_CASES` and `KITH_AMOUNT_FUZZ_SEEDS` (a
+// comma-separated list) run millions locally:
+//
+//     KITH_AMOUNT_FUZZ_CASES=2000000 KITH_AMOUNT_FUZZ_SEEDS=1,2,3 \
+//       node --test test/extractionAmountFuzz.test.mjs
+
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { amountsInText, parseAmount } from "../dist/extraction/index.js";
+import { pageLines } from "../dist/extraction/lines.js";
+
+// ---------------------------------------------------------------------------
+// A pseudo-random generator, so a failure is a seed and a case number rather
+// than a story. Mulberry32: thirty lines of arithmetic, no dependency, and
+// the same sequence on every machine and every version of Node.
+// ---------------------------------------------------------------------------
+
+function mulberry32(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) | 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function makeRandom(seed) {
+  const next = mulberry32(seed);
+  const random = {
+    int: (bound) => Math.floor(next() * bound),
+    pick: (list) => list[Math.floor(next() * list.length)],
+    chance: (odds) => next() < odds,
+    digits: (count, leadingZero = false) => {
+      let out = "";
+      for (let at = 0; at < count; at += 1) {
+        const low = at === 0 && !leadingZero ? 1 : 0;
+        out += String(low + Math.floor(next() * (10 - low)));
+      }
+      return out;
+    },
+  };
+  return random;
+}
+
+// ---------------------------------------------------------------------------
+// The oracle. `coefficient` and `scale` are an exact decimal: the value is
+// `coefficient / 10^scale`. A magnitude multiplies by a power of ten, which
+// is done by moving the point -- subtracting from the scale and padding with
+// zeros when it runs out -- never by multiplying a float.
+// ---------------------------------------------------------------------------
+
+/** The exact value of a printed token, as the canonical decimal string the
+ * store keeps. Written from the pieces the generator chose, with no reference
+ * to the grammar that has to read them back. */
+function truthOf({ whole, fraction, magnitude, negative }) {
+  let coefficient = BigInt(whole + fraction);
+  let scale = fraction.length;
+  if (magnitude > 0) {
+    if (magnitude <= scale) {
+      scale -= magnitude;
+    } else {
+      coefficient *= 10n ** BigInt(magnitude - scale);
+      scale = 0;
+    }
+  }
+  return formatDecimal(negative, coefficient, scale);
+}
+
+function formatDecimal(negative, coefficient, scale) {
+  let digits = coefficient.toString();
+  if (scale > 0) {
+    digits = digits.padStart(scale + 1, "0");
+    const head = digits.slice(0, digits.length - scale);
+    const tail = digits.slice(digits.length - scale).replace(/0+$/, "");
+    digits = tail.length > 0 ? `${head}.${tail}` : head;
+  }
+  digits = digits.replace(/^0+(?=\d)/, "");
+  if (/^0(\.0*)?$/.test(digits)) return "0";
+  return (negative ? "-" : "") + digits;
+}
+
+/** Ten to the power of `places`, as a decimal-shifting helper the invariants
+ * use to name a wrong scale. */
+function shiftedBy(value, places) {
+  const negative = value.startsWith("-");
+  const bare = negative ? value.slice(1) : value;
+  const [head, tail = ""] = bare.split(".");
+  const coefficient = BigInt(head + tail);
+  const scale = tail.length - places;
+  if (scale >= 0) return formatDecimal(negative, coefficient, scale);
+  return formatDecimal(negative, coefficient * 10n ** BigInt(-scale), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The pieces a printed amount is made of.
+// ---------------------------------------------------------------------------
+
+/** Every gap a parsed page puts between two tokens, including the ones the
+ * fourth review found were not treated as gaps at all. */
+const GAPS = [
+  " ",
+  "  ",
+  "   ",
+  "      ",
+  "\t",
+  " \t ",
+  "\u00a0",
+  "\u00a0\u00a0",
+  "\u2003",
+  "\u202f",
+  "\u205f",
+  "\u3000",
+  "\u2028",
+];
+
+/** Characters with no width at all, which a PDF's text layer emits freely. */
+const ZERO_WIDTH = ["\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"];
+
+/** Currency markers, with the code each names. */
+const SYMBOLS = [
+  ["$", "USD"],
+  ["\u00a3", "GBP"],
+  ["\u00a5", "JPY"],
+  ["\u20b9", "INR"],
+  ["\u20a9", "KRW"],
+  ["\u20ac", "EUR"],
+];
+const CODES = ["USD", "EUR", "GBP", "CAD", "CHF", "JPY", "AUD", "SEK"];
+
+/** Magnitudes, as the letters and the words a document prints them with. */
+const MAGNITUDE_LETTERS = [
+  ["k", 3],
+  ["K", 3],
+  ["m", 6],
+  ["M", 6],
+  ["MM", 6],
+  ["mm", 6],
+  ["mn", 6],
+  ["b", 9],
+  ["B", 9],
+  ["bn", 9],
+];
+const MAGNITUDE_WORDS = [
+  ["thousand", 3],
+  ["thousands", 3],
+  ["million", 6],
+  ["millions", 6],
+  ["billion", 9],
+  ["billions", 9],
+];
+
+/** Every dash a document prints where it means a minus. */
+const DASHES = [
+  "-",
+  "\u2010",
+  "\u2011",
+  "\u2012",
+  "\u2013",
+  "\u2014",
+  "\u2015",
+  "\u2212",
+  "\u02d7",
+  "\ufe58",
+  "\ufe63",
+  "\uff0d",
+];
+
+/** Words safe to stand beside an amount: two letters or more, and none of
+ * them a magnitude, a credit marker or an ISO code. */
+const WORDS = [
+  "Total",
+  "Subtotal",
+  "Balance",
+  "Paid",
+  "Invoice",
+  "Item",
+  "Amount",
+  "the",
+  "statement",
+  "and",
+  "for",
+  "Widget",
+  "Consulting",
+  "services",
+];
+
+/**
+ * Tokens that are not amounts at all, printed on the same lines. Every one of
+ * them is a shape one of the four reviews saw read as a number.
+ *
+ * Their oracle value is *nothing*: the finder may offer no value on their
+ * account, so any value it does offer has to come from a real token beside
+ * them, and a fragment of one of these fails invariant (a) outright.
+ */
+const HOSTILE = [
+  "INV-0012",
+  "1099-K",
+  "20260918-000123",
+  "#1234",
+  "qty3",
+  "abc12.00",
+  "Tax12.99",
+  "09/01/2026",
+  "2026-11-02",
+  "1.2.26",
+  "5-10",
+  "2026-2027",
+  "(206) 555-0134",
+  "12:30",
+  "\u2460250.00",
+  "12\u00bd",
+  "12.99\u00b2",
+  "\u2488250",
+  "401K",
+  "10K",
+  "1'234.56",
+  "12.99%",
+  "45.00(1)",
+  "401(k)",
+  "1234-5678-9012-3456",
+  "0012",
+  "000123",
+  "1,23,456.00",
+  "$2.5m\u00b2",
+  "\u0661\u066b\u0665",
+];
+
+/**
+ * One printed amount, and the value it prints.
+ *
+ * Every choice is recorded in the returned record, so a failing case can be
+ * read back rather than guessed at. Shapes the grammar is documented to
+ * refuse -- a magnitude letter with no currency, a flag on a number that is
+ * not two decimal places, a sign a gap away from its digits -- are generated
+ * deliberately: the oracle still knows what they say, and refusing them is
+ * always allowed, but *misreading* them is not.
+ */
+function makeAmount(random) {
+  const wholeLength = 1 + random.int(7);
+  let fractionLength = random.pick([0, 0, 0, 2, 2, 2, 1, 3, 4]);
+  const whole = random.digits(wholeLength);
+  let fraction = random.digits(fractionLength, true);
+
+  // A currency marker, on either side, glued or a gap away.
+  const wants = random.pick(["none", "none", "symbol", "symbol", "code"]);
+  let symbol = "";
+  let code = "";
+  let currencyName;
+  if (wants === "symbol") {
+    const chosen = random.pick(SYMBOLS);
+    symbol = chosen[0];
+    currencyName = chosen[1];
+  } else if (wants === "code") {
+    code = random.pick(CODES);
+    currencyName = code;
+  }
+  const marker = symbol || code;
+  const markerSide = marker ? random.pick(["before", "before", "after"]) : "";
+  let markerGap = marker ? random.pick(["", "", " ", random.pick(GAPS)]) : "";
+
+  // Grouping and the decimal separator, in the two conventions the grammar
+  // documents plus the space grouping a currency marker settles.
+  let grouping = random.pick([
+    "none",
+    "none",
+    "comma",
+    "dot",
+    "space",
+    "commaDecimal",
+  ]);
+  if (grouping === "comma" && wholeLength < 4) grouping = "none";
+  if (grouping === "dot" && wholeLength < 7) grouping = "none";
+  if (grouping === "space" && wholeLength < 7) grouping = "none";
+  let printedWhole = whole;
+  let point = ".";
+  if (grouping === "comma") printedWhole = groupFrom(whole, ",");
+  else if (grouping === "dot") {
+    printedWhole = groupFrom(whole, ".");
+    point = ",";
+  } else if (grouping === "space") printedWhole = groupFrom(whole, " ");
+  else if (grouping === "commaDecimal") point = ",";
+  // A decimal comma with exactly three digits after it is two readings a
+  // thousand apart and nothing in the text settles either: `1000,000` is a
+  // thousand and a million at once, and `123,456` is a hundred and
+  // twenty-three thousand to an English reader and a hundred and twenty-three
+  // and a bit to a German one. The fraction goes rather than the comma,
+  // because moving the comma to a dot beside *dot* grouping would print a
+  // fourth group and invent a different ambiguity.
+  if (point === "," && fractionLength === 3) {
+    fractionLength = 0;
+    fraction = "";
+  }
+  const digits =
+    fractionLength > 0 ? `${printedWhole}${point}${fraction}` : printedWhole;
+
+  // A magnitude: a letter pressed against the digits, or a word that may be a
+  // gap away.
+  const magnitudeKind = random.pick([
+    "none",
+    "none",
+    "none",
+    "letter",
+    "word",
+  ]);
+  let magnitude = 0;
+  let suffix = "";
+  let suffixGap = "";
+  if (magnitudeKind === "letter") {
+    const [letters, places] = random.pick(MAGNITUDE_LETTERS);
+    magnitude = places;
+    suffix = letters;
+  } else if (magnitudeKind === "word") {
+    const [word, places] = random.pick(MAGNITUDE_WORDS);
+    magnitude = places;
+    suffix = word;
+    suffixGap = random.pick(["", " ", random.pick(GAPS)]);
+  }
+
+  // A tax or status flag, which changes nothing about the value.
+  const flag =
+    magnitudeKind === "none" && random.chance(0.12)
+      ? random.pick(["T", "A", "F", "N", "X"])
+      : "";
+  // A flag glued to a trailing currency code makes one word -- `CHFN`, `AUDA`
+  // -- which is neither, so the token the oracle priced is not the token the
+  // page prints.
+  const flagGap = flag
+    ? markerSide === "after"
+      ? random.pick([" ", random.pick(GAPS)])
+      : random.pick(["", " ", random.pick(GAPS)])
+    : "";
+
+  // The sign, in every shape a ledger prints one.
+  const signKind = random.pick([
+    "none",
+    "none",
+    "none",
+    "leading",
+    "trailing",
+    "parentheses",
+    "credit",
+    "debit",
+    "gapped",
+  ]);
+  let negative = false;
+  let before = "";
+  let after = "";
+  if (signKind === "leading") {
+    negative = true;
+    before = random.pick(DASHES);
+  } else if (signKind === "gapped") {
+    negative = true;
+    before = random.pick(DASHES) + random.pick(GAPS);
+  } else if (signKind === "trailing") {
+    negative = true;
+    after = random.pick(DASHES);
+  } else if (signKind === "credit") {
+    negative = true;
+    after = `${random.pick([" ", " ", random.pick(GAPS)])}CR`;
+  } else if (signKind === "debit") {
+    after = `${random.pick([" ", random.pick(GAPS)])}DR`;
+  }
+
+  // A magnitude letter is pressed against the digits; a word may be a gap
+  // away. Either way it is part of the number, and the currency marker goes
+  // outside both.
+  let core = digits;
+  if (magnitudeKind === "letter") core = `${digits}${suffix}`;
+  else if (magnitudeKind === "word") core = `${digits}${suffixGap}${suffix}`;
+  // A magnitude word and a trailing currency code need something between
+  // them. `millionsCAD` is one word to any reader and to the grammar, so the
+  // oracle would be pricing a token nobody printed.
+  if (magnitudeKind === "word" && markerSide === "after" && markerGap === "") {
+    markerGap = " ";
+  }
+  let body =
+    markerSide === "before"
+      ? `${marker}${markerGap}${core}`
+      : markerSide === "after"
+        ? `${core}${markerGap}${marker}`
+        : core;
+  if (flag) body = `${body}${flagGap}${flag}`;
+  let text = `${before}${body}${after}`;
+  if (signKind === "parentheses") {
+    negative = true;
+    const inner = random.pick(["", " ", random.pick(GAPS)]);
+    const outer = random.pick(["", " ", random.pick(GAPS)]);
+    text = `(${inner}${text}${outer})`;
+  }
+  // Zero-width characters have no width, so they change nothing a reader sees.
+  if (random.chance(0.12)) {
+    const at = random.int(text.length + 1);
+    text = text.slice(0, at) + random.pick(ZERO_WIDTH) + text.slice(at);
+  }
+
+  const value = truthOf({ whole, fraction, magnitude, negative });
+  return { text, value, currencyName, grouping, signKind, magnitudeKind };
+}
+
+/** `1234567` as `1,234,567`: the last groups are three digits and the first
+ * is whatever is left. */
+function groupFrom(whole, separator) {
+  const head = whole.length % 3 === 0 ? 3 : whole.length % 3;
+  const groups = [whole.slice(0, head)];
+  for (let at = head; at < whole.length; at += 3) {
+    groups.push(whole.slice(at, at + 3));
+  }
+  return groups.join(separator);
+}
+
+/** A token that is not an amount, and whose oracle value is nothing at all. */
+function makeHostile(random) {
+  return { text: random.pick(HOSTILE), value: undefined, signKind: "none" };
+}
+
+function makeToken(random) {
+  return random.chance(0.18) ? makeHostile(random) : makeAmount(random);
+}
+
+// ---------------------------------------------------------------------------
+// The contexts a token appears in.
+// ---------------------------------------------------------------------------
+
+function word(random) {
+  return random.pick(WORDS);
+}
+
+/** One case: the string to scan, and every value it prints. */
+function makeCase(random) {
+  const shape = random.int(6);
+  if (shape === 0) {
+    const token = makeToken(random);
+    return { text: token.text, tokens: [token], single: true };
+  }
+  if (shape === 1) {
+    const token = makeToken(random);
+    return {
+      text: `${word(random)} ${token.text} ${word(random)} ${word(random)}`,
+      tokens: [token],
+    };
+  }
+  if (shape === 2) {
+    // A receipt column: a label, a wide gap, and the amounts.
+    const left = makeToken(random);
+    const right = makeToken(random);
+    return {
+      text: `${word(random)}${columnGap(random)}${left.text}${columnGap(random)}${right.text}`,
+      tokens: [left, right],
+    };
+  }
+  if (shape === 3) {
+    // Two tokens with a separator that may or may not join them.
+    const left = makeToken(random);
+    const right = makeToken(random);
+    const joiner = joinerFor(random, left, right);
+    return { text: `${left.text}${joiner}${right.text}`, tokens: [left, right] };
+  }
+  if (shape === 4) {
+    // A sentence with the token buried in it.
+    const token = makeToken(random);
+    return {
+      text: `${word(random)} ${word(random)}: ${token.text}, ${word(random)} ${word(random)}.`,
+      tokens: [token],
+    };
+  }
+  // A ledger row: description, then two columns.
+  const left = makeToken(random);
+  const right = makeToken(random);
+  const trailing = random.chance(0.5)
+    ? ""
+    : `${columnGap(random)}${word(random)}`;
+  return {
+    text: `${word(random)} ${word(random)}${columnGap(random)}${left.text}${columnGap(random)}${right.text}${trailing}`,
+    tokens: [left, right],
+  };
+}
+
+/**
+ * The gap between two cells of a column, which is never one space wide.
+ *
+ * A single space between two digit runs is a grouping separator as readily as
+ * a column boundary -- `$1 234 567` and `$5 250` are the same shape and two
+ * different readings -- so a generator that printed one would be printing a
+ * token whose value it does not know. The spec table owns those rows by hand;
+ * everything wider is unambiguously two cells and belongs here.
+ */
+function columnGap(random) {
+  return random.pick(WIDE_GAPS);
+}
+
+/**
+ * Gaps that are still wider than one space after NFKC.
+ *
+ * The no-break, em, narrow and ideographic spaces all fold to a single
+ * U+0020, so a column printed with one of them is character for character a
+ * grouping separator: `CHF 3 376 853` beside `375` is `CHF 3 376 853 375`,
+ * which is one amount to any reader and to the grammar. The oracle cannot
+ * price that, so the generator does not print it.
+ */
+const WIDE_GAPS = GAPS.filter((gap) => gap.normalize("NFKC") !== " ");
+
+/**
+ * A separator between two tokens, chosen so the pair cannot fuse into a third
+ * printed number.
+ *
+ * `1, 234` is one thousand two hundred and thirty-four and also two
+ * references; `10. 80` is ten point eight and also two numbers. Which one a
+ * page means is exactly what the text does not say, so the oracle cannot
+ * price the pair and the generator does not print it. Those joins are
+ * asserted by hand in `extractionGate.test.mjs`, where each row carries the
+ * reading it was given and why.
+ */
+function joinerFor(random, left, right) {
+  const joiner = random.pick([
+    " ",
+    ", ",
+    ". ",
+    ": ",
+    "/",
+    "'",
+    "-",
+    " and ",
+    " | ",
+    "\t",
+    "",
+    "%",
+    " (",
+    ") ",
+  ]);
+  const before = visible(left.text);
+  const after = visible(right.text);
+  const fuses =
+    FUSING_EDGE.test(before[before.length - 1] ?? "") &&
+    FUSING_EDGE.test(after[0] ?? "");
+  return fuses ? random.pick([" and ", " | ", "   "]) : joiner;
+}
+
+/** The token as a reader sees it: the zero-width characters are not an edge,
+ * because they are not anything. */
+function visible(text) {
+  return text.replace(/[\u200b\u200c\u200d\u2060\ufeff]/g, "");
+}
+
+/** Any character a printed amount can carry at its edge. Two tokens that
+ * touch through one of these are one token to a reader, whatever the
+ * generator meant, and the oracle would be pricing a fiction. */
+const FUSING_EDGE =
+  /[\p{L}\d.,()%$\u00a3\u00a5\u20ac\u20b9\u20a9+'#:/\u2010-\u2015\u2212\u02d7\ufe58\ufe63\uff0d-]/u;
+
+// ---------------------------------------------------------------------------
+// The invariants.
+// ---------------------------------------------------------------------------
+
+/** Why one offered value is wrong, in the words of invariant (c), or null. */
+function faultOf(offered, truths) {
+  if (truths.has(offered)) return null;
+  const negated = offered.startsWith("-") ? offered.slice(1) : `-${offered}`;
+  if (truths.has(negated)) return "wrong sign";
+  for (let places = -12; places <= 12; places += 1) {
+    if (places === 0) continue;
+    if (truths.has(shiftedBy(offered, places))) return `wrong by 10^${places}`;
+  }
+  for (const truth of truths) {
+    const bare = truth.replace(/^-/, "").replace(".", "");
+    const seen = offered.replace(/^-/, "").replace(".", "");
+    if (bare.startsWith(seen) || bare.endsWith(seen)) {
+      return "a fragment of a printed token";
+    }
+  }
+  return "a number the text does not print";
+}
+
+function check(report, label, text, tokens, options) {
+  const truths = new Set();
+  for (const token of tokens) {
+    if (token.value !== undefined) truths.add(token.value);
+  }
+  let offered;
+  try {
+    offered = amountsInText(text, options);
+  } catch (error) {
+    report.push({ label, text, failure: `threw ${String(error)}` });
+    return;
+  }
+  for (const value of offered) {
+    const fault = faultOf(value, truths);
+    if (fault) {
+      report.push({
+        label,
+        text,
+        offered,
+        truths: [...truths],
+        failure: `${value} is ${fault}`,
+      });
+      return;
+    }
+  }
+}
+
+/** The long-line context. A cut edge is unknown, so no piece may offer a
+ * value the whole line does not print either. */
+function checkSplit(report, random, tokens) {
+  const filler = `${word(random)} `.repeat(20 + random.int(40));
+  const joined = tokens
+    .map((token) => token.text)
+    .join(`${columnGap(random)}${word(random)}${columnGap(random)}`);
+  const tail = random.chance(0.5) ? "" : ` ${word(random)}`;
+  const line = `${filler}${joined}${tail}`;
+  const pieces = pageLines(line);
+  const rebuilt = pieces.map((piece) => piece.text).join("");
+  if (rebuilt !== line) {
+    report.push({ label: "split", text: line, failure: "pieces do not cover the line" });
+    return;
+  }
+  for (const piece of pieces) {
+    if (line.slice(piece.start, piece.end) !== piece.text) {
+      report.push({ label: "split", text: line, failure: "a piece's offsets moved" });
+      return;
+    }
+    check(report, "split piece", piece.text, tokens, {
+      cutStart: piece.cutStart,
+      cutEnd: piece.cutEnd,
+    });
+  }
+}
+
+function run(seed, cases) {
+  const random = makeRandom(seed);
+  const report = [];
+  for (let at = 0; at < cases && report.length < 8; at += 1) {
+    const shaped = makeCase(random);
+    check(report, `seed ${seed} case ${at}`, shaped.text, shaped.tokens);
+    if (shaped.single && shaped.tokens[0].signKind !== "credit" &&
+        shaped.tokens[0].signKind !== "debit") {
+      // (b) One printed token: the finder offers what the scanner reads, or
+      // nothing. A third answer means the two have drifted apart again.
+      //
+      // Against the token with its gap runs collapsed, because that is the
+      // one difference the finder is allowed to have: it owns where a token
+      // starts and ends on a *line*, and a line puts runs of spaces where a
+      // value has one. `CR` and `DR` are excluded for the same reason from
+      // the other side -- they are a sign the line prints beside the number
+      // and the scanner never sees them.
+      const collapsed = shaped.text
+        .replace(/[\u200b\u200c\u200d\u2060\ufeff]/g, "")
+        .replace(/\s+/g, " ");
+      const scanned = parseAmount(collapsed);
+      const offered = amountsInText(shaped.text);
+      const allowed =
+        offered.length === 0 ||
+        (offered.length === 1 &&
+          scanned !== undefined &&
+          offered[0] === scanned);
+      if (!allowed) {
+        report.push({
+          label: `seed ${seed} case ${at}`,
+          text: shaped.text,
+          offered,
+          failure: `the scanner reads ${String(scanned)} for ${JSON.stringify(collapsed)}`,
+        });
+      }
+    }
+    if (at % 8 === 0) {
+      checkSplit(report, random, shaped.tokens);
+    }
+  }
+  return report;
+}
+
+const CASES = Number(process.env.KITH_AMOUNT_FUZZ_CASES ?? 50000);
+const SEEDS = (process.env.KITH_AMOUNT_FUZZ_SEEDS ?? "20260920")
+  .split(",")
+  .map((seed) => Number(seed.trim()))
+  .filter((seed) => Number.isFinite(seed));
+
+test("no generated line ever offers a number it does not print", () => {
+  for (const seed of SEEDS) {
+    const report = run(seed, CASES);
+    assert.deepEqual(
+      report,
+      [],
+      `seed ${seed}: ${report.length} counterexample(s)\n` +
+        report.map((entry) => JSON.stringify(entry)).join("\n"),
+    );
+  }
+});
+
+test("the oracle is exact, and would notice if it were not", () => {
+  // The oracle's own arithmetic, checked against hand-written answers. A
+  // silent oracle is worse than no oracle: it would pass everything.
+  assert.equal(
+    truthOf({ whole: "2", fraction: "5", magnitude: 6, negative: false }),
+    "2500000",
+  );
+  assert.equal(
+    truthOf({ whole: "1", fraction: "2345", magnitude: 6, negative: false }),
+    "1234500",
+  );
+  assert.equal(
+    truthOf({ whole: "1234", fraction: "56", magnitude: 0, negative: true }),
+    "-1234.56",
+  );
+  assert.equal(
+    truthOf({ whole: "0", fraction: "00", magnitude: 0, negative: true }),
+    "0",
+  );
+  assert.equal(
+    truthOf({ whole: "13", fraction: "20", magnitude: 0, negative: false }),
+    "13.2",
+  );
+  assert.equal(
+    truthOf({ whole: "3", fraction: "4", magnitude: 9, negative: false }),
+    "3400000000",
+  );
+  assert.equal(shiftedBy("2.5", 6), "2500000");
+  assert.equal(shiftedBy("2500000", -6), "2.5");
+  assert.equal(groupFrom("1234567", ","), "1,234,567");
+  assert.equal(groupFrom("123456", " "), "123 456");
+  // And the fault reporter names the fault rather than shrugging.
+  assert.equal(faultOf("2.5", new Set(["2500000"])), "wrong by 10^6");
+  assert.equal(faultOf("42", new Set(["-42"])), "wrong sign");
+  assert.equal(faultOf("42", new Set(["42"])), null);
+  assert.equal(faultOf("234", new Set(["1234"])), "a fragment of a printed token");
+});

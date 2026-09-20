@@ -32,6 +32,7 @@ import {
 } from "../dist/index.js";
 import {
   amountsInText,
+  applyCorrection,
   checkValue,
   diagnoseExtractions,
   valueSignature,
@@ -281,17 +282,22 @@ test("a rendering space closes only next to a currency mark", () => {
   // Must NOT read. Each of these was joined into one fabricated amount by the
   // first version of the repair, which is a value the page never stated under
   // a citation that looked right.
-  assert.deepEqual(amountsInText("APPLES   12    .99"), ["12", "99"]);
-  assert.deepEqual(amountsInText("Invoice refs 1, 234, 567"), [
-    "1",
-    "234",
-    "567",
-  ]);
-  assert.deepEqual(amountsInText("3. 12 Pack Soda   5.99"), ["3", "12", "5.99"]);
-  assert.deepEqual(amountsInText("Milk 2. 5L"), ["2", "5"]);
-  // A bare column gap is two numbers, and becomes a correction rather than
-  // a guess.
-  assert.deepEqual(amountsInText("Total 10. 80"), ["10", "80"]);
+  // ADM-5g round five: the bare number beside the fragment is gone as well.
+  // A separator with a digit reachable through it is settled by pasting the
+  // two halves back together and asking `parseAmount`: "12    .99" reads as
+  // 12.99, "1, 234" as 1,234 and "3. 12" as 3.12, so neither side of any of
+  // them may be offered. The earlier round offered the left-hand number,
+  // which is the right answer only if the column gap was not a separator --
+  // and nothing on the line says which it was.
+  assert.deepEqual(amountsInText("APPLES   12    .99"), []);
+  assert.deepEqual(amountsInText("Invoice refs 1, 234, 567"), []);
+  assert.deepEqual(amountsInText("3. 12 Pack Soda   5.99"), ["5.99"]);
+  // ADM-5g: `5L` is digits with a letter glued to them that is neither a
+  // currency, a magnitude nor a flag, so the token is not an amount at all --
+  // and "2. 5L" does not read as 2.5 either, so the 2 stands on its own.
+  assert.deepEqual(amountsInText("Milk 2. 5L"), ["2"]);
+  // A bare column gap is two numbers or one, and the page does not say which.
+  assert.deepEqual(amountsInText("Total 10. 80"), []);
 
   // A genuine pair of column amounts stays a pair.
   assert.deepEqual(amountsInText("20.00      1.60   21.60"), [
@@ -392,8 +398,8 @@ test("a column receipt stores every money field it cites", { skip }, async (t) =
         statement("purchase_date", "09/18/26", [3]),
         statement("line_items", null, [4, 5], {
           line_items: [
-            { description: "Chisel", amount: "12.00" },
-            { description: "Mallet", amount: "8.00" },
+            { description: "Chisel", amount: "12.00", lines: [4] },
+            { description: "Mallet", amount: "8.00", lines: [5] },
           ],
         }),
         statement("subtotal", "20.00", [6, 7]),
@@ -407,11 +413,13 @@ test("a column receipt stores every money field it cites", { skip }, async (t) =
   assert.equal(outcome.kind, "receipt");
   assert.equal(outcome.failed, 0, "no corrections at all");
   const stored = await f.stored();
+  // ADM-5g: an item's key follows its evidence, so the list is counted.
   assert.deepEqual(
-    stored.map((row) => row.observation_key).sort(),
+    stored
+      .map((row) => row.observation_key)
+      .filter((key) => !key.startsWith("line_items:"))
+      .sort(),
     [
-      "line_items:0",
-      "line_items:1",
       "payment_last_four",
       "purchase_date",
       "subtotal",
@@ -419,6 +427,11 @@ test("a column receipt stores every money field it cites", { skip }, async (t) =
       "total",
       "vendor",
     ],
+  );
+  assert.equal(
+    stored.filter((row) => row.observation_key.startsWith("line_items:"))
+      .length,
+    2,
   );
   assert.equal(
     stored.find((row) => row.observation_key === "total").value.amount,
@@ -444,8 +457,8 @@ test("a pipe-rendered table receipt reads the same way", { skip }, async (t) => 
         statement("purchase_date", "09/18/26", [2]),
         statement("line_items", null, [4, 5], {
           line_items: [
-            { description: "Chisel", amount: "12.00" },
-            { description: "Mallet", amount: "8.00" },
+            { description: "Chisel", amount: "12.00", lines: [4] },
+            { description: "Mallet", amount: "8.00", lines: [5] },
           ],
         }),
         statement("subtotal", "20.00", [6]),
@@ -473,8 +486,8 @@ test("OCR artifacts and a foreign decimal still read", { skip }, async (t) => {
         statement("invoice_date", "9 Apr 2026", [3]),
         statement("line_items", null, [4, 5], {
           line_items: [
-            { description: "Planing", amount: "120.00" },
-            { description: "Fitting", amount: "45.00" },
+            { description: "Planing", amount: "120.00", lines: [4] },
+            { description: "Fitting", amount: "45.00", lines: [5] },
           ],
         }),
         statement("subtotal", "$ 165 .00", [6]),
@@ -708,8 +721,18 @@ test("an ambiguous printed date waits for the kind to say which order", { skip }
     { field_name: "purchase_date", reason: "date_ambiguous" },
   ]);
   assert.deepEqual(
-    (await f.stored()).map((row) => row.observation_key).sort(),
-    ["total", "vendor"],
+    (await f.stored())
+      .map((row) => row.observation_key)
+      .filter((key) => !key.startsWith("line_items:"))
+      .sort(),
+    ["total", "vendor"].sort(),
+  );
+  // ADM-5g: an item's key follows its evidence, so the list is counted.
+  assert.equal(
+    (await f.stored()).filter((row) =>
+      row.observation_key.startsWith("line_items:"),
+    ).length,
+    0,
   );
 
   // The kind says month-first, so it reads. Same data home as the model knob.
@@ -936,8 +959,18 @@ test("a single-page document at ordinal 0 reads through line citations", { skip 
   );
   assert.equal(outcome.failed, 0);
   assert.deepEqual(
-    (await f.stored()).map((row) => row.observation_key).sort(),
-    ["purchase_date", "total", "vendor"],
+    (await f.stored())
+      .map((row) => row.observation_key)
+      .filter((key) => !key.startsWith("line_items:"))
+      .sort(),
+    ["purchase_date", "total", "vendor"].sort(),
+  );
+  // ADM-5g: an item's key follows its evidence, so the list is counted.
+  assert.equal(
+    (await f.stored()).filter((row) =>
+      row.observation_key.startsWith("line_items:"),
+    ).length,
+    0,
   );
   assert.deepEqual(await f.corrections(), []);
 });
@@ -973,8 +1006,18 @@ test("sparse 0-based ordinals and a blank page number from one", { skip }, async
 
   assert.equal(outcome.failed, 0);
   assert.deepEqual(
-    (await f.stored()).map((row) => row.observation_key).sort(),
-    ["invoice_date", "invoice_number", "total", "vendor"],
+    (await f.stored())
+      .map((row) => row.observation_key)
+      .filter((key) => !key.startsWith("line_items:"))
+      .sort(),
+    ["invoice_date", "invoice_number", "total", "vendor"].sort(),
+  );
+  // ADM-5g: an item's key follows its evidence, so the list is counted.
+  assert.equal(
+    (await f.stored()).filter((row) =>
+      row.observation_key.startsWith("line_items:"),
+    ).length,
+    0,
   );
   // The spans point at the real page rows, ordinals and all.
   const spans = await f.rows(
@@ -1084,10 +1127,12 @@ test("a column receipt stores its money fields from far-apart lines", { skip }, 
         // may span.
         statement("vendor", "BRACKEN TOOLS LTD.", [1, 2]),
         statement("purchase_date", "09/18/26 14:32", [4]),
+        // Each item cites the line with its description and the line with
+        // its amount: on this receipt they are different lines.
         statement("line_items", null, [6, 8], {
           line_items: [
-            { description: "Chisel", amount: "12.00" },
-            { description: "Mallet", amount: "8.00" },
+            { description: "Chisel", amount: "12.00", lines: [5, 6] },
+            { description: "Mallet", amount: "8.00", lines: [7, 8] },
           ],
         }),
         // Label and amount, five lines apart. Every one of these was
@@ -1101,16 +1146,18 @@ test("a column receipt stores its money fields from far-apart lines", { skip }, 
   );
   assert.equal(outcome.failed, 0, "no corrections");
   assert.deepEqual(
-    (await f.stored()).map((row) => row.observation_key).sort(),
-    [
-      "line_items:0",
-      "line_items:1",
-      "purchase_date",
-      "subtotal",
-      "tax",
-      "total",
-      "vendor",
-    ],
+    (await f.stored())
+      .map((row) => row.observation_key)
+      .filter((key) => !key.startsWith("line_items:"))
+      .sort(),
+    ["purchase_date", "subtotal", "tax", "total", "vendor"].sort(),
+  );
+  // ADM-5g: an item's key follows its evidence, so the list is counted.
+  assert.equal(
+    (await f.stored()).filter((row) =>
+      row.observation_key.startsWith("line_items:"),
+    ).length,
+    2,
   );
   const stored = await f.stored();
   assert.equal(
@@ -1372,6 +1419,82 @@ test("a long line is never cut through a number or a date", () => {
   }
 });
 
+test("a cut edge is unknown, so no piece offers what the line does not", () => {
+  // ADM-5g round five. The fourth review cut `...$2.5 million` down to
+  // `$2.5`, `( 1,234 )` down to `( 1,234` and `45.00 CR` down to `45.00`, and
+  // each survivor was then shown to the model as a line of its own, cited in
+  // good faith, and stored as a number the page never printed -- the 10^6,
+  // sign-flip and lost-parenthesis errors, arriving through the splitter
+  // rather than through the finder.
+  //
+  // Two things close it, and the test checks both at once. The splitter no
+  // longer cuts beside a digit, a currency mark, a parenthesis, a sign, a
+  // magnitude word or a `CR`; and where it does cut, the piece carries
+  // `cutStart`/`cutEnd`, which makes the amount finder treat the edge as
+  // unknown and refuse anything touching it. The invariant is the same one
+  // the oracle fuzzer asserts: **no piece may offer a value the whole line
+  // does not.**
+  const tails = [
+    "$2.5 million",
+    "$2.5  million",
+    "$2.5 M",
+    "( 1,234 )",
+    "(1,234)",
+    "45.00 CR",
+    "$1 000 000",
+    "1,234.56",
+    "12.99T",
+    "$2.5M",
+    "(1,234.56) CR",
+    "USD 13.20",
+    "13.20 USD",
+    "-$42.00",
+    "250.00-",
+  ];
+  for (const tail of tails) {
+    const whole = new Set(amountsInText(`Consulting services ${tail} paid`));
+    // Every offset around the 240-character bound, so the cut lands before,
+    // inside and after the amount in turn.
+    for (let pad = 180; pad < 300; pad += 1) {
+      const line = `${"word ".repeat(Math.ceil(pad / 5)).slice(0, pad)}${tail} paid`;
+      const pieces = pageLines(line);
+      assert.equal(
+        pieces.map((piece) => piece.text).join(""),
+        line,
+        `${tail} at ${pad}: exact cover`,
+      );
+      for (const piece of pieces) {
+        assert.equal(line.slice(piece.start, piece.end), piece.text);
+        const offered = amountsInText(piece.text, {
+          cutStart: piece.cutStart,
+          cutEnd: piece.cutEnd,
+        });
+        for (const value of offered) {
+          assert.ok(
+            whole.has(value),
+            `${JSON.stringify(tail)} at ${pad}: piece ${JSON.stringify(piece.text.slice(-40))} offered ${value}, which the line does not print (${[...whole].join(", ") || "nothing"})`,
+          );
+        }
+      }
+    }
+  }
+});
+
+test("a cut edge refuses the amount that touches it", () => {
+  // The rule on its own, without the splitter: the same text, read once as a
+  // whole line and once as a piece with an unknown edge.
+  assert.deepEqual(amountsInText("Fund size $2.5"), ["2.5"]);
+  assert.deepEqual(amountsInText("Fund size $2.5", { cutEnd: true }), []);
+  assert.deepEqual(amountsInText("$2.5 mill", { cutEnd: true }), []);
+  assert.deepEqual(amountsInText("55390.", { cutEnd: true }), []);
+  assert.deepEqual(amountsInText("12:", { cutEnd: true }), []);
+  assert.deepEqual(amountsInText("1,234 total", { cutStart: true }), []);
+  // A cut on the other side leaves the amount alone.
+  assert.deepEqual(amountsInText("Fund size $2.5", { cutStart: true }), ["2.5"]);
+  // And a real line edge is not a cut.
+  assert.deepEqual(amountsInText("total 1,234"), ["1234"]);
+});
+
 test("a value cut in half cannot be stored", { skip }, async (t) => {
   const f = await fixture(t);
   const page = [
@@ -1527,4 +1650,485 @@ test("the diagnostic survives a correction with a scalar reading", { skip }, asy
   // still say the document prints it.
   assert.equal(failure.onCitedPage, false);
   assert.equal(failure.onOtherPage, true);
+});
+
+// ---------------------------------------------------------------------------
+// Line items, entry by entry (ADM-5g).
+//
+// With a strong model the remaining failures on the owner's documents were
+// both line items: a whole list refused because one entry was garbled, an
+// amount that arrived as "1299" for a printed 12.99, and an amount carrying a
+// tax letter. Each entry is now gated on its own citation and stored on its
+// own.
+// ---------------------------------------------------------------------------
+
+/** A receipt whose items print their description and amount on separate
+ * lines, one description wrapping onto a second line, and one amount
+ * carrying a tax flag. */
+const ITEMISED_RECEIPT = [
+  "BRACKEN TOOLS",          // 1
+  "09/18/26",               // 2
+  "Chisel",                 // 3
+  "12.99 T",                // 4
+  "Mallet, rubber faced",   // 5
+  "two pound",              // 6
+  "8.00",                   // 7
+  "Screws box of 100",      // 8
+  "4.25",                   // 9
+  "Total",                  // 10
+  "25.24",                  // 11
+].join("\n");
+
+test("each line item stores on its own citation", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-itemised");
+  await f.client.query(
+    `UPDATE kith.document_types
+        SET examples = '[{"setting":"date_order","value":"MDY"}]'::jsonb
+      WHERE space_id = $1 AND kind = 'receipt'`,
+    [f.spaceId],
+  );
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS", [1]),
+        statement("purchase_date", "09/18/26", [2]),
+        statement("line_items", null, [3, 4], {
+          line_items: [
+            // Description and amount on different lines.
+            { description: "Chisel", amount: "12.99 T", lines: [3, 4] },
+            // A description wrapped over two adjacent lines.
+            {
+              description: "Mallet, rubber faced two pound",
+              amount: "8.00",
+              lines: [5, 6, 7],
+            },
+            { description: "Screws box of 100", amount: "4.25", lines: [8, 9] },
+          ],
+        }),
+        statement("total", "25.24", [10, 11]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.failed, 0, "no corrections");
+  const stored = await f.stored();
+  // ADM-5g: an item's key follows its evidence, so the list is counted.
+  assert.deepEqual(
+    stored
+      .map((row) => row.observation_key)
+      .filter((key) => !key.startsWith("line_items:"))
+      .sort(),
+    ["purchase_date", "total", "vendor"],
+  );
+  assert.equal(
+    stored.filter((row) => row.observation_key.startsWith("line_items:"))
+      .length,
+    3,
+  );
+  // The tax letter is a flag, not a digit.
+  assert.deepEqual(
+    stored
+      .filter((row) => row.observation_key.startsWith("line_items:"))
+      .map((row) => row.value.amount),
+    ["12.99", "8", "4.25"],
+  );
+  // Each item's span is the line that prints its own amount, so three
+  // different spans.
+  const spans = await f.rows(
+    `SELECT DISTINCT s."start" FROM kith.observations o
+       JOIN kith.evidence_spans s ON s.id = (o.value_evidence->>0)
+      WHERE o.space_id = $1 AND o.observation_type = 'line_items'`,
+    [f.spaceId],
+  );
+  assert.equal(spans.length, 3);
+});
+
+test("a bad entry is one entry, and the rest still store", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-partial-items");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("line_items", null, [3, 4], {
+          line_items: [
+            { description: "Chisel", amount: "12.99 T", lines: [3, 4] },
+            // The decimal point dropped: 1299 is not what line 4 prints.
+            { description: "Mallet, rubber faced", amount: "1299", lines: [5, 7] },
+            { description: "Screws box of 100", amount: "4.25", lines: [8, 9] },
+          ],
+        }),
+      ],
+    }),
+    ids,
+  );
+  // Two of three stored, and one row saying one is missing.
+  assert.equal(outcome.stored, 2);
+  assert.deepEqual(
+    (await f.stored()).map((row) => row.value.amount),
+    ["12.99", "4.25"],
+  );
+  const corrections = await f.rows(
+    "SELECT reason, original_value FROM kith.corrections WHERE space_id = $1",
+    [f.spaceId],
+  );
+  assert.equal(corrections.length, 1);
+  assert.equal(corrections[0].reason, "line_items_partial");
+  // Counts only: which entries failed is the diagnostic's business.
+  assert.equal(corrections[0].original_value.value.failedItems, 1);
+  assert.equal(corrections[0].original_value.value.totalItems, 3);
+  // The shape of the entry that failed, folded: enough to see the decimal
+  // point is missing, and not enough to read the receipt.
+  assert.deepEqual(corrections[0].original_value.value.failedShapes, [
+    {
+      amount: "9999",
+      description: "aaaaaa, aaaaaa aaaaa",
+      lines: [5, 7],
+      reason: "value_not_in_quote",
+    },
+  ]);
+  // A partial list is never compared against a stated total, which would
+  // raise a mismatch that says nothing.
+  assert.equal(
+    (
+      await f.rows(
+        "SELECT id FROM kith.corrections WHERE space_id = $1 AND reason = 'line_items_mismatch'",
+        [f.spaceId],
+      )
+    ).length,
+    0,
+  );
+});
+
+test("a statement that cites nothing says so by name", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-no-citation");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        { field: "total", value: "25.24", page: 1, lines: [] },
+        statement("vendor", "BRACKEN TOOLS", [1]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  // Its own reason: "the model forgot to cite" is not "the quote is not on
+  // the page", and the counts have to separate them.
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "total", reason: "citation_missing" },
+  ]);
+});
+
+test("the diagnostic shows each entry's amount and description apart", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-item-signatures");
+  await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("line_items", null, [3, 4], {
+          line_items: [
+            { description: "Chisel", amount: "1299", lines: [3, 4] },
+            { description: "Mallet", amount: "8.00", lines: [5, 7] },
+          ],
+        }),
+      ],
+    }),
+    ids,
+  );
+  const summary = await withKithTransaction(f.pool, (client) =>
+    diagnoseExtractions(client, { kind: "receipt", limit: 5 }),
+  );
+  const failure = summary.documents[0].failures.find(
+    (entry) => entry.field === "line_items",
+  );
+  assert.ok(failure);
+  // The whole-list signature reads as one run of folded JSON. Split out, the
+  // missing decimal point is visible at a glance.
+  assert.deepEqual(failure.itemSignatures, [
+    {
+      amount: "9999",
+      description: "aaaaaa",
+      lines: [3, 4],
+      reason: "value_not_in_quote",
+    },
+  ]);
+  // And still nothing the document says.
+  const printed = JSON.stringify(summary);
+  for (const secret of ["BRACKEN", "Chisel", "Mallet", "Screws"]) {
+    assert.equal(printed.includes(secret), false, secret);
+  }
+});
+
+test("an item with no lines of its own needs an unambiguous statement", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-item-fallback");
+  // Line 3 prints "Chisel", line 4 prints "12.99 T". An entry with no lines
+  // of its own, under a statement citing both, used to take the whole
+  // citation -- which is how a description on one line paired with a
+  // different item's amount on another.
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("line_items", null, [3, 4], {
+          line_items: [{ description: "Chisel", amount: "12.99", lines: [] }],
+        }),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 0);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "line_items", reason: "value_not_in_quote" },
+  ]);
+
+  // A statement naming exactly one line leaves no ambiguity, so the entry may
+  // still lean on it.
+  const single = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("line_items", null, [9], {
+          line_items: [
+            { description: "Screws box of 100", amount: "4.25", lines: [] },
+          ],
+        }),
+      ],
+    }),
+    ids,
+    NOW + 3_000,
+  );
+  assert.equal(single.stored, 0, "line 9 prints the amount but not the words");
+  const named = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("line_items", null, [8], {
+          line_items: [
+            { description: "Screws box of 100", amount: "4.25", lines: [8, 9] },
+          ],
+        }),
+      ],
+    }),
+    ids,
+    NOW + 4_000,
+  );
+  assert.equal(named.stored, 1);
+});
+
+test("an item's key follows its evidence, not its position", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-stable-keys");
+  const three = [
+    { description: "Chisel", amount: "12.99 T", lines: [3, 4] },
+    { description: "Mallet, rubber faced", amount: "8.00", lines: [5, 7] },
+    { description: "Screws box of 100", amount: "4.25", lines: [8, 9] },
+  ];
+  await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [statement("line_items", null, [3, 4], { line_items: three })],
+    }),
+    ids,
+  );
+  const first = (await f.stored())
+    .filter((row) => row.observation_key.startsWith("line_items:"))
+    .map((row) => [row.observation_key, row.value.amount]);
+  assert.equal(first.length, 3);
+
+  // The model lists the same receipt in a different order, and the first
+  // entry fails. Position-keyed, every later key would shift by one and an
+  // owner's correction on one line would land on another.
+  await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("line_items", null, [3, 4], {
+          line_items: [
+            { description: "Chisel", amount: "1299", lines: [3, 4] },
+            three[2],
+            three[1],
+          ],
+        }),
+      ],
+    }),
+    ids,
+    NOW + 3_000,
+  );
+  const second = (await f.stored())
+    .filter((row) => row.observation_key.startsWith("line_items:"))
+    .map((row) => [row.observation_key, row.value.amount]);
+  assert.equal(second.length, 2);
+  // Each surviving key still carries the amount it carried before.
+  for (const [key, amount] of second) {
+    const before = first.find((entry) => entry[0] === key);
+    assert.ok(before, `${key} kept its key across a reorder`);
+    assert.equal(before[1], amount);
+  }
+});
+
+test("a one-item list still keys by evidence", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-one-item");
+  await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("line_items", null, [3, 4], {
+          line_items: [
+            { description: "Chisel", amount: "12.99 T", lines: [3, 4] },
+          ],
+        }),
+      ],
+    }),
+    ids,
+  );
+  const [only] = await f.stored();
+  // Not the bare field name: a list keyed `line_items` today orphans the
+  // owner's correction the moment next week's receipt has two lines.
+  assert.match(only.observation_key, /^line_items:\d+-[a-z0-9]+-\d+$/);
+});
+
+test("two identical items on one line get their own keys", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(TABLE_RECEIPT, "synthetic-twin-items");
+  const page = ["BRACKEN TOOLS", "Chisel 5.00   Chisel 5.00"].join("\n");
+  await repaginate(f, ids, [[0, page]]);
+  await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("line_items", null, [2], {
+          line_items: [
+            { description: "Chisel", amount: "5.00", lines: [2] },
+            { description: "Chisel", amount: "5.00", lines: [2] },
+          ],
+        }),
+      ],
+    }),
+    ids,
+  );
+  const stored = await f.stored();
+  assert.equal(stored.length, 2);
+  // Same line, same words, same amount -- and still two keys, or correcting
+  // one would correct both.
+  assert.notEqual(stored[0].observation_key, stored[1].observation_key);
+});
+
+test("a correction with no line left to land on is not duplicated", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-orphan-correction");
+  // The same item is printed twice on this receipt -- once in the body and
+  // once in a summary block -- so two different lines are an equally correct
+  // citation for it.
+  const page = [
+    "BRACKEN TOOLS", // 1
+    "Chisel 12.99", // 2
+    "SUMMARY", // 3
+    "Chisel 12.99", // 4
+  ].join("\n");
+  await repaginate(f, ids, [[0, page]]);
+  const reading = (line) => ({
+    kind: "receipt",
+    summary: "Hardware receipt.",
+    statements: [
+      statement("line_items", null, [line], {
+        line_items: [{ description: "Chisel", amount: "12.99", lines: [line] }],
+      }),
+    ],
+  });
+  await f.extract(fakeModel(reading(2)), ids);
+  const [item] = await f.stored();
+  await withKithTransaction(f.pool, (client) =>
+    applyCorrection(client, {
+      spaceId: f.spaceId,
+      sourceItemId: ids.sourceItemId,
+      fieldName: item.observation_key,
+      correctedValue: { type: "money", amount: "13.99", currency: "USD" },
+      actorUserId: f.userId,
+      now: NOW + 3_000,
+    }),
+  );
+  assert.equal((await f.stored())[0].value.amount, "13.99");
+
+  // The next run cites the summary line instead, so the old key matches
+  // nothing. Inserting the corrected value under it would put the item in the
+  // list twice and make every sum over it double count, silently.
+  await f.extract(fakeModel(reading(4)), ids, NOW + 4_000);
+  const after = await f.stored();
+  assert.equal(after.length, 1, "one line item, not two");
+  const orphan = (await f.corrections()).find(
+    (row) => row.reason === "correction_orphaned",
+  );
+  assert.ok(orphan, "the owner is told the correction no longer lands");
+  // ADM-5g: keyed on the list field, not on the line key. A line key carries
+  // the evidence hash of the line the run cited, so an item keyed on it comes
+  // back under a new id on every run and a dismissal never holds.
+  assert.equal(orphan.field_name, "line_items");
+  assert.equal(
+    (await f.corrections()).filter(
+      (row) => row.reason === "correction_orphaned",
+    ).length,
+    1,
+  );
+});
+
+test("a correction that lands on nothing says so as it is made", { skip }, async (t) => {
+  // ADM-5g: the same orphan, one step earlier. `applyCorrection` writes the
+  // row and pushes the value through to the observation; when the key names
+  // no observation, the push returns -1 and used to be discarded. The screen
+  // then showed `resolved` while `sum_money` and `latest_observation` never
+  // saw the owner's number -- the two halves of the store disagreeing about
+  // the same fact, which is what the write-through exists to prevent.
+  const f = await fixture(t);
+  const ids = await f.ingest(ITEMISED_RECEIPT, "synthetic-orphan-on-apply");
+  const page = ["BRACKEN TOOLS", "Chisel 12.99"].join("\n");
+  await repaginate(f, ids, [[0, page]]);
+  await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("line_items", null, [2], {
+          line_items: [{ description: "Chisel", amount: "12.99", lines: [2] }],
+        }),
+      ],
+    }),
+    ids,
+  );
+  const stale = "line_items:9-0000000-0";
+  await withKithTransaction(f.pool, (client) =>
+    applyCorrection(client, {
+      spaceId: f.spaceId,
+      sourceItemId: ids.sourceItemId,
+      fieldName: stale,
+      correctedValue: { type: "money", amount: "13.99", currency: "USD" },
+      actorUserId: f.userId,
+      now: NOW + 3_000,
+    }),
+  );
+  // The item the run did store is untouched: a correction that lands nowhere
+  // must not land on a neighbour.
+  assert.equal((await f.stored())[0].value.amount, "12.99");
+  const orphan = (await f.corrections()).find(
+    (row) => row.reason === "correction_orphaned",
+  );
+  assert.ok(orphan, "the owner is told the correction never reached the sum");
+  assert.equal(orphan.field_name, "line_items");
 });

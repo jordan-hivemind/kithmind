@@ -345,10 +345,18 @@ test("the schema makes the field name unrepresentable when absent", { skip }, as
     "line_items",
   ]);
   // ADM-5e: both count from 1, and the schema says so.
-  assert.deepEqual(statement.properties.lines, {
-    type: "array",
-    items: { type: "integer", minimum: 1 },
+  assert.equal(statement.properties.lines.minItems, 1);
+  assert.deepEqual(statement.properties.lines.items, {
+    type: "integer",
+    minimum: 1,
   });
+  // ADM-5g: each list entry carries its own citation and states its amount
+  // format, because entries sit on different lines and a model that drops the
+  // decimal point loses every one of them.
+  const item = statement.properties.line_items.items;
+  assert.deepEqual(item.required, ["description", "amount", "lines"]);
+  assert.equal(item.properties.lines.minItems, 1);
+  assert.match(item.properties.amount.description, /12\.99.*1299/);
   assert.deepEqual(statement.properties.page, {
     type: "integer",
     minimum: 1,
@@ -356,10 +364,7 @@ test("the schema makes the field name unrepresentable when absent", { skip }, as
   assert.equal(statement.additionalProperties, false);
   assert.ok(statement.properties.field.enum.includes("vendor"));
   assert.deepEqual(statement.properties.line_items.type, ["array", "null"]);
-  assert.deepEqual(
-    statement.properties.line_items.items.required,
-    ["description", "amount"],
-  );
+
   // And the prompt says the same thing in words, for an endpoint that honours
   // no schema.
   const built = buildRequest({
@@ -395,16 +400,23 @@ for (const [kind, text, external] of [
         ORDER BY observation_key`,
       [f.spaceId],
     );
+    // ADM-5g: an item's key follows its evidence, so the list is counted.
     assert.deepEqual(
-      stored.map((row) => row.observation_key).sort(),
+      stored
+        .map((row) => row.observation_key)
+        .filter((key) => !key.startsWith("line_items:"))
+        .sort(),
       [
-        "line_items:0",
-        "line_items:1",
         kind === "receipt" ? "purchase_date" : "invoice_date",
         "subtotal",
         "total",
         "vendor",
       ].sort(),
+    );
+    assert.equal(
+      stored.filter((row) => row.observation_key.startsWith("line_items:"))
+        .length,
+      2,
     );
     assert.equal(
       stored.find((row) => row.observation_key === "vendor").value.value,
