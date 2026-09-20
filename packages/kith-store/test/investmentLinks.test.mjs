@@ -1801,6 +1801,133 @@ test("a notice and the wire that paid it can both be confirmed", { skip }, async
   await consistent(base.ctx);
 });
 
+/** Every link on the entry, and the state of the entry itself, as one
+ * comparable snapshot. What a re-evaluation must not change. */
+async function settlement(base) {
+  const links = await linksFor(base, { entryIds: [base.entryId] });
+  const entry = await entryRow(base);
+  return {
+    links: links
+      .map((link) => `${link.sourceItemId}:${link.state}:${link.decidedBy}`)
+      .sort(),
+    entryDate: entry.entryDate,
+    dateIsEstimated: entry.dateIsEstimated,
+    documentId: entry.documentId,
+    corrections: (await dateCorrections(base)).length,
+  };
+}
+
+test("a document the owner has settled beside is not demoted by its own neighbour", { skip }, async (t) => {
+  // The shape this exists for: a capital call notice auto-links and moves the
+  // estimated date; the wire confirmation for the SAME payment is offered and
+  // the owner confirms it. Re-evaluating the notice then saw the wire as "a
+  // live link from another document", refused its own auto-link as
+  // `entry_already_linked`, and the sweep demoted it -- taking the date back
+  // to the guess, moving the mirror to the wire and writing two more
+  // correction rows, all for a document nobody had said anything about.
+  const base = await estimatedCallFixture(t);
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  const wire = await seedWire(base);
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: wire.sourceItemId,
+  });
+  const [offered] = await linksFor(base, { sourceItemId: wire.sourceItemId });
+  await confirmInvestmentDocumentLink(base.ctx, {
+    principal: base.principal,
+    linkId: offered.id,
+  });
+
+  const settled = await settlement(base);
+  assert.deepEqual(settled.links, [
+    `${base.document.sourceItemId}:auto_linked:rule`,
+    `${wire.sourceItemId}:confirmed:owner`,
+  ]);
+  assert.equal(settled.entryDate, "2026-03-12");
+  assert.equal(settled.dateIsEstimated, false);
+  assert.equal(settled.documentId, base.document.documentId);
+  assert.equal(settled.corrections, 1);
+
+  // Both orders, twice. A sweep is not a one-shot: it runs nightly, and
+  // "stable" has to mean stable.
+  for (const order of [
+    [base.document.sourceItemId, wire.sourceItemId],
+    [wire.sourceItemId, base.document.sourceItemId],
+  ]) {
+    for (let run = 0; run < 2; run += 1) {
+      for (const sourceItemId of order) {
+        await evaluateDocumentLinks(base.ctx, {
+          spaceId: base.spaceId,
+          sourceItemId,
+        });
+      }
+      assert.deepEqual(
+        await settlement(base),
+        settled,
+        `re-evaluation changed something on run ${run} of ${order.join(",")}`,
+      );
+    }
+  }
+  await consistent(base.ctx);
+});
+
+test("the same holds when the wire arrives first and the notice second", { skip }, async (t) => {
+  const base = await fixture(t);
+  const investmentId = await createInvestment(base.ctx, {
+    principal: base.principal,
+    spaceId: base.spaceId,
+    name: "Synthetic Growth Partners III",
+  });
+  const entry = await createInvestmentEntry(base.ctx, {
+    principal: base.principal,
+    investmentId,
+    entryType: "capital_call_paid",
+    entryDate: "2026-03-10",
+    amount: "25000.00",
+    dateIsEstimated: true,
+  });
+  const scoped = { ...base, investmentId, entryId: entry.id };
+  const wire = await seedWire(scoped);
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: wire.sourceItemId,
+  });
+  const notice = await seedDocument(base.ctx, base.spaceId, {
+    kind: "capital_call_notice",
+    statements: [
+      org("fund", "Synthetic Growth Partners III"),
+      money("amount_called", "25000.00"),
+      date("due_date", "2026-03-12"),
+    ],
+  });
+  await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: notice.sourceItemId,
+  });
+  const [offered] = await linksFor(scoped, { sourceItemId: notice.sourceItemId });
+  assert.equal(offered.state, "suggested", "the second document is offered");
+  await confirmInvestmentDocumentLink(base.ctx, {
+    principal: base.principal,
+    linkId: offered.id,
+  });
+
+  const withEntry = { ...scoped, document: wire };
+  const settled = await settlement(withEntry);
+  assert.equal(settled.entryDate, "2026-03-11", "the wire dated it, being first");
+  assert.equal(settled.documentId, wire.documentId);
+
+  for (let run = 0; run < 2; run += 1) {
+    for (const sourceItemId of [wire.sourceItemId, notice.sourceItemId]) {
+      await evaluateDocumentLinks(base.ctx, { spaceId: base.spaceId, sourceItemId });
+    }
+    assert.deepEqual(await settlement(withEntry), settled, `run ${run}`);
+  }
+  await consistent(base.ctx);
+});
+
 test("rejecting the primary promotes the next live link and re-runs the date rule", { skip }, async (t) => {
   const base = await estimatedCallFixture(t);
   await evaluateDocumentLinks(base.ctx, {

@@ -324,6 +324,17 @@ when they differ from the values it was OPENED with (`entryPatchFields` in
 `apps/web/src/lib/kith/investment-entry-patch.ts`), never from the live row,
 which is the version that moves.
 
+**A document is not blocked by a neighbour that arrived after it.** An entry
+counts as already spoken for, and so refuses this document's auto-link, only
+when it carries a live link from ANOTHER document and this document holds no
+live link on it. Without the second half, confirming the wire beside an
+auto-linked notice made the next re-evaluation of the NOTICE read the wire as
+"this entry is taken": it refused its own auto-link, the sweep below demoted
+it, and the date went back to the guess with the mirror on the wire. Stated
+generally: a re-evaluation must never demote a row whose only disqualifier is
+another live link on the same entry that arrived after it, and a live row of
+the document's own is the proof that it did not.
+
 **A rule's auto-link is the rule's to take back.** When a rule-made
 `auto_linked` row stops qualifying -- a second identical entry appears, the
 document's party or amount is corrected, the document now names no investment

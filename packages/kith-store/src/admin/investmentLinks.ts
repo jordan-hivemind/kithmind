@@ -592,17 +592,39 @@ export async function evaluateDocumentLinks(
   // the date goes back. `matchedNothing` only changes what is reported.
   const matchedNothing = matched.length === 0 && entryRecords.length === 0;
 
-  // Which candidate entries already carry a live link from ANOTHER document.
-  // From another: re-evaluating the same document must keep its own auto-link
-  // rather than read it as "this entry is taken" and downgrade it.
+  // Which candidate entries are SPOKEN FOR as far as this document is
+  // concerned: they carry a live link from another document, and this
+  // document holds no live link on them itself.
+  //
+  // That second half is the whole subtlety, and leaving it out cost a date.
+  // An entry may carry several live links now -- a capital call notice and
+  // the wire confirmation that paid it. Once the owner confirms the wire, a
+  // re-evaluation of the NOTICE saw "a live link from another document",
+  // refused its own auto-link as `entry_already_linked`, and the sweep
+  // demoted the notice for it: the date went back to the guess, the mirror
+  // jumped to the wire, and two correction rows recorded a change nobody had
+  // asked for.
+  //
+  // The rule, stated generally: a re-evaluation must never demote a row whose
+  // only disqualifier is another live link on the same entry that arrived
+  // AFTER it. A live row of this document's own IS that proof of arriving
+  // first -- it can only exist because it once qualified -- so its presence
+  // is what takes the entry out of this set. A document with no live row here
+  // is still refused, which is what keeps a second document from auto-linking
+  // onto an entry the owner has not spoken about.
   const entryIds = entryRecords.map((record) => record.id);
   const liveElsewhere = new Set<string>();
   if (entryIds.length > 0) {
     const live = await rows<{ entry_id: string }>(
       ctx,
-      `SELECT entry_id FROM kith.investment_document_links
-        WHERE space_id = $1 AND entry_id = ANY($2::text[])
-          AND state = ANY($3::text[]) AND source_item_id <> $4`,
+      `SELECT l.entry_id FROM kith.investment_document_links l
+        WHERE l.space_id = $1 AND l.entry_id = ANY($2::text[])
+          AND l.state = ANY($3::text[]) AND l.source_item_id <> $4
+          AND NOT EXISTS (
+            SELECT 1 FROM kith.investment_document_links mine
+             WHERE mine.space_id = l.space_id AND mine.entry_id = l.entry_id
+               AND mine.source_item_id = $4
+               AND mine.state = ANY($3::text[]))`,
       [spaceId, entryIds, [...LIVE_STATES], sourceItemId],
     );
     for (const record of live) liveElsewhere.add(record.entry_id);
@@ -615,14 +637,21 @@ export async function evaluateDocumentLinks(
     // these as real links; this is the belt for the window before it runs.
     const attached = await rows<{ id: string }>(
       ctx,
+      // `d.source_item_id IS DISTINCT FROM $3` for the same reason as above:
+      // an entry whose unlinked mirror is THIS document is not an entry this
+      // document is about to take from someone else.
       `SELECT e.id FROM kith.investment_entries e
         WHERE e.space_id = $1 AND e.id = ANY($2::text[])
           AND e.document_id IS NOT NULL
           AND NOT EXISTS (
             SELECT 1 FROM kith.investment_document_links l
              WHERE l.space_id = e.space_id AND l.entry_id = e.id
-               AND l.document_id = e.document_id)`,
-      [spaceId, entryIds],
+               AND l.document_id = e.document_id)
+          AND NOT EXISTS (
+            SELECT 1 FROM kith.documents d
+             WHERE d.id = e.document_id AND d.space_id = e.space_id
+               AND d.source_item_id = $3)`,
+      [spaceId, entryIds, sourceItemId],
     );
     for (const record of attached) liveElsewhere.add(record.id);
   }

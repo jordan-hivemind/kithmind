@@ -316,6 +316,12 @@ ALTER TABLE kith.corrections
 -- `source_item_id` is the link's durable identity and there is nothing
 -- truthful to put in it. The count of those rows is raised below rather than
 -- guessed at from a comment.
+--
+-- The `record_change` trigger is created above, before this statement, so
+-- each adopted link writes one row to `kith.changes`. That is deliberate and
+-- wanted: it is a handful of rows for the owner's few dozen attachments, the
+-- prune sweep clears them on its own schedule, and it means an admin screen
+-- open while the backfill runs shows the adopted links without a refresh.
 INSERT INTO kith.investment_document_links
   (id, space_id, created_at, investment_id, entry_id, document_id,
    source_item_id, state, score, signals, evidence, decided_by, decided_at,
