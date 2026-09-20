@@ -114,20 +114,23 @@ function href(view: BrowseView, historical: boolean, type = ""): string {
   return `/browse?${params.toString()}`;
 }
 
-/** Square segmented links: the current one filled blue. */
+/** Segmented links select the current inventory without adding a second toolbar. */
 function Segment({
   options,
 }: {
   options: readonly { href: string; label: string; active: boolean }[];
 }) {
   return (
-    <div className="flex rounded-tag border border-gray-300 text-xs">
+    <nav
+      aria-label="Browse view"
+      className="flex rounded-control border border-kith-border-subtle text-sm"
+    >
       {options.map((option) => (
         <Link
           key={option.label}
           href={option.href}
           aria-current={option.active ? "page" : undefined}
-          className={`px-3 py-1 focus-visible:outline-2 focus-visible:outline-accent-600 ${
+          className={`px-3 py-1.5 focus-visible:outline-2 focus-visible:outline-accent-600 ${
             option.active
               ? "bg-accent-600 text-white"
               : "bg-white text-gray-700 hover:bg-gray-50"
@@ -136,7 +139,7 @@ function Segment({
           {option.label}
         </Link>
       ))}
-    </div>
+    </nav>
   );
 }
 
@@ -208,20 +211,41 @@ function FactsTable({
         id: "statement",
         accessorKey: "statement",
         header: "Fact",
+        size: 420,
+        minSize: 240,
         cell: ({ row }) => (
           <span
-            className={row.original.status === "current" ? "" : "text-gray-500"}
+            title={row.original.statement}
+            className={`block truncate ${
+              row.original.status === "current" ? "" : "text-gray-500"
+            }`}
           >
             {row.original.statement}
           </span>
         ),
       },
-      { id: "subject", accessorKey: "subject", header: "Subject" },
-      { id: "predicate", accessorKey: "predicate", header: "Predicate" },
+      {
+        id: "subject",
+        accessorKey: "subject",
+        header: "Subject",
+        size: 180,
+        minSize: 120,
+        meta: { nowrap: true },
+      },
+      {
+        id: "predicate",
+        accessorKey: "predicate",
+        header: "Predicate",
+        size: 170,
+        minSize: 120,
+        meta: { nowrap: true },
+      },
       {
         id: "status",
         accessorKey: "status",
         header: "Status",
+        size: 90,
+        minSize: 80,
         cell: ({ row }) => (
           <Tag tone={row.original.status === "current" ? "accent" : "neutral"}>
             {row.original.status}
@@ -232,12 +256,16 @@ function FactsTable({
         id: "core",
         accessorKey: "core",
         header: "Core",
+        size: 70,
+        minSize: 60,
         cell: ({ row }) => (row.original.core ? <Tag>core</Tag> : null),
       },
       {
         id: "validFrom",
         accessorKey: "validFrom",
         header: "From",
+        size: 110,
+        minSize: 90,
         meta: { nowrap: true },
         cell: ({ row }) => (
           <span className="text-gray-600 tabular-nums">
@@ -249,6 +277,8 @@ function FactsTable({
         id: "validTo",
         accessorKey: "validTo",
         header: "Until",
+        size: 110,
+        minSize: 90,
         meta: { nowrap: true },
         cell: ({ row }) => (
           <span className="text-gray-600 tabular-nums">
@@ -315,19 +345,17 @@ function FactsTable({
         id="browse-facts"
         data={rows}
         columns={columns}
-        filterColumns={["status", "core", "predicate"]}
+        filterColumns={includeHistorical ? ["status", "core"] : ["core"]}
         initialSorting={[{ id: "subject", desc: false }]}
         actions={actions}
         onRowClick={openEdit}
         searchPlaceholder="Search facts"
         empty="No facts"
         toolbar={
-          <span className="ml-auto">
-            <HistoryToggle
-              on={includeHistorical}
-              to={href("facts", !includeHistorical)}
-            />
-          </span>
+          <HistoryToggle
+            on={includeHistorical}
+            to={href("facts", !includeHistorical)}
+          />
         }
       />
 
@@ -463,76 +491,89 @@ export function KithBrowse({
 
   return (
     <div>
-      <PageHeader title="Browse">
-        <Segment
-          options={[
-            {
-              href: href("facts", includeHistorical),
-              label: "Facts",
-              active: data.view === "facts",
-            },
-            {
-              href: href("thoughts", includeHistorical, type),
-              label: "Thoughts",
-              active: data.view === "thoughts",
-            },
-          ]}
-        />
-      </PageHeader>
+      <PageHeader title="Browse" />
 
-      {data.view === "facts" ? (
-        <FactsTable
-          facts={data.facts}
-          includeHistorical={includeHistorical}
-          onEdit={async (id, value, options) => {
-            await editFact.mutateAsync({ id, value, ...options });
-          }}
-          onRetire={async (id) => {
-            await retireFact.mutateAsync(id);
-          }}
-        />
-      ) : (
-        <KithThoughtSearch
-          key={`${type}-${includeHistorical}`}
-          initialThoughts={data.thoughts}
-          type={type}
-          includeHistorical={includeHistorical}
-          onEdit={async (id, values) => {
-            await editThought.mutateAsync({ id, ...values });
-          }}
-          onDelete={async (id) => {
-            await deleteThought.mutateAsync(id);
-          }}
-          toolbar={
-            <span className="ml-auto flex items-center gap-2">
-              <label htmlFor="thought-type" className="sr-only">
-                Type
-              </label>
-              <select
-                id="thought-type"
-                value={type}
-                onChange={(event) =>
-                  router.push(
-                    href("thoughts", includeHistorical, event.target.value),
-                  )
-                }
-                className={inputClass}
-              >
-                <option value="">All types</option>
-                {THOUGHT_TYPES.map((value) => (
-                  <option key={value} value={value}>
-                    {label(value)}
-                  </option>
-                ))}
-              </select>
-              <HistoryToggle
-                on={includeHistorical}
-                to={href("thoughts", !includeHistorical, type)}
-              />
-            </span>
-          }
-        />
-      )}
+      <section
+        aria-label="Browse inventory"
+        className="kith-tile overflow-hidden"
+      >
+        <div className="kith-tile-header flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+          <Segment
+            options={[
+              {
+                href: href("facts", includeHistorical),
+                label: "Facts",
+                active: data.view === "facts",
+              },
+              {
+                href: href("thoughts", includeHistorical, type),
+                label: "Thoughts",
+                active: data.view === "thoughts",
+              },
+            ]}
+          />
+          <p className="text-meta text-kith-text-secondary" aria-live="polite">
+            {data.view === "facts" ? data.facts.length : data.thoughts.length}{" "}
+            {data.view}
+          </p>
+        </div>
+
+        <div className="p-4">
+          {data.view === "facts" ? (
+            <FactsTable
+              facts={data.facts}
+              includeHistorical={includeHistorical}
+              onEdit={async (id, value, options) => {
+                await editFact.mutateAsync({ id, value, ...options });
+              }}
+              onRetire={async (id) => {
+                await retireFact.mutateAsync(id);
+              }}
+            />
+          ) : (
+            <KithThoughtSearch
+              key={`${type}-${includeHistorical}`}
+              initialThoughts={data.thoughts}
+              type={type}
+              includeHistorical={includeHistorical}
+              onEdit={async (id, values) => {
+                await editThought.mutateAsync({ id, ...values });
+              }}
+              onDelete={async (id) => {
+                await deleteThought.mutateAsync(id);
+              }}
+              toolbar={
+                <div className="flex flex-wrap items-center gap-2">
+                  <label htmlFor="thought-type" className="sr-only">
+                    Thought type
+                  </label>
+                  <select
+                    id="thought-type"
+                    value={type}
+                    onChange={(event) =>
+                      router.push(
+                        href("thoughts", includeHistorical, event.target.value),
+                      )
+                    }
+                    className={inputClass}
+                  >
+                    <option value="">All types</option>
+                    {THOUGHT_TYPES.map((value) => (
+                      <option key={value} value={value}>
+                        {label(value)}
+                      </option>
+                    ))}
+                  </select>
+                  <HistoryToggle
+                    on={includeHistorical}
+                    to={href("thoughts", !includeHistorical, type)}
+                  />
+                </div>
+              }
+            />
+          )}
+        </div>
+      </section>
     </div>
   );
 }

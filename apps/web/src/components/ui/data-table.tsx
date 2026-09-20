@@ -458,7 +458,7 @@ export function DataTable<T>({
             }}
             placeholder={searchPlaceholder}
             aria-label={searchPlaceholder}
-            className="h-8 w-56 rounded-control border border-kith-border-subtle bg-kith-surface px-2.5 text-sm outline-none focus:border-kith-action focus:ring-1 focus:ring-kith-action"
+            className="h-8 w-full rounded-control border border-kith-border-subtle bg-kith-surface px-2.5 text-sm outline-none focus:border-kith-action focus:ring-1 focus:ring-kith-action sm:w-56"
           />
           {chipOptions.map(({ columnId, options }) =>
             options.map((option) => {
@@ -518,10 +518,13 @@ export function DataTable<T>({
           {toolbar}
         </div>
 
-        <div className="overflow-x-auto">
+        <div className="w-full overflow-x-auto">
           <table
-            style={{ width: table.getTotalSize() + kebabWidth + selectWidth }}
-            className="kith-table-text table-fixed border-collapse text-kith-text"
+            style={{
+              width: "100%",
+              minWidth: table.getTotalSize() + kebabWidth + selectWidth,
+            }}
+            className="kith-table-text w-full table-fixed border-collapse text-kith-text"
           >
             <thead>
               {table.getHeaderGroups().map((headerGroup) => (
@@ -606,9 +609,11 @@ export function DataTable<T>({
                 <tr>
                   <td
                     colSpan={table.getAllLeafColumns().length + extraColumns}
-                    className="h-row px-2 text-gray-500"
+                    className="h-36 px-4 text-center align-middle"
                   >
-                    {empty}
+                    <div role="status" className="text-sm text-kith-text-muted">
+                      {empty}
+                    </div>
                   </td>
                 </tr>
               ) : (
@@ -707,7 +712,7 @@ export function DataTable<T>({
                           style={{ width: cell.column.getSize() }}
                           className={`h-row px-2 align-middle ${
                             cell.column.columnDef.meta?.nowrap === true
-                              ? "whitespace-nowrap"
+                              ? "overflow-hidden text-ellipsis whitespace-nowrap"
                               : ""
                           }`}
                         >

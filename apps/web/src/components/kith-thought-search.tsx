@@ -233,7 +233,7 @@ export function KithThoughtSearch({
         id="browse-thoughts"
         data={rows}
         columns={columns}
-        filterColumns={["type"]}
+        filterColumns={[]}
         initialSorting={[{ id: "createdAt", desc: true }]}
         actions={actions}
         onRowClick={openEdit}
