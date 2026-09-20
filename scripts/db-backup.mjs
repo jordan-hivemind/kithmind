@@ -82,7 +82,7 @@ export async function runDbBackup(argv, deps = {}) {
   const loadedVerify = await postgres.loadPostgresVerifyConfig(verifyConfig);
   const stateRunner = deps.stateRunner ?? runWithDatabaseBackupState;
   const clock = deps.clock ?? Date.now;
-  return stateRunner(loaded, async ({ setStage, priorProof, recordProof }) => {
+  return stateRunner(loaded, async ({ setStage, priorProof, recordProof, recordRetention }) => {
     const result = await postgres.runPostgresDatabaseBackup(loaded);
     await setStage("verify");
     // The isolated restore proof runs on a cadence
@@ -93,16 +93,38 @@ export async function runDbBackup(argv, deps = {}) {
     const runRestoreProof =
       proofNow || priorProof.lastProofAt === null ||
       clock() - priorProof.lastProofAt >= everyMs;
-    const verification = await postgres.verifyPostgresBackup(
-      loadedVerify,
-      result,
-      { runRestoreProof },
-    );
+    let verification;
+    try {
+      verification = await postgres.verifyPostgresBackup(
+        loadedVerify,
+        result,
+        { runRestoreProof },
+      );
+    } catch (error) {
+      // Retention (forget/prune) must never run against an unverified
+      // backup: pruning here could age an older, known-good snapshot out on
+      // the strength of a new one that turns out not to verify (BAK-1
+      // review). Record why retention was skipped this run rather than
+      // leaving the field silently unchanged, so a health check reading the
+      // status file can tell "skipped because verify failed" apart from
+      // "not attempted yet".
+      recordRetention({ state: "skipped", code: null, at: clock(), removed: null, kept: null });
+      throw error;
+    }
     if (verification.restore?.status === "passed") {
       const at = clock();
       recordProof({ lastProofAt: at, nextProofDueAt: at + everyMs });
     }
-    return { engine, result, verification };
+    await setStage("retention");
+    const retention = await postgres.runPostgresRetention(loaded);
+    recordRetention({
+      state: retention.status === "passed" ? "ok" : "failed",
+      code: retention.code ?? null,
+      at: clock(),
+      removed: retention.removedCount ?? null,
+      kept: retention.keptCount ?? null,
+    });
+    return { engine, result, verification, retention };
   });
 }
 

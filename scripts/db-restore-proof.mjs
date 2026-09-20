@@ -104,7 +104,13 @@ function parseConfig(value) {
   if (row.version !== 1 || !Number.isSafeInteger(row.timeoutMs) || row.timeoutMs < 1000 || row.timeoutMs > 3_600_000) fail("config_invalid");
   if (optional.includes("scratchDatabase") && typeof row.scratchDatabase !== "boolean") fail("config_invalid");
   for (const key of ["expectedFinanceSchemaVersion", "expectedKithSchemaVersion"]) {
-    if (row[key] !== undefined && (!Number.isSafeInteger(row[key]) || row[key] < 1)) fail("config_invalid");
+    // `!= null` (loose), not `!== undefined`: restorePostgresProof re-parses
+    // its own already-parsed output (main() calls loadRestoreProofConfig
+    // then restorePostgresProof), and the resolved value for an omitted key
+    // is `null`, not an absent key. Strict `undefined` here made every CLI
+    // run whose config omits these now-optional keys fail closed on the
+    // second parse.
+    if (row[key] != null && (!Number.isSafeInteger(row[key]) || row[key] < 1)) fail("config_invalid");
   }
   return {
     version: 1,

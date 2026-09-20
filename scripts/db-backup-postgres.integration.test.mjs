@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 
-import { runPostgresDatabaseBackup, verifyPostgresBackup } from "./db-backup-postgres.mjs";
+import { resticForget, runPostgresDatabaseBackup, runPostgresRetention, verifyPostgresBackup } from "./db-backup-postgres.mjs";
 import { runWithDatabaseBackupState } from "./run-database-backup.mjs";
 import pg from "../packages/kith-store/node_modules/pg/esm/index.mjs";
 import {
@@ -313,32 +313,48 @@ test("a transient export failure is retried with backoff, and the backup still p
   assert.ok(elapsedMs >= 6_500, `expected at least ~7s of backoff, took ${elapsedMs}ms`);
 });
 
-test("a forget failure is reported but does not fail the backup", { skip: !ADMIN }, async (t) => {
+// BAK-1 review row 3: retention is its own step now, run by db-backup.mjs
+// only after verification succeeds -- runPostgresDatabaseBackup no longer
+// touches restic forget/prune at all. These tests call runPostgresRetention
+// directly against a backup this fixture already published, the same way
+// db-backup.mjs would call it post-verification.
+test("a forget failure is reported but does not throw, and does not affect the already-published backup", { skip: !ADMIN }, async (t) => {
   const { root, backupConfig } = await minimalBackupFixture(t);
+  const publish = await runPostgresDatabaseBackup(backupConfig);
+  assert.equal(publish.status, "passed");
   // Delegates every restic subcommand to the real binary except `forget`,
-  // which always fails -- the new snapshot this run publishes must still be
-  // a success regardless.
+  // which always fails.
   const flakyRestic = join(root, "restic-forget-fails.sh");
   await writeFile(
     flakyRestic,
     `#!/bin/sh\nfor a in "$@"; do if [ "$a" = "forget" ]; then echo "synthetic forget failure" >&2; exit 1; fi; done\nexec '${RESTIC}' "$@"\n`,
     { mode: 0o700 },
   );
-  backupConfig.resticBinary = flakyRestic;
-  const result = await runPostgresDatabaseBackup(backupConfig);
-  assert.equal(result.status, "passed");
-  assert.equal(result.retention.status, "failed");
-  assert.equal(typeof result.retention.code, "string");
+  const retention = await runPostgresRetention({ ...backupConfig, resticBinary: flakyRestic });
+  assert.equal(retention.status, "failed");
+  assert.equal(typeof retention.code, "string");
+  // The snapshot the fixture published above is untouched by the failed
+  // forget attempt.
+  const snapshots = JSON.parse(
+    (await execute(RESTIC, [
+      "--repo", backupConfig.resticRepositoryPath,
+      "--password-command", backupConfig.resticPasswordCommand.path,
+      "--no-cache", "--host", backupConfig.host, "--tag", "kith-db",
+      "snapshots", "--json",
+    ])).stdout,
+  );
+  assert.equal(snapshots.length, 1);
 });
 
 test("retention is scoped to this host and the kith-db tag with the configured defaults", { skip: !ADMIN }, async (t) => {
   const { backupConfig } = await minimalBackupFixture(t);
-  const result = await runPostgresDatabaseBackup(backupConfig);
-  assert.equal(result.status, "passed");
-  assert.equal(result.retention.status, "passed");
+  const publish = await runPostgresDatabaseBackup(backupConfig);
+  assert.equal(publish.status, "passed");
+  const retention = await runPostgresRetention(backupConfig);
+  assert.equal(retention.status, "passed");
   // Nothing was old enough to remove yet, but the snapshot this run just
   // published must itself already carry the retention tag going forward.
-  assert.equal(result.retention.removedCount, 0);
+  assert.equal(retention.removedCount, 0);
   const snapshots = JSON.parse(
     (await execute(RESTIC, [
       "--repo", backupConfig.resticRepositoryPath,
@@ -350,4 +366,84 @@ test("retention is scoped to this host and the kith-db tag with the configured d
   assert.equal(snapshots.length, 1);
   assert.deepEqual(snapshots[0].tags.sort(), ["kith-db", backupConfig.operationId].sort());
   assert.equal(snapshots[0].hostname, backupConfig.host);
+});
+
+// BAK-1 review row 1 (HIGH): without `--group-by host`, restic's default
+// `host,paths` grouping put every uniquely-timestamped staging directory's
+// snapshot alone in its own group, so "keep N" trivially kept it and forget
+// removed nothing, ever. This proves the fix against a real repository: 10
+// kith-db-tagged snapshots with distinct paths (mirroring 10 real backup
+// runs' distinct staging directories) and back-dated times, plus one
+// snapshot carrying a different tag standing in for another writer (the
+// pipeline's document archive) sharing the same host and repository.
+test("retention actually removes aged-out snapshots across distinct staging paths, and never touches an untagged snapshot", { skip: !ADMIN }, async (t) => {
+  const root = await mkdtemp(join(homedir(), ".kith-pg-retention-groupby-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repository = join(root, "repository");
+  const passwordCommand = await helper(root, "password.sh", "synthetic-password");
+  await execute(RESTIC, ["--repo", repository, "--password-command", passwordCommand.path, "init"]);
+  const host = "kith-db-groupby-test";
+  const baseline = new Date("2026-01-01T00:00:00Z").getTime();
+  const dayMs = 24 * 60 * 60 * 1000;
+  // 10 snapshots, 10 days apart, each in its own staging-style directory (a
+  // distinct `paths` value per snapshot, like freshStagingDirectory's real
+  // per-run timestamped directories) so the grouping bug this row fixes
+  // would otherwise put each one alone in its own group.
+  for (let i = 0; i < 10; i += 1) {
+    const stagingDirectory = join(root, `2026-run-${i}-postgres-backup`);
+    await mkdir(stagingDirectory, { mode: 0o700 });
+    await writeFile(join(stagingDirectory, "kithmind.dump.age"), `synthetic-${i}`);
+    const time = new Date(baseline + i * 10 * dayMs).toISOString().replace("T", " ").replace(/\.\d+Z$/, "");
+    await execute(RESTIC, [
+      "--repo", repository, "--password-command", passwordCommand.path, "--no-cache",
+      "backup", "--host", host, "--tag", "kith-db", "--tag", `run-${i}`, "--time", time,
+      "kithmind.dump.age",
+    ], { cwd: stagingDirectory });
+  }
+  // One snapshot for a different writer sharing this host and repository
+  // (e.g. the pipeline's independent document-archive backup), old enough
+  // that it would also be aged out if the `--tag kith-db` filter did not
+  // exclude it from consideration entirely.
+  const otherDirectory = join(root, "document-archive-object");
+  await mkdir(otherDirectory, { mode: 0o700 });
+  await writeFile(join(otherDirectory, "receipt.pdf.age"), "synthetic-document");
+  const otherTime = new Date(baseline - 365 * dayMs).toISOString().replace("T", " ").replace(/\.\d+Z$/, "");
+  await execute(RESTIC, [
+    "--repo", repository, "--password-command", passwordCommand.path, "--no-cache",
+    "backup", "--host", host, "--tag", "document-archive", "--time", otherTime,
+    "receipt.pdf.age",
+  ], { cwd: otherDirectory });
+
+  const passwordArgument = `'${passwordCommand.path}'`;
+  const result = await resticForget(
+    RESTIC, repository, passwordArgument, host,
+    { keepDaily: 3, keepWeekly: 0, keepMonthly: 0 }, 60_000, false,
+  );
+  assert.equal(result.status, "passed");
+  // A bug that regressed `--group-by host` would report keptCount 10,
+  // removedCount 0 here (every distinct-path snapshot kept in its own
+  // group of one) instead of this.
+  assert.equal(result.keptCount, 3);
+  assert.equal(result.removedCount, 7);
+
+  const remainingTagged = JSON.parse(
+    (await execute(RESTIC, [
+      "--repo", repository, "--password-command", passwordCommand.path,
+      "--no-cache", "--host", host, "--tag", "kith-db", "snapshots", "--json",
+    ])).stdout,
+  );
+  // The 3 most recent of the 10 (run-7, run-8, run-9) survive; the 7 oldest
+  // are gone.
+  assert.deepEqual(
+    remainingTagged.map((snapshot) => snapshot.tags.find((tag) => tag.startsWith("run-"))).sort(),
+    ["run-7", "run-8", "run-9"],
+  );
+
+  const untouched = JSON.parse(
+    (await execute(RESTIC, [
+      "--repo", repository, "--password-command", passwordCommand.path,
+      "--no-cache", "--host", host, "--tag", "document-archive", "snapshots", "--json",
+    ])).stdout,
+  );
+  assert.equal(untouched.length, 1);
 });

@@ -20,13 +20,14 @@ and fails closed if another run holds its lock.
 A daily schedule runs only when the owner machine is logged in and awake. A missed time is handled by the next available scheduled run; this guide
 does not promise provider behavior or an exact catch-up time.
 
-The postgres engine runs restic's own `forget`/`prune` after every successful
-backup, scoped to this recipe's snapshots only (see
-[Retention](#retention) below). The generic public runner
+`scripts/db-backup.mjs` runs restic's own `forget`/`prune` once a backup has
+been independently verified (never before), scoped to this recipe's snapshots
+only (see [Retention](#retention) below). The generic public runner
 (`scripts/run-database-backup.mjs`) still does not prune staging directories
-or remote backups itself; that is the postgres engine's own responsibility,
-not the runner's. Recovery identities and keys are managed separately from
-this guide and are never included in commands, logs, or public configuration.
+or remote backups itself; that is the CLI's own responsibility after
+verification, not the runner's or the engine's. Recovery identities and keys
+are managed separately from this guide and are never included in commands,
+logs, or public configuration.
 
 ## Public runner contract
 
@@ -69,12 +70,13 @@ must emit a exact stdout JSON `{ "status": "passed" }`. Commands run without a s
 The state directory records bounded `running`, `failed`, or `succeeded` status
 and preserves the last successful time across a failure, plus the last
 successful isolated-restore-proof time and when the next one is due (see
-[Restore-proof cadence](#restore-proof-cadence)). A lock conflict fails
+[Restore-proof cadence](#restore-proof-cadence)), and the outcome of the most
+recent retention attempt (see [Retention](#retention)). A lock conflict fails
 closed. Before manual lock recovery, verify no runner or child process remains
 active and preserve failed status evidence. The generic runner itself does not
 automatically prune staging directories, prune remote backups, or forget
-snapshots; the postgres engine does its own retention after publishing (see
-[Retention](#retention)).
+snapshots; `scripts/db-backup.mjs` runs retention itself, only after
+verification succeeds (see [Retention](#retention)).
 
 Owner export and backup adapters remain private. The public setup does not
 install a schedule. Operators must configure and verify their own scheduler and
@@ -177,18 +179,33 @@ The engine, in order:
    path used to publish), re-downloads the ciphertext with a fresh `--no-cache`
    restic invocation, decrypts, and compares bytes against what the backup
    process itself hashed. It then drives an isolated restore (below) and
-   requires its exact `{status:"passed"}` result.
+   requires its exact `{status:"passed"}` result. Retention (below) runs only
+   after this step succeeds, never before: `--prune` running on an unverified
+   backup could age an older, known-good snapshot out on the strength of a
+   new one that turns out not to verify.
 
 ## Retention
 
-After a successful backup, the engine runs restic's own retention policy,
-scoped so it can only ever touch snapshots this recipe created:
+After verification (step 7) succeeds -- orchestrated by `scripts/db-backup.mjs`,
+not the engine itself -- it runs restic's own retention policy, scoped so it
+can only ever touch snapshots this recipe created:
 
 ```
-restic forget --host <host> --tag kith-db \
+restic forget --host <host> --tag kith-db --group-by host \
   --keep-daily <keepDaily> --keep-weekly <keepWeekly> --keep-monthly <keepMonthly> \
   --prune
 ```
+
+`--group-by host` is required, not cosmetic. restic's default grouping is
+`host,paths`, and every run's staging directory is uniquely timestamped
+(`freshStagingDirectory`), so every snapshot's recorded `paths` differs from
+every other snapshot's. Without `--group-by host`, every snapshot lands alone
+in its own group, `--keep-daily 7` (etc.) trivially keeps that one snapshot,
+and `forget` removes nothing -- ever, silently, while `--prune` still runs
+every night for no reason. `--group-by host` (not `host,tags`: `operationId`
+can vary run to run) puts every `kith-db`-tagged snapshot on this host into
+one group, so the keep-daily/weekly/monthly buckets actually apply across the
+full set the `--host`/`--tag` filters already selected.
 
 A restic repository is not necessarily dedicated to database backups. The
 pipeline's independent document-archive backup
@@ -204,7 +221,9 @@ candidate set entirely, regardless of what the operator does with the
 repository path.
 
 Retention is config, not hard-coded, under `resticRetention` in the backup
-config (all three keys optional, independently):
+config (all three keys optional, independently, but their sum must be at
+least 1 -- all zero would keep nothing at all, every run, with only restic's
+own guard standing between that config and a full delete):
 
 | Key           | Default | Meaning                              |
 | ------------- | ------- | ------------------------------------- |
@@ -218,13 +237,24 @@ config (all three keys optional, independently):
 }
 ```
 
-A `forget` or `prune` failure is reported in the backup's own result as
-`retention: { "status": "failed", "code": "<code>" }` and logged, but it never
-fails the backup run itself: the new snapshot the run just published already
-exists and is independently readable, which is what makes the run a success
-regardless of what retention does afterward. A successful retention run
-reports `{ "status": "passed", "dryRun": false, "keptCount": <n>,
-"removedCount": <n>, "removedTimes": [...] }`.
+A `forget` or `prune` failure never fails the backup run itself: the backup
+that was just independently verified stays a success regardless of what
+retention does afterward. It is not silent, though: it is logged as a
+`retention_failed` notice on stderr, and it is written into the durable
+status journal (`database-backup-status.json`) as
+
+```json
+{ "retention": { "state": "failed", "code": "<code>", "at": <epoch-ms>, "removed": null, "kept": null } }
+```
+
+so a health check reading that one file, not grepping logs, can alert on it.
+`state` is `"ok"` after a successful `forget`/`prune`, `"failed"` on the error
+case above, or `"skipped"` when verification itself failed and retention
+never ran at all (its own case, not folded into `"failed"`, so the two causes
+stay distinguishable). A run that never reaches the retention step -- the
+convex engine, or a run that fails earlier than verification -- leaves the
+prior run's recorded `retention` value in place rather than erasing it, the
+same way `lastSuccessAt` already survives a failure.
 
 Run retention by hand, without touching Postgres, age, or the dump/publish
 path, with the backup config's own `--forget`:
@@ -240,6 +270,37 @@ prune:
 ```json
 { "status": "passed", "dryRun": true, "keptCount": 12, "removedCount": 3, "removedTimes": ["2026-08-01T03:00:00Z", "2026-08-02T03:00:00Z", "2026-08-03T03:00:00Z"] }
 ```
+
+Unlike the automatic post-verification run above, this manual command's own
+failure is not swallowed: a bad config or an unreachable repository exits
+non-zero, because an operator running it by hand wants to know.
+
+A `prune` killed mid-run (a `command_timeout`, or the process being killed
+outright) can leave a stale repository lock behind. Before running `restic
+unlock` by hand, confirm no backup or forget process for this repository is
+still alive; then run `restic unlock` against the same `--repo`/
+`--password-command`. Never script or automate the unlock itself -- a lock
+held by a run that is still genuinely in progress must not be cleared out
+from under it.
+
+### One-time retroactive retention for pre-existing snapshots
+
+Snapshots created before this row shipped carry no `kith-db` tag, so the
+automatic policy above never sees them and never ages them out. Bringing them
+under retention is a deliberate, one-time, manual operator action, scoped by
+the stable `operationId` tag instead (never automated, and always dry-run
+first):
+
+```sh
+restic --repo <repositoryPath> --password-command <resticPasswordCommand> forget \
+  --host <host> --tag <operationId> --group-by host \
+  --keep-daily 7 --keep-weekly 5 --keep-monthly 12 --dry-run
+```
+
+Review what it reports, then run the identical command without `--dry-run`
+and with `--prune` added, once satisfied it matches expectations. New
+snapshots are already covered automatically by the `kith-db` tag above; this
+is only for the backlog that predates it.
 
 ## Restore-proof cadence
 

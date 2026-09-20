@@ -222,6 +222,10 @@ function parseRetention(value) {
   for (const key of ["keepDaily", "keepWeekly", "keepMonthly"]) {
     if (!Number.isSafeInteger(row[key]) || row[key] < 0) fail("config_invalid");
   }
+  // All three at zero keeps nothing at all, every run: only restic's own
+  // guard would stand between that config and a full delete. Refuse it here
+  // instead of trusting restic to save an operator from their own config.
+  if (row.keepDaily + row.keepWeekly + row.keepMonthly < 1) fail("config_invalid");
   return { keepDaily: row.keepDaily, keepWeekly: row.keepWeekly, keepMonthly: row.keepMonthly };
 }
 
@@ -273,7 +277,13 @@ function parseBackupConfig(value) {
   if (typeof row.gitRevision !== "string" || !/^[a-f0-9]{40}$/.test(row.gitRevision))
     fail("config_invalid");
   for (const key of ["expectedFinanceSchemaVersion", "expectedKithSchemaVersion"]) {
-    if (row[key] !== undefined && (!Number.isSafeInteger(row[key]) || row[key] < 1))
+    // `!= null` (loose), not `!== undefined`: this function re-parses its own
+    // already-parsed output (runPostgresDatabaseBackup accepts a config
+    // object directly, not only a file path), and the resolved value for an
+    // omitted key is `null`, not absence of the key. Requiring strict
+    // `undefined` here made every config that omits these now-optional keys
+    // fail closed on its second parse, which is every real CLI run.
+    if (row[key] != null && (!Number.isSafeInteger(row[key]) || row[key] < 1))
       fail("config_invalid");
   }
   return {
@@ -1086,6 +1096,12 @@ export async function resticForget(
   timeoutMs,
   dryRun = false,
 ) {
+  // Defense in depth: parseRetention already bounds the three keep counts and
+  // loadPostgresBackupConfig already bounds `host` with OPAQUE_ID, but this is
+  // the function that actually builds the forget argv, so it re-checks the
+  // two values a hostile or malformed direct call (this function is exported)
+  // could otherwise send straight through to restic.
+  if (!host || !RETENTION_TAG) fail("config_invalid");
   const result = await runCapture(
     resticBinary,
     [
@@ -1096,6 +1112,17 @@ export async function resticForget(
       host,
       "--tag",
       RETENTION_TAG,
+      // restic's default `--group-by host,paths` groups snapshots by their
+      // exact backed-up path set. Every run's staging directory is uniquely
+      // timestamped (`freshStagingDirectory`), so without this flag every
+      // snapshot lands alone in its own group and "keep N" trivially keeps
+      // that lone snapshot and removes nothing, forever -- retention would
+      // silently do nothing while `--prune` ran nightly for no reason. Group
+      // by host alone (not host,tags: operationId can vary run to run) so
+      // every kith-db-tagged snapshot on this host falls into one group and
+      // the keep-daily/weekly/monthly buckets actually apply across it.
+      "--group-by",
+      "host",
       "--keep-daily",
       String(retention.keepDaily),
       "--keep-weekly",
@@ -1108,7 +1135,18 @@ export async function resticForget(
   );
   let groups;
   try {
-    groups = JSON.parse(result.stdout.toString("utf8"));
+    // `forget --json` prints the JSON result as its own first line, but a
+    // real `--prune` that actually rewrites pack files can still print a
+    // plain-text warning afterward (observed: "running prune without a
+    // cache, this may be very slow!", tied to `--no-cache` above, not
+    // suppressed by `--json`). Parsing the whole of stdout as one JSON
+    // document broke on exactly that combination -- the case that only
+    // starts happening once `--group-by host` (this same row) makes
+    // retention actually remove anything. Only the first line is ever the
+    // JSON result; anything after it is diagnostic text this function
+    // doesn't need.
+    const firstLine = result.stdout.toString("utf8").split("\n", 1)[0];
+    groups = JSON.parse(firstLine);
   } catch {
     fail("retention_output_invalid");
   }
@@ -1126,6 +1164,36 @@ export async function resticForget(
       .map((snapshot) => snapshot?.time)
       .filter((time) => typeof time === "string"),
   };
+}
+
+/** Runs retention after this backup has been independently verified --
+ * db-backup.mjs calls this only once `verifyPostgresBackup` has already
+ * succeeded, never before. A failure here is caught and reported, never
+ * thrown: the backup that was just verified stays a success regardless of
+ * what `forget`/`prune` do afterward, but the failure must not be silent, so
+ * it is logged here as a named stderr notice (the caller additionally
+ * persists it into the durable status journal). */
+export async function runPostgresRetention(config, options = {}) {
+  config = parseBackupConfig(config);
+  await validateBackupConfigPaths(config);
+  const passwordCommandArgument_ = await passwordCommandArgument(
+    config.resticPasswordCommand,
+  );
+  try {
+    return await resticForget(
+      config.resticBinary,
+      config.resticRepositoryPath,
+      passwordCommandArgument_,
+      config.host,
+      config.resticRetention,
+      config.timeoutMs,
+      options.dryRun ?? false,
+    );
+  } catch (error) {
+    const code = error instanceof PostgresBackupError ? error.code : "unknown";
+    notice("retention_failed", { code, host: config.host });
+    return { status: "failed", code };
+  }
 }
 
 // ponytail: a fixed 3-attempt count and fixed backoff, not a configurable
@@ -1277,32 +1345,19 @@ export async function runPostgresDatabaseBackup(config) {
     ["kithmind.dump.age", "manifest.json.age"],
     config.timeoutMs,
   );
-  // Retention runs after publication and must never fail the backup: the new
-  // snapshot above already exists and is independently readable, which is
-  // what makes today's run a success regardless of what `forget`/`prune` do.
-  let retention;
-  try {
-    retention = await resticForget(
-      config.resticBinary,
-      config.resticRepositoryPath,
-      passwordCommandArgument_,
-      config.host,
-      config.resticRetention,
-      config.timeoutMs,
-    );
-  } catch (error) {
-    retention = {
-      status: "failed",
-      code: error instanceof PostgresBackupError ? error.code : "unknown",
-    };
-  }
+  // Retention (restic forget/prune) does NOT run here. It runs only after
+  // the separate-process verification below has proven this snapshot's
+  // ciphertext round-trips and restores correctly (db-backup.mjs calls
+  // runPostgresRetention once verifyPostgresBackup has succeeded). Pruning
+  // here, before verification, could age an older backup out on the strength
+  // of a new one that turns out to be corrupt -- exactly backwards from what
+  // a backup's retention policy is supposed to protect.
   return {
     status: "passed",
     stagingDirectory,
     snapshotId,
     repositoryId: config.expectedResticRepositoryId,
     manifest,
-    retention,
     ciphertexts: {
       "kithmind.dump.age": dumpCiphertext,
       "manifest.json.age": manifestCiphertext,
@@ -1335,7 +1390,7 @@ async function runVerifyWorker(payload) {
   if (
     !backupResult ||
     JSON.stringify(Object.keys(backupResult).sort()) !==
-      JSON.stringify(["status", "stagingDirectory", "snapshotId", "repositoryId", "manifest", "retention", "ciphertexts", "plaintexts"].sort()) ||
+      JSON.stringify(["status", "stagingDirectory", "snapshotId", "repositoryId", "manifest", "ciphertexts", "plaintexts"].sort()) ||
     backupResult.status !== "passed" ||
     backupResult.repositoryId !== config.expectedResticRepositoryId ||
     typeof backupResult.stagingDirectory !== "string" ||

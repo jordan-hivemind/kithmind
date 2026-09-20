@@ -484,7 +484,7 @@ async function fakeResticForget(root, body) {
   return path;
 }
 
-test("resticForget scopes forget to the host and the kith-db tag, with the configured retention counts", async (t) => {
+test("resticForget scopes forget to the host and the kith-db tag, with the configured retention counts and --group-by host", async (t) => {
   const { root } = await fixture(t);
   const captured = join(root, "argv.txt");
   const restic = await fakeResticForget(
@@ -499,16 +499,25 @@ test("resticForget scopes forget to the host and the kith-db tag, with the confi
   assert.equal(result.dryRun, false);
   assert.equal(result.keptCount, 0);
   assert.equal(result.removedCount, 0);
-  const argv = (await readFile(captured, "utf8")).split("\n");
-  assert.ok(argv.includes("--host"));
-  assert.equal(argv[argv.indexOf("--host") + 1], "kith-db-01");
-  assert.ok(argv.includes("--tag"));
-  assert.equal(argv[argv.indexOf("--tag") + 1], "kith-db");
-  assert.equal(argv[argv.indexOf("--keep-daily") + 1], "7");
-  assert.equal(argv[argv.indexOf("--keep-weekly") + 1], "5");
-  assert.equal(argv[argv.indexOf("--keep-monthly") + 1], "12");
-  assert.ok(argv.includes("--prune"));
-  assert.ok(!argv.includes("--dry-run"));
+  const argv = (await readFile(captured, "utf8")).trim().split("\n");
+  // Exact argv, not just presence: `--group-by host` is load-bearing (BAK-1
+  // review row 1) -- without it every uniquely-timestamped staging
+  // directory's snapshot lands in its own restic default `host,paths` group,
+  // and "keep N" trivially keeps a group of one, so retention would remove
+  // nothing, forever, while --prune ran every night for no reason.
+  assert.deepEqual(argv, [
+    "--repo", "/abs/repo",
+    "--password-command", "'/bin/true'",
+    "--no-cache",
+    "forget", "--json",
+    "--host", "kith-db-01",
+    "--tag", "kith-db",
+    "--group-by", "host",
+    "--keep-daily", "7",
+    "--keep-weekly", "5",
+    "--keep-monthly", "12",
+    "--prune",
+  ]);
 });
 
 test("resticForget's --dry-run reports counts and snapshot times, with --prune omitted", async (t) => {

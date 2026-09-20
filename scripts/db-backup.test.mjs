@@ -109,15 +109,27 @@ test("runDbBackup routes --engine convex to the unchanged Convex runner only", a
 });
 
 // A fake stateRunner standing in for runWithDatabaseBackupState's real
-// context object (`priorProof`/`recordProof`), so the cadence decision in
-// runDbBackup can be exercised without the durable status journal.
+// context object (`priorProof`/`recordProof`/`recordRetention`), so the
+// cadence decision and the retention ordering in runDbBackup can be
+// exercised without the durable status journal.
 function fakeStateRunner(calls, priorProof) {
   return async (_config, operation) =>
     operation({
       setStage: async (stage) => calls.push(["stage", stage]),
       priorProof,
       recordProof: (next) => calls.push(["recordProof", next]),
+      recordRetention: (next) => calls.push(["recordRetention", next]),
     });
+}
+// Every postgresModule fake below reaches retention after a passing verify
+// (BAK-1 review row 3: retention runs only after verification succeeds), so
+// each one needs this stubbed even when a given test's own assertions are
+// about the proof cadence rather than retention.
+function fakeRunPostgresRetention(calls) {
+  return async () => {
+    calls.push(["retention"]);
+    return { status: "passed", dryRun: false, keptCount: 1, removedCount: 0, removedTimes: [] };
+  };
 }
 
 test("runDbBackup routes --engine postgres to the postgres adapter only, runs a due restore proof, and records it", async () => {
@@ -143,6 +155,10 @@ test("runDbBackup routes --engine postgres to the postgres adapter only, runs a 
       calls.push(["verify", config, result, options]);
       return { status: "passed", restore: { status: "passed" } };
     },
+    runPostgresRetention: async (config) => {
+      calls.push(["retention", config]);
+      return { status: "passed", dryRun: false, keptCount: 7, removedCount: 2, removedTimes: [] };
+    },
   };
   // No prior proof recorded: due on the very first backup.
   const output = await runDbBackup(
@@ -166,11 +182,16 @@ test("runDbBackup routes --engine postgres to the postgres adapter only, runs a 
       { runRestoreProof: true },
     ],
     ["recordProof", { lastProofAt: 1_000, nextProofDueAt: 1_000 + 30 * 86_400_000 }],
+    // Retention runs strictly after the verify call above, not before it.
+    ["stage", "retention"],
+    ["retention", { fake: "pg-config" }],
+    ["recordRetention", { state: "ok", code: null, at: 1_000, removed: 2, kept: 7 }],
   ]);
   assert.deepEqual(output, {
     engine: "postgres",
     result: { status: "passed", snapshotId: "s1" },
     verification: { status: "passed", restore: { status: "passed" } },
+    retention: { status: "passed", dryRun: false, keptCount: 7, removedCount: 2, removedTimes: [] },
   });
 });
 
@@ -184,6 +205,7 @@ test("runDbBackup skips the restore proof when one already passed within the cad
       calls.push(["verify", options]);
       return { status: "passed", restore: { status: "skipped" } };
     },
+    runPostgresRetention: fakeRunPostgresRetention(calls),
   };
   const now = 20 * 86_400_000;
   await runDbBackup(
@@ -201,6 +223,8 @@ test("runDbBackup skips the restore proof when one already passed within the cad
   );
   // A skipped proof must never be recorded as one that ran.
   assert.deepEqual(calls.filter((call) => call[0] === "recordProof"), []);
+  // Retention still runs regardless of the proof cadence decision.
+  assert.deepEqual(calls.filter((call) => call[0] === "retention"), [["retention"]]);
 });
 
 test("runDbBackup forces the restore proof with --proof-now even inside the cadence", async () => {
@@ -213,6 +237,7 @@ test("runDbBackup forces the restore proof with --proof-now even inside the cade
       calls.push(["verify", options]);
       return { status: "passed", restore: { status: "passed" } };
     },
+    runPostgresRetention: fakeRunPostgresRetention(calls),
   };
   const now = 20 * 86_400_000;
   await runDbBackup(
@@ -242,6 +267,7 @@ test("runDbBackup runs a due restore proof once the cadence has elapsed", async 
       calls.push(["verify", options]);
       return { status: "passed", restore: { status: "passed" } };
     },
+    runPostgresRetention: fakeRunPostgresRetention(calls),
   };
   const now = 40 * 86_400_000;
   await runDbBackup(
@@ -290,6 +316,11 @@ test("a restore-proof failure code reaches the caller and the status file", asyn
   assert.equal(journal.state, "failed");
   assert.equal(journal.stage, "verify");
   assert.equal(journal.failureCode, "restore_proof_failed:restore_parity_failed");
+  // BAK-1 review row 3: retention must never run against an unverified
+  // backup. It is recorded as skipped, not silently left unset, so a health
+  // check can tell "verify failed" apart from "retention not attempted yet".
+  assert.equal(journal.retention.state, "skipped");
+  assert.equal(journal.retention.code, null);
 });
 
 test("postgres CLI cannot report success without restore verification", () => {

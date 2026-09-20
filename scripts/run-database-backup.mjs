@@ -234,6 +234,7 @@ async function atomicStatus(path, value, runId) {
     "lastSuccessAt",
     "lastProofAt",
     "nextProofDueAt",
+    "retention",
     ...(value.state === "failed" ? ["failureCode"] : []),
   ];
   exact(value, keys, "status_invalid");
@@ -257,6 +258,23 @@ async function atomicStatus(path, value, runId) {
   await rename(temporary, path);
   await fsyncDirectory(dirname(path));
 }
+const RETENTION_STATES = new Set(["ok", "failed", "skipped"]);
+// A run's own retention outcome (BAK-1 review row 2): null until the postgres
+// engine's first retention-aware run, then always this shape so a health
+// check has one field to read instead of grepping logs for a notice.
+function validRetention(value) {
+  if (value === null) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  if (Object.keys(value).sort().join() !== ["state", "code", "at", "removed", "kept"].sort().join())
+    return false;
+  return (
+    RETENTION_STATES.has(value.state) &&
+    (value.code === null || (typeof value.code === "string" && value.code.length <= 64)) &&
+    (value.at === null || Number.isSafeInteger(value.at)) &&
+    (value.removed === null || Number.isSafeInteger(value.removed)) &&
+    (value.kept === null || Number.isSafeInteger(value.kept))
+  );
+}
 function parseStatus(value) {
   const keys = [
     "version",
@@ -268,6 +286,7 @@ function parseStatus(value) {
     "lastSuccessAt",
     "lastProofAt",
     "nextProofDueAt",
+    "retention",
     ...(value?.state === "failed" ? ["failureCode"] : []),
   ];
   exact(value, keys, "status_invalid");
@@ -280,7 +299,8 @@ function parseStatus(value) {
     !Number.isSafeInteger(value.updatedAt) ||
     (value.lastSuccessAt !== null && !Number.isSafeInteger(value.lastSuccessAt)) ||
     (value.lastProofAt !== null && !Number.isSafeInteger(value.lastProofAt)) ||
-    (value.nextProofDueAt !== null && !Number.isSafeInteger(value.nextProofDueAt))
+    (value.nextProofDueAt !== null && !Number.isSafeInteger(value.nextProofDueAt)) ||
+    !validRetention(value.retention)
   )
     fail("status_invalid");
   if (value.state === "failed") text(value.failureCode, 64);
@@ -291,6 +311,9 @@ function parseStatus(value) {
 // durable status journal carries its own last-success time and next-due time
 // alongside the backup's, and preserves both across a run that did not
 // attempt a proof, the same way `lastSuccessAt` already survives a failure.
+// `retention` is carried forward the same way: a run that fails before
+// reaching retention (or an engine, like convex, that has none) must not
+// erase the last known retention outcome.
 async function priorStatus(path) {
   try {
     const parsed = parseStatus(
@@ -300,10 +323,11 @@ async function priorStatus(path) {
       lastSuccessAt: parsed.lastSuccessAt,
       lastProofAt: parsed.lastProofAt,
       nextProofDueAt: parsed.nextProofDueAt,
+      retention: parsed.retention,
     };
   } catch (error) {
     if (error?.code === "ENOENT")
-      return { lastSuccessAt: null, lastProofAt: null, nextProofDueAt: null };
+      return { lastSuccessAt: null, lastProofAt: null, nextProofDueAt: null, retention: null };
     if (error instanceof DatabaseBackupRunnerError) throw error;
     fail("status_invalid");
   }
@@ -442,6 +466,7 @@ function status({
   lastSuccessAt,
   lastProofAt,
   nextProofDueAt,
+  retention,
   failureCode,
 }) {
   return {
@@ -454,6 +479,7 @@ function status({
     lastSuccessAt,
     lastProofAt: lastProofAt ?? null,
     nextProofDueAt: nextProofDueAt ?? null,
+    retention: retention ?? null,
     ...(failureCode ? { failureCode } : {}),
   };
 }
@@ -469,17 +495,24 @@ export async function runWithDatabaseBackupState(config, operation, options = {}
   const lock = await acquireLock(lockPath, runId, startedAt);
   let mayRelease = false;
   let stage = "export";
-  let prior = { lastSuccessAt: null, lastProofAt: null, nextProofDueAt: null };
+  let prior = { lastSuccessAt: null, lastProofAt: null, nextProofDueAt: null, retention: null };
   let runningRecorded = false;
   // The operation callback (the postgres engine's own cadence decision, in
   // db-backup.mjs) calls this when a restore proof actually ran and passed;
   // omitted, the prior proof time carries forward unchanged, on both success
   // and failure, exactly like `lastSuccessAt` already does.
   let proof = null;
+  // Same carry-forward contract for retention (BAK-1 review row 2): the
+  // operation calls recordRetention once, after it has decided the run's own
+  // outcome (ok/failed/skipped); a run that never calls it (an engine with no
+  // retention step, or a failure before reaching that point) keeps the prior
+  // recorded outcome rather than erasing it.
+  let retention = null;
   const record = async () => atomicStatus(statusPath, status({
     state: "running", stage, runId, startedAt, updatedAt: clock(),
     lastSuccessAt: prior.lastSuccessAt,
     lastProofAt: prior.lastProofAt, nextProofDueAt: prior.nextProofDueAt,
+    retention: prior.retention,
   }), runId);
   try {
     prior = await priorStatus(statusPath);
@@ -496,6 +529,17 @@ export async function runWithDatabaseBackupState(config, operation, options = {}
           nextProofDueAt: Number.isSafeInteger(next?.nextProofDueAt) ? next.nextProofDueAt : null,
         };
       },
+      recordRetention: (next) => {
+        const candidate = {
+          state: next?.state,
+          code: typeof next?.code === "string" ? next.code : null,
+          at: Number.isSafeInteger(next?.at) ? next.at : null,
+          removed: Number.isSafeInteger(next?.removed) ? next.removed : null,
+          kept: Number.isSafeInteger(next?.kept) ? next.kept : null,
+        };
+        if (!RETENTION_STATES.has(candidate.state)) fail("status_invalid");
+        retention = candidate;
+      },
     });
     const finishedAt = clock();
     await atomicStatus(statusPath, status({
@@ -503,6 +547,7 @@ export async function runWithDatabaseBackupState(config, operation, options = {}
       updatedAt: finishedAt, lastSuccessAt: finishedAt,
       lastProofAt: proof?.lastProofAt ?? prior.lastProofAt,
       nextProofDueAt: proof?.nextProofDueAt ?? prior.nextProofDueAt,
+      retention: retention ?? prior.retention,
     }), runId);
     mayRelease = true;
     return { ...result, runId, startedAt, finishedAt };
@@ -518,6 +563,7 @@ export async function runWithDatabaseBackupState(config, operation, options = {}
         lastSuccessAt: prior.lastSuccessAt,
         lastProofAt: proof?.lastProofAt ?? prior.lastProofAt,
         nextProofDueAt: proof?.nextProofDueAt ?? prior.nextProofDueAt,
+        retention: retention ?? prior.retention,
         failureCode,
       }), runId);
       mayRelease = true;

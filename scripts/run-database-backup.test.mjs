@@ -95,11 +95,12 @@ test("one fresh exact staging path passes from export to backup", async (t) => {
     startedAt: result.startedAt,
     updatedAt: result.finishedAt,
     lastSuccessAt: result.finishedAt,
-    // This convex-engine path never runs a restore proof; the postgres
-    // engine's own runWithDatabaseBackupState suite below covers proof
-    // cadence tracking.
+    // This convex-engine path never runs a restore proof or retention; the
+    // postgres engine's own runWithDatabaseBackupState suite below covers
+    // proof cadence and retention tracking.
     lastProofAt: null,
     nextProofDueAt: null,
+    retention: null,
   });
 });
 test("export failure stops backup and preserves staging", async (t) => {
@@ -243,6 +244,55 @@ test("runWithDatabaseBackupState preserves the prior proof across a failed run, 
   assert.equal(journal.state, "failed");
   assert.equal(journal.lastProofAt, 111);
   assert.equal(journal.nextProofDueAt, 222);
+});
+
+// BAK-1 review row 2: the retention outcome (ok/failed/skipped) is its own
+// field in the status journal, carried forward across a run that never
+// reaches it, exactly like lastProofAt above.
+test("runWithDatabaseBackupState defaults retention to null and persists what recordRetention reports", async (t) => {
+  const f = await fixture(t);
+  const config = await loadDatabaseBackupConfig(f.configPath);
+  const seen = [];
+  await runWithDatabaseBackupState(config, async ({ priorProof, recordRetention }) => {
+    seen.push(priorProof);
+    recordRetention({ state: "ok", code: null, at: 777, removed: 3, kept: 12 });
+    return { ok: true };
+  });
+  const journal = await status(f);
+  assert.deepEqual(journal.retention, { state: "ok", code: null, at: 777, removed: 3, kept: 12 });
+});
+
+test("runWithDatabaseBackupState carries the prior retention outcome forward when the operation never calls recordRetention", async (t) => {
+  const f = await fixture(t);
+  const config = await loadDatabaseBackupConfig(f.configPath);
+  await runWithDatabaseBackupState(config, async ({ recordRetention }) => {
+    recordRetention({ state: "failed", code: "command_failed", at: 100, removed: null, kept: null });
+    return { ok: true };
+  });
+  await runWithDatabaseBackupState(config, async () => ({ ok: true }));
+  const journal = await status(f);
+  // Unchanged: a run that did not attempt retention must not erase the last
+  // known outcome.
+  assert.deepEqual(journal.retention, { state: "failed", code: "command_failed", at: 100, removed: null, kept: null });
+});
+
+test("runWithDatabaseBackupState records a skipped retention outcome and preserves it across a later failure", async (t) => {
+  const f = await fixture(t);
+  const config = await loadDatabaseBackupConfig(f.configPath);
+  await runWithDatabaseBackupState(config, async ({ recordRetention }) => {
+    recordRetention({ state: "skipped", code: null, at: 55, removed: null, kept: null });
+    return { ok: true };
+  });
+  let journal = await status(f);
+  assert.deepEqual(journal.retention, { state: "skipped", code: null, at: 55, removed: null, kept: null });
+  await assert.rejects(
+    runWithDatabaseBackupState(config, async () => {
+      throw Object.assign(new Error("boom"), { code: "operation_failed" });
+    }),
+  );
+  journal = await status(f);
+  assert.equal(journal.state, "failed");
+  assert.deepEqual(journal.retention, { state: "skipped", code: null, at: 55, removed: null, kept: null });
 });
 
 test("CLI stdout is a closed safe result without private paths", async (t) => {
