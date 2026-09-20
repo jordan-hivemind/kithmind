@@ -335,6 +335,17 @@ generally: a re-evaluation must never demote a row whose only disqualifier is
 another live link on the same entry that arrived after it, and a live row of
 the document's own is the proof that it did not.
 
+**A decision that has not changed writes nothing.** The matcher runs nightly,
+so a pass that reaches the same conclusion must not touch the row: rewriting
+it with identical values still moves `decided_at`, still writes a new row
+version, and still fires the `record_change` trigger the screens refresh
+from. Both write paths therefore compare first -- the link upsert's
+`ON CONFLICT ... DO UPDATE` has a `WHERE` that requires some stored column to
+differ, and `syncEntryDocument` reads the mirror before writing it. The tests
+snapshot each link's id and both timestamps along with the count of
+`kith.changes`, so "nothing moved" means the rows were not touched rather
+than merely that they still say the same thing.
+
 **A rule's auto-link is the rule's to take back.** When a rule-made
 `auto_linked` row stops qualifying -- a second identical entry appears, the
 document's party or amount is corrected, the document now names no investment

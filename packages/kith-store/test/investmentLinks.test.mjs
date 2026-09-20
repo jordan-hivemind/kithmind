@@ -1801,20 +1801,58 @@ test("a notice and the wire that paid it can both be confirmed", { skip }, async
   await consistent(base.ctx);
 });
 
-/** Every link on the entry, and the state of the entry itself, as one
- * comparable snapshot. What a re-evaluation must not change. */
+/**
+ * Every link on the entry, the state of the entry itself, and how many rows
+ * the change feed holds: one comparable snapshot of what a re-evaluation must
+ * not change.
+ *
+ * Each link carries its `id` and both of its timestamps, so "nothing moved"
+ * means the ROWS were not touched rather than merely that they still say the
+ * same thing. A re-evaluation that rewrote a settled row with identical
+ * values would keep every earlier assertion true and still be wrong: it fires
+ * the change feed on every nightly sweep, and `created_at` is what decides
+ * which link is PRIMARY.
+ *
+ * Sorted by `created_at` then source item, never by id. Ids are random, so an
+ * assertion whose order depends on them passes or fails by luck -- which is
+ * exactly how this helper's first version reached CI.
+ */
 async function settlement(base) {
   const links = await linksFor(base, { entryIds: [base.entryId] });
   const entry = await entryRow(base);
+  const changes = await base.ctx.client.query(
+    "SELECT count(*)::int AS n FROM kith.changes WHERE space_id = $1",
+    [base.spaceId],
+  );
   return {
     links: links
-      .map((link) => `${link.sourceItemId}:${link.state}:${link.decidedBy}`)
-      .sort(),
+      .map((link) => ({
+        sourceItemId: link.sourceItemId,
+        id: link.id,
+        state: link.state,
+        decidedBy: link.decidedBy,
+        createdAt: link.createdAt,
+        decidedAt: link.decidedAt,
+      }))
+      .sort(
+        (left, right) =>
+          left.createdAt - right.createdAt ||
+          left.sourceItemId.localeCompare(right.sourceItemId),
+      ),
     entryDate: entry.entryDate,
     dateIsEstimated: entry.dateIsEstimated,
     documentId: entry.documentId,
     corrections: (await dateCorrections(base)).length,
+    changes: changes.rows[0].n,
   };
+}
+
+/** The snapshot's `links`, as the short strings the readable assertions use.
+ * Sorted the same way, so neither side depends on a random id. */
+function linkStates(snapshot) {
+  return snapshot.links.map(
+    (link) => `${link.sourceItemId}:${link.state}:${link.decidedBy}`,
+  );
 }
 
 test("a document the owner has settled beside is not demoted by its own neighbour", { skip }, async (t) => {
@@ -1842,7 +1880,10 @@ test("a document the owner has settled beside is not demoted by its own neighbou
   });
 
   const settled = await settlement(base);
-  assert.deepEqual(settled.links, [
+  // In `created_at` order: the notice auto-linked first, the wire came after.
+  // Never in id order -- ids are random and an assertion that depends on them
+  // passes or fails by luck.
+  assert.deepEqual(linkStates(settled), [
     `${base.document.sourceItemId}:auto_linked:rule`,
     `${wire.sourceItemId}:confirmed:owner`,
   ]);

@@ -828,10 +828,25 @@ export async function evaluateDocumentLinks(
 /**
  * Insert or refresh one rule-decided row.
  *
- * `ON CONFLICT` on the pair index, with a guard: a row the owner has settled
- * is never rewritten by a rule. Those pairs are excluded before scoring, so
- * the guard is belt to that braces -- and it is what makes this statement
- * safe if a future caller forgets.
+ * `ON CONFLICT` on the pair index, with TWO guards on the update.
+ *
+ * The first is authority: a row the owner has settled is never rewritten by a
+ * rule. Those pairs are excluded before scoring, so this is belt to that
+ * braces -- and it is what makes the statement safe if a future caller
+ * forgets.
+ *
+ * The second is that something must actually have changed. Without it, a
+ * re-evaluation that reaches the same decision still rewrote the row: it
+ * moved `decided_at`, wrote a new row version, and fired the `record_change`
+ * trigger. The matcher is meant to run nightly, so that is a change-feed row
+ * per link per night for a decision nobody made, and the feed is what the
+ * screens refresh from. "Nothing moved" has to mean the rows were not
+ * touched, not merely that they still say the same thing --
+ * `test/investmentLinks.test.mjs` snapshots each link's id and both of its
+ * timestamps, and the count of `kith.changes`, to keep it honest.
+ *
+ * `date_correction_id` is deliberately not in either list: the update never
+ * sets it, so a refreshed decision keeps whatever date claim it already held.
  */
 async function upsertRuleLink(
   ctx: IdentityCtx,
@@ -846,7 +861,7 @@ async function upsertRuleLink(
   const id = newKithId();
   const record = await row<{ id: string }>(
     ctx,
-    `INSERT INTO kith.investment_document_links
+    `INSERT INTO kith.investment_document_links AS link
        (id, space_id, investment_id, entry_id, document_id, source_item_id,
         state, score, signals, evidence, decided_by, reason)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,'rule',$11)
@@ -861,7 +876,12 @@ async function upsertRuleLink(
        decided_by = 'rule',
        decided_at = transaction_timestamp(),
        reason = EXCLUDED.reason
-     WHERE kith.investment_document_links.state IN ('auto_linked', 'suggested')
+     WHERE link.state IN ('auto_linked', 'suggested')
+       AND (link.state, link.document_id, link.score, link.signals,
+            link.evidence, link.decided_by, link.reason)
+           IS DISTINCT FROM
+           (EXCLUDED.state, EXCLUDED.document_id, EXCLUDED.score,
+            EXCLUDED.signals, EXCLUDED.evidence, 'rule'::text, EXCLUDED.reason)
      RETURNING id`,
     [
       id,
@@ -878,8 +898,10 @@ async function upsertRuleLink(
     ],
   );
   if (record) return record.id;
-  // The guard above refused the update, which means a settled row holds the
-  // pair. Return its id rather than inventing one.
+  // No row came back, which means one of the two guards refused the update:
+  // either a settled row holds the pair, or the decision is word for word the
+  // one already stored and there was nothing to write. Both want the same
+  // answer -- the id of the row that is there.
   const held = await row<{ id: string }>(
     ctx,
     `SELECT id FROM kith.investment_document_links
@@ -951,22 +973,44 @@ export async function syncEntryDocument(
   const adopted = await adoptEntryMirror(ctx, spaceId, entryId);
   if (adopted === "unadoptable") return;
   const primary = await primaryLink(ctx, spaceId, entryId);
+  const documentId = primary?.document_id ?? null;
+  const citedSpanId = Array.isArray(primary?.evidence)
+    ? ((primary.evidence as LinkEvidence[])[0]?.evidenceSpanId ?? null)
+    : null;
+  // Read before writing, so an UPDATE only happens when the mirror is
+  // actually wrong. PostgreSQL fires an AFTER UPDATE trigger for every row it
+  // touches, identical values included, so writing unconditionally meant a
+  // `kith.changes` row for every entry on every nightly sweep -- a feed the
+  // screens refresh from, filled with changes nobody made.
+  //
+  // The span is resolved in the same read rather than trusted: one a cleanup
+  // pass has removed resolves to null instead of failing the write.
+  const current = await row<{
+    document_id: string | null;
+    evidence_span_id: string | null;
+    cited_span_id: string | null;
+  }>(
+    ctx,
+    `SELECT e.document_id, e.evidence_span_id,
+            (SELECT s.id FROM kith.evidence_spans s
+              WHERE s.id = $3 AND s.space_id = e.space_id) AS cited_span_id
+       FROM kith.investment_entries e
+      WHERE e.id = $2 AND e.space_id = $1`,
+    [spaceId, entryId, citedSpanId],
+  );
+  if (!current) return;
+  if (
+    current.document_id === documentId &&
+    current.evidence_span_id === current.cited_span_id
+  ) {
+    return;
+  }
   await exec(
     ctx,
-    `UPDATE kith.investment_entries e
-        SET document_id = $3,
-            evidence_span_id = (
-              SELECT s.id FROM kith.evidence_spans s
-               WHERE s.id = $4 AND s.space_id = e.space_id)
-      WHERE e.id = $2 AND e.space_id = $1`,
-    [
-      spaceId,
-      entryId,
-      primary?.document_id ?? null,
-      (Array.isArray(primary?.evidence)
-        ? ((primary.evidence as LinkEvidence[])[0]?.evidenceSpanId ?? null)
-        : null),
-    ],
+    `UPDATE kith.investment_entries
+        SET document_id = $3, evidence_span_id = $4
+      WHERE id = $2 AND space_id = $1`,
+    [spaceId, entryId, documentId, current.cited_span_id],
   );
 }
 
