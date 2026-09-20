@@ -1593,7 +1593,13 @@ test("a citation one line off its value is repaired, and no further", { skip }, 
         // the document states it, and the cited line states nothing at all
         // -- so the citation moves one line and the value is stored.
         statement("subtotal", "20.00", [2]),
-        // The same miss from the other side: cited the line after the value.
+        // ADM-5k: the same miss from the other side no longer repairs. A
+        // label stands above its amount, and a repair that may also reach
+        // backwards cannot tell which side of one it is reading -- see the
+        // `Subtotal` / `20.00` / `Total` / `21.60` case below, where reaching
+        // backwards stored a subtotal as a total. This citation names the
+        // line after the value, which is the rarer half of the miss, and it
+        // is refused with the dangerous half.
         statement("total", "21.60", [8]),
         // Five lines away. One line off is the miss this exists for; five is
         // a search of the page, and the refusal stands.
@@ -1602,12 +1608,13 @@ test("a citation one line off its value is repaired, and no further", { skip }, 
     }),
     ids,
   );
-  assert.equal(outcome.stored, 3);
+  assert.equal(outcome.stored, 2);
   assert.deepEqual(await f.corrections(), [
     { field_name: "tax", reason: "value_not_in_quote" },
+    { field_name: "total", reason: "value_not_in_quote" },
   ]);
-  // Each repaired citation points at the line that states the value, never
-  // at the line the model named.
+  // The repaired citation points at the line that states the value, never at
+  // the line the model named.
   const spans = await f.rows(
     `SELECT o.observation_type AS field, s."start", s."end"
        FROM kith.observations o
@@ -1618,8 +1625,97 @@ test("a citation one line off its value is repaired, and no further", { skip }, 
   );
   assert.deepEqual(
     spans.map((row) => page.slice(row.start, row.end)),
-    ["20.00", "21.60"],
+    ["20.00"],
   );
+});
+
+test("a repair reads the line after the label, never the one before", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(COLUMN_TOTALS_RECEIPT, "synthetic-label-side");
+  // ADM-5k, the residue PR #332 left. Labels and amounts alternate, so the
+  // line *before* `Total` is the subtotal's amount and the line after it is
+  // the total's. A model that reads the wrong one and cites only the label
+  // stored 20.00 as the total: the repair had no way to tell which side of a
+  // label it was on, and 20.00 is on a line one id from `Total` exactly as
+  // 21.60 is.
+  const page = [
+    "BRACKEN TOOLS LTD.", // 1
+    "Subtotal", // 2
+    "20.00", // 3
+    "Total", // 4
+    "21.60", // 5
+  ].join("\n");
+  await repaginate(f, ids, [[0, page]]);
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS LTD.", [1]),
+        // The wrong side of the label. Refused.
+        statement("total", "20.00", [4]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "total", reason: "value_not_in_quote" },
+  ]);
+  // And the right side of the same label still repairs, so the rule cost the
+  // layout it exists for nothing.
+  const second = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [statement("total", "21.60", [4])],
+    }),
+    ids,
+  );
+  assert.equal(second.stored, 1);
+  const spans = await f.rows(
+    `SELECT s."start", s."end"
+       FROM kith.observations o
+       JOIN kith.evidence_spans s ON s.id = (o.value_evidence->>0)
+      WHERE o.space_id = $1 AND o.observation_type = 'total'`,
+    [f.spaceId],
+  );
+  assert.deepEqual(
+    spans.map((row) => page.slice(row.start, row.end)),
+    ["21.60"],
+  );
+});
+
+test("a wrapped line does not hide the word that scales it", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(COLUMN_TOTALS_RECEIPT, "synthetic-wrapped-scale");
+  // ADM-5k. A line break is not a full stop. The letter states two and a half
+  // million across two lines, and the finder offered two and a half for the
+  // first of them -- a real line edge is a known edge, so nothing asked what
+  // stood beyond it.
+  const page = [
+    "BRACKEN TOOLS LTD.", // 1
+    "The fund raised $2.5", // 2
+    "million from its partners.", // 3
+    "Total", // 4
+    "21.60", // 5
+  ].join("\n");
+  await repaginate(f, ids, [[0, page]]);
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS LTD.", [1]),
+        statement("total", "2.50", [2]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "total", reason: "value_not_in_quote" },
+  ]);
 });
 
 test("a vendor may be folded and split, but a number may not", { skip }, async (t) => {
@@ -3099,10 +3195,13 @@ test("a scaled amount copied as the page prints it still repairs", { skip }, asy
       summary: "Round summary.",
       statements: [
         statement("vendor", "THORNFIELD VENTURES", [1]),
-        // Cited the line after the amount. The amount is alone on its line,
-        // the line on the far side of it is a label rather than another bare
-        // value, and no other line of the document prints it.
-        statement("total", "$2.5M", [4]),
+        // Cited the label above the amount. The amount is alone on its
+        // line, the line on the far side of it is a label rather than
+        // another bare value, and no other line of the document prints it.
+        // ADM-5k: citing line 4 instead, the line *after* the amount, no
+        // longer repairs -- a label stands above its amount, and a repair
+        // that also reaches backwards cannot tell which side of one it is on.
+        statement("total", "$2.5M", [2]),
       ],
     }),
     ids,

@@ -859,6 +859,8 @@ function lineCandidate(line: PageLine): Candidate {
     end: line.end,
     cutStart: line.cutStart,
     cutEnd: line.cutEnd,
+    previousToken: line.previousToken,
+    nextToken: line.nextToken,
   };
 }
 
@@ -923,6 +925,10 @@ function isMoneyShaped(value: unknown): boolean {
  *   `Fee 100.00` and `Total 250.00` stored a total of 100.
  * - The line is more than one id away from any cited line, or on another
  *   page. One off is the miss this exists for; two off is a search.
+ * - The line is not directly *after* a cited line. A label stands above its
+ *   amount, and the repair could not tell which side of one it was reading:
+ *   `Subtotal`, `20.00`, `Total`, `21.60` with a total of 20.00 cited to
+ *   `Total` stored the subtotal's amount as the total.
  * - More than one line of that window states the value. Choosing between
  *   them is a guess.
  * - Any other line of the whole document states it. A value printed twice
@@ -958,12 +964,30 @@ function repairTarget(
       ...scan,
       ...(candidate.cutStart ? { cutStart: true } : {}),
       ...(candidate.cutEnd ? { cutEnd: true } : {}),
+      ...(candidate.previousToken === undefined
+        ? {}
+        : { previousToken: candidate.previousToken }),
+      ...(candidate.nextToken === undefined
+        ? {}
+        : { nextToken: candidate.nextToken }),
     });
     if (printed.length > 0) return null;
   }
+  // Only the line *after* a cited label, never the one before it.
+  //
+  // The repair had no way to tell which side of a label its value sat on,
+  // and a label sits above its amount on every layout this exists for. A
+  // page printing `Subtotal`, `20.00`, `Total`, `21.60` with a total of
+  // 20.00 cited to `Total` stored 20: the line before `Total` belongs to
+  // `Subtotal`, and reading it as the total is the silent wrong number this
+  // gate exists to prevent. The backwards miss -- a citation naming the line
+  // *after* the value, which the column receipt test exercised -- is refused
+  // with it. It is the rarer half of a rule that could not distinguish the
+  // two, and refusing is always allowed where reading is a coin flip.
   const carrying = page.lines.filter(
     (line) =>
       cited.every((one) => Math.abs(line.id - one.id) <= 1) &&
+      cited.some((one) => line.id === one.id + 1) &&
       lineCarries(page, valueType, value, line),
   );
   if (carrying.length !== 1) return null;
@@ -972,6 +996,10 @@ function repairTarget(
     ...scan,
     ...(line.cutStart ? { cutStart: true as const } : {}),
     ...(line.cutEnd ? { cutEnd: true as const } : {}),
+    ...(line.previousToken === undefined
+      ? {}
+      : { previousToken: line.previousToken }),
+    ...(line.nextToken === undefined ? {} : { nextToken: line.nextToken }),
   });
   // The target has to be a value and nothing else. A line that prints a word
   // beside its amount belongs to that word: `Tax 1.60` is the tax, whatever
