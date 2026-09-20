@@ -131,8 +131,13 @@ export function InstitutionsTable({
         id: "currentValue",
         accessorKey: "currentValue",
         header: "Current value",
-        size: 130,
+        size: 170,
         meta: { nowrap: true },
+        // A figure older than the inactivity threshold carries its date in the
+        // cell, not only in the tooltip: a 2019 balance on an account whose
+        // statements are still arriving reads as today's money otherwise, and
+        // nobody hovers a number that looks current. Muted for the same
+        // reason, on the row's own inactive status or on the figure's age.
         cell: ({ row }) =>
           row.original.currentValue === null ||
           row.original.currentValueCurrency === null ? (
@@ -141,14 +146,24 @@ export function InstitutionsTable({
             <Detail
               label={
                 <span
-                  className={`tabular-nums ${
-                    row.original.status === "inactive" ? "text-gray-400" : ""
-                  }`}
+                  className={
+                    row.original.currentValueStale ||
+                    row.original.status === "inactive"
+                      ? "text-kith-text-muted"
+                      : undefined
+                  }
                 >
-                  {tableMoney(
-                    row.original.currentValue,
-                    row.original.currentValueCurrency,
-                  )}
+                  <span className="tabular-nums">
+                    {tableMoney(
+                      row.original.currentValue,
+                      row.original.currentValueCurrency,
+                    )}
+                  </span>
+                  {row.original.currentValueStale ? (
+                    <span className="ml-1.5 tabular-nums">
+                      {archiveDate(row.original.currentValueAsOf)}
+                    </span>
+                  ) : null}
                 </span>
               }
               detail={`as of ${archiveDate(row.original.currentValueAsOf)}`}

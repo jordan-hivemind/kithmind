@@ -71,6 +71,10 @@ export type InstitutionRow = {
   currentValue: number | null;
   currentValueCurrency: string | null;
   currentValueAsOf: string | null;
+  /** The figure is older than the inactivity threshold, so the screen shows
+   * its date beside it and mutes it rather than letting it read as today's.
+   * See `valueIsStale`. */
+  currentValueStale: boolean;
   /** What the archive itself says, and the owner's override of it. On an
    * account row only: the edit panel shows the first as what clearing the
    * second returns to. */
@@ -121,6 +125,27 @@ function last4Reason(
 function ageDays(asOf: string | null, now: number): number | null {
   if (asOf === null) return null;
   return Math.floor(Math.max(now - Date.parse(`${asOf}T00:00:00Z`), 0) / DAY);
+}
+
+/**
+ * Whether a reported value is too old to read as the account's value now.
+ *
+ * The same threshold that makes an account inactive, applied to the figure
+ * rather than to the activity: an account can be perfectly fresh -- monthly
+ * statements arriving, holdings updated last week -- while the only total the
+ * archive will state for it is a balance from 2019. That number is correct and
+ * it is not current, and `$900` shown in a live-looking row with the date
+ * hidden in a tooltip reads as today's.
+ *
+ * Exactly the threshold is still current; a day past it is not. `null` is
+ * nothing to judge, and there is no figure beside it either.
+ */
+export function valueIsStale(
+  currentValueAsOf: string | null,
+  now: number,
+): boolean {
+  const age = ageDays(currentValueAsOf, now);
+  return age !== null && age > INACTIVE_AFTER_DAYS;
 }
 
 /** One row's tag, plus the age the tooltip explains it with. */
@@ -205,6 +230,7 @@ export function groupInstitutions(
           : Number(record.currentValue.value.decimal),
       currentValueCurrency: record.currentValue?.value.currency ?? null,
       currentValueAsOf: record.currentValue?.asOf ?? null,
+      currentValueStale: valueIsStale(record.currentValue?.asOf ?? null, now),
       accountType: override?.accountType ?? record.account.accountType ?? null,
       accounts: null,
       statements: record.statementCount,
@@ -232,6 +258,7 @@ export function groupInstitutions(
       override: null,
       last4Reason: null,
       currentValue: null,
+      currentValueStale: false,
       currentValueCurrency: null,
       currentValueAsOf: null,
       accountType: null,
@@ -263,7 +290,7 @@ export function groupInstitutions(
     .map((group) => ({
       ...group,
       ...groupFreshness(group),
-      ...groupValue(group),
+      ...groupValue(group, now),
     }))
     .sort((left, right) => left.name.localeCompare(right.name));
 }
@@ -322,6 +349,7 @@ const NO_VALUE = {
   currentValue: null,
   currentValueCurrency: null,
   currentValueAsOf: null,
+  currentValueStale: false,
 } as const;
 
 /**
@@ -334,26 +362,40 @@ const NO_VALUE = {
  * this figure as what the institution holds, and a total quietly missing an
  * account is worse than an empty cell that makes him open the rows.
  *
- * Live means `fresh` or `stale`. Two kinds of account are left out of both
- * the sum and the requirement, because neither is a gap in what is held now:
+ * Live means `fresh` or `stale`. An `inactive` account -- closed, or quiet
+ * past the threshold -- is not in the sum: its last figure is the day it went
+ * quiet, which is not what the institution is worth now, and its own row still
+ * shows that figure, dated.
  *
- *   * `inactive` -- closed, or quiet past the threshold. Its last figure is
- *     the day it went quiet, which is not what the institution is worth now.
- *     Its own row still shows that figure, dated.
- *   * `empty` -- the archive holds no statement and no record for it, so
- *     there is nothing to have failed to value. The table hides these by
- *     default for the same reason.
+ * But leaving it out of the sum is only honest while it holds nothing. An
+ * account can pass the inactivity threshold and still hold money: a CD, an
+ * account on quarterly statements, one the owner marked Closed before the
+ * balance was moved. Dropping half a million dollars out of a total that still
+ * says "the institution's value" is the same silent subtraction this function
+ * exists to prevent, so any excluded account with a non-zero value blanks the
+ * total instead. A zero and an unvalued excluded account block nothing: there
+ * is nothing to have dropped.
+ *
+ * `empty` accounts never block. The archive holds no statement and no record
+ * for them, so there is no value to have left out, and the table hides them by
+ * default for the same reason.
  *
  * The date is the OLDEST component's, never the newest. A total dated by its
  * newest part claims every other part was still true that day. The oldest is
- * the honest answer: no part of this figure is older than this.
+ * the honest answer: no part of this figure is older than this. The total is
+ * judged stale by that same oldest date.
  */
-function groupValue(group: InstitutionRow): {
+function groupValue(
+  group: InstitutionRow,
+  now: number,
+): {
   currentValue: number | null;
   currentValueCurrency: string | null;
   currentValueAsOf: string | null;
+  currentValueStale: boolean;
 } {
-  const live = (group.children ?? []).filter(
+  const children = group.children ?? [];
+  const live = children.filter(
     (child) => child.status === "fresh" || child.status === "stale",
   );
   if (live.length === 0) return { ...NO_VALUE };
@@ -364,13 +406,20 @@ function groupValue(group: InstitutionRow): {
     )
   )
     return { ...NO_VALUE };
+  const held = children.some(
+    (child) =>
+      child.status === "inactive" &&
+      child.currentValue !== null &&
+      child.currentValue !== 0,
+  );
+  if (held) return { ...NO_VALUE };
   const currencies = new Set(live.map((child) => child.currentValueCurrency));
   if (currencies.size !== 1) return { ...NO_VALUE };
+  const asOf = live.map((child) => child.currentValueAsOf!).sort()[0]!;
   return {
     currentValue: live.reduce((sum, child) => sum + child.currentValue!, 0),
     currentValueCurrency: live[0]!.currentValueCurrency,
-    currentValueAsOf: live
-      .map((child) => child.currentValueAsOf!)
-      .sort()[0]!,
+    currentValueAsOf: asOf,
+    currentValueStale: valueIsStale(asOf, now),
   };
 }

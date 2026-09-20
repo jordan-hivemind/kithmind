@@ -6,6 +6,7 @@ import {
   freshness,
   friendlyAccountName,
   groupInstitutions,
+  valueIsStale,
 } from "@/lib/kith/institutions";
 
 const NOW = Date.parse("2026-09-18T12:00:00Z");
@@ -150,23 +151,17 @@ describe("current value", () => {
     currentValue: { value: { decimal, currency }, asOf, source: "balance" },
   });
 
-  test("a group sums its active accounts and leaves out the ones that went quiet", () => {
+  test("a group sums its live accounts", () => {
     const [group] = groupInstitutions(
       [
         record(value("100.5")),
         record({ account: account({ accountId: "b" }), ...value("50") }),
-        record({
-          account: account({ accountId: "c" }),
-          activityTo: "2022-12-31",
-          latestSnapshotAsOf: "2022-10-31",
-          ...value("7000", "USD", "2022-12-31"),
-        }),
       ],
       NOW,
     );
     expect(group!.currentValue).toBe(150.5);
     expect(group!.currentValueCurrency).toBe("USD");
-    expect(group!.children![2]!.currentValue).toBe(7000);
+    expect(group!.currentValueAsOf).toBe("2026-08-31");
   });
 
   test("a group across currencies has no total", () => {
@@ -215,31 +210,112 @@ describe("current value", () => {
     expect(group!.currentValueAsOf).toBe("2026-03-31");
   });
 
-  test("an account that went quiet is left out of the total and out of the requirement", () => {
+  test("an account that went quiet holding nothing is left out of the total", () => {
     const [group] = groupInstitutions(
       [
         record(value("100")),
+        // Quiet and valueless: nothing was dropped from the total, so the
+        // total is still the whole of what the institution holds.
         record({
           account: account({ accountId: "b" }),
-          activityTo: "2022-12-31",
-          latestSnapshotAsOf: "2022-10-31",
-          ...value("7000", "USD", "2022-12-31"),
-        }),
-        // Inactive and valueless: still not a hole in the live total.
-        record({
-          account: account({ accountId: "c" }),
           activityTo: "2022-12-31",
           latestSnapshotAsOf: "2022-10-31",
         }),
       ],
       NOW,
     );
+    expect(group!.children![1]!.status).toBe("inactive");
     expect(group!.currentValue).toBe(100);
     expect(group!.currentValueAsOf).toBe("2026-08-31");
-    expect(group!.children![1]!.currentValue).toBe(7000);
   });
 
-  test("an account the archive holds nothing for is not a hole either", () => {
+  test("a closed account with no value is left out of the total, and cannot hold it back", () => {
+    const overrides = new Map([
+      ["b", { displayName: null, accountLast4: null, accountType: null, closed: true }],
+    ]);
+    const [group] = groupInstitutions(
+      [
+        record(value("100")),
+        record({ account: account({ accountId: "b" }) }),
+      ],
+      NOW,
+      overrides,
+    );
+    expect(group!.children!.find((child) => child.id === "b")!.status).toBe(
+      "inactive",
+    );
+    expect(group!.currentValue).toBe(100);
+  });
+
+  test("an excluded account that still holds money blanks the total", () => {
+    const [group] = groupInstitutions(
+      [
+        record(value("100")),
+        // Quiet past the threshold, and holding half a million. Summing the
+        // live accounts alone would show this institution as worth 100.
+        record({
+          account: account({ accountId: "b" }),
+          activityTo: "2022-12-31",
+          latestSnapshotAsOf: "2022-10-31",
+          ...value("500000", "USD", "2022-12-31"),
+        }),
+      ],
+      NOW,
+    );
+    expect(group!.children!.find((child) => child.id === "b")!.status).toBe(
+      "inactive",
+    );
+    expect(group!.currentValue).toBeNull();
+    // The account's own row still shows what it holds.
+    expect(group!.children!.find((child) => child.id === "b")!.currentValue).toBe(
+      500000,
+    );
+  });
+
+  test("a closed account holding a balance blanks the total", () => {
+    const closed = new Map([
+      [
+        "b",
+        { displayName: null, accountLast4: null, accountType: null, closed: true },
+      ],
+    ]);
+    const [group] = groupInstitutions(
+      [
+        record(value("100")),
+        record({ account: account({ accountId: "b" }), ...value("250") }),
+      ],
+      NOW,
+      closed,
+    );
+    expect(group!.currentValue).toBeNull();
+  });
+
+  test("a closed account with nothing left in it does not block the total", () => {
+    const closed = new Map([
+      [
+        "b",
+        { displayName: null, accountLast4: null, accountType: null, closed: true },
+      ],
+      [
+        "c",
+        { displayName: null, accountLast4: null, accountType: null, closed: true },
+      ],
+    ]);
+    const [group] = groupInstitutions(
+      [
+        record(value("100")),
+        // Emptied before it was closed.
+        record({ account: account({ accountId: "b" }), ...value("0") }),
+        // Closed, and the archive states no value for it at all.
+        record({ account: account({ accountId: "c" }) }),
+      ],
+      NOW,
+      closed,
+    );
+    expect(group!.currentValue).toBe(100);
+  });
+
+  test("an account the archive holds nothing for never blocks the total", () => {
     const [group] = groupInstitutions(
       [
         record(value("100")),
@@ -258,24 +334,6 @@ describe("current value", () => {
     expect(group!.currentValue).toBe(100);
   });
 
-  test("a closed account is left out of the total, and cannot hold it back", () => {
-    const overrides = new Map([
-      ["b", { displayName: null, accountLast4: null, accountType: null, closed: true }],
-    ]);
-    const [group] = groupInstitutions(
-      [
-        record(value("100")),
-        record({ account: account({ accountId: "b" }) }),
-      ],
-      NOW,
-      overrides,
-    );
-    expect(group!.children!.find((child) => child.id === "b")!.status).toBe(
-      "inactive",
-    );
-    expect(group!.currentValue).toBe(100);
-  });
-
   test("an institution with no active account at all has no total", () => {
     const [group] = groupInstitutions(
       [
@@ -289,6 +347,89 @@ describe("current value", () => {
       NOW,
     );
     expect(group!.currentValue).toBeNull();
+  });
+});
+
+describe("a value older than the inactivity threshold is not a current one", () => {
+  // NOW is 2026-09-18. 100 days before it is 2026-06-10.
+  test("exactly the threshold is still current", () => {
+    expect(valueIsStale("2026-06-10", NOW)).toBe(false);
+  });
+
+  test("one day past the threshold is not", () => {
+    expect(valueIsStale("2026-06-09", NOW)).toBe(true);
+  });
+
+  test("today is current, and no date is nothing to judge", () => {
+    expect(valueIsStale("2026-09-18", NOW)).toBe(false);
+    expect(valueIsStale(null, NOW)).toBe(false);
+  });
+
+  test("an account whose balance is years old carries the flag, although it is fresh", () => {
+    // The reviewer's fixture: a 2019 balance with 2026 holdings activity. The
+    // archive is right to report the balance, and the row is right to read
+    // fresh -- the statements are recent. The figure is still seven years old.
+    const [group] = groupInstitutions(
+      [
+        record({
+          currentValue: {
+            value: { decimal: "900", currency: "USD" },
+            asOf: "2019-01-31",
+            source: "balance",
+          },
+        }),
+      ],
+      NOW,
+    );
+    const child = group!.children![0]!;
+    expect(child.status).toBe("fresh");
+    expect(child.currentValue).toBe(900);
+    expect(child.currentValueStale).toBe(true);
+    // And the institution's own total, dated by that same figure.
+    expect(group!.currentValueStale).toBe(true);
+  });
+
+  test("a recent figure carries no flag, on the account or the total", () => {
+    const [group] = groupInstitutions(
+      [
+        record({
+          currentValue: {
+            value: { decimal: "900", currency: "USD" },
+            asOf: "2026-08-31",
+            source: "balance",
+          },
+        }),
+      ],
+      NOW,
+    );
+    expect(group!.children![0]!.currentValueStale).toBe(false);
+    expect(group!.currentValueStale).toBe(false);
+  });
+
+  test("a total is judged by its oldest component, like its date", () => {
+    const [group] = groupInstitutions(
+      [
+        record({
+          currentValue: {
+            value: { decimal: "100", currency: "USD" },
+            asOf: "2026-08-31",
+            source: "balance",
+          },
+        }),
+        record({
+          account: account({ accountId: "b" }),
+          currentValue: {
+            value: { decimal: "50", currency: "USD" },
+            asOf: "2019-01-31",
+            source: "balance",
+          },
+        }),
+      ],
+      NOW,
+    );
+    expect(group!.currentValue).toBe(150);
+    expect(group!.currentValueAsOf).toBe("2019-01-31");
+    expect(group!.currentValueStale).toBe(true);
   });
 });
 
