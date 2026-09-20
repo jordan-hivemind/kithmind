@@ -62,7 +62,13 @@ import { withKithReadTransaction, withKithTransaction } from "../schema.js";
 export const MAX_SWEEP_SPANS = 2000;
 
 /**
- * Every span id named anywhere in one space.
+ * Every span id named anywhere in one space -- the single copy of the
+ * whitelist, parameterized by how the caller names "this space". `unreferencedSpanIds`
+ * instantiates it with the bound parameter `$1`; the cleanup's pre-filter
+ * below instantiates the identical text with a correlated column reference,
+ * so a span the pre-filter waves through and a span the per-generation
+ * delete would keep are provably the same check, not two checks that happen
+ * to agree today.
  *
  * ponytail: space-wide, not narrowed to the text version under sweep. An
  * observation's evidence always comes from its own text version *by
@@ -72,50 +78,54 @@ export const MAX_SWEEP_SPANS = 2000;
  * notice. Narrow it (or index `value_evidence` with GIN) when a space's
  * observation count makes this show up in a timing.
  */
-const REFERENCED_SPAN_IDS = `
+function referencedSpanIdsSql(spaceIdExpr: string): string {
+  return `
   SELECT jsonb_array_elements_text(m.evidence_span_ids) AS id
     FROM kith.processing_generation_payload_manifests m
-   WHERE m.space_id = $1
+   WHERE m.space_id = ${spaceIdExpr}
      AND jsonb_typeof(m.evidence_span_ids) = 'array'
   UNION ALL
   SELECT jsonb_array_elements_text(o.value_evidence)
     FROM kith.observations o
-   WHERE o.space_id = $1
+   WHERE o.space_id = ${spaceIdExpr}
      AND jsonb_typeof(o.value_evidence) = 'array'
   UNION ALL
   SELECT jsonb_array_elements_text(entry.value)
     FROM kith.event_versions v,
          jsonb_each(v.field_evidence) AS entry(key, value)
-   WHERE v.space_id = $1
+   WHERE v.space_id = ${spaceIdExpr}
      AND jsonb_typeof(v.field_evidence) = 'object'
      AND jsonb_typeof(entry.value) = 'array'
   UNION ALL
   SELECT jsonb_array_elements_text(d.evidence_span_ids)
     FROM kith.documents d
-   WHERE d.space_id = $1
+   WHERE d.space_id = ${spaceIdExpr}
      AND jsonb_typeof(d.evidence_span_ids) = 'array'
   UNION ALL
   SELECT jsonb_array_elements_text(c.evidence_span_ids)
     FROM kith.chunks c
-   WHERE c.space_id = $1
+   WHERE c.space_id = ${spaceIdExpr}
      AND jsonb_typeof(c.evidence_span_ids) = 'array'
   UNION ALL
   SELECT jsonb_array_elements_text(w.evidence_span_ids)
     FROM kith.worker_parsed_stages w
-   WHERE w.space_id = $1
+   WHERE w.space_id = ${spaceIdExpr}
      AND jsonb_typeof(w.evidence_span_ids) = 'array'
   UNION ALL
   SELECT e.evidence_span_id
     FROM kith.investment_entries e
-   WHERE e.space_id = $1
+   WHERE e.space_id = ${spaceIdExpr}
      AND e.evidence_span_id IS NOT NULL
   UNION ALL
   SELECT statement.value->>'evidenceSpanId'
     FROM kith.document_extractions x,
          jsonb_array_elements(x.statements) AS statement(value)
-   WHERE x.space_id = $1
+   WHERE x.space_id = ${spaceIdExpr}
      AND jsonb_typeof(x.statements) = 'array'
 `;
+}
+
+const REFERENCED_SPAN_IDS = referencedSpanIdsSql("$1");
 
 export type SweepScope = {
   spaceId: string;
@@ -217,48 +227,88 @@ export type CleanupSummary = {
   applied: boolean;
   /** The ceiling this run worked under, so a truncated run is visible. */
   limit: number;
-  /** Sealed generations that carried at least one candidate span. */
+  /** Sealed generations the pre-filter found still holding an unreferenced
+   * candidate span. A generation whose only candidate spans are referenced
+   * does not appear here: the pre-filter applies the same whitelist the
+   * per-generation delete does, so it is not a candidate in the first place. */
   generationsScanned: number;
-  /** Of those, the ones that still had one after the reference check. */
+  /** Of those, the ones that still had one after the reference check ran
+   * again inside their own transaction. Ordinarily equal to
+   * `generationsScanned`; it can fall short only when a concurrent write
+   * references the span in the gap between the pre-filter and that
+   * transaction, which SERIALIZABLE surfaces as the transaction seeing
+   * nothing left to remove rather than a stale delete. */
   generationsAffected: number;
   /** Spans removed, or that `--apply` would remove. */
   spans: number;
 };
 
 /**
+ * Raised when a per-generation transaction fails partway through a run. Only
+ * the failing generation is rolled back -- every generation processed before
+ * it already committed -- so `summary` is not empty progress lost, it is the
+ * count the caller can trust and report before exiting nonzero.
+ */
+export class CleanupInterrupted extends Error {
+  readonly summary: CleanupSummary;
+
+  constructor(cause: unknown, summary: CleanupSummary) {
+    super("kith-extraction-span-cleanup: a generation's transaction failed mid-run");
+    this.name = "CleanupInterrupted";
+    this.cause = cause;
+    this.summary = summary;
+  }
+}
+
+/**
  * The legacy residue: spans stranded before the write path swept, which carry
  * no `extraction_v1` marker because the marker did not exist yet.
  *
  * Bounded (`limit` generations per run), transactional per generation, and
- * idempotent -- a generation with nothing left to remove drops out of the
- * candidate list, so repeated runs make progress instead of re-walking the
- * same head of the table.
+ * idempotent -- a generation whose only candidate spans are referenced is
+ * excluded by the pre-filter itself, so repeated runs make progress instead
+ * of re-walking the same head of the table forever.
  *
  * Deliberately conservative twice over: the candidate set is narrowed by the
- * generation's own manifest *before* the reference check, and the reference
- * check is the whole whitelist at the top of this file. A span that any of
- * the eight sites names survives, whatever its locator says.
+ * generation's own manifest, and the reference check applied against it --
+ * both in the pre-filter below and again inside each generation's own
+ * transaction -- is `referencedSpanIdsSql`, the one whitelist at the top of
+ * this file. A span that any of the eight sites names survives, whatever its
+ * locator says.
  */
 export async function cleanupOrphanedExtractionSpans(
   pool: Pool,
   options: { apply: boolean; limit?: number } = { apply: false },
 ): Promise<CleanupSummary> {
   const limit = options.limit ?? DEFAULT_CLEANUP_GENERATIONS;
-  // A cheap pre-filter: sealed generations holding a span that is outside
-  // their own manifest, is not a card's, and carries no foreign locator
-  // kind. The expensive whitelist runs per generation below.
+  // The pre-filter: sealed generations holding a span that is outside their
+  // own manifest, is not a card's, carries no foreign locator kind, and --
+  // the same whitelist `unreferencedSpanIds` uses, instantiated here as a
+  // correlated subquery instead of a bound parameter -- is named by nothing.
+  // Sharing the fragment is the point: a generation cannot pass this filter
+  // and then find its only candidate span referenced once the per-generation
+  // transaction below runs the identical check, except by a genuine race,
+  // which `generationsAffected` accounts for separately.
   const generations = await withKithReadTransaction(pool, (client) =>
     client.query<{ space_id: string; text_version_id: string }>(
-      `SELECT DISTINCT m.space_id, m.source_text_version_id AS text_version_id
-         FROM kith.processing_generation_payload_manifests m
-         JOIN kith.evidence_spans s
-           ON s.space_id = m.space_id
-          AND s.source_text_version_id = m.source_text_version_id
-        WHERE s.card_extraction_fingerprints IS NULL
-          AND (s.locator->>'kind' IS NULL OR s.locator->>'kind' = $1)
-          AND jsonb_typeof(m.evidence_span_ids) = 'array'
-          AND NOT (m.evidence_span_ids @> to_jsonb(s.id))
-        ORDER BY m.space_id, m.source_text_version_id
+      `WITH candidate AS (
+         SELECT DISTINCT m.space_id, m.source_text_version_id AS text_version_id, s.id AS span_id
+           FROM kith.processing_generation_payload_manifests m
+           JOIN kith.evidence_spans s
+             ON s.space_id = m.space_id
+            AND s.source_text_version_id = m.source_text_version_id
+          WHERE s.card_extraction_fingerprints IS NULL
+            AND (s.locator->>'kind' IS NULL OR s.locator->>'kind' = $1)
+            AND jsonb_typeof(m.evidence_span_ids) = 'array'
+            AND NOT (m.evidence_span_ids @> to_jsonb(s.id))
+       )
+       SELECT DISTINCT cand.space_id, cand.text_version_id
+         FROM candidate cand
+        WHERE NOT EXISTS (
+          SELECT 1 FROM (${referencedSpanIdsSql("cand.space_id")}) referenced
+           WHERE referenced.id = cand.span_id
+        )
+        ORDER BY cand.space_id, cand.text_version_id
         LIMIT $2`,
       [EXTRACTION_SPAN_LOCATOR_KIND, limit],
     ),
@@ -273,16 +323,24 @@ export async function cleanupOrphanedExtractionSpans(
   for (const row of generations.rows) {
     // One transaction per generation: a run interrupted halfway leaves whole
     // generations done and whole generations untouched, never a half-swept
-    // one, and the next run picks up exactly where this stopped.
-    const removed = await withKithTransaction(pool, async (client) => {
-      const ids = await unreferencedSpanIds(client, {
-        spaceId: row.space_id,
-        sourceTextVersionId: row.text_version_id,
-        include: "legacy",
+    // one, and the next run picks up exactly where this stopped. A failure
+    // here is re-thrown carrying the summary as committed so far, so a caller
+    // that has already lost this generation's transaction does not also lose
+    // the count of what came before it.
+    let removed: number;
+    try {
+      removed = await withKithTransaction(pool, async (client) => {
+        const ids = await unreferencedSpanIds(client, {
+          spaceId: row.space_id,
+          sourceTextVersionId: row.text_version_id,
+          include: "legacy",
+        });
+        if (options.apply) await deleteSpans(client, row.space_id, ids);
+        return ids.length;
       });
-      if (options.apply) await deleteSpans(client, row.space_id, ids);
-      return ids.length;
-    });
+    } catch (error) {
+      throw new CleanupInterrupted(error, { ...summary });
+    }
     if (removed > 0) summary.generationsAffected += 1;
     summary.spans += removed;
   }

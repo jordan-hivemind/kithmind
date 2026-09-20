@@ -25,7 +25,7 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 
 import { createKithPool } from "../schema.js";
-import { cleanupOrphanedExtractionSpans } from "./spanSweep.js";
+import { CleanupInterrupted, cleanupOrphanedExtractionSpans } from "./spanSweep.js";
 
 function usage(): never {
   process.stderr.write(
@@ -81,19 +81,36 @@ export async function main(argv: string[]): Promise<number> {
   }
 }
 
+/**
+ * A failed run's report: the counts already committed, if the failure
+ * happened partway through (numbers and booleans only, same as a clean run),
+ * then the error's name -- not its message, since a thrown query error
+ * carries the statement and its parameters, and a parameter here is a space
+ * id. Always signals failure. Takes the writers as arguments so this is
+ * testable without a real stdout or process.exit.
+ */
+export function reportFailure(
+  error: unknown,
+  writeStdout: (chunk: string) => void = (chunk) => {
+    process.stdout.write(chunk);
+  },
+  writeStderr: (chunk: string) => void = (chunk) => {
+    process.stderr.write(chunk);
+  },
+): number {
+  if (error instanceof CleanupInterrupted) {
+    writeStdout(`${JSON.stringify(error.summary, null, 2)}\n`);
+  }
+  writeStderr(`${error instanceof Error ? error.name : "Error"}\n`);
+  return 1;
+}
+
 if (
   process.argv[1] &&
   import.meta.url === pathToFileURL(process.argv[1]).href
 ) {
   main(process.argv.slice(2)).then(
     (code) => process.exit(code),
-    (error: unknown) => {
-      // The error's name, not its message: a thrown query error carries the
-      // statement and its parameters, and a parameter here is a space id.
-      process.stderr.write(
-        `${error instanceof Error ? error.name : "Error"}\n`,
-      );
-      process.exit(1);
-    },
+    (error: unknown) => process.exit(reportFailure(error)),
   );
 }
