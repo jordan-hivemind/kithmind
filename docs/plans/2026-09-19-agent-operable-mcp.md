@@ -2,6 +2,15 @@
 
 Date: 2026-09-19. Status: design, not adopted.
 
+> Amended 2026-09-20: sensitivity re-scoped by the owner, see PR #319.
+> Section 6's consent-screen default is corrected from sensitivity `normal`
+> to `restricted` (full access), matching the shipped ceiling default.
+> Section 8's slice 8 no longer includes redaction at the read boundary,
+> which was proposed for the sensitivity work and rejected by the owner.
+> Open question 1 is resolved: the owner's three levels shipped, `restricted`
+> is not confined to the admin UI, and every credential's default ceiling is
+> full access. Domain grants remain proposed, unbuilt work.
+
 Goal: an assistant with only an MCP connection can run Kith Mind. It writes as
 well as reads, and it learns the vocabulary from the server, never from the
 code. Silent wrong data is the one unacceptable failure. Never nag for
@@ -293,9 +302,11 @@ the same words as a read refusal. A write result never echoes a field the
 caller could not read, so "already exists" and "no such thing" are worded
 identically.
 
-The consent screen gains a domain matrix and a maximum sensitivity selector,
-keeping the space picker from `consent-spaces.ts`. Defaults: read everywhere,
-write nowhere, sensitivity `normal`.
+The consent screen gains a domain matrix, keeping the space picker from
+`consent-spaces.ts`, and already carries the maximum sensitivity selector
+PR #319 shipped. Defaults: read everywhere, write nowhere, sensitivity
+`restricted` (full access, matching the shipped ceiling default), narrowed
+by the owner per connection, never narrowed by default.
 
 `apps/web/src/lib/mcp/*` and `packages/kith-store/src/identity/*` are tier 2
 work and need a second-model security review before merge, per AGENTS.md.
@@ -328,7 +339,7 @@ did not make. The bar is ten of ten on duplicates and on asking.
 | 5 | `list_attention`, `resolve_attention` | attention items in matching plan | example three |
 | 6 | `resolve_person`, fact correct and retire, thought update and retract | people profiles | example two |
 | 7 | `list_source_folders`, `add_source_folder`, `reextract_document`, `correct_extracted_value` | 2 | filing guidance is real, not prose |
-| 8 | Redaction at the read boundary, per-connection ceiling, domain grants, consent matrix | sensitivity work | ceiling refusals, oracle tests |
+| 8 | Domain grants, consent matrix, on top of the per-connection ceiling PR #319 already shipped. No redaction at the read boundary: the owner rejected that design, and a lowered ceiling filters and counts rather than refuses | sensitivity work | domain refusals, oracle tests |
 | 9 | Conformance suite and the ten-utterance eval | 1 to 8 | the whole surface |
 
 Each slice is three to six agent hours. Slices 1, 2 and 7 depend on nothing
@@ -337,10 +348,14 @@ document is the common case.
 
 ## 9. Open questions
 
-1. Sensitivity levels. The tax plan specifies two, `low` and `high`. The owner
-   named three: normal, sensitive, restricted. Recommended default: adopt
-   three, map `low` to normal and `high` to sensitive, and define restricted
-   as never leaving the admin UI at any ceiling.
+1. Sensitivity levels. Resolved by PR #319: the owner's three levels,
+   `normal`, `sensitive`, `restricted`, shipped. `restricted` is not confined
+   to the admin UI; it is readable through MCP like any other level, and the
+   default ceiling (`restricted`, meaning everything) reads it in full. Only
+   a ceiling the owner has deliberately lowered withholds a `restricted`
+   document, and even then only for the reads listed in PR #319 (document
+   search, document fetch, inventory, the review queue and record queries),
+   not for thoughts, facts, investments, sources or stats.
 2. Domain grants. Adding `kith.api_key_domains` is a migration and a consent
    screen change. Recommended default: build it, because a connection that can
    create financial rows should not also be able to write family facts unless
