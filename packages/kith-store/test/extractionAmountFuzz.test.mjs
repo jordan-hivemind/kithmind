@@ -190,6 +190,16 @@ const MAGNITUDE_WORDS = [
   ["millions", 6],
   ["billion", 9],
   ["billions", 9],
+  // ADM-5k. A trillion is a million million, a lakh is a hundred thousand
+  // and a crore is ten million, wherever they are printed. These are claims
+  // about the words, not about the code: the oracle shifts the point by the
+  // places written here and the grammar has to agree.
+  ["trillion", 12],
+  ["trillions", 12],
+  ["lakh", 5],
+  ["lakhs", 5],
+  ["crore", 7],
+  ["crores", 7],
 ];
 
 /** Every dash a document prints where it means a minus. */
@@ -225,7 +235,123 @@ const WORDS = [
   "Widget",
   "Consulting",
   "services",
+  // ADM-5k: the fourteen above were the whole vocabulary, so a word was
+  // never a surprise. These are ordinary English a receipt, a statement or a
+  // letter prints, and not one of them measures or scales anything.
+  "Reference",
+  "Description",
+  "Store",
+  "Card",
+  "Change",
+  "Cash",
+  "Account",
+  "Order",
+  "Customer",
+  "Thank",
+  "Receipt",
+  "Terminal",
+  "Merchant",
+  "Approved",
+  "Purchase",
+  "Discount",
+  "Delivery",
+  "Shipping",
+  "Handling",
+  "Service",
+  "Register",
+  "Cashier",
+  "Visit",
+  "again",
+  "please",
+  "monthly",
+  "annual",
+  "opening",
+  "closing",
 ];
+
+/**
+ * Words that make the amount **in front of them** unpriceable.
+ *
+ * Every one of these is a statement about English rather than about the
+ * grammar under test: a line printing `2.5 mil` does not print two and a
+ * half, `45 cents` is not forty-five of the units a money field stores,
+ * `45.00 CR` is not a charge, and `2.5 M` beside a room number is not two and
+ * a half million. Whether the page means the scaled reading, the other
+ * reading, or something a reader would have to guess at, the one answer that
+ * cannot be a wrong number is no answer at all -- so the oracle prices none
+ * of them and the finder may offer nothing.
+ *
+ * In front of the amount instead, almost none of them binds: `million 42.00`
+ * is forty-two to any reader and `Cost basis 1,234.56` is a money line with a
+ * label on it. {@link SPOILING_BEFORE} holds the few that do.
+ *
+ * An ISO currency code is not here at all. A code names the money and never
+ * changes the number, on either side: `Tax 13.20 USD` is thirteen twenty.
+ *
+ * The generator does not say which of them the grammar reads and which it
+ * refuses. It says only that it cannot price them, which is the claim that
+ * makes an offer a counterexample.
+ */
+const SPOILING_AFTER = [
+  // Scale, spelled a way no page settles.
+  "mil",
+  "mill",
+  "mills",
+  "mln",
+  "thou",
+  "thous",
+  "grand",
+  "bill",
+  "bil",
+  "bills",
+  "tn",
+  "trn",
+  "tril",
+  "trill",
+  "lac",
+  "lacs",
+  "mio",
+  // Scale, as a single letter a room number wears just as well.
+  "K",
+  "M",
+  "B",
+  "k",
+  "m",
+  "b",
+  "MM",
+  "mm",
+  "bn",
+  "mn",
+  // Not a sign: `CR` and `DR` one space after an amount are the documented
+  // credit and debit markers, and the oracle prices those itself. In front of
+  // the amount they are {@link SPOILING_BEFORE}.
+  // Units, which measure something a money field does not store.
+  "cents",
+  "cent",
+  "percent",
+  "pct",
+  "bps",
+  "bp",
+  "basis",
+  "shares",
+  "share",
+  "units",
+  "unit",
+  "per",
+  "each",
+  "ea",
+  "apiece",
+];
+
+/**
+ * Words that make the amount **after** them unpriceable.
+ *
+ * Only a sign does that. A ledger that prints its credits with the marker in
+ * front means minus forty-five by `CR 45.00`, and a ledger that does not
+ * means forty-five; the characters are the same and the page does not say.
+ * A scale or a unit binds backwards and cannot reach the number after it.
+ */
+const SPOILING_BEFORE = ["CR", "DR", "cr", "dr", "Cr", "Dr"];
 
 /**
  * Tokens that are not amounts at all, printed on the same lines. Every one of
@@ -348,10 +474,21 @@ function makeAmount(random) {
   let magnitude = 0;
   let suffix = "";
   let suffixGap = "";
+  /** True when the printed token says something this generator cannot put a
+   * number to, so the only value it may be offered is none. */
+  let spoiled = false;
   if (magnitudeKind === "letter") {
     const [letters, places] = random.pick(MAGNITUDE_LETTERS);
     magnitude = places;
     suffix = letters;
+    // ADM-5k: a magnitude letter a gap away from its digits. `$2.5 M` is two
+    // and a half million, `Room 12 B` is a room, and `Serving 250 m l` is a
+    // volume -- the same characters, and the page does not say which. The
+    // generator prints it and prices nothing.
+    if (random.chance(0.25)) {
+      suffixGap = random.pick([" ", random.pick(GAPS)]);
+      spoiled = true;
+    }
   } else if (magnitudeKind === "word") {
     const [word, places] = random.pick(MAGNITUDE_WORDS);
     magnitude = places;
@@ -425,12 +562,12 @@ function makeAmount(random) {
   // away. Either way it is part of the number, and the currency marker goes
   // outside both.
   let core = printedDigits;
-  if (magnitudeKind === "letter") core = `${digits}${suffix}`;
+  if (magnitudeKind === "letter") core = `${digits}${suffixGap}${suffix}`;
   else if (magnitudeKind === "word") core = `${digits}${suffixGap}${suffix}`;
   // A magnitude word and a trailing currency code need something between
   // them. `millionsCAD` is one word to any reader and to the grammar, so the
   // oracle would be pricing a token nobody printed.
-  if (magnitudeKind === "word" && markerSide === "after" && markerGap === "") {
+  if (suffixGap !== "" && markerSide === "after" && markerGap === "") {
     markerGap = " ";
   }
   let body =
@@ -453,10 +590,41 @@ function makeAmount(random) {
     text = text.slice(0, at) + random.pick(ZERO_WIDTH) + text.slice(at);
   }
 
-  const value = truthOf({ whole, fraction, magnitude, negative });
+  // ADM-5k. Three shapes the generator never printed, each of them a token a
+  // reader cannot price either. A second sign is not a second negation and
+  // not a positive: `--5` is not five and `-+5` is not anything. A
+  // parenthesis with no partner is an accounting minus to one reader and a
+  // footnote to another. And a digit from another script, or a circled one,
+  // is a digit a reader reads and this grammar must not -- the number it
+  // would make is a number nobody printed.
+  const damage = random.int(40);
+  if (damage === 0) {
+    text = `${random.pick(DASHES)}${random.pick(["-", "+", ...DASHES])}${text}`;
+    spoiled = true;
+  } else if (damage === 1) {
+    text = `${random.pick(DASHES)}${text}${random.pick(DASHES)}`;
+    spoiled = true;
+  } else if (damage === 2) {
+    text = random.chance(0.5) ? `(${text}` : `${text})`;
+    spoiled = true;
+  } else if (damage === 3) {
+    const digitAt = [...text].findIndex((unit) => /\d/.test(unit));
+    if (digitAt >= 0) {
+      text =
+        text.slice(0, digitAt + 1) +
+        random.pick(EXOTIC_DIGITS) +
+        text.slice(digitAt + 1);
+      spoiled = true;
+    }
+  }
+
+  const value = spoiled
+    ? undefined
+    : truthOf({ whole, fraction, magnitude, negative });
   return {
     text,
     value,
+    spoiled,
     currencyName,
     grouping,
     signKind,
@@ -464,6 +632,31 @@ function makeAmount(random) {
     trailingDot,
   };
 }
+
+/**
+ * Digits a reader reads and this grammar must not.
+ *
+ * Arabic-Indic and Devanagari are digits to Unicode; the circled, enclosed
+ * and dingbat forms become ASCII digits under NFKC, which is how `①250.00`
+ * once read as 1,250. One of them inside a number means the number a reader
+ * sees is not the number the ASCII digits spell, so the generator prices
+ * nothing for the whole token.
+ */
+const EXOTIC_DIGITS = [
+  "\u0665",
+  "\u0667",
+  "\u0967",
+  "\u096b",
+  "\u2460",
+  "\u2465",
+  "\u2488",
+  "\u2776",
+  "\u277b",
+  "\u2780",
+  "\u2793",
+  "\u00bd",
+  "\u00b2",
+];
 
 /** `1234567` as `1,234,567`: the last groups are three digits and the first
  * is whatever is left. */
@@ -495,10 +688,15 @@ function word(random) {
 
 /** One case: the string to scan, and every value it prints. */
 function makeCase(random) {
-  const shape = random.int(9);
+  const shape = random.int(14);
   if (shape === 6) return makeCurrencyGap(random);
   if (shape === 7) return makeTrailingDotPair(random);
   if (shape === 8) return makeListOrdinal(random);
+  if (shape === 9) return makeSpoiled(random);
+  if (shape === 10) return makeDecimalHeadGroups(random);
+  if (shape === 11) return makePipeRow(random);
+  if (shape === 12) return makeMarked(random);
+  if (shape === 13) return makeSpoiled(random);
   if (shape === 0) {
     const token = makeToken(random);
     return { text: token.text, tokens: [token], single: true };
@@ -601,6 +799,9 @@ function makeCurrencyGap(random) {
     "",
     " due",
     " total",
+    " DUE",
+    " TOTAL",
+    " million",
     "a",
     "b",
     ".",
@@ -608,7 +809,13 @@ function makeCurrencyGap(random) {
     "-",
     "+",
   ]);
-  const ends = tail === "" || tail.startsWith(" ");
+  // ADM-5k: and a gap then a lowercase word is prose. `We paid $500. 25
+  // people` is a sentence with a full stop in it, and the rule closed the gap
+  // and priced 500.25 -- a number no reader of that sentence would say. A
+  // receipt cell and a sentence print the same characters, so the generator
+  // prices neither reading.
+  const ends =
+    tail === "" || (tail.startsWith(" ") && !/^ \p{Ll}/u.test(tail));
   const text = `${mark}${whole}. ${right}${tail}`;
   const value =
     right.length === 2 && ends
@@ -658,6 +865,116 @@ function makeListOrdinal(random) {
 }
 
 /**
+ * An amount with a word beside it that this generator cannot price it
+ * through.
+ *
+ * `$2.5 mil`, `45 cents`, `2.5 M`, `CR 45.00`, `12 USD 15` -- each of them is
+ * a line whose number depends on a word, and the word does not settle it.
+ * The oracle prices nothing, so any value at all is a counterexample. Both
+ * orders, because a marker in front of a number signs it on a ledger that
+ * prints its credits that way.
+ */
+function makeSpoiled(random) {
+  const token = makeAmount(random);
+  const gap = random.pick([" ", " ", random.pick(GAPS)]);
+  const text = random.chance(0.75)
+    ? `${word(random)} ${token.text}${gap}${random.pick(SPOILING_AFTER)}`
+    : `${word(random)} ${random.pick(SPOILING_BEFORE)}${gap}${token.text}`;
+  return { text, tokens: [{ text, value: undefined, signKind: "none" }] };
+}
+
+/**
+ * `$12.99 100 200`: a price, then two cells of three digits.
+ *
+ * A single space before a run of exactly three digits is a grouping separator
+ * in `$1 000 000` and a column boundary in `$123 456   789`, and the finder
+ * settles it on the currency marker and the width of the gap. What it may
+ * never do is let a head that already has a decimal point take them: the
+ * cents belong to the head, so the groups cannot be the same number's, and
+ * `$12.99 100 200` offered 12.991002 -- a number with the cents of one cell
+ * and the digits of two more. The oracle prices nothing here, because a
+ * priced head beside three-digit cells says one thing to one reader and
+ * another to the next.
+ */
+function makeDecimalHeadGroups(random) {
+  const mark = random.pick(["$", "\u20ac", "\u00a3", "\u00a5", "USD ", "GBP "]);
+  const head = random.digits(1 + random.int(4));
+  const cents = random.digits(random.pick([1, 2, 2, 3]), true);
+  const groups = [];
+  for (let at = 0; at < 1 + random.int(3); at += 1) {
+    groups.push(random.digits(3));
+  }
+  const text = `${mark}${head}.${cents} ${groups.join(" ")}`;
+  return { text, tokens: [{ text, value: undefined, signKind: "none" }] };
+}
+
+/**
+ * `| Total | 21.60 |`: the pipe-rendered table many of this store's parsed
+ * receipts print.
+ *
+ * A bar cannot sign or scale a number, so the row's amount reads -- that is
+ * real recall and it has to survive. What a bar may not do is hide the cell
+ * behind it: `| Payment | 45.00 | CR |` prints a credit, and the finder
+ * offered a charge because it stopped at the bar. When a marker cell is
+ * printed the oracle prices nothing; when it is not, the amount is the
+ * amount.
+ */
+function makePipeRow(random) {
+  const token = makeToken(random);
+  const spoiler = random.chance(0.5) ? random.pick(SPOILING_AFTER) : "";
+  const cells = [word(random), token.text];
+  if (spoiler) cells.push(spoiler);
+  else if (random.chance(0.4)) cells.push(word(random));
+  const bar = random.pick(["|", "\u00a6", "\u2502", "\u2551"]);
+  const pad = random.pick([" ", " ", "  "]);
+  const text = `${bar}${pad}${cells.join(`${pad}${bar}${pad}`)}${pad}${bar}`;
+  if (spoiler) {
+    return { text, tokens: [{ text, value: undefined, signKind: "none" }] };
+  }
+  return { text, tokens: [token] };
+}
+
+/**
+ * An amount with a mark pressed against a word beside it.
+ *
+ * `joinerFor` kept the pair from fusing by choosing a different separator,
+ * and because almost every generated token both starts and ends with a
+ * digit, it chose one in about ninety-six cases in a hundred -- so `/`, `'`,
+ * `-`, `%`, `(` and `)` were printed a few times in a million. A word on the
+ * far side cannot fuse with a number, so the mark is printed as it stands and
+ * the amount keeps its value: `$9.99/mo`, `Total-42.00` and `(42.00` each
+ * either read the amount or read nothing, and never a third number.
+ */
+function makeMarked(random) {
+  const token = makeAmount(random);
+  // Never a parenthesis beside a token that already prints one. A token with
+  // an unbalanced parenthesis is one the generator declared unpriceable, and
+  // a partner supplied from outside would balance it back into an accounting
+  // minus the grammar reads correctly and the oracle no longer knows about.
+  const marks = /[()]/.test(token.text)
+    ? ["/", "'", "-", "%", ":", "#", "\u2019"]
+    : ["/", "'", "-", "%", "(", ")", ":", "#", "\u2019"];
+  const mark = random.pick(marks);
+  const other = word(random);
+  const text = random.chance(0.5)
+    ? `${other} ${token.text}${mark}${other}`
+    : `${other}${mark}${token.text} ${other}`;
+  // The mark can carry a sign or a scale of its own -- a parenthesis is an
+  // accounting minus, a percent re-measures, a dash between two things is a
+  // sign to one reader and a range to another -- and the generator prices
+  // none of those. The rest group, time or identify, and every one of them
+  // needs digits on both sides to do it: with a word on the far side they
+  // cannot touch the number, so the amount is whatever it printed.
+  const priced = ":#/'\u2019".includes(mark);
+  return {
+    text,
+    tokens: [
+      priced ? token : { text, value: undefined, signKind: "none" },
+    ],
+  };
+}
+
+/**
  * The gap between two cells of a column, which is never one space wide.
  *
  * A single space between two digit runs is a grouping separator as readily as
@@ -693,6 +1010,10 @@ const WIDE_GAPS = GAPS.filter((gap) => gap.normalize("NFKC") !== " ");
  * reading it was given and why.
  */
 function joinerFor(random, left, right) {
+  // A parenthesis joiner is dropped when either token prints an unbalanced
+  // one of its own, for the reason {@link makeMarked} gives: the pair would
+  // read as an accounting minus the oracle does not know it printed.
+  const safeParens = !unbalanced(left.text) && !unbalanced(right.text);
   const joiner = random.pick([
     " ",
     ", ",
@@ -706,15 +1027,34 @@ function joinerFor(random, left, right) {
     "\t",
     "",
     "%",
-    " (",
-    ") ",
+    ...(safeParens ? [" (", ") "] : ["  ", "\t"]),
   ]);
   const before = visible(left.text);
   const after = visible(right.text);
-  const fuses =
-    FUSING_EDGE.test(before[before.length - 1] ?? "") &&
-    FUSING_EDGE.test(after[0] ?? "");
-  return fuses ? random.pick([" and ", " | ", "   "]) : joiner;
+  // A pair that would fuse keeps its joiner and gets a column-wide gap on the
+  // side that fuses, rather than a different joiner altogether. Almost every
+  // generated token both starts and ends with a digit, so replacing the
+  // joiner printed `/`, `'`, `-`, `%`, `(` and `)` in about four cases in a
+  // hundred and the six of them together in a few per million. A wide gap is
+  // two cells to any reader, so the two tokens keep their values and the mark
+  // between them is still printed.
+  const leftFuses = FUSING_EDGE.test(before[before.length - 1] ?? "");
+  const rightFuses = FUSING_EDGE.test(after[0] ?? "");
+  if (!leftFuses || !rightFuses) return joiner;
+  if (joiner.trim() === "") return random.pick(WIDE_GAPS);
+  return `${random.pick(WIDE_GAPS)}${joiner.trim()}${random.pick(WIDE_GAPS)}`;
+}
+
+/** Whether a token's parentheses do not pair up, which is the damage
+ * {@link makeAmount} prints deliberately and no context may undo. */
+function unbalanced(text) {
+  let depth = 0;
+  for (const unit of text) {
+    if (unit === "(") depth += 1;
+    else if (unit === ")") depth -= 1;
+    if (depth < 0) return true;
+  }
+  return depth !== 0;
 }
 
 /** The token as a reader sees it: the zero-width characters are not an edge,
@@ -806,6 +1146,55 @@ function checkSplit(report, random, tokens) {
   }
 }
 
+/**
+ * The wrap. A printed sentence runs past the right-hand margin and carries
+ * its next word onto the line below, and a line break is not a full stop:
+ * `raised $2.5` with `million` under it prints two and a half million, and
+ * the finder offered two and a half. A prefix-credit ledger breaks the other
+ * way, with `CR` above its amount.
+ *
+ * Each line is scanned as the gate scans it -- with the wrap tokens
+ * `pageLines` carries -- and the whole page's values are the truths, because
+ * a line may print one number and the page beside it another. A spoiled wrap
+ * prices nothing at all: what the two lines print together is exactly what
+ * the break does not say.
+ */
+function checkWrapped(report, random, seed, at) {
+  const token = makeAmount(random);
+  const spoiled = random.chance(0.55);
+  const tailWord = spoiled
+    ? random.pick([...SPOILING_AFTER, ...MAGNITUDE_WORDS.map(([one]) => one)])
+    : word(random);
+  const head = `${word(random)} ${word(random)} ${token.text}`;
+  const rest = `${tailWord} ${word(random)} ${word(random)}`;
+  const page = `${head}\n${rest}`;
+  const truths = spoiled ? [] : [token];
+  for (const line of pageLines(page)) {
+    check(report, `seed ${seed} case ${at} wrap`, line.text, truths, {
+      cutStart: line.cutStart,
+      cutEnd: line.cutEnd,
+      ...(line.previousToken === undefined
+        ? {}
+        : { previousToken: line.previousToken }),
+      ...(line.nextToken === undefined ? {} : { nextToken: line.nextToken }),
+    });
+  }
+  // And the mirror: a marker at the end of one line, its amount at the start
+  // of the next.
+  const above = `${word(random)} ${random.pick(SPOILING_BEFORE)}`;
+  const below = `${token.text} ${word(random)}`;
+  for (const line of pageLines(`${above}\n${below}`)) {
+    check(report, `seed ${seed} case ${at} wrap back`, line.text, [], {
+      cutStart: line.cutStart,
+      cutEnd: line.cutEnd,
+      ...(line.previousToken === undefined
+        ? {}
+        : { previousToken: line.previousToken }),
+      ...(line.nextToken === undefined ? {} : { nextToken: line.nextToken }),
+    });
+  }
+}
+
 function run(seed, cases) {
   const random = makeRandom(seed);
   const report = [];
@@ -844,6 +1233,9 @@ function run(seed, cases) {
     }
     if (at % 8 === 0) {
       checkSplit(report, random, shaped.tokens);
+    }
+    if (at % 5 === 0) {
+      checkWrapped(report, random, seed, at);
     }
   }
   return report;
