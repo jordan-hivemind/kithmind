@@ -982,11 +982,11 @@ const QUOTE_SPEC = [
   // the model's value still has to be one the line prints, and a bare run of
   // digits can never repair a citation onto a money field (`repairTarget`).
   ["1 Ordinary business income 12,345.", ["1", "12345"]],
-  // ADM-5k: `mill` is a million and a property-tax mill, and the finder
-  // cannot tell a street from a fund. The row used to offer 12; refusing it
-  // is what makes `$2.5 mill` refuse too, and that is the reading that
-  // mattered.
-  ["12 Mill Lane", []],
+  // ADM-5k, second round: a Capitalized word followed by another Capitalized
+  // word is a name, so the street reads again while `$2.5 mill` still
+  // refuses. The first round refused both and the confirmation review
+  // measured what that cost.
+  ["12 Mill Lane", ["12"]],
 
   // -------------------------------------------------------------------------
   // ADM-5g round five: every counterexample the four reviews produced.
@@ -1130,9 +1130,14 @@ const QUOTE_SPEC = [
   ["Rate 45 basis points", []],
   ["Holding 100 shares", []],
   ["Holding 12 units", []],
-  ["Price $5.00 per", []],
-  ["Price $5.00 each", []],
-  ["Price 2 ea", []],
+  // ADM-5k, second round: a rate is still the printed dollars. The gate's
+  // claim is that the cited text prints the value, not that the value is a
+  // total, so `per` and `each` are neutral for money again.
+  ["Price $5.00 per", ["5"]],
+  ["Price $5.00 each", ["5"]],
+  ["Price 2 ea", ["2"]],
+  ["Rent $2,000.00 per month", ["2000"]],
+  ["Dividend $0.52 per share 100 shares $52.00", ["0.52", "52"]],
   // Only directly after the amount, which is the one place a unit can stand.
   // A unit word in front of a number is that number's label.
   ["Cost basis 1,234.56", ["1234.56"]],
@@ -1198,6 +1203,87 @@ const QUOTE_SPEC = [
   // asserted since the grammar was written.
   ["Total 3.499", ["3.499"]],
   ["Total Rp 12.000", ["12"]],
+
+  // -------------------------------------------------------------------------
+  // ADM-5k, second round. The confirmation review found no new wrong number
+  // and measured the round losing about a third of the correct offers on the
+  // owner's commonest shapes. Every row below is a relaxation, and every one
+  // of them is mechanical; the guards under each are the closed cases the
+  // relaxation may not reopen.
+  // -------------------------------------------------------------------------
+
+  // A cell past a rule is a neighbouring value, not a marker on this one. A
+  // cell that reads as a whole amount, a lone currency code, a blank marker,
+  // or a label with nothing in it that can sign or scale, all say nothing
+  // about the amount on the other side of the bar.
+  ["| Dividends | $12.50 | $150.00 |", ["12.5", "150"]],
+  ["| (5.00) | (6.00) |", ["-5", "-6"]],
+  ["| Net income (loss) | (12,500) | 3,200 |", ["-12500", "3200"]],
+  ["| Check | 45.00 | -1,204.17 |", ["45", "-1204.17"]],
+  ["| Gain | 2,500.00 | USD |", ["2500"]],
+  ["| 45.00 | N/A |", ["45"]],
+  ["| Opening | 1,000.00 | Closing | 1,250.00 |", ["1000", "1250"]],
+  ["| $2.5M | $3.0M |", ["2500000", "3000000"]],
+  ["| $2.5M | $3.0K |", ["2500000", "3000"]],
+  // And the cells that still refuse, because each of them could sign, scale
+  // or re-measure the amount beside it.
+  ["| Payment | 45.00 | CR |", []],
+  ["| 45.00 | million |", []],
+  ["| 45.00 | % |", []],
+  ["| 2.5 | M |", []],
+  ["| 45.00 | CR 12.00 |", []],
+  ["| 45.00 | (12.00 |", []],
+  ["| 45.00 | - |", []],
+  // A percent sign in the next cell measures the next cell. The bar is what
+  // says so, and the 12.5 it does reach is refused on its own account.
+  ["| 45.00 | 12.5% |", ["45"]],
+  ["-| 45.00", []],
+
+  // A scale word that is also an ordinary word or a name refuses only
+  // directly after the amount, and never where it opens a name. In front of
+  // the amount it is that amount's label.
+  ["Water Bill $64.12", ["64.12"]],
+  ["Bill 120.00", ["120"]],
+  ["Nashville, TN $45.00", ["45"]],
+  ["$1,250.00 Mill Creek Partners LP", ["1250"]],
+  ["500.00 Grand Rapids", ["500"]],
+  ["Grand total 1,234.56", ["1234.56"]],
+  ["Raised $2.5 mill", []],
+  ["Raised $2.5 grand", []],
+  ["Raised $3 bill", []],
+  ["Raised $2 tn", []],
+  ["Raised $2.5 Mill", []],
+  ["Raised $2.5 mill.", []],
+
+  // A currency mark says the amount is money whatever noun follows it; a
+  // bare count is still a count.
+  ["Invested $50,000.00 Shares issued 5,000", ["50000", "5000"]],
+  ["Holding 100 shares", []],
+  ["Holding 12 units", []],
+  ["Holding $100.00 shares", ["100"]],
+  ["Rate 45.00 percent", []],
+  ["Paid 45 cents", []],
+
+  // A gap after the cents followed by a digit is the next cell, not the end
+  // of this number: `$7. 42 849.70` offered 7.42 and 849.70 for a line that
+  // may print either two cells or one number.
+  ["$7. 42 849.70", []],
+  ["$6. 25", ["6.25"]],
+  ["$82. 12 DUE", ["82.12"]],
+
+  // A compound amount is one number said the way a person says it. Two
+  // scaled spans one space apart, the larger scale first, used to offer the
+  // first of them whole -- short by whatever the second one adds.
+  ["$3 million 2 thousand", []],
+  ["1 crore 25 lakh", []],
+  ["5 lakh 20 thousand", []],
+  ["Raised $2.5 million", ["2500000"]],
+  ["Raised 2.5 Million", ["2500000"]],
+
+  // A Capitalized scale word followed by a Capitalized word is a place.
+  ["45.00 Lakh Street", []],
+  ["45.00 Thousand Oaks", []],
+  ["Raised 45.00 thousand", ["45000"]],
 ];
 
 test("a page line offers exactly the amounts the table says", () => {
@@ -1233,12 +1319,11 @@ const WRAP_SPEC = [
   ["raised $2.5", {}, { nextToken: "M" }, []],
   ["raised $2.5", {}, { nextToken: "mil" }, []],
   ["raised $2.5", {}, { nextToken: "trillion" }, []],
-  ["raised $2.5", {}, { nextToken: "per" }, []],
+  ["raised $2.5", {}, { nextToken: "per month" }, ["2.5"]],
   ["Balance 45.00", {}, { nextToken: "CR" }, []],
   ["Balance 45.00", {}, { nextToken: "USD" }, []],
   ["Balance 45.00", {}, { nextToken: "%" }, []],
   ["Balance 45.00", {}, { nextToken: ")" }, []],
-  ["Balance 45.00", {}, { nextToken: "-5.00" }, []],
   // And the mirror: a marker at the end of the line above.
   ["45.00", { previousToken: "CR" }, {}, []],
   ["45.00", { previousToken: "DR" }, {}, []],
@@ -1251,8 +1336,44 @@ const WRAP_SPEC = [
   ["Balance 45.00", {}, { nextToken: "Paid" }, ["45"]],
   ["Balance 45.00", {}, { nextToken: "Total" }, ["45"]],
   ["Balance 45.00", {}, {}, ["45"]],
-  ["(9,999.)", {}, { nextToken: "L" }, ["-9999"]],
+  ["(9,999.)", {}, { nextToken: "L Ending capital account" }, ["-9999"]],
   ["1 Ordinary business income 12,345.", {}, { nextToken: "2" }, ["1", "12345"]],
+
+  // ADM-5k, second round. A next line that reads as a whole amount is the
+  // next cell of a column, not a marker on this one: refusing every line
+  // whose neighbour opens with `$`, `(` or `-` cost an eighth of the correct
+  // offers on amount columns.
+  ["$20.00", {}, { nextToken: "$1.60" }, ["20"]],
+  ["$1.60", { previousToken: "$20.00" }, { nextToken: "$21.60" }, ["1.6"]],
+  ["$21.60", { previousToken: "Total" }, { nextToken: "$5.00" }, ["21.6"]],
+  ["(5.00)", {}, { nextToken: "(6.00)" }, ["-5"]],
+  ["45.00", {}, { nextToken: "-1,204.17" }, ["45"]],
+  ["45.00", { previousToken: "(1,204.17)" }, {}, ["45"]],
+  ["45.00", {}, { nextToken: "$12.00 Tax" }, ["45"]],
+  // And a next line that is a marker still refuses, whatever it is dressed
+  // in. A zero-width character and a soft hyphen are not characters a reader
+  // sees, leading punctuation is stepped over, and a blank line is looked
+  // past by `pageLines` before the token is ever cut.
+  ["Balance 45.00", {}, { nextToken: "-" }, []],
+  ["Balance 45.00", {}, { nextToken: "(credit)" }, []],
+  ["Balance 45.00", {}, { nextToken: "*CR" }, []],
+  ["Balance 45.00", {}, { nextToken: "[CR]" }, []],
+  ["Balance 45.00", {}, { nextToken: "\u200bCR" }, []],
+  ["raised $2.5", {}, { nextToken: ".million" }, []],
+  ["raised $2.5", {}, { nextToken: ", million" }, []],
+  ["raised $2.5", {}, { nextToken: "\u00admillion" }, []],
+
+  // A form labels its rows with the letters a magnitude is written with, so
+  // a single closing letter is a label when a word follows it and a
+  // magnitude when nothing does.
+  ["12,345.", {}, { nextToken: "K Net rental real estate income" }, ["12345"]],
+  ["12,345.", {}, { nextToken: "M Section 179 deduction 500." }, ["12345"]],
+  ["12,345.", {}, { nextToken: "D Nonqualified plans" }, ["12345"]],
+  ["2.5", {}, { nextToken: "K" }, []],
+  ["2.5", {}, { nextToken: "M" }, []],
+  ["2.5", {}, { nextToken: "M." }, []],
+  ["2.5", {}, { nextToken: "M 500" }, []],
+  ["2.5", {}, { nextToken: "L Ending capital account" }, ["2.5"]],
   ["45.00", { previousToken: "Subtotal" }, {}, ["45"]],
   ["45.00", { previousToken: "20.00" }, {}, ["45"]],
   ["45.00", { previousToken: "|" }, {}, ["45"]],
@@ -1285,11 +1406,19 @@ test("a page's lines carry the tokens their neighbours print", () => {
   assert.deepEqual(
     lines.map((line) => [line.text, line.previousToken, line.nextToken]),
     [
-      ["raised $2.5", undefined, "million"],
-      ["million from", "$2.5", "21.60"],
-      ["21.60", "from", undefined],
+      ["raised $2.5", undefined, "million from"],
+      ["million from", "raised $2.5", "21.60"],
+      ["21.60", "million from", undefined],
     ],
   );
+  // ADM-5k, second round: a blank line is looked past, not stopped at, and
+  // what a reader cannot see is taken out before the lead is cut. A page
+  // printing `45.00`, a blank line and `CR` prints a credit.
+  const spaced = pageLines("45.00\n   \n\nCR");
+  assert.equal(spaced[0].nextToken, "CR");
+  assert.equal(spaced[3].previousToken, "45.00");
+  assert.equal(pageLines("45.00\n\u200bCR")[0].nextToken, "CR");
+  assert.equal(pageLines("$2.5\n\u00admillion")[0].nextToken, "million");
   // A cut is not a line break, so a piece carries no wrap token across one.
   const long = pageLines(`${"word ".repeat(80)}$2.5 million`);
   assert.ok(long.length > 1, "the line was split");
