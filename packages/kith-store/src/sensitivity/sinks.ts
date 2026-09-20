@@ -71,17 +71,40 @@ export function scrubThrown(error: unknown): string {
 }
 
 /**
+ * How much of an error string is scanned for identifiers.
+ *
+ * The scan is several regexes over the whole input, so its cost is linear in a
+ * length nothing bounds: a handler that stringifies a document page or a driver
+ * that quotes a multi-megabyte parameter hands this a multi-megabyte message,
+ * inside the transaction that is failing the job. Only the first `maxChars` of
+ * the result is ever stored, and this is four times that, so ordinary text --
+ * where masking replaces a few short runs -- fills the stored string exactly as
+ * it did before. Text that is almost entirely identifiers can mask down below
+ * `maxChars` inside this window; the result then says so with its ellipsis
+ * rather than reading another megabyte looking for more diagnostic.
+ */
+const SCAN_CHARS = 8_000;
+
+/**
  * A `deferred_work.last_error` string before it is written.
  *
  * Bounded as well as scrubbed: the column takes a diagnostic, and a stack trace
  * or a quoted document page is neither diagnostic nor something this row should
  * carry a copy of.
+ *
+ * Bounded BEFORE scrubbing as well as after. For any message an operator would
+ * read, what is stored is unchanged -- `maxChars` plus an ellipsis, as it has
+ * always been -- but the scan no longer reads a megabyte to throw away all but
+ * two thousand characters of it.
  */
 export function scrubJobError(message: string, maxChars = 2_000): string {
-  const scrubbed = scrubIdentifiers(message);
-  return scrubbed.length <= maxChars
-    ? scrubbed
-    : `${scrubbed.slice(0, maxChars)}…`;
+  const scanned =
+    message.length <= SCAN_CHARS ? message : message.slice(0, SCAN_CHARS);
+  const scrubbed = scrubIdentifiers(scanned);
+  if (scrubbed.length > maxChars) return `${scrubbed.slice(0, maxChars)}…`;
+  // Only reachable when masking shrank an over-long input below `maxChars`:
+  // text was still dropped, so the ellipsis still belongs.
+  return scanned.length < message.length ? `${scrubbed}…` : scrubbed;
 }
 
 /**

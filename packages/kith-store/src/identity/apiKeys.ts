@@ -483,9 +483,18 @@ export async function setMaxSensitivity(
     });
   }
   const key = await getApiKey(ctx, args.id);
-  // The same conflation `revoke` uses: someone else's key, a missing key and
-  // an in-flight OAuth key are all "not found", so this cannot enumerate keys.
-  if (!key || key.userId !== args.principal.userId) {
+  // The same conflation `revoke` uses, and the same three cases: someone
+  // else's key, a missing key and an in-flight OAuth key are all "not found",
+  // so this cannot enumerate keys. The OAuth case is not only about
+  // enumeration. A `preparing` or `pending` row's ceiling is the consent
+  // screen's choice and is covered by `oauth_request_hash`; changing it here,
+  // in either direction, would hand the client about to exchange the code
+  // something other than the screen it was shown said it would get.
+  if (
+    !key ||
+    key.userId !== args.principal.userId ||
+    !hasNoOAuthLifecycle(key)
+  ) {
     throw new Error("API key not found");
   }
   await exec(

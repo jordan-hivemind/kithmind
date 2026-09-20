@@ -194,6 +194,33 @@ test("sink: a job's last_error is scrubbed and still bounded", () => {
   assert.ok(long.endsWith("…"));
 });
 
+test("sink: a huge last_error is bounded before it is scanned", () => {
+  // A handler that stringifies a page, or a driver quoting a large parameter,
+  // is how a multi-megabyte message reaches this -- inside the transaction that
+  // is failing the job. Every scanner used to run over the whole thing so that
+  // all but two thousand characters could be thrown away.
+  const huge = `SSN 123-45-6789 then ${"x".repeat(4_000_000)}`;
+
+  // What is stored is exactly what it was before the bound was added: 2000
+  // characters plus an ellipsis, with the identifier at the front still masked.
+  const stored = scrubJobError(huge);
+  assert.equal(stored.length, 2_001);
+  assert.ok(stored.startsWith("SSN ••••6789 then "));
+  assert.ok(stored.endsWith("…"));
+
+  // Raising the stored bound past the scan window is what makes the window
+  // visible: with four megabytes scanned this would be 20001 characters, and
+  // the scan stops long before that. Timing would prove the same thing less
+  // reliably.
+  const wide = scrubJobError(huge, 20_000);
+  assert.ok(
+    wide.length <= 8_100,
+    `only the scanned window should survive, got ${wide.length} characters`,
+  );
+  assert.ok(wide.endsWith("…"), "text was still dropped, so say so");
+  assert.ok(wide.startsWith("SSN ••••6789 then "));
+});
+
 test("sink: a change-feed payload's strings are scrubbed", () => {
   const scrubbed = scrubFeedPayload({
     table: "documents",

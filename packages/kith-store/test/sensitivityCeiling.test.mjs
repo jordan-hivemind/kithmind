@@ -511,17 +511,90 @@ test("only an owner session may change a key's ceiling", { skip }, async (t) => 
     "the bearer attempt must not have widened anything",
   );
 
+  // The owner may widen it again, too: narrowing is not one-way for a plain key.
+  await setApiKeyMaxSensitivity(ctx, {
+    principal: { userId, capabilities: ["read", "write", "ingest"] },
+    id: keyId,
+    maxSensitivity: "restricted",
+  });
+  const widened = await ctx.client.query(
+    "SELECT max_sensitivity FROM kith.api_keys WHERE id = $1",
+    [keyId],
+  );
+  assert.equal(widened.rows[0].max_sensitivity, "restricted");
+
   // Another user's session cannot touch it either.
   const strangerId = await makeUser(ctx, { name: "Stranger" });
   await assert.rejects(
     setApiKeyMaxSensitivity(ctx, {
       principal: { userId: strangerId, capabilities: ["read"] },
       id: keyId,
-      maxSensitivity: "restricted",
+      maxSensitivity: "normal",
     }),
     /API key not found/,
   );
 });
+
+/**
+ * An in-flight OAuth row is not a key yet, and its ceiling is the consent
+ * screen's, not the settings page's.
+ *
+ * `preparing` and `pending` rows exist so a code can be exchanged for them, and
+ * the ceiling the consent screen chose is covered by `oauth_request_hash`.
+ * Letting the settings page reach one would let the owner widen a grant a
+ * client is about to receive, out from under that hash -- the client would get
+ * more than the screen it was shown said it would. `revoke` already conflates
+ * such a row with "not found"; so does this. Both directions are refused,
+ * because the defect is the row being reachable at all, not which way it moved.
+ */
+for (const lifecycle of ["preparing", "pending"]) {
+  test(
+    `an OAuth ${lifecycle} row's ceiling cannot be changed`,
+    { skip },
+    async (t) => {
+      const { ctx, userId } = await fixture(t);
+      const keyId = newKithId();
+      await ctx.client.query(
+        `INSERT INTO kith.api_keys
+           (id, user_id, key_hash, key_prefix, name, capabilities,
+            max_sensitivity, oauth_lifecycle, oauth_request_hash,
+            oauth_grant_expires_at)
+           VALUES ($1, $2, $3, 'kith_test_', 'In-flight grant', '["read"]'::jsonb,
+                   'sensitive', $4, $5, transaction_timestamp())`,
+        [keyId, userId, "c".repeat(64), lifecycle, "d".repeat(64)],
+      );
+
+      // Narrowing is refused.
+      await assert.rejects(
+        setApiKeyMaxSensitivity(ctx, {
+          principal: { userId, capabilities: ["read", "write", "ingest"] },
+          id: keyId,
+          maxSensitivity: "normal",
+        }),
+        /API key not found/,
+      );
+      // And so is widening, which is the one that hands out more than the
+      // consent screen promised.
+      await assert.rejects(
+        setApiKeyMaxSensitivity(ctx, {
+          principal: { userId, capabilities: ["read", "write", "ingest"] },
+          id: keyId,
+          maxSensitivity: "restricted",
+        }),
+        /API key not found/,
+      );
+      const row = await ctx.client.query(
+        "SELECT max_sensitivity FROM kith.api_keys WHERE id = $1",
+        [keyId],
+      );
+      assert.equal(
+        row.rows[0].max_sensitivity,
+        "sensitive",
+        "the consent screen's ceiling must survive both attempts",
+      );
+    },
+  );
+}
 
 test("a new key defaults to full access", { skip }, async (t) => {
   const { ctx, userId } = await fixture(t);
