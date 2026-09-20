@@ -38,6 +38,21 @@ const describeWithDatabase = adminUrl ? describe : describe.skip;
 const secret = randomBytes(32).toString("hex");
 const config = { secret, secure: false };
 const PASSWORD = "a strong enough password";
+const GOOGLE_HOSTED_DOMAIN = "staff.synthetic.test";
+const GOOGLE_ENV = {
+  NODE_ENV: "test",
+  KITH_SESSION_SECRET: secret,
+  GOOGLE_OAUTH_CLIENT_ID: "synthetic-client.apps.example.test",
+  GOOGLE_OAUTH_CLIENT_SECRET: "synthetic-client-secret",
+  GOOGLE_OAUTH_ORIGIN: "https://brain.example.test",
+  GOOGLE_OAUTH_HOSTED_DOMAIN: GOOGLE_HOSTED_DOMAIN,
+} as const;
+
+type TestGoogleIdentity = {
+  subject: string;
+  verifiedEmail: string;
+  hostedDomain: string | null;
+};
 
 type Routes = {
   signIn: (request: Request) => Promise<Response>;
@@ -60,6 +75,7 @@ type Routes = {
       verifyIdToken?: () => Promise<{
         subject: string;
         verifiedEmail: string;
+        hostedDomain: string | null;
       }>;
     },
   ) => Promise<Response>;
@@ -151,6 +167,31 @@ describeWithDatabase("the kith session routes", () => {
       if (error instanceof IdentityError) return null;
       throw error;
     }
+  }
+
+  async function googleSignIn(
+    identity: TestGoogleIdentity,
+    env: Readonly<Record<string, string | undefined>> = GOOGLE_ENV,
+  ): Promise<Response> {
+    const start = await routes.googleStart(
+      new Request("https://brain.example.test/api/auth/google"),
+      { env },
+    );
+    expect(start.status).toBe(302);
+    const authorize = new URL(start.headers.get("location")!);
+    return await routes.googleCallback(
+      new Request(
+        `https://brain.example.test/api/auth/google/callback?code=synthetic-code&state=${encodeURIComponent(authorize.searchParams.get("state")!)}`,
+        {
+          headers: { cookie: namedCookie(start, "kith_google_oauth") },
+        },
+      ),
+      {
+        env,
+        exchangeCode: async () => "synthetic-id-token",
+        verifyIdToken: async () => identity,
+      },
+    );
   }
 
   beforeAll(async () => {
@@ -313,6 +354,7 @@ describeWithDatabase("the kith session routes", () => {
           // The existing Kith session is linking authority. A verified Google
           // address does not have to equal the password provider address.
           verifiedEmail: "chosen-google-account@example.test",
+          hostedDomain: null,
         }),
       },
     );
@@ -346,6 +388,7 @@ describeWithDatabase("the kith session routes", () => {
         verifyIdToken: async () => ({
           subject: "google-owner-subject",
           verifiedEmail: "renamed-google-account@example.test",
+          hostedDomain: null,
         }),
       },
     );
@@ -355,6 +398,356 @@ describeWithDatabase("the kith session routes", () => {
     );
     expect(await principalFor(namedCookie(signedIn, "kith_session"))).toBe(
       userId,
+    );
+
+    const otherCookie = cookieHeaderFrom(
+      await post(routes.signUp, { email: email(), password: PASSWORD }),
+    );
+    const conflictingStart = await routes.googleStart(
+      new Request("https://brain.example.test/api/auth/google?action=link", {
+        headers: { cookie: otherCookie },
+      }),
+      { env: googleEnv },
+    );
+    const conflictingAuthorize = new URL(
+      conflictingStart.headers.get("location")!,
+    );
+    const conflictingLink = await routes.googleCallback(
+      new Request(
+        `https://brain.example.test/api/auth/google/callback?code=synthetic-code&state=${encodeURIComponent(conflictingAuthorize.searchParams.get("state")!)}`,
+        {
+          headers: {
+            cookie: `${otherCookie}; ${namedCookie(conflictingStart, "kith_google_oauth")}`,
+          },
+        },
+      ),
+      {
+        env: googleEnv,
+        exchangeCode: async () => "synthetic-id-token",
+        verifyIdToken: async () => ({
+          subject: "google-owner-subject",
+          verifiedEmail: "other-google-account@example.test",
+          hostedDomain: null,
+        }),
+      },
+    );
+    expect(conflictingLink.status).toBe(401);
+  });
+
+  test("auto-links one exact normalized organization email without changing memberships", async () => {
+    const suffix = randomBytes(4).toString("hex");
+    const storedEmail = `Organization-${suffix}@${GOOGLE_HOSTED_DOMAIN}`;
+    const passwordCookie = cookieHeaderFrom(
+      await post(routes.signUp, { email: storedEmail, password: PASSWORD }),
+    );
+    const userId = await principalFor(passwordCookie);
+    expect(userId).not.toBeNull();
+    const membershipsBefore = await pool.query(
+      "SELECT space_id, role FROM kith.space_members WHERE user_id = $1 ORDER BY space_id",
+      [userId],
+    );
+
+    const signedIn = await googleSignIn(
+      {
+        subject: `organization-subject-${suffix}`,
+        verifiedEmail: storedEmail.toLowerCase(),
+        hostedDomain: GOOGLE_HOSTED_DOMAIN,
+      },
+      { ...GOOGLE_ENV, GOOGLE_OAUTH_AUTOLINK_USER_ID: userId! },
+    );
+    expect(signedIn.status).toBe(302);
+    expect(signedIn.headers.get("location")).toBe(
+      "https://brain.example.test/",
+    );
+    expect(await principalFor(namedCookie(signedIn, "kith_session"))).toBe(
+      userId,
+    );
+    expect(
+      (
+        await pool.query(
+          `SELECT user_id, email_verified FROM kith.auth_accounts
+            WHERE provider = 'google' AND provider_account_id = $1`,
+          [`organization-subject-${suffix}`],
+        )
+      ).rows,
+    ).toEqual([{ user_id: userId, email_verified: storedEmail.toLowerCase() }]);
+    const membershipsAfter = await pool.query(
+      "SELECT space_id, role FROM kith.space_members WHERE user_id = $1 ORDER BY space_id",
+      [userId],
+    );
+    expect(membershipsAfter.rows).toEqual(membershipsBefore.rows);
+  });
+
+  test("auto-link fails closed for domain and email ambiguity", async () => {
+    const suffix = randomBytes(4).toString("hex");
+    const matchingEmail = `gate-${suffix}@${GOOGLE_HOSTED_DOMAIN}`;
+    const matchingCookie = cookieHeaderFrom(
+      await post(routes.signUp, {
+        email: matchingEmail,
+        password: PASSWORD,
+      }),
+    );
+    const matchingUserId = await principalFor(matchingCookie);
+    expect(matchingUserId).not.toBeNull();
+    const eligibleEnv = {
+      ...GOOGLE_ENV,
+      GOOGLE_OAUTH_AUTOLINK_USER_ID: matchingUserId!,
+    };
+
+    const withoutAutoLink = {
+      ...GOOGLE_ENV,
+      GOOGLE_OAUTH_HOSTED_DOMAIN: undefined,
+      GOOGLE_OAUTH_AUTOLINK_USER_ID: undefined,
+    };
+    const attempts: Array<{
+      identity: TestGoogleIdentity;
+      env?: Readonly<Record<string, string | undefined>>;
+    }> = [
+      {
+        identity: {
+          subject: `wrong-domain-${suffix}`,
+          verifiedEmail: matchingEmail,
+          hostedDomain: "other.synthetic.test",
+        },
+      },
+      {
+        identity: {
+          subject: `missing-domain-${suffix}`,
+          verifiedEmail: matchingEmail,
+          hostedDomain: null,
+        },
+      },
+      {
+        identity: {
+          subject: `disabled-${suffix}`,
+          verifiedEmail: matchingEmail,
+          hostedDomain: GOOGLE_HOSTED_DOMAIN,
+        },
+        env: withoutAutoLink,
+      },
+      {
+        identity: {
+          subject: `unapproved-${suffix}`,
+          verifiedEmail: matchingEmail,
+          hostedDomain: GOOGLE_HOSTED_DOMAIN,
+        },
+        env: {
+          ...GOOGLE_ENV,
+          GOOGLE_OAUTH_AUTOLINK_USER_ID: "a".repeat(26),
+        },
+      },
+      {
+        identity: {
+          subject: `missing-email-${suffix}`,
+          verifiedEmail: `absent-${suffix}@${GOOGLE_HOSTED_DOMAIN}`,
+          hostedDomain: GOOGLE_HOSTED_DOMAIN,
+        },
+      },
+    ];
+    for (const attempt of attempts) {
+      const denied = await googleSignIn(
+        attempt.identity,
+        attempt.env ?? eligibleEnv,
+      );
+      expect(denied.status).toBe(302);
+      expect(denied.headers.get("location")).toBe(
+        "https://brain.example.test/sign-in?googleError=not-connected",
+      );
+    }
+
+    const ambiguous = `ambiguous-${suffix}@${GOOGLE_HOSTED_DOMAIN}`;
+    const ambiguousCookie = cookieHeaderFrom(
+      await post(routes.signUp, { email: ambiguous, password: PASSWORD }),
+    );
+    const ambiguousUserId = await principalFor(ambiguousCookie);
+    expect(ambiguousUserId).not.toBeNull();
+    expect(
+      (
+        await post(routes.signUp, {
+          email: ambiguous.toUpperCase(),
+          password: PASSWORD,
+        })
+      ).status,
+    ).toBe(204);
+    const deniedAmbiguous = await googleSignIn(
+      {
+        subject: `ambiguous-${suffix}`,
+        verifiedEmail: ambiguous,
+        hostedDomain: GOOGLE_HOSTED_DOMAIN,
+      },
+      {
+        ...GOOGLE_ENV,
+        GOOGLE_OAUTH_AUTOLINK_USER_ID: ambiguousUserId!,
+      },
+    );
+    expect(deniedAmbiguous.headers.get("location")).toContain(
+      "googleError=not-connected",
+    );
+
+    const subjects = attempts
+      .map(({ identity }) => identity.subject)
+      .concat(`ambiguous-${suffix}`);
+    expect(
+      (
+        await pool.query(
+          `SELECT provider_account_id FROM kith.auth_accounts
+            WHERE provider = 'google' AND provider_account_id = ANY($1::text[])`,
+          [subjects],
+        )
+      ).rows,
+    ).toHaveLength(0);
+  });
+
+  test("an existing subject wins and a user cannot acquire a different Google identity", async () => {
+    const suffix = randomBytes(4).toString("hex");
+    const firstEmail = `first-${suffix}@${GOOGLE_HOSTED_DOMAIN}`;
+    const secondEmail = `second-${suffix}@${GOOGLE_HOSTED_DOMAIN}`;
+    const firstCookie = cookieHeaderFrom(
+      await post(routes.signUp, { email: firstEmail, password: PASSWORD }),
+    );
+    const secondCookie = cookieHeaderFrom(
+      await post(routes.signUp, { email: secondEmail, password: PASSWORD }),
+    );
+    const firstUserId = await principalFor(firstCookie);
+    const secondUserId = await principalFor(secondCookie);
+    expect(firstUserId).not.toBe(secondUserId);
+
+    const firstSubject = `first-subject-${suffix}`;
+    const firstLink = await googleSignIn(
+      {
+        subject: firstSubject,
+        verifiedEmail: firstEmail,
+        hostedDomain: GOOGLE_HOSTED_DOMAIN,
+      },
+      { ...GOOGLE_ENV, GOOGLE_OAUTH_AUTOLINK_USER_ID: firstUserId! },
+    );
+    expect(await principalFor(namedCookie(firstLink, "kith_session"))).toBe(
+      firstUserId,
+    );
+
+    const subjectPrecedence = await googleSignIn({
+      subject: firstSubject,
+      verifiedEmail: secondEmail,
+      hostedDomain: null,
+    });
+    expect(
+      await principalFor(namedCookie(subjectPrecedence, "kith_session")),
+    ).toBe(firstUserId);
+
+    const replacement = await googleSignIn(
+      {
+        subject: `replacement-${suffix}`,
+        verifiedEmail: firstEmail,
+        hostedDomain: GOOGLE_HOSTED_DOMAIN,
+      },
+      { ...GOOGLE_ENV, GOOGLE_OAUTH_AUTOLINK_USER_ID: firstUserId! },
+    );
+    expect(replacement.headers.get("location")).toContain(
+      "googleError=not-connected",
+    );
+    expect(
+      (
+        await pool.query(
+          `SELECT provider_account_id FROM kith.auth_accounts
+            WHERE provider = 'google' AND user_id = $1`,
+          [firstUserId],
+        )
+      ).rows,
+    ).toEqual([{ provider_account_id: firstSubject }]);
+  });
+
+  test("concurrent auto-links converge on one Google identity", async () => {
+    const suffix = randomBytes(4).toString("hex");
+    const accountEmail = `race-${suffix}@${GOOGLE_HOSTED_DOMAIN}`;
+    const passwordCookie = cookieHeaderFrom(
+      await post(routes.signUp, {
+        email: accountEmail,
+        password: PASSWORD,
+      }),
+    );
+    const userId = await principalFor(passwordCookie);
+    expect(userId).not.toBeNull();
+    const env = {
+      ...GOOGLE_ENV,
+      GOOGLE_OAUTH_AUTOLINK_USER_ID: userId!,
+    };
+
+    const responses = await Promise.all([
+      googleSignIn(
+        {
+          subject: `race-a-${suffix}`,
+          verifiedEmail: accountEmail,
+          hostedDomain: GOOGLE_HOSTED_DOMAIN,
+        },
+        env,
+      ),
+      googleSignIn(
+        {
+          subject: `race-b-${suffix}`,
+          verifiedEmail: accountEmail,
+          hostedDomain: GOOGLE_HOSTED_DOMAIN,
+        },
+        env,
+      ),
+    ]);
+    expect(
+      responses.map((response) => response.headers.get("location")).sort(),
+    ).toEqual(
+      [
+        "https://brain.example.test/",
+        "https://brain.example.test/sign-in?googleError=not-connected",
+      ].sort(),
+    );
+    expect(
+      (
+        await pool.query(
+          `SELECT provider_account_id FROM kith.auth_accounts
+            WHERE provider = 'google' AND user_id = $1`,
+          [userId],
+        )
+      ).rows,
+    ).toHaveLength(1);
+  });
+
+  test("development start and callback preserve a validated 127.0.0.1 Host", async () => {
+    const developmentEnv = {
+      ...GOOGLE_ENV,
+      NODE_ENV: "development",
+      GOOGLE_OAUTH_ORIGIN: undefined,
+    } as const;
+    const start = await routes.googleStart(
+      new Request("http://localhost:3001/api/auth/google", {
+        headers: { host: "127.0.0.1:3001" },
+      }),
+      { env: developmentEnv },
+    );
+    const authorize = new URL(start.headers.get("location")!);
+    expect(authorize.searchParams.get("redirect_uri")).toBe(
+      "http://127.0.0.1:3001/api/auth/google/callback",
+    );
+
+    const callback = await routes.googleCallback(
+      new Request(
+        `http://localhost:3001/api/auth/google/callback?code=synthetic-code&state=${encodeURIComponent(authorize.searchParams.get("state")!)}`,
+        {
+          headers: {
+            host: "127.0.0.1:3001",
+            cookie: namedCookie(start, "kith_google_oauth"),
+          },
+        },
+      ),
+      {
+        env: developmentEnv,
+        exchangeCode: async () => "synthetic-id-token",
+        verifyIdToken: async () => ({
+          subject: `host-test-${randomBytes(4).toString("hex")}`,
+          verifiedEmail: `absent-${randomBytes(4).toString("hex")}@${GOOGLE_HOSTED_DOMAIN}`,
+          hostedDomain: GOOGLE_HOSTED_DOMAIN,
+        }),
+      },
+    );
+    expect(callback.headers.get("location")).toBe(
+      "http://127.0.0.1:3001/sign-in?googleError=not-connected",
     );
   });
 
@@ -420,6 +813,7 @@ describeWithDatabase("the kith session routes", () => {
         verifyIdToken: async () => ({
           subject: "must-not-link",
           verifiedEmail: "verified@example.test",
+          hostedDomain: null,
         }),
       },
     );

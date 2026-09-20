@@ -109,6 +109,23 @@ test("web preflight accepts Google OAuth only as a complete optional group", () 
   ]);
 });
 
+test("web preflight validates the optional Google auto-link pair", () => {
+  const environment = {
+    ...validWebEnvironment(),
+    GOOGLE_OAUTH_CLIENT_ID: "synthetic-client.apps.example.test",
+    GOOGLE_OAUTH_CLIENT_SECRET: "synthetic-secret",
+    GOOGLE_OAUTH_ORIGIN: "https://brain.example.test",
+    GOOGLE_OAUTH_HOSTED_DOMAIN: "staff.synthetic.test",
+    GOOGLE_OAUTH_AUTOLINK_USER_ID: "a".repeat(26),
+  };
+  assert.deepEqual(validateWebEnvironment(environment), []);
+
+  delete environment.GOOGLE_OAUTH_AUTOLINK_USER_ID;
+  assert.deepEqual(validateWebEnvironment(environment), [
+    { name: "GOOGLE_OAUTH_AUTOLINK_USER_ID", problem: "missing" },
+  ]);
+});
+
 test("web preflight returns names only for missing variables", () => {
   assert.deepEqual(
     validateWebEnvironment({}),
@@ -132,6 +149,8 @@ test("web preflight rejects malformed values", () => {
   environment.GOOGLE_OAUTH_CLIENT_ID = "synthetic-client.apps.example.test";
   environment.GOOGLE_OAUTH_CLIENT_SECRET = "synthetic-secret";
   environment.GOOGLE_OAUTH_ORIGIN = "http://localhost:3000";
+  environment.GOOGLE_OAUTH_HOSTED_DOMAIN = "Staff Synthetic";
+  environment.GOOGLE_OAUTH_AUTOLINK_USER_ID = "not-an-id";
 
   assert.deepEqual(validateWebEnvironment(environment), [
     { name: "MCP_PUBLIC_ORIGIN", problem: "invalid" },
@@ -139,6 +158,8 @@ test("web preflight rejects malformed values", () => {
     { name: "KITH_SESSION_SECRET", problem: "invalid" },
     { name: "MCP_OAUTH_ENCRYPTION_KEY", problem: "invalid" },
     { name: "GOOGLE_OAUTH_ORIGIN", problem: "invalid" },
+    { name: "GOOGLE_OAUTH_HOSTED_DOMAIN", problem: "invalid" },
+    { name: "GOOGLE_OAUTH_AUTOLINK_USER_ID", problem: "invalid" },
     { name: "MCP_TOOL_PROFILE", problem: "invalid" },
   ]);
 });

@@ -33,6 +33,13 @@ const GOOGLE_OAUTH_VARIABLES = [
   "GOOGLE_OAUTH_CLIENT_SECRET",
   "GOOGLE_OAUTH_ORIGIN",
 ];
+const GOOGLE_OAUTH_AUTOLINK_VARIABLES = [
+  "GOOGLE_OAUTH_HOSTED_DOMAIN",
+  "GOOGLE_OAUTH_AUTOLINK_USER_ID",
+];
+const KITH_ID = /^[a-z0-9]{20,64}$/;
+const HOSTED_DOMAIN =
+  /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
 
 function isAllowedOrigin(value) {
   try {
@@ -86,8 +93,19 @@ export function validateWebEnvironment(environment) {
   for (const name of WEB_REQUIRED_VARIABLES) {
     if (!environment[name]) issues.push({ name, problem: "missing" });
   }
-  if (GOOGLE_OAUTH_VARIABLES.some((name) => Boolean(environment[name]))) {
+  if (
+    [...GOOGLE_OAUTH_VARIABLES, ...GOOGLE_OAUTH_AUTOLINK_VARIABLES].some(
+      (name) => Boolean(environment[name]),
+    )
+  ) {
     for (const name of GOOGLE_OAUTH_VARIABLES) {
+      if (!environment[name]) issues.push({ name, problem: "missing" });
+    }
+  }
+  if (
+    GOOGLE_OAUTH_AUTOLINK_VARIABLES.some((name) => Boolean(environment[name]))
+  ) {
+    for (const name of GOOGLE_OAUTH_AUTOLINK_VARIABLES) {
       if (!environment[name]) issues.push({ name, problem: "missing" });
     }
   }
@@ -121,6 +139,19 @@ export function validateWebEnvironment(environment) {
     !isHttpsOrigin(environment.GOOGLE_OAUTH_ORIGIN)
   ) {
     issues.push({ name: "GOOGLE_OAUTH_ORIGIN", problem: "invalid" });
+  }
+  if (
+    environment.GOOGLE_OAUTH_HOSTED_DOMAIN &&
+    (environment.GOOGLE_OAUTH_HOSTED_DOMAIN.length > 253 ||
+      !HOSTED_DOMAIN.test(environment.GOOGLE_OAUTH_HOSTED_DOMAIN))
+  ) {
+    issues.push({ name: "GOOGLE_OAUTH_HOSTED_DOMAIN", problem: "invalid" });
+  }
+  if (
+    environment.GOOGLE_OAUTH_AUTOLINK_USER_ID &&
+    !KITH_ID.test(environment.GOOGLE_OAUTH_AUTOLINK_USER_ID)
+  ) {
+    issues.push({ name: "GOOGLE_OAUTH_AUTOLINK_USER_ID", problem: "invalid" });
   }
 
   if (

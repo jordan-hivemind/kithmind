@@ -29,7 +29,7 @@
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
-import { newKithId } from "../ids.js";
+import { KITH_ID, newKithId } from "../ids.js";
 import {
   ensurePersonalSpace,
   userExists,
@@ -688,6 +688,102 @@ export async function linkGoogleAccount(
       verifiedEmail,
     ],
   );
+}
+
+function requireGoogleHostedDomain(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 253 ||
+    value !== value.toLowerCase() ||
+    !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(
+      value,
+    )
+  ) {
+    throw new IdentityError("Invalid credentials");
+  }
+  return value;
+}
+
+/**
+ * Opens a Google session, linking one organization account when safe.
+ *
+ * An existing subject is authoritative and is resolved before any current
+ * email or hosted-domain metadata. A new subject may link only when Google's
+ * verified email names exactly one existing Kith user after lowercase
+ * normalization, that user is the operator-pinned auto-link account, and
+ * Google's signed `hd` claim exactly equals the configured organization
+ * domain. The user-id pin prevents a public signup from pre-registering a
+ * victim's email and retaining password access after that victim signs in with
+ * Google. This is intentionally not Gmail alias normalization:
+ * dots, plus suffixes and other provider rules do not identify a Kith user.
+ *
+ * Password-created users do not carry a separate Kith email-verification
+ * timestamp. The signed, verified organization email is the proof here; the
+ * stored user email is only the exact normalized locator. A missing or
+ * ambiguous locator fails closed and never creates a user.
+ */
+export async function signInOrAutoLinkGoogle(
+  ctx: IdentityCtx,
+  args: {
+    providerAccountId: string;
+    verifiedEmail: string;
+    hostedDomain: string | null;
+    allowedHostedDomain: string | null;
+    autoLinkUserId: string | null;
+  },
+): Promise<{
+  userId: string;
+  sessionId: string;
+  token: string;
+  expiresAt: number;
+}> {
+  const providerAccountId = requireGoogleSubject(args.providerAccountId);
+  const account = await getGoogleAccount(ctx, providerAccountId);
+  if (account) {
+    if (!(await userExists(ctx, account.userId))) {
+      throw new IdentityError("Invalid credentials");
+    }
+    return {
+      userId: account.userId,
+      ...(await createSession(ctx, account.userId)),
+    };
+  }
+
+  const verifiedEmail = requireValidEmail(args.verifiedEmail);
+  if (
+    args.allowedHostedDomain === null ||
+    args.hostedDomain === null ||
+    args.autoLinkUserId === null ||
+    !KITH_ID.test(args.autoLinkUserId)
+  ) {
+    throw new IdentityError("Invalid credentials");
+  }
+  const allowedHostedDomain = requireGoogleHostedDomain(
+    args.allowedHostedDomain,
+  );
+  if (args.hostedDomain !== allowedHostedDomain) {
+    throw new IdentityError("Invalid credentials");
+  }
+
+  const candidates = await rows<{ id: string }>(
+    ctx,
+    `SELECT id FROM kith.users
+      WHERE email IS NOT NULL AND lower(email) = $1
+      ORDER BY id
+      LIMIT 2`,
+    [verifiedEmail.toLowerCase()],
+  );
+  if (candidates.length !== 1 || candidates[0]!.id !== args.autoLinkUserId) {
+    throw new IdentityError("Invalid credentials");
+  }
+  const userId = candidates[0]!.id;
+  await linkGoogleAccount(ctx, {
+    userId,
+    providerAccountId,
+    verifiedEmail,
+  });
+  return { userId, ...(await createSession(ctx, userId)) };
 }
 
 /** Opens an ordinary Kith web session for an explicitly linked Google subject. */

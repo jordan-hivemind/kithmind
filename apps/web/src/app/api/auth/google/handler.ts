@@ -38,7 +38,11 @@ export async function handleGoogleOAuthStart(
     }
     const action: GoogleOAuthAction =
       requestedAction === "link" ? "link" : "sign-in";
-    const oauth = googleOAuthConfig(request.url, env);
+    const oauth = googleOAuthConfig(
+      request.url,
+      env,
+      request.headers.get("host"),
+    );
     const sessionConfig = kithSessionConfig(env);
 
     const link =

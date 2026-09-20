@@ -26,6 +26,8 @@ export type GoogleOAuthConfig = {
   clientSecret: string;
   origin: string;
   redirectUri: string;
+  allowedHostedDomain: string | null;
+  autoLinkUserId: string | null;
 };
 
 export type GoogleOAuthAction = "sign-in" | "link";
@@ -44,6 +46,7 @@ export type GoogleOAuthTransaction = {
 export type VerifiedGoogleIdentity = {
   subject: string;
   verifiedEmail: string;
+  hostedDomain: string | null;
 };
 
 export class GoogleOAuthError extends Error {
@@ -75,9 +78,9 @@ function productionOrigin(value: string | undefined): string | null {
   }
 }
 
-function developmentOrigin(requestUrl: string): string | null {
+function loopbackOrigin(value: string): URL | null {
   try {
-    const parsed = new URL(requestUrl);
+    const parsed = new URL(value);
     const loopback =
       parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
     const port = Number(parsed.port);
@@ -92,10 +95,57 @@ function developmentOrigin(requestUrl: string): string | null {
     ) {
       return null;
     }
-    return parsed.origin;
+    return parsed;
   } catch {
     return null;
   }
+}
+
+function developmentOrigin(
+  requestUrl: string,
+  requestHost: string | null | undefined,
+): string | null {
+  const request = loopbackOrigin(requestUrl);
+  if (request === null) return null;
+  if (requestHost === null || requestHost === undefined) return request.origin;
+
+  // Next dev may canonicalize Request.url to `localhost` even when the browser
+  // used `127.0.0.1`. The raw Host header preserves the browser-visible host.
+  // It is accepted only for the same explicit port as the already validated
+  // loopback URL, so this cannot become an arbitrary host or port redirect.
+  const host = loopbackOrigin(`http://${requestHost}`);
+  if (
+    host === null ||
+    host.host !== requestHost ||
+    host.pathname !== "/" ||
+    host.search !== "" ||
+    host.hash !== "" ||
+    host.port !== request.port
+  ) {
+    return null;
+  }
+  return host.origin;
+}
+
+/** A canonical Google Workspace domain, or null when auto-linking is off. */
+function allowedHostedDomain(value: string | undefined): string | null {
+  if (!present(value)) return null;
+  if (
+    value.length > 253 ||
+    value !== value.toLowerCase() ||
+    !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(
+      value,
+    )
+  ) {
+    throw new GoogleOAuthError();
+  }
+  return value;
+}
+
+function autoLinkUserId(value: string | undefined): string | null {
+  if (!present(value)) return null;
+  if (!/^[a-z0-9]{20,64}$/.test(value)) throw new GoogleOAuthError();
+  return value;
 }
 
 /** Whether server-rendered pages should offer Google as an auth choice. */
@@ -106,9 +156,15 @@ export function googleOAuthEnabled(env: Environment = process.env): boolean {
   ) {
     return false;
   }
-  return env.NODE_ENV === "development"
-    ? true
-    : productionOrigin(env.GOOGLE_OAUTH_ORIGIN) !== null;
+  try {
+    allowedHostedDomain(env.GOOGLE_OAUTH_HOSTED_DOMAIN);
+    autoLinkUserId(env.GOOGLE_OAUTH_AUTOLINK_USER_ID);
+    return env.NODE_ENV === "development"
+      ? true
+      : productionOrigin(env.GOOGLE_OAUTH_ORIGIN) !== null;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -121,13 +177,22 @@ export function googleOAuthEnabled(env: Environment = process.env): boolean {
 export function googleOAuthConfig(
   requestUrl: string,
   env: Environment = process.env,
+  requestHost?: string | null,
 ): GoogleOAuthConfig {
   const clientId = env.GOOGLE_OAUTH_CLIENT_ID;
   const clientSecret = env.GOOGLE_OAUTH_CLIENT_SECRET;
   const origin =
     env.NODE_ENV === "development"
-      ? developmentOrigin(requestUrl)
+      ? developmentOrigin(requestUrl, requestHost)
       : productionOrigin(env.GOOGLE_OAUTH_ORIGIN);
+  let hostedDomain: string | null;
+  let eligibleUserId: string | null;
+  try {
+    hostedDomain = allowedHostedDomain(env.GOOGLE_OAUTH_HOSTED_DOMAIN);
+    eligibleUserId = autoLinkUserId(env.GOOGLE_OAUTH_AUTOLINK_USER_ID);
+  } catch {
+    throw new GoogleOAuthError();
+  }
   if (!present(clientId) || !present(clientSecret) || origin === null) {
     throw new GoogleOAuthError();
   }
@@ -136,6 +201,8 @@ export function googleOAuthConfig(
     clientSecret,
     origin,
     redirectUri: `${origin}${GOOGLE_OAUTH_PATH}`,
+    allowedHostedDomain: hostedDomain,
+    autoLinkUserId: eligibleUserId,
   };
 }
 
@@ -357,7 +424,7 @@ const googleSigningKeys = createRemoteJWKSet(new URL(GOOGLE_JWKS_ENDPOINT), {
   timeoutDuration: 5_000,
 });
 
-/** Verifies Google's signed OIDC identity. Email is metadata; `sub` is identity. */
+/** Verifies Google's signed OIDC identity. Email and `hd` are signed metadata. */
 export async function verifyGoogleIdToken(
   idToken: string,
   config: Pick<GoogleOAuthConfig, "clientId">,
@@ -385,7 +452,14 @@ export async function verifyGoogleIdToken(
     ) {
       throw new GoogleOAuthError();
     }
-    return { subject: payload.sub, verifiedEmail: payload.email };
+    return {
+      subject: payload.sub,
+      verifiedEmail: payload.email,
+      hostedDomain:
+        typeof payload.hd === "string" && payload.hd.length <= 253
+          ? payload.hd
+          : null,
+    };
   } catch {
     throw new GoogleOAuthError();
   }
