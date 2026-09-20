@@ -311,7 +311,7 @@ their exact reading.
 A dense form puts a model one line off its value, so a money or number value
 on none of the cited lines may be stored from a line **next to** one of them.
 This is the only rule in the round that relaxes a check, so it is fenced on
-every side. All ten of these have to hold:
+every side. All eleven of these have to hold:
 
 | Condition | Why |
 | --- | --- |
@@ -320,6 +320,7 @@ every side. All ten of these have to hold:
 | A money value carries a decimal point or a currency mark | A bare run of digits is a suite number, a tax year or a page number, and each of those stored a wrong total end to end |
 | No cited line states a value of that type | Then the model contradicted its own citation rather than missing by a line: `Fee 100.00` cited as a total of 250.00 |
 | The target is within one line id of **every** cited line, on the cited page | One off is the miss this exists for; further is a search of the page |
+| The target is the line **after** a cited line, never the one before it (ADM-5k) | A label stands above its amount. Reaching backwards as well, the repair could not tell which side of a label it was reading: `Subtotal`/`20.00`/`Total`/`21.60` with a total of 20.00 cited to `Total` stored the subtotal's amount as the total, because 20.00 is one line from `Total` exactly as 21.60 is. The backwards miss -- a citation naming the line *after* its value -- is refused with it: it is the rarer half of a rule that could not tell them apart |
 | Exactly one line of that window states the value | Choosing between two is a guess |
 | No other line of the **whole document** states it | A value printed twice says nothing about which line states it |
 | The target line prints that one value and nothing else | A line with a word on it belongs to that word: `Tax 1.60` beside `Subtotal`, `Invoice 48210` beside `Odometer`, `Page 2023` beside `Tax year` and a K-1's `12 Section 179 deduction` beside `Profit share` each stored the neighbour's number |
@@ -347,7 +348,14 @@ are refused rather than read as zero.
 The amount grammar is one explicit rule, written out in
 `packages/kith-store/src/extraction/gate.ts` and pinned by a table in
 `test/extractionGate.test.mjs` that holds every adversarial input the reviews
-have found. A magnitude suffix is **applied**, not dropped and not refused, under two
+have found, and by a seeded generator in `test/extractionAmountFuzz.test.mjs`
+whose oracle is an independent `BigInt` calculation from the pieces it
+printed. The generator prints the shapes the reviews had to find by hand:
+spaced magnitude letters, unit words, scale words it declares unpriceable,
+unbalanced parentheses, a credit marker in front of an amount, double signs,
+digits from other scripts inside a number, `$N. N`, a decimal head beside
+space groups, pipe-rendered rows and two-line wraps. `KITH_AMOUNT_FUZZ_CASES`
+and `KITH_AMOUNT_FUZZ_SEEDS` run it harder than the suite does. A magnitude suffix is **applied**, not dropped and not refused, under two
 rules that together keep it from inventing a number.
 
 An **abbreviation** (`k`, `m`, `b`, `mm`, `mn`, `bn`) scales only when it is
@@ -360,6 +368,30 @@ number, or `401K` would quietly become 401. This is why: `401K` is a plan,
 of them read as money before the rule existed. A **word** (`thousand`,
 `million`, `billion`) is unambiguous and scales with or without a currency
 marker, separated by at most one space.
+
+**The scale and unit vocabulary is a rule, not a deny-list (ADM-5k).** Before
+this, any word the grammar did not recognise was neutral, so `$2.5 trillion`,
+`₹2.5 lakh`, `$2.5 mln` and `$3 thou` each offered the unscaled number and
+`45 cents` and `45.00 percent` each offered forty-five. Every word a document
+prints beside an amount now falls in one of three tables.
+
+| Table | Words | What happens |
+| --- | --- | --- |
+| Scale, read | `thousand(s)`, `million(s)`, `billion(s)`, `trillion(s)`, `lakh(s)`, `crore(s)`, and the abbreviations `k`, `m`, `b`, `mm`, `mn`, `bn` glued to the digits beside a currency marker | The point moves. Each of these spells one number and no other |
+| Scale, refused | `mil`, `mio`, `mln`, `mill(s)`, `thou(s)`, `grand`, `bil`, `bill(s)`, `tn`, `trn`, `tril(l)`, `lac(s)`, and a magnitude abbreviation a space away from its digits | The word joins the token and the whole token is refused. `mil` is a million, a millilitre and a thousandth of an inch; `mill` is a million and a property-tax mill; `bill` is a billion and an invoice; `grand` is a thousand and an adjective; `tn` is a trillion and Tennessee |
+| Unit | `cent(s)`, `percent`, `percentage`, `pct`, `bp`, `bps`, `basis`, `share(s)`, `unit(s)`, `per`, `each`, `ea`, `apiece` | Refused for a money field. A unit is not a scale: `45 cents` is not forty-five dollars and `45.00 percent` is not forty-five of anything a money field stores |
+
+A **unit** word counts only where a unit can stand, which is directly after
+the amount: `Cost basis 1,234.56` is a money line with a label on it, and
+`1,234.56 basis points` is not a money value at all. A **scale** word is
+refused on either side, which is the rule the grammar has had since ADM-5g;
+`Grand Total 1,234.56` still reads, because the word beside the amount is
+`Total`. The `number` value type is dimensionless by construction and keeps
+its existing reading of units, exactly as it already keeps `12 %`.
+
+Recall lost to this, deliberately: `12 Mill Lane` offered 12 and now offers
+nothing. A street and a fund print the same characters, and `$2.5 mill` was
+the reading that mattered.
 
 The scaling is exact, by moving the decimal point. A token carrying a suffix
 has exactly one value, the scaled one, on both the value side and the quote
@@ -394,6 +426,83 @@ run is a box label, a magnitude or a ledger's own sign rather than cents, so
 `$6. 25a`, `$5. 25b` and `€642. 73.-` offer nothing. A point pressed against a
 whole dollar with a digit reachable through it makes the line ambiguous
 whatever stands beyond it, which is how `$780. 554a` offered 780.
+
+ADM-5k added the last two conditions on that rule. **A gap and a lowercase
+word after the two digits is prose**, not a receipt cell: `We paid $500. 25
+people` is a sentence with a full stop in it, and the rule closed the gap and
+offered 500.25. A sentence and a cell print the same characters, so both
+readings are refused and `$82. 12 due` and `$94. 50 total` lose their amounts
+with it. And **the marker has to be a currency this store prices**: three
+capitals are a word far more often than a code everywhere else in this file,
+and the gap-closing rule was reading any of them, so `FEE 162. 95` and
+`QTY 12. 34` closed up into amounts.
+
+**Neutral punctuation is not a wall (ADM-5k).** A bar, a semicolon or a
+quote mark cannot sign or scale a number, and the finder therefore stopped at
+one and offered the amount -- so the marker behind it was invisible.
+`| Payment | 45.00 | CR |` printed a credit and offered a charge, `$45.00 |
+million` offered forty-five and `-| 45.00` offered a positive. The finder now
+steps over neutral punctuation to the real neighbour beyond it, bounded like
+every other walk in the file. A pipe-rendered table is how many of this
+store's parsed receipts print a column, and that recall is unchanged:
+`| Total | 1,234.56 |` still offers 1,234.56, because what stands past the
+bar is the end of the line.
+
+**An unreadable neighbour is unknown, not separate (ADM-5k).** A digit this
+grammar must not read poisons its token, and the poison mark cut the token in
+half -- so the neighbour rule was handed a fragment, found that the fragment
+joined nothing, and offered the amount beside it. `380 3१24.5` offered 380.
+The poison mark on either side of a neighbouring run now refuses the amount,
+which is the answer a cut edge already gets. The set of poisoned digits is a
+Unicode property rather than a list of blocks: anything Unicode files as
+"other number" -- `①`, `⒈`, `❶`, `½` -- because a list is what the
+last four reviews kept finding a gap in.
+
+**Two runs join when *any* reading joins them (ADM-5k).** "Do these two runs
+join" is a question about digits and separators, and a reading refused for
+some other reason is no evidence they are separate. `1, 234K` offered the
+leading 1 because `1,234K` is refused for want of a currency marker -- a rule
+about `401K`, not a proof that the 1 stands alone. The pasted region is now
+asked four ways: as it stands, without a currency marker it opens with, with
+a marker it does not print, and without a trailing tail that belongs to
+neither run.
+
+**A decimal head never takes space groups (ADM-5k).** A single space before a
+run of exactly three digits is a grouping separator in `$1 000 000` and a
+column boundary in `$123 456   789`; only the last character of the head was
+checked, so `$12.99 100 200` offered 12.991002 -- a number with the cents of
+one cell and the digits of two more. The head has to be a bare run of digits.
+
+**A line break is not a full stop (ADM-5k).** A real line edge was a *known*
+edge, so nothing asked what stood past it: a letter printing `raised $2.5`
+with `million` wrapped onto the next line offered two and a half, and a ledger
+printing `CR` above its amount offered a charge. Each line now carries the
+last token of the line before it and the first token of the line after it, and
+an amount touching that edge is refused when the token is scale- or
+sign-bearing -- a magnitude word or letter, `CR`/`DR`, a currency code, a
+sign, a bracket, a percent sign. The token is never read as part of the
+amount: assembling a number out of two lines is the fabrication this gate
+exists to prevent.
+
+Scale and sign, and deliberately nothing else. A column receipt prints one
+amount per line and a form labels its boxes, so a digit or an ordinary word on
+the next line is the common case and refusing those would cost every receipt
+and every K-1 in the store. For the same reason a single letter, which is
+never neutral *within* a line, is refused across a wrap only when it is one of
+the letters that carries a scale or a sign (`k`, `m`, `b`, `c`, `d`): a K-1's
+`L Ending capital account` would otherwise refuse the box above it. A cut edge
+carries no wrap token, because a cut is not a line break and what lay beyond
+it is still gone.
+
+**Known behaviour, documented rather than fixed.** A grouping separator at a
+line end with digits on the next line could be one wrapped number:
+`Total $1,234,` over `567` offers 1,234. Refusing every line-final separator
+with a digit under it would refuse every K-1 box, whose trailing point sits
+above the next box's number, and a PDF's text layer does not break a number in
+half. The locale ambiguity is the other one: `3.499`, `Rp 12.000` and
+`12.345 kr` read as a decimal point wherever the token carries no currency
+whose own locale says otherwise. Both need a per-kind setting beside
+`date_order` and neither has one.
 
 **A list ordinal offers nothing (ADM-5h).** Digits at the start of a line,
 then `.` or `)`, then a space and a word, are a bullet: `1. Rent 500.00`
