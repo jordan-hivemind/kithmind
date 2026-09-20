@@ -405,6 +405,7 @@ export async function runWatch(
     initialConfig,
     makeTransport(initialConfig, initialCredential),
     journal.watcherId,
+    journal.legacyWatcherId,
   );
   heartbeat.start();
   try {

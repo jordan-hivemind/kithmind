@@ -4,7 +4,10 @@ import type {
   WorkerDiagnosticsStatusResult,
   WorkerRequest,
 } from "@repo/worker-protocol/request";
-import type { PrincipalRef } from "../identity/authorization.js";
+import {
+  requireSpaceAccess,
+  type PrincipalRef,
+} from "../identity/authorization.js";
 
 import { newKithId } from "../ids.js";
 import { sha256Utf8 } from "../provenance/sql.js";
@@ -18,6 +21,18 @@ export const WORKER_HEARTBEAT_OVERDUE_MS = 180_000;
 export const WORKER_HEARTBEAT_MIN_WRITE_MS = 5_000;
 /** How many active watchers the daily incident writer inspects per call. */
 export const WORKER_MISSING_INCIDENT_SWEEP_LIMIT = 500;
+/**
+ * ADM-10 review. How long one process must hold the heartbeat alone before a
+ * recorded split brain is treated as over.
+ *
+ * Ten minutes is twenty heartbeats at the 30-second interval. A second host
+ * that is still running cannot stay quiet that long -- it would have to miss
+ * twenty of its own pings -- and a second host that has been stopped clears
+ * the screen without anyone having to click anything. Shorter, and the two
+ * hosts' own interleaving could clear it between their pings; longer, and a
+ * fixed problem stays red for no reason.
+ */
+export const WATCHER_SPLIT_BRAIN_QUIET_MS = 10 * 60_000;
 
 type Watcher = {
   id: string;
@@ -36,6 +51,14 @@ type Watcher = {
   /** ADM-9, migration 029. Null until a pass has reported one. */
   lastPassFinishedAt: Date | null;
   lastPassUnhealthySince: Date | null;
+  /**
+   * ADM-10 review, migration 031. The last two heartbeat nonces accepted for
+   * this watcher, and when a returning one was last seen. Null on a watcher
+   * that has never sent one.
+   */
+  heartbeatNonce: string | null;
+  heartbeatNoncePrevious: string | null;
+  splitBrainAt: Date | null;
 };
 
 type Incident = {
@@ -222,6 +245,121 @@ export async function getWorkerDiagnosticsStatus(
   };
 }
 
+/**
+ * ADM-10. Whether this heartbeat is the registered watcher under its new id.
+ *
+ * What the identity check is for. The worker credential is what authorizes a
+ * heartbeat at all (`requireWorkerSourceAccount`), so this check is not an
+ * authentication control and never was: a holder of the key can already open
+ * scans and publish documents. What it protects is the *operational* truth the
+ * health screen reads off this row -- that exactly one host is the registered
+ * watcher for a source account, so a host that goes silent shows up as missing
+ * instead of being masked by a second host's pings. Two hosts on one credential
+ * and a stale process left running are the same failure seen twice, and the
+ * refusal is what makes either of them visible rather than a race to write
+ * last.
+ *
+ * That is preserved here. A heartbeat presenting neither the registered id nor
+ * the id it was registered under is still refused, and re-registration stays an
+ * owner action (`resetWorkerWatcher`). What is allowed is exactly one thing: a
+ * watcher that presents, as `legacyWatcherId`, the id the row already holds may
+ * carry that row to its ADM-10 id. It is the same installation saying the same
+ * thing in the new spelling, and a *live* watcher can do it without a gap --
+ * gating it on the row being overdue would mean every upgraded worker went
+ * missing for the overdue window and opened an incident for it.
+ *
+ * The trade, stated plainly: a second host on the same credential that reads
+ * the registered id from `diagnostics.status` can present it here and take the
+ * row over, where before ADM-10 it was refused. It gains the heartbeat row and
+ * nothing else, it must already hold a key that can write documents into the
+ * space, and the host it displaced is refused from its next ping onward and
+ * says so. Set against a derivation that killed the heartbeat on every parser
+ * upgrade, that is the better failure.
+ */
+function adoptsLegacyWatcherId(
+  current: Watcher,
+  request: Extract<WorkerRequest, { operation: "diagnostics.heartbeat" }>,
+): boolean {
+  return (
+    request.legacyWatcherId !== undefined &&
+    current.watcherId === request.legacyWatcherId
+  );
+}
+
+/**
+ * ADM-10 review, finding 1. Two live hosts on one copied journal.
+ *
+ * The old derivation hashed the configuration fingerprint, which included the
+ * watched roots with their absolute paths, so two hosts almost always
+ * disagreed about something, registered as two watchers, and the second was
+ * refused. That was an accident rather than a design, but it was a tripwire,
+ * and deriving the identity from the salt and the authority binding alone
+ * removes it: a copied journal is deliberately the same watcher now. That is
+ * what makes a host move work, and it is also what makes two hosts
+ * indistinguishable -- `connectorVersion` is a compile-time constant,
+ * `actorCredentialId` is the same key, and `receivedAt` is clamped forward.
+ * The journal lock is a loopback port and does not reach across machines, so
+ * nothing else stops the owner running his laptop and his new always-on host
+ * at once.
+ *
+ * So the worker sends a nonce minted once per process and this keeps the last
+ * two. The rule is that a nonce *returns*: 128 random bits cannot recur unless
+ * a process that already heartbeated heartbeats again after a different one
+ * did, which is two live processes and is never a restart. A restart mints a
+ * fresh nonce and never comes back, and so does a crash loop -- which is why
+ * counting changes inside a window would have confused a crash loop with a
+ * split brain, and why a returning nonce cannot. An alternating pair is caught
+ * on its third ping, about a minute in.
+ *
+ * The record goes stale on its own after `WATCHER_SPLIT_BRAIN_QUIET_MS` of one
+ * process holding the heartbeat alone, so stopping the second host clears the
+ * screen without anyone clicking anything.
+ *
+ * A worker too old to send a nonce leaves all three columns as they are rather
+ * than nulling them: an old worker is not evidence that a second host went
+ * away.
+ */
+function nextNonceState(
+  current: Watcher | undefined,
+  request: Extract<WorkerRequest, { operation: "diagnostics.heartbeat" }>,
+  now: number,
+): {
+  current: string | null;
+  previous: string | null;
+  splitBrainAt: number | null;
+} {
+  const stored = {
+    current: current?.heartbeatNonce ?? null,
+    previous: current?.heartbeatNoncePrevious ?? null,
+    splitBrainAt: current?.splitBrainAt?.getTime() ?? null,
+  };
+  const seen = request.heartbeatNonce;
+  if (seen === undefined) return stored;
+  if (seen === stored.current) {
+    // One process, pinging steadily. Let a recorded split brain age out.
+    return {
+      ...stored,
+      splitBrainAt:
+        stored.splitBrainAt !== null &&
+        now - stored.splitBrainAt >= WATCHER_SPLIT_BRAIN_QUIET_MS
+          ? null
+          : stored.splitBrainAt,
+    };
+  }
+  // A nonce already seen, arriving again after a different one: two live
+  // processes. Shift anyway, so an alternating pair keeps re-proving it rather
+  // than settling into a state that would read as resolved.
+  if (stored.previous !== null && seen === stored.previous) {
+    return { current: seen, previous: stored.current, splitBrainAt: now };
+  }
+  // A nonce never seen before: a first heartbeat, or an ordinary restart.
+  return {
+    current: seen,
+    previous: stored.current,
+    splitBrainAt: stored.splitBrainAt,
+  };
+}
+
 export async function recordWorkerHeartbeat(
   ctx: WorkerCtx,
   principal: PrincipalRef,
@@ -239,11 +377,18 @@ export async function recordWorkerHeartbeat(
   const current = await watcherForSource(ctx, source.account.id, true);
   if (current) {
     validateWatcher(current, source);
-    if (current.watcherId !== request.watcherId)
+    if (
+      current.watcherId !== request.watcherId &&
+      !adoptsLegacyWatcherId(current, request)
+    )
       workerProtocolError("identity_review_required");
   }
   const incident = await openIncident(ctx, source.account.id, true);
-  if (incident) validateIncident(incident, source, request.watcherId);
+  // The incident belongs to the *registered* watcher, which on an ADM-10
+  // adoption is still the legacy id. It is resolved below in this same
+  // transaction, so it is never left pointing at an id no row carries.
+  if (incident)
+    validateIncident(incident, source, current?.watcherId ?? request.watcherId);
   if (
     incident &&
     current?.state === "active" &&
@@ -254,6 +399,17 @@ export async function recordWorkerHeartbeat(
   if (
     current?.state === "active" &&
     !incident &&
+    // An adoption is a write even inside the damping window: skipping it here
+    // would answer the ping and leave the row on the legacy id, so the next
+    // ping outside the window would have to adopt all over again.
+    current.watcherId === request.watcherId &&
+    // So is a ping from a different process. Two hosts that happen to land
+    // within five seconds of each other would otherwise both be damped, and
+    // the nonce that proves they are two would never be recorded. This is the
+    // one case where the damping would hide exactly what it is being asked to
+    // notice.
+    (request.heartbeatNonce === undefined ||
+      current.heartbeatNonce === request.heartbeatNonce) &&
     ctx.now >= current.lastSeenAt!.getTime() &&
     ctx.now - current.lastSeenAt!.getTime() < WORKER_HEARTBEAT_MIN_WRITE_MS
   ) {
@@ -267,12 +423,16 @@ export async function recordWorkerHeartbeat(
   }
   const receivedAt = Math.max(ctx.now, current?.lastSeenAt?.getTime() ?? 0);
   const nextExpectedAt = nextExpected(receivedAt);
+  const nonce = nextNonceState(current, request, ctx.now);
   if (current) {
     await exec(
       ctx,
-      `UPDATE kith.worker_watcher_states SET state = 'active', connector_version = $1,
+      `UPDATE kith.worker_watcher_states SET state = 'active', watcher_id = $7,
+      connector_version = $1,
       actor_user_id = $2, actor_credential_id = $3, last_seen_at = $4, next_expected_at = $5,
-      sweep_after = $5, updated_at = $4 WHERE id = $6`,
+      sweep_after = $5, updated_at = $4,
+      heartbeat_nonce = $8, heartbeat_nonce_previous = $9, split_brain_at = $10
+      WHERE id = $6`,
       [
         request.connectorVersion,
         source.principal.userId,
@@ -280,6 +440,10 @@ export async function recordWorkerHeartbeat(
         at(receivedAt),
         at(nextExpectedAt),
         current.id,
+        request.watcherId,
+        nonce.current,
+        nonce.previous,
+        nonce.splitBrainAt === null ? null : at(nonce.splitBrainAt),
       ],
     );
   } else {
@@ -287,8 +451,9 @@ export async function recordWorkerHeartbeat(
       ctx,
       `INSERT INTO kith.worker_watcher_states
       (id, space_id, created_at, source_account_id, watcher_id, state, connector_version,
-       actor_user_id, actor_credential_id, last_seen_at, next_expected_at, sweep_after, created_at_field, updated_at)
-      VALUES ($1,$2,transaction_timestamp(),$3,$4,'active',$5,$6,$7,$8,$9,$9,$8,$8)`,
+       actor_user_id, actor_credential_id, last_seen_at, next_expected_at, sweep_after, created_at_field, updated_at,
+       heartbeat_nonce)
+      VALUES ($1,$2,transaction_timestamp(),$3,$4,'active',$5,$6,$7,$8,$9,$9,$8,$8,$10)`,
       [
         newKithId(),
         source.spaceId,
@@ -299,6 +464,7 @@ export async function recordWorkerHeartbeat(
         source.principal.credentialId,
         at(receivedAt),
         at(nextExpectedAt),
+        nonce.current,
       ],
     );
   }
@@ -794,5 +960,106 @@ export async function resetWorkerWatcher(
     watcherId: args.nextWatcherId,
     reused: false,
     changedAt: ctx.now,
+  };
+}
+
+export type ReregisterWatcherResult = {
+  sourceAccountId: string;
+  /** The id that was cleared, or null when nothing was registered. */
+  clearedWatcherId: string | null;
+  changedAt: number;
+};
+
+/**
+ * ADM-10. The owner's re-registration: clear the binding so the next heartbeat
+ * claims it.
+ *
+ * This is the supported way out of `identity_review_required`, and it is the
+ * only one. Section "Worker heartbeat diagnostics" of the worker protocol plan
+ * settles who may do it: "A worker cannot approve an ambiguous identity mapping
+ * itself", and "Only a current-session owner operation may replace or clear the
+ * binding". A worker-credential subcommand that re-registered its own host --
+ * even gated on the registered watcher being overdue -- is exactly the
+ * self-approval that sentence forbids, so there is no `reregister-watcher` CLI
+ * on the worker and this is the whole surface. It costs nothing to do without
+ * one: the owner is already on the health screen looking at the pill that told
+ * him, and the watcher recovers on its next ping, within thirty seconds.
+ *
+ * `nextWatcherId: null` rather than a replacement id, because the server cannot
+ * derive the worker's id and must not be told one over this route: the
+ * heartbeat is the only thing that knows it, and `recordWorkerHeartbeat`'s
+ * first-heartbeat path claims an unbound source. So the window this opens is
+ * one heartbeat interval wide and closes on the first ping that arrives -- and
+ * the first ping to arrive is the host that is up.
+ *
+ * Authorization, in order: the account is loaded by id and its *own* space is
+ * what `requireSpaceAccess` is asked about, so no space id crosses the wire;
+ * `write` is required before the role is looked at, so a reader is refused by
+ * the same path an outsider is; and then the membership must be `owner`, which
+ * denies an editor. Every refusal is the same `Source account not found` the
+ * rest of this surface gives, so a caller cannot map another space's accounts
+ * by reading the denial.
+ */
+export async function reregisterWorkerWatcher(
+  ctx: WorkerCtx,
+  principal: PrincipalRef,
+  args: { sourceAccountId: string; requestId: string },
+): Promise<ReregisterWatcherResult> {
+  validateNow(ctx.now);
+  const account = await row<{
+    id: string;
+    space_id: string;
+    enabled: boolean | null;
+  }>(ctx, "SELECT id, space_id, enabled FROM kith.source_accounts WHERE id = $1", [
+    args.sourceAccountId,
+  ]);
+  if (!account) throw new Error("Source account not found");
+  let membership;
+  try {
+    membership = await requireSpaceAccess(
+      ctx,
+      principal,
+      account.space_id,
+      "write",
+    );
+  } catch {
+    throw new Error("Source account not found");
+  }
+  if (membership.role !== "owner") throw new Error("Source account not found");
+
+  // `resetWorkerWatcher` is a compare-and-set, and the id to compare against
+  // is whatever is registered right now. A retry of the same request would
+  // therefore compute a *different* expectation -- the row this call already
+  // deleted -- and be answered `request_conflict` by its own receipt. So a
+  // replay reuses the expectation the receipt recorded, which is what makes a
+  // lost response safe to retry instead of merely safe to repeat.
+  const prior = await row<{ expected_watcher_id: string | null }>(
+    ctx,
+    `SELECT expected_watcher_id FROM kith.worker_watcher_reset_receipts
+       WHERE source_account_id = $1 AND request_id = $2 LIMIT 1`,
+    [args.sourceAccountId, args.requestId],
+  );
+  const current = await watcherForSource(ctx, account.id, true);
+  const expectedWatcherId = prior
+    ? prior.expected_watcher_id
+    : (current?.watcherId ?? null);
+  const reset = await resetWorkerWatcher(
+    ctx,
+    {
+      id: account.id,
+      spaceId: account.space_id,
+      enabled: account.enabled === true,
+    },
+    membership.userId,
+    {
+      requestId: args.requestId,
+      expectedWatcherId,
+      nextWatcherId: null,
+    },
+  );
+  return {
+    sourceAccountId: account.id,
+    clearedWatcherId: expectedWatcherId,
+    changedAt: reset.changedAt,
   };
 }

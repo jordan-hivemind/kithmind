@@ -139,12 +139,15 @@ test("watch heartbeat is bounded, non-overlapping, and stops its request", async
         calls += 1;
         assert.deepEqual(Object.keys(request).sort(), [
           "connectorVersion",
+          // ADM-10 review: always sent, and minted once per process.
+          "heartbeatNonce",
           "operation",
           "protocolVersion",
           "sourceAccountId",
           "spaceId",
           "watcherId",
         ]);
+        assert.match(request.heartbeatNonce, /^[0-9a-f]{32}$/);
         assert.equal(request.operation, "diagnostics.heartbeat");
         signal.addEventListener("abort", () => {
           aborted = true;
@@ -168,6 +171,90 @@ test("watch heartbeat is bounded, non-overlapping, and stops its request", async
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(aborted, true);
   assert.equal(calls, 1);
+});
+
+// ADM-10 review, version skew. A server older than ADM-10 refuses an unknown
+// key outright rather than ignoring it, and that would kill the heartbeat --
+// which is the bug this task exists to fix. The first `invalid_request` drops
+// both ADM-10 fields for the rest of the process and retries at once, so the
+// worker is safe to deploy before or after its server.
+test("a server too old for the ADM-10 fields gets a heartbeat anyway", async () => {
+  const sent = [];
+  let accepted = 0;
+  const heartbeat = new WatchHeartbeat(
+    config,
+    {
+      call: async (request) => {
+        sent.push(Object.keys(request).sort());
+        if (
+          "heartbeatNonce" in request ||
+          "legacyWatcherId" in request
+        )
+          return { error: { code: "invalid_request" } };
+        accepted += 1;
+        return {
+          operation: "diagnostics.heartbeat",
+          sourceAccountId: "source",
+          watcherId: request.watcherId,
+          receivedAt: 1,
+          nextExpectedAt: 180_001,
+        };
+      },
+    },
+    watcherId,
+    "22222222-2222-4222-8222-222222222222",
+  );
+  try {
+    await heartbeat.ping();
+    // One rejected attempt, then the same tick retries without the fields.
+    assert.equal(sent.length, 2);
+    assert.ok(sent[0].includes("heartbeatNonce"));
+    assert.ok(sent[0].includes("legacyWatcherId"));
+    assert.ok(!sent[1].includes("heartbeatNonce"));
+    assert.ok(!sent[1].includes("legacyWatcherId"));
+    assert.equal(accepted, 1);
+
+    // And it stays dropped: no extra round trip on every later tick.
+    await heartbeat.ping();
+    assert.equal(sent.length, 3);
+    assert.ok(!sent[2].includes("heartbeatNonce"));
+    assert.equal(accepted, 2);
+  } finally {
+    heartbeat.stop();
+  }
+});
+
+test("one WatchHeartbeat is one nonce, for every ping it sends", async () => {
+  const nonces = new Set();
+  const heartbeat = new WatchHeartbeat(
+    config,
+    {
+      call: async (request) => {
+        nonces.add(request.heartbeatNonce);
+        return {
+          operation: "diagnostics.heartbeat",
+          sourceAccountId: "source",
+          watcherId: request.watcherId,
+          receivedAt: 1,
+          nextExpectedAt: 180_001,
+        };
+      },
+    },
+    watcherId,
+  );
+  try {
+    await heartbeat.ping();
+    await heartbeat.ping();
+    await heartbeat.ping();
+    assert.equal(nonces.size, 1, "a process must not look like two hosts");
+    // A second process is a second nonce, which is what makes two live hosts
+    // visible at all.
+    const other = new WatchHeartbeat(config, { call: async () => ({}) }, watcherId);
+    assert.notEqual(other.heartbeatNonce, [...nonces][0]);
+    assert.match(other.heartbeatNonce, /^[0-9a-f]{32}$/);
+  } finally {
+    heartbeat.stop();
+  }
 });
 
 // ADM-9 follow-up. `ping` swallowed every failure with a bare `catch {}`, and

@@ -619,3 +619,114 @@ test("a pass that ended incomplete is still between passes and rebinds", async (
     );
   }
 });
+
+// ADM-10. The watcher identity the heartbeat presents.
+//
+// The bug: `watcherId` hashed the whole binding, `configFingerprint` included,
+// and `journalBindingForConfig` hashes the watched roots with their absolute
+// paths and the whole `pdfDocQa` block into that fingerprint. So adding a root
+// or moving the parser minted a new identity, `recordWorkerHeartbeat` refused
+// it as a different watcher, and the host went on working while the server
+// recorded it as missing.
+
+test("the watcher identity survives every ordinary configuration change", async () => {
+  const path = await directory();
+  const authority = binding();
+  const first = await openJournal(path, { binding: authority });
+  const identity = first.watcherId;
+  assert.match(
+    identity,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  );
+  assert.notEqual(identity, first.legacyWatcherId);
+  await first.close();
+
+  // Three different configuration edits, each of which produces a different
+  // `configFingerprint`: a new watched root, a moved parser executable, and a
+  // rewritten `pdfDocQa` block. None of them is a new watcher.
+  for (const fingerprint of ["b", "c", "d"]) {
+    const reopened = await openJournal(path, {
+      binding: reconfigured(authority, fingerprint.repeat(64)),
+    });
+    assert.equal(
+      reopened.watcherId,
+      identity,
+      `configuration ${fingerprint} must not mint a new watcher identity`,
+    );
+    // The legacy id moves with the configuration, which is the whole problem
+    // it is presented to solve: it is only ever the id the server may still be
+    // holding, never the one this watcher claims.
+    assert.notEqual(reopened.legacyWatcherId, identity);
+    await reopened.close();
+  }
+});
+
+test("a fresh journal is a new watcher and a copied one is not", async () => {
+  const authority = binding();
+  const first = await directory();
+  const original = await openJournal(first, { binding: authority });
+  const identity = original.watcherId;
+  await original.close();
+
+  // A copied journal keeps its salt, so it keeps its identity: the same
+  // installation moved to a new host is the same watcher, which is exactly
+  // what a host migration must not have to re-register.
+  const copied = await directory();
+  await writeFile(
+    join(copied, "state.json"),
+    await readFile(join(first, "state.json"), "utf8"),
+    { mode: 0o600 },
+  );
+  const moved = await openJournal(copied, { binding: authority });
+  assert.equal(moved.watcherId, identity);
+  await moved.close();
+
+  // A journal created from nothing mints a new salt, and that is a genuinely
+  // new watcher the server has to be told about.
+  const empty = await directory();
+  const fresh = await openJournal(empty, { binding: authority });
+  assert.notEqual(fresh.watcherId, identity);
+  await fresh.close();
+});
+
+test("the watcher identity is bound to one account, space and credential slot", async () => {
+  const authority = binding();
+  const path = await directory();
+  const journal = await openJournal(path, { binding: authority });
+  const identity = journal.watcherId;
+  const salt = JSON.parse(
+    await readFile(join(path, "state.json"), "utf8"),
+  ).credentialSalt;
+  await journal.close();
+
+  // Same salt, different authority: each of these names a different worker and
+  // must not be able to present itself as this one.
+  for (const change of [
+    { spaceId: `space_${randomUUID()}` },
+    { sourceAccountId: `source_${randomUUID()}` },
+    { credentialSlot: "OTHER_WORKER_KEY" },
+    { endpoint: "https://other.example/api/worker" },
+  ]) {
+    const other = await directory();
+    const state = JSON.parse(await readFile(join(path, "state.json"), "utf8"));
+    await writeFile(
+      join(other, "state.json"),
+      JSON.stringify({
+        ...state,
+        binding: { ...authority, ...change },
+      }),
+      { mode: 0o600 },
+    );
+    const opened = await openJournal(other, {
+      binding: { ...authority, ...change },
+    });
+    assert.equal(
+      JSON.parse(await readFile(join(other, "state.json"), "utf8"))
+        .credentialSalt,
+      salt,
+      "the salt is held constant so only the authority change is under test",
+    );
+    assert.notEqual(opened.watcherId, identity, Object.keys(change)[0]);
+    await opened.close();
+  }
+});

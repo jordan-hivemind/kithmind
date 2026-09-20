@@ -58,6 +58,13 @@ export type WatcherFact = {
    * many passes that took is the host's cadence, not a fact about health.
    */
   unhealthySince: number | null;
+  /**
+   * ADM-10 review, migration 031. When a heartbeat nonce this watcher had
+   * already used arrived again after a different one, which is two live
+   * processes on one journal. Null when that has never happened or when one
+   * process has since held the heartbeat alone long enough for it to go stale.
+   */
+  splitBrainAt: number | null;
 };
 
 export type IndexFact = {
@@ -137,6 +144,7 @@ type WatcherDbRow = {
   last_pass_code: string | null;
   last_pass_finished_at: Date | null;
   last_pass_unhealthy_since: Date | null;
+  split_brain_at: Date | null;
 };
 
 type CountsDbRow = Record<string, string | number | null>;
@@ -162,7 +170,7 @@ export async function readHealthFacts(
     `SELECT a.id AS source_account_id, a.name, a.enabled,
             w.state AS watcher_state, w.last_seen_at, w.next_expected_at,
             w.last_pass_state, w.last_pass_code, w.last_pass_finished_at,
-            w.last_pass_unhealthy_since,
+            w.last_pass_unhealthy_since, w.split_brain_at,
             s.state AS assessment_state,
             coalesce(s.completed_at, s.updated_at, s.started_at)
               AS assessment_at,
@@ -276,6 +284,7 @@ export async function readHealthFacts(
           : null,
       lastPassAt: epoch(record.last_pass_finished_at),
       unhealthySince: epoch(record.last_pass_unhealthy_since),
+      splitBrainAt: epoch(record.split_brain_at),
     })),
     index: {
       eligible: number(counts.eligible),

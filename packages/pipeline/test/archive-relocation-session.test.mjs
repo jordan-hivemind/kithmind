@@ -938,7 +938,9 @@ test("one session holds locks through the complete workflow and journal transfer
   const final = await workflow.resume();
   assert.equal(final.phase, "resumed");
   assert.equal(scanResumed, true);
-  assert.notEqual(session.journal.watcherId, oldWatcherId);
+  // ADM-10: the identity survives a relocation. The binding below is what
+  // the rebind moves; the watcher id is not derived from it any more.
+  assert.equal(session.journal.watcherId, oldWatcherId);
   assert.deepEqual(
     session.journal.binding,
     journalBindingForConfig(f.proposed),
