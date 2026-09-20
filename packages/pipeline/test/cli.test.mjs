@@ -105,6 +105,61 @@ test("run takes --retry-parked and no other command does", () => {
   );
 });
 
+// ADM-6a review: three codes now. `journal_behind_server` refused every pass
+// with no way through, and the remedy it named instead cost more than it
+// saved, so it takes the same one-pass, explicitly-named override the other
+// two take -- and, like them, only the word that names its own refusal.
+test("a run accepts one named retirement code and no other word", () => {
+  for (const code of [
+    "root_selection_would_retire_items",
+    "root_contents_collapsed",
+    "journal_behind_server",
+  ])
+    assert.deepEqual(
+      argumentsFor([
+        "run",
+        "--config",
+        "/tmp/config.json",
+        "--accept-retirement",
+        code,
+      ]),
+      {
+        command: "run",
+        configPath: "/tmp/config.json",
+        retryParked: false,
+        operatorClear: false,
+        acceptRetirement: code,
+      },
+    );
+  for (const args of [
+    ["run", "--config", "/tmp/config.json", "--accept-retirement", "yes"],
+    [
+      "run",
+      "--config",
+      "/tmp/config.json",
+      "--accept-retirement",
+      "journal_behind",
+    ],
+    [
+      "run",
+      "--config",
+      "/tmp/config.json",
+      "--accept-retirement",
+      "journal_behind_server",
+      "--accept-retirement",
+      "root_contents_collapsed",
+    ],
+    [
+      "watch",
+      "--config",
+      "/tmp/config.json",
+      "--accept-retirement",
+      "journal_behind_server",
+    ],
+  ])
+    assert.throws(() => argumentsFor(args), args.join(" "));
+});
+
 test("reconcile-receipts takes only its own two optional flags", () => {
   assert.deepEqual(
     argumentsFor(["reconcile-receipts", "--config", "/tmp/config.json"]),

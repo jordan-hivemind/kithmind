@@ -7535,13 +7535,144 @@ test("a journal that remembers a fraction of what the server holds refuses the p
   }
 });
 
-// This refusal is not a deletion to confirm, so unlike the other two it has no
-// way through. Confirming a deletion nobody performed is the mistake.
-test("accepting a retirement never accepts a journal that is behind the server", async () => {
+// ADM-6a review. The way out, and the one the refusal is allowed to name.
+//
+// The first draft refused this code without appeal and told the operator to
+// remove the journal directory instead. Rehearsed, that directory also holds
+// the archive catalog and the scan cache, and the four passes after it ended
+// `failed / stale_observation`; removing only the state file left a source
+// with unavailable items ending `identity_review_required` four passes running.
+// So the refusal names the remedy that works, and takes the same per-pass,
+// explicitly-named override the other two codes take.
+
+const REHEARSAL_COUNTS = {
+  roots: [{ rootAlias: "fixture", liveItems: REHEARSAL_FILES }],
+};
+
+/** Runs `attempt` with `console.warn` collected rather than printed. */
+async function withWarnings(attempt) {
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(" "));
+  try {
+    const value = await attempt();
+    return { value, warnings };
+  } finally {
+    console.warn = originalWarn;
+  }
+}
+
+test("the refusal names a remedy the operator can carry out, and never a deletion", async () => {
+  const setup = await fixture(REHEARSAL_FILES);
+  try {
+    const { value: pass, warnings } = await withWarnings(() =>
+      identityPass({
+        setup,
+        bindings: rehearsalBindings(),
+        providers: [],
+        itemCounts: REHEARSAL_COUNTS,
+      }),
+    );
+    assert.equal(pass.result.code, "journal_behind_server");
+    const refusal = warnings.find((line) => line.includes("refusing the scan"));
+    assert.ok(refusal, "a refused pass says why on the way out");
+    assert.match(
+      refusal,
+      /start the worker with this source's own, current journal/i,
+      "the one remedy that recovers a stale copy",
+    );
+    assert.match(
+      refusal,
+      /--accept-retirement journal_behind_server/,
+      "and the override, named exactly",
+    );
+    // Asserted on the string, because this is the sentence an operator acts
+    // on at two in the morning. Every one of these was in the first draft or
+    // one keystroke from it, and each one loses the archive catalog, the scan
+    // cache, or both.
+    for (const advice of [
+      "remove",
+      "delete",
+      "rm ",
+      "state.json",
+      "journal directory",
+      "journaldir",
+      "wipe",
+      "erase",
+    ]) {
+      assert.equal(
+        refusal.toLowerCase().includes(advice),
+        false,
+        `the refusal must not tell the operator to ${advice.trim()} anything`,
+      );
+    }
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("an operator who names this code proceeds, for that one pass only", async () => {
+  const setup = await fixture(REHEARSAL_FILES);
+  try {
+    const bindings = rehearsalBindings();
+    const remembered = new Set(bindings.map((row) => row.externalId));
+    const { value: accepted, warnings } = await withWarnings(() =>
+      identityPass({
+        setup,
+        bindings,
+        providers: [],
+        acceptRetirement: "journal_behind_server",
+        itemCounts: REHEARSAL_COUNTS,
+      }),
+    );
+    assert.notEqual(accepted.result.code, "journal_behind_server");
+    assert.equal(accepted.mode, "normal", "the scan opened");
+    assert.equal(
+      accepted.bindings.filter((row) => !remembered.has(row.externalId)).length,
+      REHEARSAL_FILES - REHEARSAL_REMEMBERED,
+      "the pass the operator asked for is the pass they get, in full",
+    );
+    const log = warnings.find((line) =>
+      line.includes("operator accepted journal_behind_server"),
+    );
+    assert.ok(
+      log,
+      "an override nobody can check afterwards is not an override",
+    );
+    assert.match(
+      log,
+      new RegExp(
+        `fixture: server ${REHEARSAL_FILES}, journal ${REHEARSAL_REMEMBERED}`,
+      ),
+      "with the per-root counts it overrode",
+    );
+    // Per pass, and nowhere else. The flag is not written to the journal and
+    // not a setting, so the same worker, the same stale journal and the same
+    // server refuse again on the next pass that does not name it. A second
+    // fixture because the accepted pass has already moved the first journal
+    // on: that is the point of accepting it.
+    const again = await fixture(REHEARSAL_FILES);
+    try {
+      const next = await identityPass({
+        setup: again,
+        bindings: rehearsalBindings(),
+        providers: [],
+        itemCounts: REHEARSAL_COUNTS,
+      });
+      assert.equal(next.result.code, "journal_behind_server");
+      assert.equal(next.mode, undefined, "the scan never opened");
+    } finally {
+      await rm(again.base, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("an accepted retirement of another code does not unlock this one", async () => {
   const setup = await fixture(REHEARSAL_FILES);
   try {
     for (const acceptRetirement of [
-      "journal_behind_server",
       "root_selection_would_retire_items",
       "root_contents_collapsed",
     ]) {
@@ -7550,11 +7681,13 @@ test("accepting a retirement never accepts a journal that is behind the server",
         bindings: rehearsalBindings(),
         providers: [],
         acceptRetirement,
-        itemCounts: {
-          roots: [{ rootAlias: "fixture", liveItems: REHEARSAL_FILES }],
-        },
+        itemCounts: REHEARSAL_COUNTS,
       });
-      assert.equal(pass.result.code, "journal_behind_server");
+      assert.equal(
+        pass.result.code,
+        "journal_behind_server",
+        `${acceptRetirement} is a different question, answered elsewhere`,
+      );
       assert.equal(pass.mode, undefined, "the scan never opened");
     }
   } finally {
@@ -7585,10 +7718,10 @@ test("a journal that is not behind the server runs the pass", async () => {
         { roots: [{ rootAlias: "fixture", liveItems: 1 }] },
       ],
       [
-        // Two more than remembered, on ten. Under both the floor and the
-        // quarter: a standing refusal for two items would be a watcher that
-        // refuses on noise.
-        "the server is ahead by less than the breaker's share",
+        // Two more than remembered, on ten. Under the floor of three: a
+        // standing refusal for two items would be a watcher that refuses on
+        // noise.
+        "the server is ahead by less than the breaker's floor",
         { roots: [{ rootAlias: "fixture", liveItems: 12 }] },
       ],
       [
@@ -7616,6 +7749,137 @@ test("a journal that is not behind the server runs the pass", async () => {
       });
       assert.notEqual(pass.result.code, "journal_behind_server", reason);
       assert.equal(pass.mode, "normal", reason);
+    }
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// ADM-6a review. The threshold, at both of its edges.
+//
+// The share was a quarter, and 687 items against 600 fit through it: 87
+// documents minted fresh, 87 of the server's own retired, and neither ADM-4c
+// breaker saw anything either, because the journal that remembers 600 of 687
+// files finds every one of them on disk. A twentieth refuses it. The floor of
+// three is unchanged, so a small root still cannot stand on one or two items.
+
+const MOVED_SOURCE_FILES = 687;
+
+/**
+ * One pass over its own fixture: `files` on disk, `remembered` of them in the
+ * journal, `held` of them live on the server. A fixture each, because a pass
+ * that is not refused writes its own bindings into the journal and the next
+ * open reads those, not the ones a case asks for.
+ */
+async function thresholdPass({ files, remembered, held }) {
+  const setup = await fixture(files);
+  try {
+    return await identityPass({
+      setup,
+      providers: [],
+      overrides: { maxFiles: 1_024 },
+      bindings: Array.from({ length: remembered }, (_, index) => ({
+        rootAlias: "fixture",
+        relativePath: `file-${index}.txt`,
+        externalId: randomUUID(),
+      })),
+      itemCounts: { roots: [{ rootAlias: "fixture", liveItems: held }] },
+    });
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+}
+
+test("the server-ahead share refuses at its edge and not below it", async () => {
+  // `Math.ceil(687 / 20)` is 35, so 652 refuses and 653 does not.
+  for (const [remembered, refused, reason] of [
+    [600, true, "the numbers that got through a quarter"],
+    [652, true, "the share exactly, which is a refusal"],
+    [653, false, "one item under the share, and the pass runs"],
+  ]) {
+    const pass = await thresholdPass({
+      files: MOVED_SOURCE_FILES,
+      remembered,
+      held: MOVED_SOURCE_FILES,
+    });
+    assert.equal(pass.result.code === "journal_behind_server", refused, reason);
+    assert.equal(pass.mode, refused ? undefined : "normal", reason);
+  }
+});
+
+test("the floor of three is what decides a small root", async () => {
+  // A twentieth of thirteen is one. On a root this small the floor is the
+  // whole rule, which is why it is a floor and not a share.
+  for (const [held, refused] of [
+    [13, true],
+    [12, false],
+  ]) {
+    const pass = await thresholdPass({ files: 10, remembered: 10, held });
+    assert.equal(
+      pass.result.code === "journal_behind_server",
+      refused,
+      `the server holds ${held} where the journal remembers 10`,
+    );
+    assert.equal(pass.mode, refused ? undefined : "normal");
+  }
+});
+
+// The asymmetry the rule rests on, re-run at the sharper threshold: a narrowed
+// root counts every binding under its alias, not only the ones inside the
+// current prefixes. Counting only the narrowed ones would read a healthy
+// narrowed root as a journal that had forgotten the rest -- five items here,
+// which a twentieth of thirty refuses.
+test("narrowing a watched root does not read as a journal behind the server", async () => {
+  const setup = await fixture(0);
+  await mkdir(join(setup.root, "investing"), { mode: 0o700 });
+  for (let index = 0; index < 25; index += 1) {
+    await writeFile(
+      join(setup.root, "investing", `kept-${index}.txt`),
+      "synthetic",
+    );
+  }
+  for (let index = 0; index < 5; index += 1) {
+    await writeFile(join(setup.root, `loose-${index}.txt`), "synthetic");
+  }
+  try {
+    const row = folderRow({ rootAlias: "fixture", relativePath: "investing" });
+    const journal = await openJournal(
+      setup.journalDir,
+      terminalCheckpoint([
+        ...Array.from({ length: 25 }, (_, index) => ({
+          rootAlias: "fixture",
+          relativePath: `investing/kept-${index}.txt`,
+          externalId: randomUUID(),
+        })),
+        ...Array.from({ length: 5 }, (_, index) => ({
+          rootAlias: "fixture",
+          relativePath: `loose-${index}.txt`,
+          externalId: randomUUID(),
+        })),
+      ]),
+    );
+    try {
+      const runner = new PipelineRunner(
+        setup.config,
+        journal,
+        identityTransport({
+          failAt: "append",
+          entries: [],
+          requests: [],
+          itemCounts: { roots: [{ rootAlias: "fixture", liveItems: 30 }] },
+        }),
+      );
+      const allowed = await canonicalRoots(setup.config);
+      const plan = await runner.resolveServerRoots(allowed, [row]);
+      await runner.startCycle(plan.roots, { inventoryEpoch: 1 });
+      assert.equal(
+        journal.checkpoint.phase,
+        "scan_begin",
+        "the pass opened its scan",
+      );
+      assert.equal(journal.checkpoint.mode, "normal");
+    } finally {
+      await journal.close();
     }
   } finally {
     await rm(setup.base, { recursive: true, force: true });

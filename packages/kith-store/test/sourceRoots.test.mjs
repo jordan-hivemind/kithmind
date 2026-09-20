@@ -25,6 +25,7 @@ import {
   upsertSourceRoot,
 } from "../dist/admin/index.js";
 import {
+  RECONCILE_EXEMPT_LIFECYCLES,
   WorkerProtocolError,
   getWorkerSourceItemCounts,
   getWorkerSourceRoots,
@@ -710,6 +711,12 @@ test("a watcher's state reaches the sources screen", { skip }, async (t) => {
 // two ever drift apart, the watcher's guard is comparing one population
 // against another, and it will refuse healthy passes or pass a fatal one --
 // so every lifecycle below is here to pin that boundary, not for coverage.
+//
+// Review of this change: the boundary is now one exported constant,
+// `RECONCILE_EXEMPT_LIFECYCLES`, which that loop tests and this query's
+// `WHERE` clause are both built from. The test below is what makes editing it
+// a deliberate act: change the constant and this fails, whichever side the
+// edit came from.
 
 async function addSourceItem(f, fields) {
   const id = newKithId();
@@ -808,6 +815,58 @@ test("the live item count is the population reconcile would retire, per root", {
     expectProtocolCode("not_authorized"),
   );
 });
+
+test(
+  "the count leaves out exactly the lifecycles reconcile passes over",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    // Every lifecycle the column can hold, and the null the migration allows.
+    // The exempt ones come from the constant `reconcileWorkerScan` itself
+    // reads, so a lifecycle moved into or out of that list fails here rather
+    // than in the field, where it would show up as a watcher refusing healthy
+    // passes or waving a fatal one through.
+    assert.deepEqual(
+      [...RECONCILE_EXEMPT_LIFECYCLES].sort(),
+      ["forgetting", "forgotten", "unavailable"],
+      "the skip list reconcile and this query share",
+    );
+    const lifecycles = [
+      "available",
+      "unavailable",
+      "forgetting",
+      "forgotten",
+      null,
+    ];
+    for (const lifecycle of lifecycles) {
+      await addSourceItem(f, {
+        uri: `fs://investing/2026/${lifecycle ?? "null"}.pdf`,
+        lifecycle,
+      });
+    }
+    const counted = lifecycles.filter(
+      (lifecycle) => !RECONCILE_EXEMPT_LIFECYCLES.includes(lifecycle),
+    ).length;
+    const result = await getWorkerSourceItemCounts(
+      workerCtx(f.client, NOW),
+      f.worker,
+      {
+        ...PROTOCOL,
+        operation: "source.itemCounts",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+      },
+    );
+    assert.equal(
+      result.liveItems,
+      counted,
+      "one item per lifecycle: the exempt ones are out, everything else is in",
+    );
+    assert.deepEqual(result.roots, [
+      { rootAlias: "investing", liveItems: counted },
+    ]);
+  },
+);
 
 test("an account holding nothing counts nothing", { skip }, async (t) => {
   const f = await fixture(t);

@@ -742,9 +742,9 @@ function journalResult(inspection: JournalInspection): JournalCheck {
     };
   }
   // ADM-6a. Ahead of every self-clearing condition below, because it is not
-  // one. The worker will refuse every pass until someone gives it the right
-  // journal or none, and a report that said `recovery_pending` instead would
-  // read as "wait".
+  // one. The worker will refuse every pass until it is started with this
+  // source's own, current journal, and a report that said `recovery_pending`
+  // instead would read as "wait".
   if (inspection.journalBehindServer) {
     return { id: "journal", state: "fail", code: "journal_behind_server" };
   }

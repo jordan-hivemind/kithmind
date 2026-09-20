@@ -13,6 +13,7 @@ import { normalizedCounts } from "./assessment.js";
 import { requireWorkerSourceAccount, type LoadedWorkerSource } from "./auth.js";
 import { row, rows, type WorkerCtx } from "./db.js";
 import { workerProtocolError } from "./errors.js";
+import { RECONCILE_EXEMPT_LIFECYCLES } from "./scans.js";
 import {
   camelizeAssessment,
   camelizeScan,
@@ -252,9 +253,15 @@ export async function getWorkerSourceStatus(
  * `reconcileWorkerScan`'s own skip list read forwards: that loop passes over
  * an item whose lifecycle is `forgotten`, `forgetting` or already
  * `unavailable`, and retires everything else it did not see this epoch. So
- * those three lifecycles, and only those three, are the ones this count
- * leaves out. `IS DISTINCT FROM` rather than `NOT IN` because the column is
- * nullable and a null lifecycle is an item reconcile *would* retire.
+ * those lifecycles, and only those, are the ones this count leaves out.
+ *
+ * Review of this change: the two lists are now one list. The clause below is
+ * generated from `RECONCILE_EXEMPT_LIFECYCLES`, the constant that loop's own
+ * two tests are written against, so neither side can be edited without the
+ * other. `IS DISTINCT FROM` rather than `NOT IN` because the column is
+ * nullable and a null lifecycle is an item reconcile *would* retire, and one
+ * bound parameter per lifecycle rather than an inlined list because nothing
+ * here interpolates a value into SQL.
  *
  * The alias comes out of the stored `fs://` URI rather than out of
  * `source_roots`, because the watcher's side of the comparison is keyed by the
@@ -273,17 +280,18 @@ export async function getWorkerSourceItemCounts(
   request: Extract<WorkerRequest, { operation: "source.itemCounts" }>,
 ): Promise<WorkerSourceItemCountsResult> {
   const source = await requireWorkerSourceAccount(ctx, principal, request);
+  const exempt = RECONCILE_EXEMPT_LIFECYCLES.map(
+    (_, index) => `AND lifecycle IS DISTINCT FROM $${index + 3}`,
+  ).join("\n        ");
   const counted = await rows<{ root_alias: string | null; live_items: string }>(
     ctx,
     `SELECT substring(uri from '^fs://([^/]+)/') AS root_alias,
             count(*) AS live_items
        FROM kith.source_items
       WHERE source_account_id = $1 AND space_id = $2
-        AND lifecycle IS DISTINCT FROM 'unavailable'
-        AND lifecycle IS DISTINCT FROM 'forgotten'
-        AND lifecycle IS DISTINCT FROM 'forgetting'
+        ${exempt}
       GROUP BY 1`,
-    [source.account.id, source.spaceId],
+    [source.account.id, source.spaceId, ...RECONCILE_EXEMPT_LIFECYCLES],
   );
   let liveItems = 0;
   const roots: Array<{ rootAlias: string; liveItems: number }> = [];
