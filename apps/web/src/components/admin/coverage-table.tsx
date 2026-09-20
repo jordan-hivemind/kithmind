@@ -14,6 +14,7 @@ import { useMemo } from "react";
 import { useAdminScreen } from "@/components/admin/admin-query";
 import { TRUNCATED_DETAIL } from "@/components/admin/institutions-table";
 import { DataTable, Detail, Tag } from "@/components/ui/data-table";
+import { archiveDate, tableInteger } from "@/lib/kith/format";
 
 type Area = admin.AreaCoverageRow;
 
@@ -40,7 +41,7 @@ const TONE: Record<admin.CoverageStatus, "neutral" | "accent" | "warn"> = {
 };
 
 function number(value: number) {
-  return <span className="tabular-nums">{value}</span>;
+  return <span className="tabular-nums">{tableInteger(value)}</span>;
 }
 
 export function CoverageTable({
@@ -85,7 +86,7 @@ export function CoverageTable({
           <span className="tabular-nums text-gray-600">
             {row.original.from === null
               ? ""
-              : `${row.original.from} to ${row.original.to ?? ""}`}
+              : `${archiveDate(row.original.from)} to ${archiveDate(row.original.to)}`}
           </span>
         ),
       },

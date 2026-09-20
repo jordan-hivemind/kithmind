@@ -38,6 +38,7 @@ import {
   inputClass,
   primaryButtonClass,
 } from "@/components/ui/drawer";
+import { tableDateTime, tableInteger } from "@/lib/kith/format";
 import { useLiveChanges } from "@/lib/kith/use-live-changes";
 
 type Source = admin.SourceInventoryRow;
@@ -93,8 +94,7 @@ type Row = {
 };
 
 function when(value: number | null): string {
-  if (value === null) return "";
-  return new Date(value).toISOString().slice(0, 16).replace("T", " ");
+  return tableDateTime(value);
 }
 
 function rootLocation(root: Root): string | null {
@@ -356,7 +356,9 @@ export function SourcesTable({
         accessorKey: "itemCount",
         header: "Items",
         cell: ({ row }) => (
-          <span className="tabular-nums">{row.original.itemCount}</span>
+          <span className="tabular-nums">
+            {tableInteger(row.original.itemCount)}
+          </span>
         ),
       },
       {
@@ -364,7 +366,9 @@ export function SourcesTable({
         accessorKey: "skippedCount",
         header: "Skipped",
         cell: ({ row }) => (
-          <span className="tabular-nums">{row.original.skippedCount}</span>
+          <span className="tabular-nums">
+            {tableInteger(row.original.skippedCount)}
+          </span>
         ),
       },
       {
@@ -416,6 +420,7 @@ export function SourcesTable({
   return (
     <>
       <DataTable
+        id="admin-sources"
         data={rows}
         columns={columns}
         getSubRows={(row) => row.children}

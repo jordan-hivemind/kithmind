@@ -36,6 +36,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { buttonClass } from "@/components/ui/drawer";
+import { archiveDate, label, tableDecimal, tableInteger } from "@/lib/kith/format";
 import {
   columnChipOptions,
   matchesChipFilter,
@@ -163,6 +164,9 @@ export type DataTableProps<T> = {
    * action still confirms first, with the count in the prompt. Selection is
    * cleared after any bulk action runs, confirmed or not. */
   bulkActions?: readonly RowAction<T[]>[];
+  /** Hide the built-in search input when the table is embedded in a compact
+   * summary. Filter chips, selection controls, and toolbar content remain. */
+  showSearch?: boolean;
 };
 
 /** Square tags (2px), gray by default, blue when they carry the selection. */
@@ -180,12 +184,16 @@ export function Tag({
     accent: "bg-accent-50 text-accent-700 border-accent-200",
     warn: "bg-amber-50 text-amber-800 border-amber-200",
   } as const;
+  const displayChildren =
+    typeof children === "string" && /^[a-z]+(?:_[a-z]+)*$/.test(children)
+      ? label(children)
+      : children;
   return (
     <span
       title={title}
       className={`inline-flex items-center rounded-tag border px-1.5 py-0.5 text-[11px] leading-none ${tones[tone]}`}
     >
-      {children}
+      {displayChildren}
     </span>
   );
 }
@@ -277,6 +285,17 @@ function loadColumnSizing(id: string | undefined): ColumnSizingState {
   }
 }
 
+/** Apply the app's table display conventions to primitive values while
+ * leaving custom React cells untouched. */
+function displayCellValue(value: React.ReactNode): React.ReactNode {
+  if (typeof value === "number" && Number.isInteger(value)) return tableInteger(value);
+  if (typeof value !== "string") return value;
+  if (/^-?\d+$/.test(value)) return tableDecimal(value);
+  if (/^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(value)) return archiveDate(value);
+  if (/^[a-z]+(?:_[a-z]+)+$/.test(value)) return label(value);
+  return value;
+}
+
 export function DataTable<T>({
   data,
   columns,
@@ -296,6 +315,7 @@ export function DataTable<T>({
   selectable = false,
   getRowId = defaultRowId,
   bulkActions = [],
+  showSearch = true,
 }: DataTableProps<T>) {
   const [sorting, setSorting] = useState<SortingState>(initialSorting);
   const [search, setSearch] = useState("");
@@ -338,6 +358,10 @@ export function DataTable<T>({
   const table = useReactTable({
     data,
     columns: sizedColumns,
+    defaultColumn: {
+      cell: ({ getValue }) =>
+        displayCellValue(getValue() as React.ReactNode),
+    },
     columnResizeMode: "onChange",
     enableColumnResizing: true,
     state: {
@@ -357,7 +381,6 @@ export function DataTable<T>({
       : { getRowCanExpand: (row: { original: T }) => canExpand(row.original) }),
     globalFilterFn: (row, _columnId, value: string) =>
       rowMatchesSearch(Object.values(row.original as object), value),
-    ...(getSubRows === undefined ? {} : { getSubRows }),
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
@@ -444,74 +467,78 @@ export function DataTable<T>({
   return (
     <Tooltip.Provider delayDuration={200}>
       <div className="flex flex-col gap-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <input
-            type="search"
-            value={search}
-            onChange={(event) => {
-              setSearch(event.target.value);
-              onSearchChange?.(event.target.value);
-            }}
-            placeholder={searchPlaceholder}
-            aria-label={searchPlaceholder}
-            className="h-7 w-56 rounded-tag border border-gray-300 px-2 text-xs outline-none focus:border-accent-500"
-          />
-          {chipOptions.map(({ columnId, options }) =>
-            options.map((option) => {
-              const selected = (chips[columnId] ?? []).includes(option.value);
-              return (
-                <button
-                  key={`${columnId}:${option.value}`}
-                  type="button"
-                  aria-pressed={selected}
-                  onClick={() => toggleChip(columnId, option.value)}
-                  className={`rounded-tag border px-1.5 py-0.5 text-[11px] leading-none ${
-                    selected
-                      ? "border-accent-600 bg-accent-600 text-white"
-                      : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"
-                  }`}
-                >
-                  {option.value}
-                  <span className="ml-1 opacity-60">{option.count}</span>
-                </button>
-              );
-            }),
-          )}
-          {selectable && selected.size > 0 ? (
-            <>
-              <Tag tone="accent">{selected.size} selected</Tag>
-              <button
-                type="button"
-                onClick={() => setSelected(new Set())}
-                className="text-[11px] text-gray-500 hover:text-gray-700"
-              >
-                Clear
-              </button>
-              {bulkActions
-                .filter((action) => !(action.hidden?.(selectedRows) ?? false))
-                .map((action) => (
+        {showSearch || chipOptions.length > 0 || selectable || toolbar ? (
+          <div className="flex flex-wrap items-center gap-2">
+            {showSearch ? (
+              <input
+                type="search"
+                value={search}
+                onChange={(event) => {
+                  setSearch(event.target.value);
+                  onSearchChange?.(event.target.value);
+                }}
+                placeholder={searchPlaceholder}
+                aria-label={searchPlaceholder}
+                className="h-7 w-56 rounded-tag border border-gray-300 px-2 text-xs outline-none focus:border-accent-500"
+              />
+            ) : null}
+            {chipOptions.map(({ columnId, options }) =>
+              options.map((option) => {
+                const selected = (chips[columnId] ?? []).includes(option.value);
+                return (
                   <button
-                    key={action.label}
+                    key={`${columnId}:${option.value}`}
                     type="button"
-                    disabled={action.disabled?.(selectedRows) ?? false}
-                    onClick={() =>
-                      action.danger
-                        ? setConfirmingBulk({ action, rows: selectedRows })
-                        : (action.onSelect(selectedRows), setSelected(new Set()))
-                    }
-                    className={
-                      action.danger
-                        ? "h-7 rounded-tag border border-red-200 px-2 text-xs text-red-600 hover:border-red-400 disabled:text-gray-300"
-                        : buttonClass
-                    }
+                    aria-pressed={selected}
+                    onClick={() => toggleChip(columnId, option.value)}
+                    className={`rounded-tag border px-1.5 py-0.5 text-[11px] leading-none ${
+                      selected
+                        ? "border-accent-600 bg-accent-600 text-white"
+                        : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"
+                    }`}
                   >
-                    {action.label}
+                    {label(option.value)}
+                    <span className="ml-1 opacity-60">{option.count}</span>
                   </button>
-                ))}
-            </>
-          ) : null}
-          {toolbar}
-        </div>
+                );
+              }),
+            )}
+            {selectable && selected.size > 0 ? (
+              <>
+                <Tag tone="accent">{selected.size} selected</Tag>
+                <button
+                  type="button"
+                  onClick={() => setSelected(new Set())}
+                  className="text-[11px] text-gray-500 hover:text-gray-700"
+                >
+                  Clear
+                </button>
+                {bulkActions
+                  .filter((action) => !(action.hidden?.(selectedRows) ?? false))
+                  .map((action) => (
+                    <button
+                      key={action.label}
+                      type="button"
+                      disabled={action.disabled?.(selectedRows) ?? false}
+                      onClick={() =>
+                        action.danger
+                          ? setConfirmingBulk({ action, rows: selectedRows })
+                          : (action.onSelect(selectedRows), setSelected(new Set()))
+                      }
+                      className={
+                        action.danger
+                          ? "h-7 rounded-tag border border-red-200 px-2 text-xs text-red-600 hover:border-red-400 disabled:text-gray-300"
+                          : buttonClass
+                      }
+                    >
+                      {action.label}
+                    </button>
+                  ))}
+              </>
+            ) : null}
+            {toolbar}
+          </div>
+        ) : null}
 
         <div className="overflow-x-auto">
           <table
@@ -520,7 +547,10 @@ export function DataTable<T>({
           >
             <thead>
               {table.getHeaderGroups().map((headerGroup) => (
-                <tr key={headerGroup.id} className="border-b border-gray-200">
+                <tr
+                  key={headerGroup.id}
+                  className="border-b border-gray-300 bg-gray-50"
+                >
                   {selectable ? (
                     <th className="h-row w-7 px-1 align-middle">
                       <SelectionCheckbox
@@ -541,7 +571,7 @@ export function DataTable<T>({
                         key={header.id}
                         scope="col"
                         style={{ width: header.getSize() }}
-                        className="relative h-row px-2 text-left align-middle font-medium text-gray-500"
+                        className="relative h-row border-r border-gray-200 px-2 text-left align-middle font-medium text-gray-600 last:border-r-0"
                       >
                         {header.isPlaceholder ? null : header.column.getCanSort() ? (
                           <button
@@ -577,7 +607,7 @@ export function DataTable<T>({
                             role="separator"
                             aria-orientation="vertical"
                             aria-label="Resize column"
-                            className="absolute inset-y-0 right-0 w-1.5 cursor-col-resize touch-none select-none hover:bg-accent-400"
+                            className="absolute inset-y-1 right-0 w-1.5 cursor-col-resize touch-none select-none border-r border-gray-300 hover:border-accent-500"
                           />
                         ) : null}
                       </th>
@@ -639,8 +669,12 @@ export function DataTable<T>({
                             }
                           : undefined
                       }
-                      className={`border-b border-gray-100 hover:bg-accent-50/40 ${
-                        row.depth > 0 ? "bg-gray-50/60 text-gray-600" : ""
+                      className={`border-b border-gray-200 hover:bg-accent-50/60 ${
+                        row.getCanExpand()
+                          ? "border-l-2 border-l-accent-500 bg-accent-50/70 font-medium"
+                          : row.depth > 0
+                            ? "bg-white text-gray-600"
+                            : "bg-white"
                       } ${
                         intent === "none"
                           ? ""
@@ -727,13 +761,19 @@ export function DataTable<T>({
                             // `getSubRows` parent would render nothing at all if
                             // this were not gated on `groupBy`. A grouped table
                             // behaves exactly as it did.
-                            flexRender(cell.column.columnDef.cell, cell.getContext())
+                            flexRender(
+                              cell.column.columnDef.cell,
+                              cell.getContext(),
+                            )
                           )}
                         </td>
                       ))}
                       {actions.length > 0 ? (
-                        <td className="h-row px-1 text-right align-middle">
-                          {row.getIsGrouped() ? null : (
+                        <td className="sticky right-0 h-row border-l border-gray-100 bg-inherit px-1 text-right align-middle">
+                          {row.getIsGrouped() ||
+                          actions.every(
+                            (action) => action.hidden?.(row.original) ?? false,
+                          ) ? null : (
                             <DropdownMenu.Root>
                               <DropdownMenu.Trigger
                                 aria-label="Row actions"

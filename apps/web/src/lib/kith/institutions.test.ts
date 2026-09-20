@@ -4,8 +4,8 @@ import { describe, expect, test } from "vitest";
 
 import {
   freshness,
+  friendlyAccountName,
   groupInstitutions,
-  maskedLabel,
 } from "@/lib/kith/institutions";
 
 const NOW = Date.parse("2026-09-18T12:00:00Z");
@@ -33,17 +33,15 @@ function record(overrides: Record<string, unknown> = {}) {
   } as never;
 }
 
-describe("account labels never carry a whole number", () => {
+describe("account names stay separate from identifiers", () => {
   test("the display label wins", () => {
-    expect(maskedLabel(account({ displayLabel: "Income" }))).toBe("Income");
+    expect(friendlyAccountName(account({ displayLabel: "Income" }))).toBe(
+      "Income",
+    );
   });
 
-  test("last four is masked, never shown bare", () => {
-    expect(maskedLabel(account({ accountLast4: "1234" }))).toBe("••••1234");
-  });
-
-  test("with neither, the opaque id stands in", () => {
-    expect(maskedLabel(account())).toBe("account-1");
+  test("a missing label is explicit instead of replaced by an account id", () => {
+    expect(friendlyAccountName(account())).toBe("Unlabeled account");
   });
 });
 
@@ -73,7 +71,11 @@ describe("grouping", () => {
       [
         record(),
         record({
-          account: account({ accountId: "account-2", displayLabel: "IRA" }),
+          account: account({
+            accountId: "account-2",
+            displayLabel: "IRA",
+            accountLast4: "1234",
+          }),
           statementCount: 2,
           recordCount: 8,
           activityFrom: "2024-06-01",
@@ -92,8 +94,16 @@ describe("grouping", () => {
     expect(group!.activityTo).toBe("2026-08-31");
     expect(group!.latestSnapshotAsOf).toBe("2026-08-31");
     expect(group!.children?.map((child) => child.name)).toEqual([
-      "account-1",
+      "Unlabeled account",
       "IRA",
+    ]);
+    expect(group!.children?.map((child) => child.accountName)).toEqual([
+      "Unlabeled account",
+      "IRA",
+    ]);
+    expect(group!.children?.map((child) => child.accountLast4)).toEqual([
+      null,
+      "1234",
     ]);
   });
 

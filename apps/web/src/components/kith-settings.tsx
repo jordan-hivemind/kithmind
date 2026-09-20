@@ -37,7 +37,7 @@ import { DataTable, Detail, type RowAction, Tag } from "@/components/ui/data-tab
 import { useToast } from "@/components/ui/toast";
 import { sourceAccountGrantsForCapabilities } from "@/lib/api-key-scopes";
 import { PLUGIN_COMMANDS, PROMPTS } from "@/lib/kith/connect-guide";
-import { shortDate } from "@/lib/kith/format";
+import { shortDate, tableInteger } from "@/lib/kith/format";
 import { isPendingId, mutateJson, pendingId, requestJson } from "@/lib/kith/optimistic";
 import type { SettingsData } from "@/lib/kith/settings-data";
 import { useOptimisticMutation, useServerData } from "@/lib/kith/use-server-data";
@@ -252,7 +252,11 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
         meta: { nowrap: true },
         cell: ({ row }) => (
           <Detail
-            label={<span className="tabular-nums">{row.original.spaceIds.length}</span>}
+            label={
+              <span className="tabular-nums">
+                {tableInteger(row.original.spaceIds.length)}
+              </span>
+            }
             detail={row.original.spaceIds
               .map((id) => spaceNames.get(id) ?? id)
               .join(", ")}
@@ -594,7 +598,11 @@ function SourceAccountsSection({
         accessorFn: (row) => row.freshnessMs / 60_000,
         header: "Freshness (min)",
         meta: { nowrap: true },
-        cell: ({ getValue }) => <span className="tabular-nums">{getValue() as number}</span>,
+        cell: ({ getValue }) => (
+          <span className="tabular-nums">
+            {tableInteger(getValue() as number)}
+          </span>
+        ),
       },
       {
         id: "status",
