@@ -125,6 +125,30 @@ lane a concrete next action, and reuse valid operational checkpoints rather
 than restarting long jobs because of a handoff. If a gate fails, identify the
 violated invariant before repeating the operation or weakening the gate.
 
+## Orchestrator continuity and priorities
+
+An active owner request continues through implementation, integration, release
+and verification of the requested outcome. A worker handoff, completed reparse,
+finished import or healthy deployment is an intermediate result. Keep moving
+within existing authorization; do not wait for another owner prompt at each
+checkpoint. Give every active lane a concrete next action and resolve dependency
+waits directly. When work truly cannot continue, state the specific missing
+input rather than implying that a saved checkpoint is active progress.
+
+Before prioritizing a repair, trace its effect on the user-visible acceptance
+condition. For example, fixing one statement may clear no stale accounts if
+other incomplete sources contribute to the same snapshot. Count affected
+accounts and remaining causes, not just successful documents or merged PRs.
+Reconsider inherited plans when this evidence changes their expected benefit.
+Preserve honest completeness and evidence requirements while correcting overly
+broad or misplaced gates.
+
+Changes to both sides of a shared protocol may need one integration candidate.
+Keep ownership and review clear, combine the dependent commits, and use that
+candidate's required CI instead of waiting for incompatible halves to pass
+independently. Record which commits and reviews the combined release includes.
+Do not duplicate a full review or test run when unchanged evidence applies.
+
 ## Cross-workstream coordination
 
 Mainline and the financial archive workstream coordinate through
