@@ -3503,6 +3503,68 @@ test(
 );
 
 test(
+  "list_account_inventory evaluates many position dates and attributed reviews without changing eligibility",
+  { skip },
+  async (t) => {
+    const { owner, reader: r } = await fixture(t);
+    const source = await institution(owner, "inventory-eligibility-scale");
+    const accountId = source.accountIds[0];
+
+    await owner.query(
+      `INSERT INTO documents
+         (id, institution_id, account_id, doc_type, doc_date, file_path, sha256,
+          parsed_ok)
+       SELECT 'inventory-scale-doc-' || g::text, $1,
+              CASE WHEN g = 36 THEN NULL ELSE $2 END,
+              'statement', DATE '2025-01-01' + g,
+              'documents/synthetic/inventory-scale-' || g::text,
+              repeat('f', 56) || lpad(to_hex(g), 8, '0'),
+              g <> 36
+         FROM generate_series(1, 36) AS g`,
+      [source.id, accountId],
+    );
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, quantity, market_value, cost_basis, currency,
+          valuation_basis, source_document_id)
+       SELECT 'inventory-scale-position-' || g::text || '-' || n::text,
+              $1, DATE '2025-01-01' + g, '1', '1', '1', 'USD',
+              'market_price', 'inventory-scale-doc-' || g::text
+         FROM generate_series(1, 36) AS g
+        CROSS JOIN generate_series(1, 12) AS n`,
+      [accountId],
+    );
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       SELECT 'inventory-scale-review-' || g::text || '-' || n::text,
+              'ambiguous_amount', $1, 'inventory-scale-doc-' || g::text,
+              'synthetic scale review ' || n::text, 'synthetic scale review',
+              CASE WHEN g < 35 THEN 'open' ELSE 'resolved' END
+         FROM generate_series(1, 36) AS g
+        CROSS JOIN generate_series(1, 25) AS n
+        WHERE g <> 35`,
+      [accountId],
+    );
+
+    const inventory = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 100,
+    });
+    const row = inventory.items.find(
+      (item) => item.account.accountId === accountId,
+    );
+    assert.equal(row.openReviewCount, 850);
+    assert.equal(row.latestSnapshotAsOf, "2025-02-05");
+    assert.deepEqual(row.currentValue, {
+      value: { decimal: "12", currency: "USD" },
+      asOf: "2025-02-05",
+      source: "positions",
+    });
+  },
+);
+
+test(
   "list_account_inventory rejects a mixed-source date until every source parses completely (FIN-FRESHNESS-1)",
   { skip },
   async (t) => {
