@@ -32,6 +32,10 @@ import {
   Tag,
 } from "@/components/ui/data-table";
 import {
+  DocumentViewer,
+  type DocumentReference,
+} from "@/components/ui/document-viewer";
+import {
   buttonClass,
   Drawer,
   inputClass,
@@ -211,12 +215,14 @@ function AttentionDrawer({
   onDismiss,
   onSnooze,
   onUndo,
+  onOpenDocument,
 }: {
   item: KithItem;
   onOpenChange: (open: boolean) => void;
   onDismiss: (reason: DismissReason) => void;
   onSnooze: (until: string) => void;
   onUndo: () => void;
+  onOpenDocument: (document: DocumentReference) => void;
 }) {
   return (
     <Drawer open onOpenChange={onOpenChange} title={issueLabel(item)}>
@@ -238,7 +244,13 @@ function AttentionDrawer({
         {item.document === null ? null : (
           <div>
             <span className="text-gray-400">Document</span>{" "}
-            {item.document.title ?? item.document.sourceItemId}
+            <button
+              type="button"
+              onClick={() => onOpenDocument(item.document!)}
+              className="text-left text-accent-700 underline-offset-2 hover:underline"
+            >
+              {item.document.title ?? item.document.sourceItemId}
+            </button>
           </div>
         )}
         {item.detector === "investment_link_date" ? (
@@ -313,6 +325,7 @@ export function AttentionTable({
   const [showInfo, setShowInfo] = useState(true);
   const [showEverything, setShowEverything] = useState(false);
   const [detail, setDetail] = useState<UnifiedItem | null>(null);
+  const [document, setDocument] = useState<DocumentReference | null>(null);
   const [beforeDate, setBeforeDate] = useState("");
   const [confirmBeforeDate, setConfirmBeforeDate] = useState(false);
 
@@ -505,6 +518,9 @@ export function AttentionTable({
       {
         id: "severity",
         header: "Severity",
+        size: 88,
+        minSize: 78,
+        maxSize: 112,
         accessorFn: (row) =>
           row.source === "finance" ? "attention" : row.item.severity,
         cell: ({ row }) => {
@@ -518,6 +534,8 @@ export function AttentionTable({
       {
         id: "what",
         header: "Needs attention",
+        size: 300,
+        minSize: 180,
         accessorFn: (row) =>
           row.source === "finance"
             ? financeReviewProblem(row.item)
@@ -542,6 +560,8 @@ export function AttentionTable({
       {
         id: "resolution",
         header: "Resolution",
+        size: 140,
+        minSize: 110,
         accessorFn: (row) =>
           row.source === "finance"
             ? financeReviewResolution(row.item)
@@ -561,6 +581,8 @@ export function AttentionTable({
       {
         id: "document",
         header: "Document",
+        size: 240,
+        minSize: 140,
         accessorFn: (row) =>
           row.source === "finance"
             ? (row.item.sourceDocumentId ?? "")
@@ -574,20 +596,24 @@ export function AttentionTable({
               />
             )
           ) : row.original.item.document === null ? null : (
-            <Detail
-              label={
-                <span className="truncate">
-                  {row.original.item.document.title ??
-                    row.original.item.document.sourceItemId}
-                </span>
-              }
-              detail={row.original.item.document.uri}
-            />
+            <button
+              type="button"
+              data-row-click-ignore
+              title={row.original.item.document.uri ?? undefined}
+              onClick={() => setDocument(row.original.item.document)}
+              className="block w-full truncate text-left text-accent-700 underline-offset-2 hover:underline"
+            >
+              {row.original.item.document.title ??
+                row.original.item.document.sourceItemId}
+            </button>
           ),
       },
       {
         id: "age",
         header: "Age",
+        size: 60,
+        minSize: 52,
+        maxSize: 72,
         meta: { nowrap: true },
         accessorFn: (row) =>
           row.source === "finance" ? 0 : row.item.createdAt,
@@ -601,6 +627,9 @@ export function AttentionTable({
       {
         id: "state",
         header: "State",
+        size: 86,
+        minSize: 76,
+        maxSize: 104,
         accessorFn: (row) =>
           row.source === "finance" ? row.item.status : row.item.state,
         cell: ({ row }) => {
@@ -614,6 +643,9 @@ export function AttentionTable({
       {
         id: "source",
         header: "Source",
+        size: 76,
+        minSize: 66,
+        maxSize: 96,
         accessorFn: (row) => row.source,
         cell: ({ row }) => <Tag>{row.original.source}</Tag>,
       },
@@ -867,8 +899,17 @@ export function AttentionTable({
             setDetail(null);
             void undoOne(detail.item.id);
           }}
+          onOpenDocument={setDocument}
         />
       )}
+
+      <DocumentViewer
+        document={document}
+        open={document !== null}
+        onOpenChange={(open) => {
+          if (!open) setDocument(null);
+        }}
+      />
 
       <AlertDialog.Root
         open={confirmBeforeDate}
