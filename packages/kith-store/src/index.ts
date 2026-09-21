@@ -341,6 +341,8 @@ export async function grantProofAppRole(
   // `worker_watcher_reset_receipts`, `space_processing_state` and
   // `source_accounts` -- the last of which every epoch bump goes through, so
   // the gap reaches almost the whole protocol rather than one corner of it.
+  // `source_triage_previews` joins that derived worker write path with the
+  // provisional-preview operation.
   //
   // This has never fired in production, and the reason is worth writing down
   // rather than guessing at: the hosted web app connects as the database OWNER
@@ -360,7 +362,7 @@ export async function grantProofAppRole(
     kith.worker_operation_receipts, kith.worker_binary_operation_receipts,
     kith.worker_parsed_stages, kith.worker_processing_assessments,
     kith.worker_watcher_states, kith.worker_operational_incidents,
-    kith.worker_watcher_reset_receipts
+    kith.worker_watcher_reset_receipts, kith.source_triage_previews
     TO "${appRole}"`);
   // The attention queue (ADM-8a, migration 030). `kith.corrections` is
   // already granted above with the admin panel; `kith.attention_mutes` is
@@ -424,6 +426,12 @@ export async function grantProofAppRole(
   // triggers, whose EXECUTE is checked when the trigger is created.
   await owner.query(
     `GRANT EXECUTE ON FUNCTION ${KITH_SCHEMA}.sensitivity_rank(text) TO "${appRole}"`,
+  );
+  // Preview unit coverage is enforced by this CHECK-constraint function. Its
+  // EXECUTE privilege is required when the hardened database has revoked the
+  // default PUBLIC routine grant, just as for `sensitivity_rank` above.
+  await owner.query(
+    `GRANT EXECUTE ON FUNCTION ${KITH_SCHEMA}.valid_triage_preview_units(jsonb, numeric) TO "${appRole}"`,
   );
   // USAGE on a domain is granted to PUBLIC by default and revoked from PUBLIC
   // when the reader role is applied, so the writer is granted it by name.

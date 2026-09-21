@@ -221,6 +221,38 @@ export function camelizeScanEntry(
   ]);
 }
 
+export type SourceTriagePreviewRow = {
+  id: string;
+  spaceId: string;
+  sourceAccountId: string;
+  sourceItemId: string;
+  observedContentHash: string;
+  observedByteLength: number;
+  observedMediaType: string;
+  observedObservationEpoch: number;
+  previewFingerprint: string;
+  previewMethod: string;
+  sourceFormat: string;
+  sourceUnitCount: number | null;
+  inspectedOriginalUnits: number[];
+  provisionalMetadata: Record<string, unknown>;
+  confidence: number | null;
+  sourceRevisionId: string | null;
+  createdAt: Date;
+  linkedAt: Date | null;
+};
+
+export function camelizeSourceTriagePreview(
+  raw: Record<string, unknown>,
+): SourceTriagePreviewRow {
+  return camelize<SourceTriagePreviewRow>(raw, [
+    "observedByteLength",
+    "observedObservationEpoch",
+    "sourceUnitCount",
+    "confidence",
+  ]);
+}
+
 export type WorkerDiscoveryWorkState =
   "queued" | "leased" | "admitted" | "failed" | "needs_review" | "obsolete";
 

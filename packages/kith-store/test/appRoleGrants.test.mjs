@@ -70,7 +70,8 @@ const GRANTED = Object.freeze({
   // group at all, including the watcher row two diagnostics operations write
   // and `source_accounts`, which every epoch bump in the protocol goes
   // through. `WORKER_WRITE_PATH` below is the assertion that keeps the list
-  // honest as handlers are added; this group is the grant it checks.
+  // honest as handlers are added; this group is the grant it checks. Preview
+  // persistence adds its table through that same derived path.
   worker: [
     "source_accounts",
     "space_processing_state",
@@ -85,6 +86,7 @@ const GRANTED = Object.freeze({
     "worker_watcher_states",
     "worker_operational_incidents",
     "worker_watcher_reset_receipts",
+    "source_triage_previews",
   ],
   attention: ["attention_mutes"],
   // ADM-8b. One table, and it is the one the nightly matcher writes on every
@@ -222,6 +224,9 @@ test(
     const database = await throwawayDatabase(t);
     const owner = await connect(database);
     await applyKithSchema(owner);
+    await owner.query(
+      "REVOKE ALL ON FUNCTION kith.valid_triage_preview_units(jsonb, numeric) FROM PUBLIC",
+    );
     const role = await createAppRole(owner);
     await grantProofAppRole(owner, role.role);
 
@@ -472,6 +477,20 @@ test(
           );
         }
       }
+
+      assert.equal(
+        (
+          await app.query(
+            `SELECT has_function_privilege(
+               current_user,
+               'kith.valid_triage_preview_units(jsonb,numeric)',
+               'EXECUTE'
+             ) AS granted`,
+          )
+        ).rows[0].granted,
+        true,
+        "preview unit validator: EXECUTE",
+      );
 
       // The control. A table deliberately left out of the grant refuses the
       // write at the server, with the code that says it was a privilege and not

@@ -97,6 +97,61 @@ export const MAX_WORKER_RECONCILE_ITEMS = 50;
 export const MAX_WORKER_RESERVATION_ITEMS = 4;
 export const MAX_WORKER_ASSESSMENT_ITEMS = 1;
 export const MAX_WORKER_ARCHIVE_FORGET_ITEMS = 4;
+export const MAX_TRIAGE_PREVIEW_UNITS = 256;
+
+export const TRIAGE_PREVIEW_METHODS = [
+  "pdf_native_text_v1",
+  "spreadsheet_manifest_v1",
+  "binary_metadata_v1",
+] as const;
+export type TriagePreviewMethod = (typeof TRIAGE_PREVIEW_METHODS)[number];
+
+export const TRIAGE_SOURCE_FORMATS = ["pdf", "spreadsheet", "unknown"] as const;
+export type TriageSourceFormat = (typeof TRIAGE_SOURCE_FORMATS)[number];
+
+export const TRIAGE_DOCUMENT_KINDS = [
+  "tax_return",
+  "financial_statement",
+  "receipt",
+  "letter",
+  "spreadsheet",
+  "other",
+  "unknown",
+] as const;
+export type TriageDocumentKind = (typeof TRIAGE_DOCUMENT_KINDS)[number];
+
+export const TRIAGE_UNCERTAINTY_CODES = [
+  "cover_only",
+  "date_ambiguous",
+  "image_only",
+  "insufficient_text",
+  "mixed_bundle",
+  "type_ambiguous",
+  "unsupported",
+] as const;
+export type TriageUncertaintyCode = (typeof TRIAGE_UNCERTAINTY_CODES)[number];
+
+export type TriageProvisionalDate = {
+  value: string;
+  precision: "year" | "month" | "day";
+};
+
+export type TriageProvisionalMetadata = {
+  title?: string;
+  documentKind?: TriageDocumentKind;
+  documentDate?: TriageProvisionalDate;
+  uncertaintyCodes?: TriageUncertaintyCode[];
+};
+
+export type TriagePreviewDeclaration = {
+  previewFingerprint: string;
+  previewMethod: TriagePreviewMethod;
+  sourceFormat: TriageSourceFormat;
+  sourceUnitCount: number | null;
+  inspectedOriginalUnits: number[];
+  provisionalMetadata: TriageProvisionalMetadata;
+  confidence: number | null;
+};
 
 export type WorkerPaginationOptions = {
   cursor: string | null;
@@ -460,6 +515,12 @@ export type WorkerRequest =
       leaseEpoch: number;
       leaseToken: string;
       text: string;
+    })
+  | (WorkerSourceRequest & {
+      operation: "discovery.recordPreview";
+      requestId: string;
+      identity: ArchivedWorkIdentity;
+      preview: TriagePreviewDeclaration;
     })
   | (WorkerSourceRequest & {
       operation: "discovery.preflightArchived";
@@ -924,6 +985,17 @@ export type WorkerDiscoveryAdmitResult = {
   reused: boolean;
 };
 
+export type WorkerDiscoveryPreviewResult = {
+  operation: "discovery.recordPreview";
+  previewId: string;
+  sourceItemId: string;
+  observedContentHash: string;
+  previewFingerprint: string;
+  sourceRevisionId?: string;
+  state: "provisional" | "retained";
+  reused: boolean;
+};
+
 export type WorkerArchivedPreflightResult = {
   operation: "discovery.preflightArchived";
   sourceItemId: string;
@@ -1289,6 +1361,7 @@ export type WorkerResult =
   | WorkerScanReconcileResult
   | WorkerDiscoveryReserveResult
   | WorkerDiscoveryAdmitResult
+  | WorkerDiscoveryPreviewResult
   | WorkerArchivedPreflightResult
   | WorkerArchivedFailResult
   | WorkerArchivedReserveResult
@@ -1693,6 +1766,150 @@ function archivedWorkIdentity(value: unknown): ArchivedWorkIdentity {
     }),
     chunkerFingerprint: string(input.chunkerFingerprint, { maxUtf8: 1_024 }),
     correctionRevision: string(input.correctionRevision, { maxUtf8: 1_024 }),
+  };
+}
+
+function provisionalDate(value: unknown): TriageProvisionalDate {
+  const input = object(value);
+  exactKeys(input, ["value", "precision"]);
+  if (
+    input.precision !== "year" &&
+    input.precision !== "month" &&
+    input.precision !== "day"
+  ) {
+    return invalid();
+  }
+  const pattern =
+    input.precision === "year"
+      ? /^\d{4}$/
+      : input.precision === "month"
+        ? /^\d{4}-(?:0[1-9]|1[0-2])$/
+        : /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/;
+  return {
+    value: string(input.value, { maxUtf16: 10, pattern }),
+    precision: input.precision,
+  };
+}
+
+function provisionalMetadata(value: unknown): TriageProvisionalMetadata {
+  const input = object(value);
+  exactKeys(
+    input,
+    [],
+    ["title", "documentKind", "documentDate", "uncertaintyCodes"],
+  );
+  let documentKind: TriageDocumentKind | undefined;
+  if (input.documentKind !== undefined) {
+    if (
+      typeof input.documentKind !== "string" ||
+      !(TRIAGE_DOCUMENT_KINDS as readonly string[]).includes(input.documentKind)
+    ) {
+      return invalid();
+    }
+    documentKind = input.documentKind as TriageDocumentKind;
+  }
+  let uncertaintyCodes: TriageUncertaintyCode[] | undefined;
+  if (input.uncertaintyCodes !== undefined) {
+    if (
+      !Array.isArray(input.uncertaintyCodes) ||
+      input.uncertaintyCodes.length > TRIAGE_UNCERTAINTY_CODES.length ||
+      input.uncertaintyCodes.some(
+        (code) =>
+          typeof code !== "string" ||
+          !(TRIAGE_UNCERTAINTY_CODES as readonly string[]).includes(code),
+      )
+    ) {
+      return invalid();
+    }
+    uncertaintyCodes = input.uncertaintyCodes as TriageUncertaintyCode[];
+    if (
+      uncertaintyCodes.some(
+        (code, index) => index > 0 && uncertaintyCodes![index - 1]! >= code,
+      )
+    ) {
+      return invalid();
+    }
+  }
+  return {
+    ...(input.title === undefined
+      ? {}
+      : { title: string(input.title, { maxUtf8: 512 }) }),
+    ...(documentKind === undefined ? {} : { documentKind }),
+    ...(input.documentDate === undefined
+      ? {}
+      : { documentDate: provisionalDate(input.documentDate) }),
+    ...(uncertaintyCodes === undefined ? {} : { uncertaintyCodes }),
+  };
+}
+
+function triagePreview(value: unknown): TriagePreviewDeclaration {
+  const input = object(value);
+  exactKeys(input, [
+    "previewFingerprint",
+    "previewMethod",
+    "sourceFormat",
+    "sourceUnitCount",
+    "inspectedOriginalUnits",
+    "provisionalMetadata",
+    "confidence",
+  ]);
+  if (
+    typeof input.previewMethod !== "string" ||
+    !(TRIAGE_PREVIEW_METHODS as readonly string[]).includes(
+      input.previewMethod,
+    ) ||
+    typeof input.sourceFormat !== "string" ||
+    !(TRIAGE_SOURCE_FORMATS as readonly string[]).includes(input.sourceFormat)
+  ) {
+    return invalid();
+  }
+  const sourceUnitCount =
+    input.sourceUnitCount === null
+      ? null
+      : integer(input.sourceUnitCount, 0, Number.MAX_SAFE_INTEGER);
+  if (
+    !Array.isArray(input.inspectedOriginalUnits) ||
+    input.inspectedOriginalUnits.length > MAX_TRIAGE_PREVIEW_UNITS
+  ) {
+    return invalid();
+  }
+  const inspectedOriginalUnits = input.inspectedOriginalUnits.map((unit) =>
+    integer(unit, 1, Number.MAX_SAFE_INTEGER),
+  );
+  if (
+    (sourceUnitCount === null && inspectedOriginalUnits.length !== 0) ||
+    inspectedOriginalUnits.some(
+      (unit, index) =>
+        (index > 0 && inspectedOriginalUnits[index - 1]! >= unit) ||
+        (sourceUnitCount !== null && unit > sourceUnitCount),
+    )
+  ) {
+    return invalid();
+  }
+  let confidence: number | null;
+  if (input.confidence === null) {
+    confidence = null;
+  } else if (
+    typeof input.confidence !== "number" ||
+    !Number.isFinite(input.confidence) ||
+    input.confidence < 0 ||
+    input.confidence > 1
+  ) {
+    return invalid();
+  } else {
+    confidence = input.confidence;
+  }
+  return {
+    previewFingerprint: string(input.previewFingerprint, {
+      maxUtf16: 64,
+      pattern: SHA256,
+    }),
+    previewMethod: input.previewMethod as TriagePreviewMethod,
+    sourceFormat: input.sourceFormat as TriageSourceFormat,
+    sourceUnitCount,
+    inspectedOriginalUnits,
+    provisionalMetadata: provisionalMetadata(input.provisionalMetadata),
+    confidence,
   };
 }
 
@@ -2449,6 +2666,15 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
           pattern: SHA256,
         }),
         text: string(input.text, { maxUtf8: 65_536 }),
+      };
+    case "discovery.recordPreview":
+      exactKeys(input, [...baseKeys, "requestId", "identity", "preview"]);
+      return {
+        ...base,
+        operation: "discovery.recordPreview",
+        requestId: requestId(input.requestId),
+        identity: archivedWorkIdentity(input.identity),
+        preview: triagePreview(input.preview),
       };
     case "discovery.preflightArchived":
       exactKeys(input, [

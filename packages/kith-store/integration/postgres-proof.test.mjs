@@ -500,6 +500,15 @@ test(
     await restoredOwner.query(
       "DROP FUNCTION IF EXISTS kith.sensitivity_rank(text)",
     );
+    // Migration 40's table triggers disappear with the migrated tables above,
+    // while both plain-created helper functions outlive them. Remove those
+    // functions so replay really starts from the restored version-1 catalog.
+    await restoredOwner.query(
+      "DROP FUNCTION IF EXISTS kith.guard_source_triage_preview()",
+    );
+    await restoredOwner.query(
+      "DROP FUNCTION IF EXISTS kith.valid_triage_preview_units(jsonb, numeric)",
+    );
     // Undo migration 6's renames as well. It gave the plain `spaces` and
     // `api_keys` names to the kith_id-keyed tables (just dropped above) and moved
     // the prototype's uuid-keyed pair to `proof_*`. A database genuinely at

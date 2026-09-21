@@ -156,7 +156,12 @@ test("diagnostics.passOutcome takes a closed state and a bounded code", () => {
 test("an unknown field is refused rather than ignored, on every operation", () => {
   for (const request of [
     { ...source, operation: "source.status" },
-    { ...source, operation: "diagnostics.heartbeat", watcherId: outcome.watcherId, connectorVersion: "1.2.3" },
+    {
+      ...source,
+      operation: "diagnostics.heartbeat",
+      watcherId: outcome.watcherId,
+      connectorVersion: "1.2.3",
+    },
     outcome,
   ]) {
     assert.deepEqual(parseWorkerRequest(request), request);
@@ -257,5 +262,109 @@ test("diagnostics.heartbeat accepts only sorted unique allowed root aliases", ()
     { ...heartbeat, allowedRootAliases: null },
   ]) {
     assert.throws(() => parseWorkerRequest(bad), WorkerProtocolParseError);
+  }
+});
+
+const archivedIdentity = {
+  sourceItemId: "j1234567890123456789012345678903",
+  scanId: "j1234567890123456789012345678904",
+  observationEpoch: 1,
+  processingEpoch: 1,
+  contentHash: "a".repeat(64),
+  byteLength: 10,
+  mediaType: "application/pdf",
+  parserProfileId: "pdf_docqa_v1",
+  parserFingerprint: "b".repeat(64),
+  extractionConfigurationFingerprint: "c".repeat(64),
+  extractorFingerprint: "docling-document-qa:v1",
+  recordSchemaFingerprint: "no-records:v1",
+  normalizationFingerprint: "docling-pages:v1",
+  chunkerFingerprint: "page-aware:v1",
+  correctionRevision: "correction:1",
+};
+
+test("discovery.recordPreview accepts bounded provisional metadata without a document page cap", () => {
+  const request = {
+    ...source,
+    operation: "discovery.recordPreview",
+    requestId: "preview-1",
+    identity: archivedIdentity,
+    preview: {
+      previewFingerprint: "d".repeat(64),
+      previewMethod: "pdf_native_text_v1",
+      sourceFormat: "pdf",
+      sourceUnitCount: 515,
+      inspectedOriginalUnits: [1, 17, 515],
+      provisionalMetadata: {
+        title: "Synthetic tax bundle",
+        documentKind: "tax_return",
+        documentDate: { value: "2025", precision: "year" },
+        uncertaintyCodes: ["cover_only", "mixed_bundle"],
+      },
+      confidence: 0.8,
+    },
+  };
+  assert.deepEqual(parseWorkerRequest(request), request);
+  const unknownUnits = {
+    ...request,
+    preview: {
+      ...request.preview,
+      previewMethod: "binary_metadata_v1",
+      sourceFormat: "unknown",
+      sourceUnitCount: null,
+      inspectedOriginalUnits: [],
+      provisionalMetadata: { uncertaintyCodes: ["unsupported"] },
+      confidence: null,
+    },
+  };
+  assert.deepEqual(parseWorkerRequest(unknownUnits), unknownUnits);
+});
+
+test("discovery.recordPreview rejects ambiguous unit coverage and open metadata", () => {
+  const valid = {
+    ...source,
+    operation: "discovery.recordPreview",
+    requestId: "preview-invalid",
+    identity: archivedIdentity,
+    preview: {
+      previewFingerprint: "d".repeat(64),
+      previewMethod: "pdf_native_text_v1",
+      sourceFormat: "pdf",
+      sourceUnitCount: 3,
+      inspectedOriginalUnits: [1, 3],
+      provisionalMetadata: { uncertaintyCodes: ["cover_only"] },
+      confidence: 0.5,
+    },
+  };
+  const previews = [
+    { ...valid.preview, sourceUnitCount: null },
+    { ...valid.preview, inspectedOriginalUnits: [3, 1] },
+    { ...valid.preview, inspectedOriginalUnits: [1, 1] },
+    { ...valid.preview, inspectedOriginalUnits: [1, 4] },
+    {
+      ...valid.preview,
+      inspectedOriginalUnits: Array.from(
+        { length: 257 },
+        (_, index) => index + 1,
+      ),
+      sourceUnitCount: 257,
+    },
+    { ...valid.preview, confidence: 1.01 },
+    {
+      ...valid.preview,
+      provisionalMetadata: { arbitraryModelOutput: "not allowed" },
+    },
+    {
+      ...valid.preview,
+      provisionalMetadata: {
+        uncertaintyCodes: ["mixed_bundle", "cover_only"],
+      },
+    },
+  ];
+  for (const preview of previews) {
+    assert.throws(
+      () => parseWorkerRequest({ ...valid, preview }),
+      WorkerProtocolParseError,
+    );
   }
 });

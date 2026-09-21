@@ -41,6 +41,7 @@ import {
   failProcessingJob,
   failArchivedDiscovery,
   lookupArchivedAdmission,
+  linkTriagePreviewsToRevision,
   preflightArchivedDiscovery,
   keysetTail,
   getWorkerDiagnosticsStatus,
@@ -49,6 +50,7 @@ import {
   getWorkerInventoryPage,
   getWorkerSourceStatus,
   recordWorkerHeartbeat,
+  recordDiscoveryPreview,
   advanceProcessingAssessment,
   requireWorkerSourceAccount,
   reconcileWorkerScan,
@@ -433,6 +435,360 @@ test(
       }),
       expectProtocolCode("not_authenticated"),
     );
+  },
+);
+
+test(
+  "provisional previews are current, immutable, replayable, and link only to matching retained bytes",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const pool = createKithPool(f.databaseUrl, 2);
+    const parserFingerprint = "b".repeat(64);
+    const extractionConfigurationFingerprint = "c".repeat(64);
+    const call = (work, now = NOW) => withWorkerTransaction(pool, work, now);
+    const content = {
+      status: "ready_binary_v1",
+      sha256: HASH_A,
+      byteLength: 10,
+      mediaType: "application/pdf",
+      parserProfileId: "pdf_docqa_v1",
+      parserFingerprint,
+      extractionConfigurationFingerprint,
+      extractorFingerprint: "docling-document-qa:v1",
+      recordSchemaFingerprint: "no-records:v1",
+      normalizationFingerprint: "docling-pages:v1",
+      chunkerFingerprint: "page-aware:v1",
+      correctionRevision: "correction:1",
+    };
+    try {
+      await f.client.query(
+        `UPDATE kith.source_accounts SET binary_profile_ids = $1,
+         binary_profile_audit_digest = $2, binary_profile_enabled_at = $3
+         WHERE id = $4`,
+        [
+          JSON.stringify(["pdf_docqa_v1"]),
+          parserFingerprint,
+          new Date(NOW),
+          f.sourceAccountId,
+        ],
+      );
+      const enumerate = async (prefix, title, expectedInventoryEpoch) => {
+        const begun = await call((ctx) =>
+          beginWorkerScan(ctx, f.principal, {
+            protocolVersion: 1,
+            operation: "scan.begin",
+            spaceId: f.spaceId,
+            sourceAccountId: f.sourceAccountId,
+            requestId: `${prefix}-begin`,
+            watcherId: "watcher-preview",
+            connectorVersion: "fs-v1",
+            mode: "normal",
+            expectedInventoryEpoch,
+          }),
+        );
+        await call((ctx) =>
+          appendWorkerScanPage(ctx, f.principal, {
+            protocolVersion: 1,
+            operation: "scan.appendPage",
+            spaceId: f.spaceId,
+            sourceAccountId: f.sourceAccountId,
+            scanId: begun.scanId,
+            requestId: `${prefix}-page`,
+            ordinal: 0,
+            entries: [
+              readyEntry({
+                uri: "fs://synthetic/preview.pdf",
+                title,
+                docType: "pdf",
+                content,
+              }),
+            ],
+          }),
+        );
+        await call((ctx) =>
+          sealWorkerScan(ctx, f.principal, {
+            protocolVersion: 1,
+            operation: "scan.seal",
+            spaceId: f.spaceId,
+            sourceAccountId: f.sourceAccountId,
+            scanId: begun.scanId,
+            requestId: `${prefix}-seal`,
+            expectedPageCount: 1,
+            health: { status: "healthy" },
+          }),
+        );
+        const reconciled = await call((ctx) =>
+          reconcileWorkerScan(ctx, f.principal, {
+            protocolVersion: 1,
+            operation: "scan.reconcile",
+            spaceId: f.spaceId,
+            sourceAccountId: f.sourceAccountId,
+            scanId: begun.scanId,
+            requestId: `${prefix}-reconcile`,
+            expectedInventoryEpoch: begun.inventoryEpoch,
+            ordinal: 0,
+            maxItems: 10,
+          }),
+        );
+        assert.equal(reconciled.done, true);
+      };
+      await enumerate("preview-first", "Preview bundle", 0);
+      const currentWork = async () =>
+        (
+          await f.client.query(
+            `SELECT * FROM kith.worker_discovery_work
+              WHERE source_account_id = $1 AND state <> 'obsolete'
+              ORDER BY created_at DESC LIMIT 1`,
+            [f.sourceAccountId],
+          )
+        ).rows[0];
+      const firstWork = await currentWork();
+      const sourceItemId = firstWork.source_item_id;
+      const identityFor = (work) => ({
+        sourceItemId: work.source_item_id,
+        scanId: work.scan_id,
+        observationEpoch: Number(work.observation_epoch),
+        processingEpoch: Number(work.processing_epoch),
+        contentHash: work.content_hash,
+        byteLength: Number(work.byte_length),
+        mediaType: work.media_type,
+        parserProfileId: work.profile_id,
+        parserFingerprint: work.parser_fingerprint,
+        extractionConfigurationFingerprint:
+          work.extraction_configuration_fingerprint,
+        extractorFingerprint: work.extractor_fingerprint,
+        recordSchemaFingerprint: work.record_schema_fingerprint,
+        normalizationFingerprint: work.normalization_fingerprint,
+        chunkerFingerprint: work.chunker_fingerprint,
+        correctionRevision: work.correction_revision,
+      });
+      const preview = {
+        previewFingerprint: "d".repeat(64),
+        previewMethod: "pdf_native_text_v1",
+        sourceFormat: "pdf",
+        sourceUnitCount: 515,
+        inspectedOriginalUnits: [1, 17, 515],
+        provisionalMetadata: {
+          title: "Synthetic 2025 return",
+          documentKind: "tax_return",
+          documentDate: { value: "2025", precision: "year" },
+          uncertaintyCodes: ["cover_only"],
+        },
+        confidence: 0.8,
+      };
+      const base = {
+        protocolVersion: 1,
+        operation: "discovery.recordPreview",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        identity: identityFor(firstWork),
+        preview,
+      };
+      const createRequest = { ...base, requestId: "preview-create" };
+      const raced = await Promise.all([
+        call((ctx) => recordDiscoveryPreview(ctx, f.principal, createRequest)),
+        call((ctx) => recordDiscoveryPreview(ctx, f.principal, createRequest)),
+      ]);
+      assert.deepEqual(raced.map(({ reused }) => reused).sort(), [false, true]);
+      assert.equal(raced[0].previewId, raced[1].previewId);
+      const created = raced.find(({ reused }) => !reused);
+      assert.ok(created);
+      assert.equal(created.state, "provisional");
+      assert.equal(created.reused, false);
+      assert.deepEqual(
+        await call((ctx) =>
+          recordDiscoveryPreview(ctx, f.principal, createRequest),
+        ),
+        { ...created, reused: true },
+      );
+      assert.equal(
+        (
+          await f.client.query(
+            `SELECT count(*)::int AS count FROM kith.source_revisions
+              WHERE source_item_id = $1`,
+            [sourceItemId],
+          )
+        ).rows[0].count,
+        0,
+      );
+      assert.equal(
+        (
+          await f.client.query(
+            `SELECT count(*)::int AS count FROM kith.processing_generations
+              WHERE source_item_id = $1`,
+            [sourceItemId],
+          )
+        ).rows[0].count,
+        0,
+      );
+      await assert.rejects(
+        call((ctx) =>
+          recordDiscoveryPreview(ctx, f.principal, {
+            ...base,
+            requestId: "preview-conflict",
+            preview: {
+              ...preview,
+              provisionalMetadata: {
+                ...preview.provisionalMetadata,
+                title: "Conflicting title",
+              },
+            },
+          }),
+        ),
+        expectProtocolCode("request_conflict"),
+      );
+      await assert.rejects(
+        call((ctx) =>
+          recordDiscoveryPreview(ctx, f.principal, {
+            ...base,
+            requestId: "preview-stale",
+            identity: {
+              ...base.identity,
+              observationEpoch: base.identity.observationEpoch + 1,
+            },
+          }),
+        ),
+        expectProtocolCode("stale_observation"),
+      );
+
+      await enumerate("preview-second", "Renamed preview bundle", 1);
+      const refreshedIdentity = identityFor(await currentWork());
+      assert.ok(
+        refreshedIdentity.observationEpoch > base.identity.observationEpoch,
+      );
+      const afterMetadataChange = await call((ctx) =>
+        recordDiscoveryPreview(ctx, f.principal, {
+          ...base,
+          identity: refreshedIdentity,
+          requestId: "preview-current-reuse",
+        }),
+      );
+      assert.equal(afterMetadataChange.previewId, created.previewId);
+      assert.equal(afterMetadataChange.reused, true);
+      assert.equal(
+        Number(
+          (
+            await f.client.query(
+              `SELECT observed_observation_epoch FROM kith.source_triage_previews
+                WHERE id = $1`,
+              [created.previewId],
+            )
+          ).rows[0].observed_observation_epoch,
+        ),
+        base.identity.observationEpoch,
+      );
+
+      const revision = await provenance.createOrGetArchivedRevision(f.client, {
+        spaceId: f.spaceId,
+        sourceItemId,
+        contentHash: HASH_A,
+        byteLength: 10,
+        mediaType: "application/pdf",
+        capturedAt: new Date(NOW),
+        userId: f.userId,
+      });
+      await call((ctx) => linkTriagePreviewsToRevision(ctx, revision));
+      await call((ctx) => linkTriagePreviewsToRevision(ctx, revision));
+      const retained = await call((ctx) =>
+        recordDiscoveryPreview(ctx, f.principal, {
+          ...base,
+          identity: refreshedIdentity,
+          requestId: "preview-retained-reuse",
+        }),
+      );
+      assert.equal(retained.previewId, created.previewId);
+      assert.equal(retained.sourceRevisionId, revision.id);
+      assert.equal(retained.state, "retained");
+      assert.equal(retained.reused, true);
+
+      await assert.rejects(
+        f.client.query(
+          `UPDATE kith.source_triage_previews SET confidence = 0.9
+            WHERE id = $1`,
+          [created.previewId],
+        ),
+        /triage preview payload is immutable/,
+      );
+      const foreignAccountId = newKithId();
+      await f.client.query(
+        `INSERT INTO kith.source_accounts
+           (id,space_id,created_at,connector,account_id,name,enabled,
+            cursor_version,freshness_ms,inventory_epoch,
+            completed_inventory_epoch,manifest_version,created_by)
+         VALUES ($1,$2,transaction_timestamp(),'fs','other','Other',true,
+                 0,60000,0,0,0,$3)`,
+        [foreignAccountId, f.spaceId, f.userId],
+      );
+      await assert.rejects(
+        f.client.query(
+          `INSERT INTO kith.source_triage_previews
+             (id,space_id,source_account_id,source_item_id,
+              observed_content_hash,observed_byte_length,observed_media_type,
+              observed_observation_epoch,preview_fingerprint,preview_method,
+              source_format,source_unit_count,inspected_original_units,
+              provisional_metadata,confidence)
+           SELECT $1,space_id,$2,source_item_id,observed_content_hash,
+                  observed_byte_length,observed_media_type,
+                  observed_observation_epoch,$3,preview_method,source_format,
+                  source_unit_count,inspected_original_units,
+                  provisional_metadata,confidence
+             FROM kith.source_triage_previews WHERE id = $4`,
+          [newKithId(), foreignAccountId, "e".repeat(64), created.previewId],
+        ),
+        /triage preview source ownership mismatch/,
+      );
+
+      const forgetEpoch = await provenance.beginSourceItemForget(f.client, {
+        spaceId: f.spaceId,
+        sourceItemId,
+        forgottenAt: new Date(NOW + 2),
+        forgottenBy: f.userId,
+      });
+      assert.equal(
+        (
+          await f.client.query(
+            `SELECT count(*)::int AS count FROM kith.source_triage_previews
+              WHERE source_item_id = $1`,
+            [sourceItemId],
+          )
+        ).rows[0].count,
+        0,
+      );
+      assert.equal(
+        await provenance.beginSourceItemForget(f.client, {
+          spaceId: f.spaceId,
+          sourceItemId,
+          forgottenAt: new Date(NOW + 3),
+          forgottenBy: f.userId,
+        }),
+        forgetEpoch,
+      );
+      await assert.rejects(
+        f.client.query(
+          `INSERT INTO kith.source_triage_previews
+             (id,space_id,source_account_id,source_item_id,
+              observed_content_hash,observed_byte_length,observed_media_type,
+              observed_observation_epoch,preview_fingerprint,preview_method,
+              source_format,source_unit_count,inspected_original_units,
+              provisional_metadata,confidence)
+           VALUES ($1,$2,$3,$4,$5,10,'application/pdf',1,$6,
+                   'pdf_native_text_v1','pdf',1,'[1]'::jsonb,
+                   '{"title":"forgotten"}'::jsonb,0.5)`,
+          [
+            newKithId(),
+            f.spaceId,
+            f.sourceAccountId,
+            sourceItemId,
+            HASH_A,
+            "f".repeat(64),
+          ],
+        ),
+        /triage preview source ownership mismatch/,
+      );
+    } finally {
+      await pool.end();
+    }
   },
 );
 
@@ -1439,7 +1795,10 @@ test(
             previousChunkId,
             previousGenerationId,
             previousInputHash,
-            `[${new Array(1536).fill(0).map((_, index) => (index === 0 ? 1 : 0)).join(",")}]`,
+            `[${new Array(1536)
+              .fill(0)
+              .map((_, index) => (index === 0 ? 1 : 0))
+              .join(",")}]`,
             JSON.stringify([
               "embedding-vector-scope-v2",
               f.spaceId,

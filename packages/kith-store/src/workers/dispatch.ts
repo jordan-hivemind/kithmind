@@ -50,6 +50,7 @@ import {
   acknowledgeProviderOriginalDetach,
   getProviderOriginalForgetTargets,
 } from "./providerOriginalForget.js";
+import { recordDiscoveryPreview } from "./preview.js";
 import {
   appendWorkerScanPage,
   beginWorkerScan,
@@ -120,6 +121,8 @@ export async function dispatchWorkerRequest(
         );
       case "discovery.admitUtf8":
         return admitDiscoveryUtf8(ctx, principal, request);
+      case "discovery.recordPreview":
+        return recordDiscoveryPreview(ctx, principal, request);
       case "discovery.preflightArchived":
         return preflightArchivedDiscovery(ctx, principal, request);
       case "discovery.failArchived":
