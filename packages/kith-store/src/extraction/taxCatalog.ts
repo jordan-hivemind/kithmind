@@ -46,7 +46,7 @@ export const FEDERAL_INDIVIDUAL_RETURN: SeedDocumentType = {
   description:
     "A federal individual income tax return and its front schedules.",
   guidance:
-    "Read the front Form 1040 and the attached Schedules 1, 2, 3, A, D, and E that are part of this return. Identify the printed form names and tax year. Capture totals and carry amounts from their printed labels, not assumed modern line positions. Preserve the original printed page evidence. A blank box is absent, not zero. Capture jurisdiction only when the return prints it. Capture signature_date only when a signed date is printed; never turn a filing, preparation, submission, or document timestamp into a signature date. Do not infer filing status, draft or filed state, amended state, jurisdiction, or any amount that is not printed. Ignore attached K-1s, brokerage packages, and other supporting documents as separate documents so their amounts are not counted again.",
+    "Read printed Form 1040 and Schedules 1,2,3,A,D,E totals and tax year by labels, not assumed line numbers. Blank is absent, not zero. Do not infer amounts, status or jurisdiction. Capture signature_date only when a signed date is printed, never from filing/preparation/submission timestamps. Exclude K-1s, brokerage packages and supporting-document amounts.",
   fields: [
     number("tax_year", true),
     text("filing_status"),
