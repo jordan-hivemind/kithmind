@@ -64,6 +64,13 @@ test(
   { skip },
   async (t) => {
     const f = await fixture(t);
+    await assert.rejects(
+      createTaxPayment(
+        f.ctx,
+        payment(f, { confirmationNumber: null, eftTrace: null }),
+      ),
+      /confirmation number or EFT trace is required/,
+    );
     const first = await createTaxPayment(f.ctx, payment(f));
     assert.equal(first.created, true);
 
@@ -98,6 +105,16 @@ test(
       totals: [],
     });
 
+    await assert.rejects(
+      setTaxPaymentStatus(f.ctx, {
+        principal: f.principal,
+        paymentId: first.paymentId,
+        status: "settled",
+        effectiveOn: "2026-09-20",
+        reason: "Impossible early settlement",
+      }),
+      /cannot predate its submission/,
+    );
     const settled = await setTaxPaymentStatus(f.ctx, {
       principal: f.principal,
       paymentId: first.paymentId,
@@ -179,6 +196,16 @@ test(
       effectiveOn: "2026-09-23",
       reason: "Synthetic settlement",
     });
+    await assert.rejects(
+      setTaxPaymentStatus(f.ctx, {
+        principal: f.principal,
+        paymentId: first.paymentId,
+        status: "reversed",
+        effectiveOn: "2026-09-22",
+        reason: "Impossible early reversal",
+      }),
+      /cannot predate its settlement/,
+    );
     await setTaxPaymentStatus(f.ctx, {
       principal: f.principal,
       paymentId: first.paymentId,

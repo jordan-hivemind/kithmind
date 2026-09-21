@@ -87,7 +87,7 @@ export const MCP_TOOL_ANNOTATIONS = {
   [MCP_TOOL_NAMES.manageEntityAliases]: managedWrite,
   [MCP_TOOL_NAMES.manageInvestment]: managedWrite,
   [MCP_TOOL_NAMES.manageInvestmentEntry]: destructiveWrite,
-  [MCP_TOOL_NAMES.manageTaxPayment]: managedWrite,
+  [MCP_TOOL_NAMES.manageTaxPayment]: idempotentAdditive,
   [MCP_TOOL_NAMES.listSupportingDocumentLinks]: readOnly,
   [MCP_TOOL_NAMES.manageSupportingDocumentLink]: managedWrite,
   [MCP_TOOL_NAMES.listAttention]: readOnly,

@@ -24,20 +24,29 @@ CREATE TABLE kith.tax_payments (
   confirmation_number text CHECK (
     confirmation_number IS NULL
     OR (char_length(btrim(confirmation_number)) BETWEEN 1 AND 200
-        AND confirmation_number = btrim(confirmation_number))
+        AND confirmation_number = btrim(confirmation_number)
+        AND confirmation_number !~ '[[:cntrl:]]')
   ),
   eft_trace text CHECK (
     eft_trace IS NULL
     OR (char_length(btrim(eft_trace)) BETWEEN 1 AND 200
-        AND eft_trace = btrim(eft_trace))
+        AND eft_trace = btrim(eft_trace)
+        AND eft_trace !~ '[[:cntrl:]]')
   ),
   evidence_span_id kith.kith_id,
   created_by kith.kith_id REFERENCES kith.users (id) ON DELETE SET NULL,
   UNIQUE (id, space_id),
   CONSTRAINT tax_payments_identifier_required_check
     CHECK (confirmation_number IS NOT NULL OR eft_trace IS NOT NULL),
+  CONSTRAINT tax_payments_status_date_check
+    CHECK (status_effective_on >= submitted_on),
   CONSTRAINT tax_payments_settlement_check
-    CHECK (current_status NOT IN ('settled', 'reversed') OR settled_on IS NOT NULL),
+    CHECK (
+      (settled_on IS NULL OR settled_on >= submitted_on)
+      AND (current_status NOT IN ('settled', 'reversed') OR settled_on IS NOT NULL)
+      AND (current_status <> 'settled' OR settled_on = status_effective_on)
+      AND (current_status <> 'reversed' OR status_effective_on >= settled_on)
+    ),
   FOREIGN KEY (payer_entity_id, space_id)
     REFERENCES kith.entities (id, space_id),
   FOREIGN KEY (evidence_span_id, space_id)

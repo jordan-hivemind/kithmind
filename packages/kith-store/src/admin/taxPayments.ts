@@ -38,6 +38,7 @@ const MONEY = /^\d{1,20}(?:\.\d{1,6})?$/;
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const IDENTIFIER_MAX = 200;
 const REASON_MAX = 500;
+const CONTROL_CHARACTER = /[\u0000-\u001f\u007f]/;
 
 export type TaxPaymentEvidence = {
   evidenceSpanId: string;
@@ -216,7 +217,7 @@ function identifier(value: unknown, name: string): string | null {
   if (
     !trimmed ||
     Array.from(trimmed).length > IDENTIFIER_MAX ||
-    trimmed.includes("\0")
+    CONTROL_CHARACTER.test(trimmed)
   ) {
     typedError("invalid_input", `${name} is invalid`);
   }
@@ -421,7 +422,12 @@ export async function createTaxPayment(
   );
   const year = taxYear(args.taxYear);
   const exactAmount = amount(args.amount);
-  const currency = validateCurrencyCode(args.currency);
+  let currency: string;
+  try {
+    currency = validateCurrencyCode(args.currency);
+  } catch {
+    typedError("invalid_input", "Currency is not supported");
+  }
   const submittedOn = isoDate(args.submittedOn, "Submitted date");
   const confirmationNumber = identifier(
     args.confirmationNumber,
@@ -565,10 +571,11 @@ export async function setTaxPaymentStatus(
     space_id: string;
     current_status: string;
     status_effective_on: Date | string;
+    submitted_on: Date | string;
     settled_on: Date | string | null;
   }>(
     ctx,
-    `SELECT space_id, current_status, status_effective_on, settled_on
+    `SELECT space_id, current_status, status_effective_on, submitted_on, settled_on
        FROM kith.tax_payments WHERE id = $1 FOR UPDATE`,
     [paymentId],
   );
@@ -590,6 +597,7 @@ export async function setTaxPaymentStatus(
   const correction = args.correction === true;
   const oldStatus = current.current_status as TaxPaymentStatus;
   const oldEffectiveOn = calendarDate(current.status_effective_on)!;
+  const submittedOn = calendarDate(current.submitted_on)!;
   if (oldStatus === status && oldEffectiveOn === effectiveOn) {
     return { paymentId, updated: false };
   }
@@ -599,10 +607,25 @@ export async function setTaxPaymentStatus(
       `Tax payment status cannot move from ${oldStatus} to ${status} without an explicit correction`,
     );
   }
+  if (effectiveOn < submittedOn) {
+    typedError(
+      "invalid_tax_payment_transition",
+      "A tax payment status cannot predate its submission",
+    );
+  }
   if (status === "reversed" && current.settled_on === null) {
     typedError(
       "invalid_tax_payment_transition",
       "A payment cannot be reversed before a settlement was recorded",
+    );
+  }
+  if (
+    status === "reversed" &&
+    effectiveOn < calendarDate(current.settled_on)!
+  ) {
+    typedError(
+      "invalid_tax_payment_transition",
+      "A reversal cannot predate its settlement",
     );
   }
   const evidenceSpanId = await checkedEvidence(
