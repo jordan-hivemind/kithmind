@@ -468,6 +468,19 @@ not encode a positive, complete, zero-position observation for every
 account/date, and this read rule does not claim that it does. Parser replay and
 source-projection replacement are separate importer concerns.
 
+The adapter contract can additionally return optional positive position-scope
+observations for later persistence. A scope names the exact document-local
+account and statement date, emitted position count, closed parser-gap codes and
+retained-text evidence for each table header and end. Complete status requires
+a positively bounded account section, every observed table accounted for and
+an anchored continuous printed-page run. A complete zero-position scope also
+requires the statement's own explicit assertion that the account holds none;
+no rows and no rejected blocks are never enough. Consolidated tables before an
+account marker produce no account scope. Older adapters and documents omit the
+optional field and keep the conservative document-wide behavior above. Until
+the account-scope persistence migration and reader integration land, these
+adapter observations do not relax `documents.parsed_ok` or any read gate.
+
 Coverage is reported at the same granularity as the record contract requires,
 so the later Kith Mind adapter wraps this surface rather than re-deriving it.
 

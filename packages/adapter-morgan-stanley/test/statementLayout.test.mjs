@@ -740,6 +740,37 @@ test("an empty extracted page prevents a page-spanning lot completion", () => {
   assert.match(parsed.parseNote, /holdings block\(s\) left unparsed/);
 });
 
+test("an interrupted or missing page produces only a partial position scope", () => {
+  const cases = [
+    {
+      name: "interrupted",
+      pages: [pageSplitEquityPages()[0]],
+    },
+    {
+      name: "missing middle page",
+      pages: pageSplitEquityPages().map((page, index) =>
+        page.map((line) =>
+          line.replace(
+            index === 0 ? /Page 1 of 2/g : /Page 2 of 2/g,
+            index === 0 ? "Page 1 of 3" : "Page 3 of 3",
+          ),
+        ),
+      ),
+    },
+  ];
+  for (const { name, pages } of cases) {
+    const parsed = parseStatementLines(
+      pages.map((page) => page.join("\n")).join(`\n${PAGE_SEPARATOR}\n`),
+      kind,
+    );
+    assert.equal(parsed.holdings.positionScopes.length, 1, name);
+    const [scope] = parsed.holdings.positionScopes;
+    assert.equal(scope.status, "partial", name);
+    assert.ok(scope.gapCodes.includes("page_sequence_gap"), name);
+    assert.equal(scope.zeroBasis, undefined, name);
+  }
+});
+
 test("a printed Total after a page gap cannot complete the interrupted security", () => {
   const pages = pageSplitEquityPages();
   pages[0] = pages[0].map((line) =>
@@ -992,6 +1023,158 @@ test("a consolidated statement attributes each position to the account whose pag
   assert.equal(bond.accountExternalKey, CONSOLIDATED_ACCOUNT_TWO);
 });
 
+test("a consolidated statement proves each account position scope from bounded tables", () => {
+  const parsed = parseStatementLines(CONSOLIDATED_LAYOUT_TEXT, kind);
+  assert.deepEqual(
+    parsed.holdings.positionScopes.map((scope) => ({
+      accountExternalKey: scope.accountExternalKey,
+      asOf: scope.asOf,
+      status: scope.status,
+      emittedPositionCount: scope.emittedPositionCount,
+      gapCodes: scope.gapCodes,
+      proofVersion: scope.proofVersion,
+    })),
+    [
+      {
+        accountExternalKey: CONSOLIDATED_ACCOUNT_ONE,
+        asOf: "2026-03-31",
+        status: "complete",
+        emittedPositionCount: 1,
+        gapCodes: [],
+        proofVersion: "position_scope_v1",
+      },
+      {
+        accountExternalKey: CONSOLIDATED_ACCOUNT_TWO,
+        asOf: "2026-03-31",
+        status: "complete",
+        emittedPositionCount: 1,
+        gapCodes: [],
+        proofVersion: "position_scope_v1",
+      },
+    ],
+  );
+  for (const scope of parsed.holdings.positionScopes) {
+    assert.ok(scope.evidence.account?.binding);
+    assert.ok(scope.evidence.scopeEnd?.binding);
+    assert.ok(scope.evidence.tables.length > 0);
+    for (const table of scope.evidence.tables) {
+      assert.ok(table.headers.length > 0);
+      assert.ok(table.end?.binding);
+      for (const locator of [...table.headers, table.end]) {
+        assert.equal(
+          CONSOLIDATED_LAYOUT_TEXT.slice(
+            locator.binding.start,
+            locator.binding.end,
+          ),
+          locator.binding.quote,
+        );
+      }
+    }
+  }
+});
+
+test("one consolidated account can be complete while another has a zero-emitted typed gap", () => {
+  const [firstPage, originalSecondPage] = CONSOLIDATED_LAYOUT_TEXT.split(
+    `\n${PAGE_SEPARATOR}\n`,
+  );
+  const secondPagePrefix = originalSecondPage.slice(
+    0,
+    originalSecondPage.indexOf("        HOLDINGS"),
+  );
+  const secondPage = [
+    secondPagePrefix,
+    "        HOLDINGS",
+    ...lotsWithoutTotalLines({ second: { sharePrice: "21.000" } }),
+  ].join("\n");
+  const parsed = parseStatementLines(
+    `${firstPage}\n${PAGE_SEPARATOR}\n${secondPage}`,
+    kind,
+  );
+  assert.equal(parsed.holdings.positions.length, 1);
+  assert.deepEqual(
+    parsed.holdings.positionScopes.map((scope) => ({
+      accountExternalKey: scope.accountExternalKey,
+      status: scope.status,
+      emittedPositionCount: scope.emittedPositionCount,
+      gapCodes: scope.gapCodes,
+    })),
+    [
+      {
+        accountExternalKey: CONSOLIDATED_ACCOUNT_ONE,
+        status: "complete",
+        emittedPositionCount: 1,
+        gapCodes: [],
+      },
+      {
+        accountExternalKey: CONSOLIDATED_ACCOUNT_TWO,
+        status: "partial",
+        emittedPositionCount: 0,
+        gapCodes: ["unproven_empty", "unresolved_lots"],
+      },
+    ],
+  );
+  assert.match(parsed.parseNote, /holdings block\(s\) left unparsed/);
+});
+
+test("a table before any consolidated account marker creates no account scope", () => {
+  const [rollupPage, ...accountPages] = CONSOLIDATED_ROLLUP_LAYOUT_TEXT.split(
+    `\n${PAGE_SEPARATOR}\n`,
+  );
+  const text = [
+    [rollupPage, "        HOLDINGS", ...equityBlockLines()].join("\n"),
+    ...accountPages,
+  ].join(`\n${PAGE_SEPARATOR}\n`);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(
+    parsed.holdings.positions.some(
+      (position) => position.accountExternalKey === undefined,
+    ),
+    true,
+    "legacy row behavior is unchanged",
+  );
+  assert.deepEqual(
+    parsed.holdings.positionScopes.map((scope) => scope.accountExternalKey),
+    [CONSOLIDATED_ACCOUNT_ONE, CONSOLIDATED_ACCOUNT_TWO],
+    "an unattributed household table cannot fall back to the pull account",
+  );
+});
+
+test("unsupported account tables remain partial even beside a recognized table", () => {
+  const [originalFirstPage, originalSecondPage] =
+    CONSOLIDATED_LAYOUT_TEXT.split(`\n${PAGE_SEPARATOR}\n`);
+  const malformed = (line) =>
+    line.replace("Security Description", "Security Name       ");
+  const unsupportedTail = equityBlockLines().slice(1).map(malformed);
+  const firstPage = [originalFirstPage, ...unsupportedTail].join("\n");
+  const secondPage = originalSecondPage.split("\n").map(malformed).join("\n");
+  const parsed = parseStatementLines(
+    `${firstPage}\n${PAGE_SEPARATOR}\n${secondPage}`,
+    kind,
+  );
+  assert.deepEqual(
+    parsed.holdings.positionScopes.map((scope) => ({
+      accountExternalKey: scope.accountExternalKey,
+      status: scope.status,
+      emittedPositionCount: scope.emittedPositionCount,
+      gapCodes: scope.gapCodes,
+    })),
+    [
+      {
+        accountExternalKey: CONSOLIDATED_ACCOUNT_ONE,
+        status: "partial",
+        emittedPositionCount: 1,
+        gapCodes: ["unsupported_table_header"],
+      },
+      {
+        accountExternalKey: CONSOLIDATED_ACCOUNT_TWO,
+        status: "partial",
+        emittedPositionCount: 0,
+        gapCodes: ["unproven_empty", "unsupported_table_header"],
+      },
+    ],
+  );
+});
+
 test("a consolidated statement attributes a liability to its own account, not the other one", () => {
   const parsed = parseStatementLines(CONSOLIDATED_LAYOUT_TEXT, kind);
   assert.equal(parsed.holdings.liabilities.length, 1);
@@ -1212,11 +1395,38 @@ test("an account holding nothing says so, and is not a statement left unparsed",
     "the statement states its total: none",
   );
   // "none" is not zero and is never recorded as one.
-  assert.deepEqual(parsed.holdings, {
-    positions: [],
-    balances: [],
-    liabilities: [],
-  });
+  assert.deepEqual(parsed.holdings.positions, []);
+  assert.deepEqual(parsed.holdings.balances, []);
+  assert.deepEqual(parsed.holdings.liabilities, []);
+  assert.equal(parsed.holdings.positionScopes.length, 1);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.deepEqual(
+    {
+      accountExternalKey: scope.accountExternalKey,
+      asOf: scope.asOf,
+      status: scope.status,
+      emittedPositionCount: scope.emittedPositionCount,
+      gapCodes: scope.gapCodes,
+      zeroBasis: scope.zeroBasis,
+    },
+    {
+      accountExternalKey: undefined,
+      asOf: "2026-03-31",
+      status: "complete",
+      emittedPositionCount: 0,
+      gapCodes: [],
+      zeroBasis: "source_stated_none",
+    },
+  );
+  assert.equal(scope.evidence.tables.length, 0);
+  assert.equal(scope.evidence.explicitNone.binding.quote, "—");
+  assert.equal(scope.evidence.scopeEnd.binding.quote, "Account Summary");
+});
+
+test("a statement with no positions does not prove zero without an explicit source statement", () => {
+  const parsed = parseStatementLines(COVER_TOTAL_LAYOUT_TEXT, kind);
+  assert.equal(parsed.holdings.positions.length, 0);
+  assert.equal(parsed.holdings.positionScopes, undefined);
 });
 
 test("a cover page stating none, over holdings, still reports the missing balance sheet", () => {

@@ -631,10 +631,70 @@ export type ParsedLiability = {
   readonly locators: Readonly<Record<string, FieldLocator>>;
 };
 
+/**
+ * Why a parser could not prove that it observed every position in one
+ * account/date section. These are membership gaps, not value availability:
+ * a retained position whose source explicitly states no market value remains
+ * an observed position and does not belong in this list.
+ */
+export type PositionScopeGapCode =
+  | "unresolved_lots"
+  | "missing_security_start"
+  | "unsupported_table_header"
+  | "unsupported_value_column"
+  | "page_sequence_gap"
+  | "unbounded_account_scope"
+  | "unproven_empty";
+
+/** The exact retained-text boundaries used to prove one holdings table. */
+export type PositionScopeTableEvidence = {
+  /** One header normally, or every reprinted header for a continued table. */
+  readonly headers: readonly FieldLocator[];
+  /** Absent when the parser never found a positively bounded table end. */
+  readonly end?: FieldLocator;
+};
+
+/**
+ * Evidence for an account/date membership observation. `scopeEnd` proves the
+ * parser reached the next account boundary or the statement's verified final
+ * page. `explicitNone` is required for a complete observation with zero
+ * emitted positions; an empty parse is never evidence of an empty account.
+ */
+export type PositionScopeEvidence = {
+  readonly account?: FieldLocator;
+  readonly tables: readonly PositionScopeTableEvidence[];
+  readonly scopeEnd?: FieldLocator;
+  readonly explicitNone?: FieldLocator;
+};
+
+/**
+ * A positive parser observation for one document/account/date position
+ * projection. This is optional on `ParsedHoldings` so adapters and retained
+ * documents that predate the proof contract remain conservative rather than
+ * being upgraded from the absence of an error.
+ */
+export type ParsedPositionScope = {
+  readonly sourceDocument: string;
+  /** Same fallback rule as `ParsedPosition.accountExternalKey`. */
+  readonly accountExternalKey?: string;
+  readonly asOf: string;
+  readonly proofVersion: "position_scope_v1";
+  readonly status: "complete" | "partial";
+  /** Positions this parser emitted for this exact document/account/date. */
+  readonly emittedPositionCount: number;
+  /** Empty exactly when `status` is `complete`; otherwise non-empty. */
+  readonly gapCodes: readonly PositionScopeGapCode[];
+  /** Present only for a complete zero-position observation. */
+  readonly zeroBasis?: "source_stated_none";
+  readonly evidence: PositionScopeEvidence;
+};
+
 export type ParsedHoldings = {
   readonly positions: readonly ParsedPosition[];
   readonly balances: readonly ParsedBalance[];
   readonly liabilities: readonly ParsedLiability[];
+  /** Positive membership observations only; absence makes no completeness claim. */
+  readonly positionScopes?: readonly ParsedPositionScope[];
 };
 
 /** What an activity-only source declines with: no positions, no invention. */
