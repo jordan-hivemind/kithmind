@@ -94,6 +94,8 @@ Starter guidance changes do not overwrite existing spaces during ordinary extrac
 
 A resolved correction remains in history across reclassification. Re-extraction materializes it into exact records only when its field belongs to the document's current kind. Restoring a compatible kind makes the correction current again. This prevents a corrected investment amount from surviving as an active record after the owner classifies the document as a non-investment kind.
 
+This classifier update does not change date semantics, required-field omission handling or extraction-model escalation. Agreement or effective dates must remain distinct from actual signature timestamps, omitted required fields still need an explicit gate, and failed quality gates still need a defined escalation path. Those changes remain coordinated extraction work rather than part of the membership-classification repair.
+
 The `sums_to_total` check spans two fields, so it needs one naming convention. A document type whose field carries that check states the sum in a money field named `subtotal`, or in one named `total` when the type has no subtotal. The preference matters on a taxed receipt: the items sum to the subtotal and the total carries the tax. A type that names its sum anything else gets no sum check, which is the same as declaring none.
 
 Dropped from the earlier card design: closed kind enums, the model tier ladder, weekly budgets and the pausing queue, the rule that a source publishes nothing until a subject entity exists, and the entity binding gate. Names are stored as written and bound to entities later.
