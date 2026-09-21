@@ -7,6 +7,11 @@ Kith Mind is an owner-first knowledge system for life records. It maintains inde
 
 This is the canonical technical design. The [Phase 1 plan](2026-09-06-phase1-brain-implementation.md) specifies the first implementation. The [review](2026-09-06-architecture-review.md) records the previous findings; its proposal to gate all work on mobile has been superseded. The [reuse assessment](2026-09-06-reuse-assessment.md) informs what we build versus integrate. Owner accounts, paths, and rollout notes remain private; they are not prerequisites for contributors.
 
+The [document triage and priority plan](2026-09-21-document-triage-and-priority.md)
+refines ingestion: establish bounded discovery metadata first, then selectively
+queue deeper processing by user goal. Metadata-only coverage remains explicit;
+full-document indexing is not a prerequisite for discovering a document.
+
 ## 1. Decisions and boundaries
 
 | Topic                | Decision                                                                                                                                                        | Basis or remaining validation                                                                                                                                                                                                                               |
