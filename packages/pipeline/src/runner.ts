@@ -70,6 +70,7 @@ import {
   existingArchiveReceiptSelection,
   existingParserArtifactSelection,
   parsedTextDeclaration,
+  provenanceCreatedAt,
 } from "./archivedRequestMapping.js";
 import {
   capturePdfFile,
@@ -2004,6 +2005,7 @@ export class PipelineRunner {
     const pdf = this.requirePdfConfig();
     const plan = this.archivedPlan(checkpoint);
     const identity = archivedIdentity(checkpoint, plan);
+    const createdAt = Date.now();
     if (!plan.externalId) {
       throw new PipelineWorkerError("archived_external_id_missing");
     }
@@ -2071,7 +2073,7 @@ export class PipelineRunner {
                 ),
               },
             }),
-        createdAt: plan.sourceModifiedAt,
+        createdAt,
       });
     }
     const fingerprints = this.processingFingerprints(plan);
@@ -2133,7 +2135,7 @@ export class PipelineRunner {
             processingId,
           ),
         },
-        createdAt: plan.sourceModifiedAt,
+        createdAt,
       });
     }
     return archivedBase(checkpoint, {
@@ -2775,19 +2777,55 @@ export class PipelineRunner {
           mapped.original,
           false,
         );
+        const selections = this.admissionSelections(
+          checkpoint,
+          mapped,
+          provider.providerOriginal,
+        );
         expected = request(this.config, operation, {
           requestId,
           workId: lease.workId,
           leaseEpoch: lease.leaseEpoch,
           leaseToken: lease.leaseToken,
-          ...this.admissionSelections(
-            checkpoint,
-            mapped,
-            provider.providerOriginal,
-          ),
+          ...selections,
           ...provider,
           parsedText: mapped.declaration,
         });
+        // A pre-upgrade pending admission must replay its exact old body.
+        // Accept only the complete historical projection rebuilt from the
+        // same catalog, never arbitrary timestamps from the pending request.
+        if (!equalJson(body, expected)) {
+          const legacy = {
+            ...expected,
+            parserArtifact:
+              selections.parserArtifact.kind === "create"
+                ? {
+                    ...selections.parserArtifact,
+                    createdAt: mapped.processing.createdAt,
+                  }
+                : selections.parserArtifact,
+            archives: selections.archives.map((archive) =>
+              archive.kind === "create"
+                ? {
+                    ...archive,
+                    createdAt:
+                      archive.subjectKind === "original_bytes"
+                        ? mapped.original.createdAt
+                        : mapped.processing.createdAt,
+                  }
+                : archive,
+            ),
+            ...(provider.providerOriginal === undefined
+              ? {}
+              : {
+                  providerOriginal: {
+                    ...provider.providerOriginal,
+                    createdAt: mapped.original.createdAt,
+                  },
+                }),
+          };
+          if (equalJson(body, legacy)) return;
+        }
         break;
       }
       case "jobs.reserveParsed": {
@@ -4092,7 +4130,11 @@ export class PipelineRunner {
         ciphertextByteLength: locator.published.ciphertext.byteLength,
         readbackVerifiedAt: locator.readbackVerifiedAt,
       },
-      createdAt: original.createdAt,
+      createdAt: provenanceCreatedAt(
+        original.createdAt,
+        verified.verifiedAt,
+        locator.readbackVerifiedAt,
+      ),
     };
   }
 
