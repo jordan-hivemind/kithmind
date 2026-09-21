@@ -129,10 +129,20 @@ function AccountForm({
         <span className="text-right tabular-nums">
           {archiveDate(row.currentValueAsOf)}
         </span>
+        <span className="text-kith-text-muted">Latest balance</span>
+        <span className="text-right tabular-nums">
+          {archiveDate(row.latestBalanceAsOf)}
+        </span>
         <span className="text-kith-text-muted">Latest snapshot</span>
         <span className="text-right tabular-nums">
           {archiveDate(row.latestSnapshotAsOf)}
         </span>
+        {row.cadence !== null ? (
+          <>
+            <span className="text-kith-text-muted">Cadence</span>
+            <span className="text-right">{label(row.cadence)}</span>
+          </>
+        ) : null}
         <span className="text-kith-text-muted">Status</span>
         <span className="text-right">{label(row.status)}</span>
         {row.currentValueStale ? (

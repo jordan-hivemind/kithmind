@@ -230,11 +230,10 @@ export function equityBlockLines({
 }
 
 /**
- * Two valued lots under one security and no Total row: no single row states
- * the position and no column can be filled from rows that disagree, so this
- * block is refused rather than guessed at.
+ * Two dated lots under one security and no Total row. Overrides exercise
+ * incomplete cells and conflicting rows without using source documents.
  */
-export function ambiguousBlockLines() {
+export function lotsWithoutTotalLines({ first = {}, second = {} } = {}) {
   return [
     "        COMMON STOCKS",
     EQUITY_HEADER,
@@ -245,6 +244,7 @@ export function ambiguousBlockLines() {
       sharePrice: "$20.000",
       totalCost: "$100.00",
       marketValue: "$100.00",
+      ...first,
     }),
     equityRow({
       tradeDate: "01/06/26",
@@ -252,6 +252,7 @@ export function ambiguousBlockLines() {
       sharePrice: "20.000",
       totalCost: "140.00",
       marketValue: "140.00",
+      ...second,
     }),
   ];
 }

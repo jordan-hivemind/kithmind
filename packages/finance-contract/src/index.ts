@@ -397,6 +397,10 @@ export type FinanceAggregateRecord = {
   };
 };
 
+/** The most balance dates one inventory row carries. A year of monthly
+ * statements, enough to tell a monthly account from a quarterly one. */
+export const FINANCE_INVENTORY_BALANCE_DATES = 12;
+
 /**
  * ADM-2: one account's inventory, as counts over what the archive holds.
  *
@@ -416,6 +420,24 @@ export type FinanceAccountInventoryRecord = {
   activityTo?: string;
   /** The latest `positions.as_of` the account has, if it has one. */
   latestSnapshotAsOf?: string;
+  /**
+   * FIN-FRESHNESS-1. The account's most recent distinct `balances.as_of`
+   * dates, newest first, at most `FINANCE_INVENTORY_BALANCE_DATES`. A
+   * statement files one balance per period, so these dates are the account's
+   * statement cadence as the archive actually holds it: month ends for a
+   * monthly account, quarter ends for a quiet one. They are dates of rows that
+   * exist, never expected or inferred dates. Absent when the account has no
+   * balance at all.
+   */
+  balanceDates?: string[];
+  /**
+   * Whether the latest balance that states both a total and a cash figure
+   * holds anything besides cash (`total_value <> cash`). `false` is an
+   * all-cash balance, so no holdings snapshot is expected for that date.
+   * Absent when no balance states both, or when that date's balances
+   * disagree.
+   */
+  latestBalanceHoldsSecurities?: boolean;
   /** `review_items` for this account still in the `open` status. */
   openReviewCount: number;
   /**
@@ -2498,7 +2520,14 @@ function accountInventoryRecord(
   exact(
     input,
     ["account", "statementCount", "recordCount", "openReviewCount"],
-    ["activityFrom", "activityTo", "latestSnapshotAsOf", "currentValue"],
+    [
+      "activityFrom",
+      "activityTo",
+      "latestSnapshotAsOf",
+      "currentValue",
+      "balanceDates",
+      "latestBalanceHoldsSecurities",
+    ],
     "invalid_response",
   );
   const count = (raw: unknown) =>
@@ -2527,6 +2556,35 @@ function accountInventoryRecord(
         latestSnapshotAsOf > activityTo))
   )
     fail("invalid_response");
+  // Balance dates are balance rows, so they sit inside the activity the same
+  // row reports, newest first and each date once.
+  const balanceDates =
+    input.balanceDates === undefined
+      ? undefined
+      : denseArray(
+          input.balanceDates,
+          1,
+          FINANCE_INVENTORY_BALANCE_DATES,
+          "invalid_response",
+        ).map((item) => isoDate(item, "invalid_response"));
+  if (
+    balanceDates !== undefined &&
+    (activityFrom === undefined ||
+      activityTo === undefined ||
+      balanceDates.some(
+        (date, index) =>
+          date < activityFrom ||
+          date > activityTo ||
+          (index > 0 && date >= balanceDates[index - 1]!),
+      ))
+  )
+    fail("invalid_response");
+  if (
+    input.latestBalanceHoldsSecurities !== undefined &&
+    (typeof input.latestBalanceHoldsSecurities !== "boolean" ||
+      balanceDates === undefined)
+  )
+    fail("invalid_response");
   let currentValue: FinanceAccountCurrentValue | undefined;
   if (input.currentValue !== undefined) {
     const raw = object(input.currentValue, "invalid_response");
@@ -2550,6 +2608,13 @@ function accountInventoryRecord(
     ...(activityFrom === undefined ? {} : { activityFrom }),
     ...(activityTo === undefined ? {} : { activityTo }),
     ...(latestSnapshotAsOf === undefined ? {} : { latestSnapshotAsOf }),
+    ...(balanceDates === undefined ? {} : { balanceDates }),
+    ...(input.latestBalanceHoldsSecurities === undefined
+      ? {}
+      : {
+          latestBalanceHoldsSecurities:
+            input.latestBalanceHoldsSecurities as boolean,
+        }),
   };
 }
 

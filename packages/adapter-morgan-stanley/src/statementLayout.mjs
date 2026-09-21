@@ -10,6 +10,7 @@
 // neighbour that happened to parse, and never reads a number as a float.
 
 import {
+  addDecimal,
   canonicalizeDecimal,
   negateDecimal,
   EMPTY_HOLDINGS,
@@ -27,8 +28,18 @@ const BASE_CURRENCY = "USD";
  */
 const BARE_ACCOUNT_LINE = /^\s*(\d{3}-\d{6}-\d{3})\s*$/;
 const MONTHS = [
-  "January", "February", "March", "April", "May", "June",
-  "July", "August", "September", "October", "November", "December",
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
 ];
 const MONTH_NAME = `(${MONTHS.join("|")})`;
 /**
@@ -110,7 +121,10 @@ function splitCells(text) {
 function bindColumn(cell, columns, tolerance = EDGE_TOLERANCE) {
   let best = null;
   for (const column of columns) {
-    const error = Math.min(Math.abs(cell.end - column.end), Math.abs(cell.start - column.start));
+    const error = Math.min(
+      Math.abs(cell.end - column.end),
+      Math.abs(cell.start - column.start),
+    );
     if (error > tolerance) continue;
     if (best === null || error < best.error) best = { column, error };
   }
@@ -126,11 +140,14 @@ function bindColumn(cell, columns, tolerance = EDGE_TOLERANCE) {
  * money columns (F1-8c). */
 function bindRow(line, columns, tolerance = EDGE_TOLERANCE) {
   const bound = new Map();
+  let conflictingCells = false;
   for (const cell of splitCells(line)) {
     const column = bindColumn(cell, columns, tolerance);
-    if (column !== null && !bound.has(column.name)) bound.set(column.name, cell);
+    if (column !== null && bound.has(column.name)) conflictingCells = true;
+    if (column !== null && !bound.has(column.name))
+      bound.set(column.name, cell);
   }
-  return { bound };
+  return { bound, conflictingCells };
 }
 
 // --- money ------------------------------------------------------------------
@@ -150,7 +167,10 @@ export function resolveStatementMoney(raw) {
   const digits = withoutFootnote.replace(/^\(|\)$/g, "").replace(/[$,\s]/g, "");
   try {
     const canonical = canonicalizeDecimal(digits);
-    return { value: negative ? negateDecimal(canonical) : canonical, note: null };
+    return {
+      value: negative ? negateDecimal(canonical) : canonical,
+      note: null,
+    };
   } catch {
     return { value: null, note: `unparseable amount: ${JSON.stringify(text)}` };
   }
@@ -270,7 +290,15 @@ function accountSpanLocator(lines, markerLines, lineIndex, kind, textMeta) {
   const matchStart = line.text.indexOf(match[1]);
   const start = line.start + matchStart;
   const end = start + match[1].length;
-  return spanLocator(kind, line.page, "account number", textMeta, start, end, match[1]);
+  return spanLocator(
+    kind,
+    line.page,
+    "account number",
+    textMeta,
+    start,
+    end,
+    match[1],
+  );
 }
 
 /** `{ accountExternalKey: key }` when non-null, else `{}` -- spread onto a
@@ -294,7 +322,8 @@ function resolvePeriod(lines) {
     const match = PERIOD_LINE.exec(text);
     if (match === null) continue;
     const startMonth = MONTHS.indexOf(match[1]);
-    const endMonth = match[3] === undefined ? startMonth : MONTHS.indexOf(match[3]);
+    const endMonth =
+      match[3] === undefined ? startMonth : MONTHS.indexOf(match[3]);
     if (endMonth < startMonth) return null;
     const iso = (month, day) =>
       `${match[5]}-${String(month + 1).padStart(2, "0")}-${day.padStart(2, "0")}`;
@@ -334,11 +363,22 @@ const BALANCE_BLOCK_LINES = 40;
  * `accountKeysByLine` -- the account whose `BALANCE SHEET` this is, which a
  * consolidated statement prints once per account.
  */
-function parseBalanceSheet(lines, anchorIndex, kind, accountKey, markerLines, textMeta) {
+function parseBalanceSheet(
+  lines,
+  anchorIndex,
+  kind,
+  accountKey,
+  markerLines,
+  textMeta,
+) {
   const block = lines.slice(anchorIndex, anchorIndex + BALANCE_BLOCK_LINES);
-  const headerLine = block.find(({ text }) => (text.match(AS_OF_HEADER) ?? []).length > 0);
+  const headerLine = block.find(
+    ({ text }) => (text.match(AS_OF_HEADER) ?? []).length > 0,
+  );
   if (headerLine === undefined) return null;
-  const asOfCells = splitCells(headerLine.text).filter((cell) => AS_OF_HEADER.test(cell.text));
+  const asOfCells = splitCells(headerLine.text).filter((cell) =>
+    AS_OF_HEADER.test(cell.text),
+  );
   if (asOfCells.length !== 2) return null;
   // Printed left to right: last period, then this period.
   const columns = [
@@ -366,7 +406,11 @@ function parseBalanceSheet(lines, anchorIndex, kind, accountKey, markerLines, te
   // review item and an evidence-yielding parse are not mutually exclusive.
   const read = (row, column, fieldLabel) => {
     if (row === undefined || !row.bound.has(column)) {
-      return { value: null, note: "row or column not printed on this statement", locator: null };
+      return {
+        value: null,
+        note: "row or column not printed on this statement",
+        locator: null,
+      };
     }
     const cell = row.bound.get(column);
     const resolved = resolveStatementMoney(cell.text);
@@ -374,16 +418,38 @@ function parseBalanceSheet(lines, anchorIndex, kind, accountKey, markerLines, te
     const end = row.lineStart + cell.end;
     return {
       ...resolved,
-      locator: spanLocator(kind, page, fieldLabel, textMeta, start, end, cell.text),
+      locator: spanLocator(
+        kind,
+        page,
+        fieldLabel,
+        textMeta,
+        start,
+        end,
+        cell.text,
+      ),
     };
   };
 
-  const total = read(rows.totalValue, "thisPeriod", "BALANCE SHEET / TOTAL VALUE");
-  const opening = read(rows.totalValue, "lastPeriod", "BALANCE SHEET / TOTAL VALUE (last period)");
+  const total = read(
+    rows.totalValue,
+    "thisPeriod",
+    "BALANCE SHEET / TOTAL VALUE",
+  );
+  const opening = read(
+    rows.totalValue,
+    "lastPeriod",
+    "BALANCE SHEET / TOTAL VALUE (last period)",
+  );
   const cash = read(rows.cash, "thisPeriod", "BALANCE SHEET / Cash");
   const asOf = resolveAsOf(columns[1].text);
   const rowLocator = locator(kind, page, "BALANCE SHEET / TOTAL VALUE");
-  const accountLocator = accountSpanLocator(lines, markerLines, anchorIndex, kind, textMeta);
+  const accountLocator = accountSpanLocator(
+    lines,
+    markerLines,
+    anchorIndex,
+    kind,
+    textMeta,
+  );
 
   const balance = {
     sourceDocument: "statement",
@@ -404,11 +470,19 @@ function parseBalanceSheet(lines, anchorIndex, kind, accountKey, markerLines, te
   };
 
   const liabilities = [];
-  const liability = read(rows.liabilities, "thisPeriod", "BALANCE SHEET / Total Liabilities");
+  const liability = read(
+    rows.liabilities,
+    "thisPeriod",
+    "BALANCE SHEET / Total Liabilities",
+  );
   // The em dash means "no liability on this statement", which is a different
   // fact from a zero balance and is not recorded as one.
   if (liability.value !== null) {
-    const liabilityLocator = locator(kind, page, "BALANCE SHEET / Total Liabilities");
+    const liabilityLocator = locator(
+      kind,
+      page,
+      "BALANCE SHEET / Total Liabilities",
+    );
     liabilities.push({
       sourceDocument: "statement",
       ...accountKeyField(accountKey),
@@ -450,7 +524,14 @@ const TOTAL_VALUE_BANNER = /TOTAL VALUE OF\s+\S+\s+ACCOUNT\b/;
  * nothing, which is a fact the statement states, not one it omits), and
  * `null` when there is no banner or nothing readable under it.
  */
-function parseTotalValueBanner(lines, kind, asOf, accountKeys, markerLines, textMeta) {
+function parseTotalValueBanner(
+  lines,
+  kind,
+  asOf,
+  accountKeys,
+  markerLines,
+  textMeta,
+) {
   const anchor = lines.findIndex(({ text }) => TOTAL_VALUE_BANNER.test(text));
   if (anchor === -1) return null;
   for (const line of lines.slice(anchor + 1, anchor + 3)) {
@@ -460,7 +541,13 @@ function parseTotalValueBanner(lines, kind, asOf, accountKeys, markerLines, text
     if (NO_VALUE.has(cell.text)) return { statedNone: true };
     const { value } = resolveStatementMoney(cell.text);
     if (value === null) continue;
-    const accountLocator = accountSpanLocator(lines, markerLines, anchor, kind, textMeta);
+    const accountLocator = accountSpanLocator(
+      lines,
+      markerLines,
+      anchor,
+      kind,
+      textMeta,
+    );
     const amountLocator = spanLocator(
       kind,
       line.page,
@@ -571,7 +658,9 @@ const ASSET_CLASS = /Asset Class:\s*(.+?)\s*$/;
 /** "3M COMPANY (MMM)" -> name and symbol; anything else stays a name. */
 const NAME_AND_SYMBOL = /^(.*?)\s*\(([A-Z0-9.]{1,8})\)$/;
 
-const HOLDINGS_LABELS = [...HOLDINGS_COLUMNS.keys()].sort((a, b) => b.length - a.length);
+const HOLDINGS_LABELS = [...HOLDINGS_COLUMNS.keys()].sort(
+  (a, b) => b.length - a.length,
+);
 
 /**
  * The header line's column spans. Two headers printed a single space apart
@@ -584,7 +673,9 @@ function headerColumns(line) {
   for (const cell of splitCells(line)) {
     let offset = 0;
     while (offset < cell.text.length) {
-      const label = HOLDINGS_LABELS.find((candidate) => cell.text.startsWith(candidate, offset));
+      const label = HOLDINGS_LABELS.find((candidate) =>
+        cell.text.startsWith(candidate, offset),
+      );
       if (label === undefined) {
         offset += 1;
         continue;
@@ -624,10 +715,13 @@ function resolveInstrument(description, detailText) {
   const labelled = CUSIP_LABEL.exec(detailText ?? "");
   const cusip = labelled === null ? null : labelled[1];
   if (description === null) {
-    return cusip === null ? null : { symbol: null, cusip, isin: null, name: null };
+    return cusip === null
+      ? null
+      : { symbol: null, cusip, isin: null, name: null };
   }
   const match = NAME_AND_SYMBOL.exec(description);
-  if (match === null) return { symbol: null, cusip, isin: null, name: description };
+  if (match === null)
+    return { symbol: null, cusip, isin: null, name: description };
   const token = match[2];
   // A nine-character alphanumeric in that position is a CUSIP, not a ticker.
   const isCusip = token.length === 9;
@@ -644,33 +738,55 @@ function resolveInstrument(description, detailText) {
  * position, or null with a reason when the block does not state one
  * unambiguously.
  *
- * Two block shapes occur. An equity or fund prints one row per tax lot and a
+ * An equity or fund prints one row per tax lot and a
  * `Total` row carrying the aggregate; that row is the position. A bond prints
  * the security on one row and its market value on the detail row beneath it,
  * with no `Total`; there the block's own rows are merged, and a column the
  * position row does not state is filled from another row **only** where that
- * row states it numerically. Anything else -- several valued lots and no
- * `Total` -- is genuinely ambiguous and is refused.
+ * row states it numerically. Without a Total, complete dated lots can be
+ * summed; undated value rows and interrupted blocks remain ambiguous.
  */
-function positionCells(block) {
+function positionCells(block, context) {
   const totalRow = block.find(
     ({ bound }) =>
-      bound.has("description") === false && /^Total\b/.test(bound.get("tradeDate")?.text ?? ""),
+      bound.has("description") === false &&
+      /^Total\b/.test(bound.get("tradeDate")?.text ?? ""),
   );
-  const valueRows = block.filter(({ bound }) => statesValue(bound.get("marketValue")));
+  const valueRows = block.filter(({ bound }) =>
+    statesValue(bound.get("marketValue")),
+  );
+  const datedRows = block.filter(({ bound }) =>
+    TRADE_DATE_CELL.test(bound.get("tradeDate")?.text ?? ""),
+  );
+  if (
+    totalRow === undefined &&
+    (datedRows.length > 1 || valueRows.length > 1)
+  ) {
+    return aggregateLotCells(block, datedRows, context);
+  }
   const row = totalRow ?? (valueRows.length === 1 ? valueRows[0] : null);
   if (row === null) return null;
   // F1-53: every merged cell carries the line it actually came from
   // (`lineStart`/`page`), row or another line in the block, so a value this
   // position took from elsewhere still cites the line that stated it.
-  const withLine = (cell, source) => ({ ...cell, lineStart: source.start, page: source.page });
+  const withLine = (cell, source) => ({
+    ...cell,
+    lineStart: source.start,
+    page: source.page,
+  });
   // Fill only from rows that agree: a column several rows state differently
   // (a per-lot cost, say) stays unfilled rather than taking one lot's number
   // as the whole position's.
   const merged = new Map(
     [...row.bound].map(([name, cell]) => [name, withLine(cell, row)]),
   );
-  for (const name of ["quantity", "price", "costBasis", "unrealized", "marketValue"]) {
+  for (const name of [
+    "quantity",
+    "price",
+    "costBasis",
+    "unrealized",
+    "marketValue",
+  ]) {
     if (statesValue(merged.get(name))) continue;
     const stated = new Map();
     for (const other of block) {
@@ -688,11 +804,66 @@ function positionCells(block) {
   return { row, merged };
 }
 
+/** Only fully dated lot rows belong to this fallback. A detail/value row
+ * without a date could be a subtotal, so it must not enter the sum. Missing
+ * secondary fields stay null; every required cell and every price must be
+ * readable, and prices must agree. No quantity-times-price inference. */
+function aggregateLotCells(block, lots, context) {
+  if (
+    context.allowLotAggregation === false ||
+    context.description === null ||
+    lots.length < 2 ||
+    lots.length !== block.length ||
+    lots.some((row) => row.conflictingCells)
+  )
+    return null;
+
+  const merged = new Map();
+  for (const name of [
+    "quantity",
+    "marketValue",
+    "price",
+    "costBasis",
+    "unrealized",
+  ]) {
+    const cells = lots.map((row) => {
+      const cell = row.bound.get(name);
+      return cell === undefined
+        ? null
+        : {
+            ...cell,
+            lineStart: row.start,
+            page: row.page,
+            value: resolveStatementMoney(cell.text).value,
+          };
+    });
+    if (cells.some((cell) => cell?.value == null)) {
+      if (["quantity", "marketValue", "price"].includes(name)) return null;
+      continue;
+    }
+    if (name === "price") {
+      if (new Set(cells.map((cell) => cell.value)).size !== 1) return null;
+      merged.set(name, cells[0]);
+      continue;
+    }
+    const sum = cells.reduce(
+      (total, cell) => addDecimal(total, cell.value),
+      "0",
+    );
+    // This text is calculated, never presented as a quote from one lot.
+    merged.set(name, { text: sum, sources: cells });
+  }
+  return { row: lots[0], merged, lotCount: lots.length };
+}
+
 /** The label this table actually printed over the column the position's value
  * is read from: `Market Value`, or the NAV-priced fund table's bare `Value`
  * (F1-61). Used only to name the column in a note. */
 function valueColumnLabel(columns) {
-  return columns.find((column) => column.name === "marketValue")?.text ?? "Market Value";
+  return (
+    columns.find((column) => column.name === "marketValue")?.text ??
+    "Market Value"
+  );
 }
 
 /**
@@ -735,7 +906,7 @@ function unstatedValue(block, name, label) {
 }
 
 function positionFromBlock(block, columns, context) {
-  const resolved = positionCells(block);
+  const resolved = positionCells(block, context);
   if (resolved === null) {
     // F1-61. Two different failures used to share one sentence. A table with
     // no value column this parser reads (the aggregate private-holdings
@@ -746,17 +917,43 @@ function positionFromBlock(block, columns, context) {
       position: null,
       reason: columns.some((column) => column.name === "marketValue")
         ? `security block over ${block.length} line(s) states neither a Total row nor a single ` +
-          "valued lot, so no one row is this security's position"
+          "valued lot, and is not a complete set of dated lots with readable quantity, " +
+          "market value and agreeing prices"
         : `the ${context.section} holdings table states no Market Value or NAV column this ` +
           `parser reads, so this security block over ${block.length} line(s) states no value ` +
           "to record",
     };
   }
   const { row, merged } = resolved;
-  const boundCell = (name) => (statesValue(merged.get(name)) ? merged.get(name) : null);
+  const boundCell = (name) =>
+    statesValue(merged.get(name)) ? merged.get(name) : null;
   const span = (name, fieldLabel) => {
     const c = boundCell(name);
     if (c === null) return null;
+    if (c.sources) {
+      return {
+        ...locator(
+          context.kind,
+          row.page,
+          `${fieldLabel} / sum of ${resolved.lotCount} dated lots`,
+        ),
+        calculation: {
+          format: "decimal_sum_v1",
+          terms: c.sources.map(
+            (source, index) =>
+              spanLocator(
+                context.kind,
+                source.page,
+                `${context.section} / ${name} / lot ${index + 1}`,
+                context.textMeta,
+                source.lineStart + source.start,
+                source.lineStart + source.end,
+                source.text,
+              ).binding,
+          ),
+        },
+      };
+    }
     return spanLocator(
       context.kind,
       c.page,
@@ -773,19 +970,43 @@ function positionFromBlock(block, columns, context) {
       ? unstatedValue(block, "marketValue", valueColumnLabel(columns))
       : resolveStatementMoney(marketValueCell.text);
   const quantityCell = boundCell("quantity");
-  const quantity = quantityCell === null ? null : resolveStatementMoney(quantityCell.text);
+  const quantity =
+    quantityCell === null ? null : resolveStatementMoney(quantityCell.text);
   const priceCell = boundCell("price");
-  const price = priceCell === null ? null : resolveStatementMoney(priceCell.text);
+  const price =
+    priceCell === null ? null : resolveStatementMoney(priceCell.text);
   const costBasisCell = boundCell("costBasis");
-  const costBasis = costBasisCell === null ? null : resolveStatementMoney(costBasisCell.text);
+  const costBasis =
+    costBasisCell === null ? null : resolveStatementMoney(costBasisCell.text);
   const unrealizedCell = boundCell("unrealized");
-  const unrealized = unrealizedCell === null ? null : resolveStatementMoney(unrealizedCell.text);
-  const rowLocator = locator(context.kind, row.page, `${context.section} / ${context.description ?? "holding"}`);
+  const unrealized =
+    unrealizedCell === null ? null : resolveStatementMoney(unrealizedCell.text);
+  const rowLocator = locator(
+    context.kind,
+    row.page,
+    `${context.section} / ${context.description ?? "holding"}`,
+  );
+  const lotLocators = {};
+  for (const [name, cell] of merged) {
+    for (const [index, source] of (cell.sources ?? []).entries()) {
+      lotLocators[`${name}.lot.${index + 1}`] = spanLocator(
+        context.kind,
+        source.page,
+        `${context.section} / ${name} / lot ${index + 1}`,
+        context.textMeta,
+        source.lineStart + source.start,
+        source.lineStart + source.end,
+        source.text,
+      );
+    }
+  }
 
   // Keyed on the printed label, not the resolved column name: F1-61's
   // NAV-priced fund table resolves its `Value` column to the market value
   // field, and the basis that value is carried at is still the reported NAV.
-  const hasMarketValueColumn = columns.some((column) => column.text === "Market Value");
+  const hasMarketValueColumn = columns.some(
+    (column) => column.text === "Market Value",
+  );
   const valuationBasis = hasMarketValueColumn
     ? "market_price"
     : columns.some((column) => column.text === "NAV")
@@ -817,14 +1038,29 @@ function positionFromBlock(block, columns, context) {
       unrealized: unrealized?.value ?? null,
       currency: BASE_CURRENCY,
       valuationBasis,
-      valuationNote,
+      valuationNote: resolved.lotCount
+        ? `${valuationNote}; summed from ${resolved.lotCount} dated lots without a printed Total row`
+        : valuationNote,
       locators: {
+        ...lotLocators,
         row: rowLocator,
-        marketValue: marketValue.value === null ? rowLocator : span("marketValue", `${context.section} / Market Value`),
-        ...(quantity?.value == null ? {} : { quantity: span("quantity", `${context.section} / Quantity`) }),
-        ...(price?.value == null ? {} : { price: span("price", `${context.section} / Price`) }),
-        ...(costBasis?.value == null ? {} : { costBasis: span("costBasis", `${context.section} / Cost Basis`) }),
-        ...(context.accountLocator === null || context.accountLocator === undefined
+        marketValue:
+          marketValue.value === null
+            ? rowLocator
+            : span("marketValue", `${context.section} / Market Value`),
+        ...(quantity?.value == null
+          ? {}
+          : { quantity: span("quantity", `${context.section} / Quantity`) }),
+        ...(price?.value == null
+          ? {}
+          : { price: span("price", `${context.section} / Price`) }),
+        ...(costBasis?.value == null
+          ? {}
+          : {
+              costBasis: span("costBasis", `${context.section} / Cost Basis`),
+            }),
+        ...(context.accountLocator === null ||
+        context.accountLocator === undefined
           ? {}
           : { account: context.accountLocator }),
       },
@@ -869,11 +1105,18 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
       [...lines.slice(Math.max(0, i - 6), i)]
         .reverse()
         .map(({ text }) => text.trim())
-        .find((text) => /^[A-Z][A-Z0-9 ,&%'/()+^-]{3,}$/.test(text)) ?? "HOLDINGS";
+        .find((text) => /^[A-Z][A-Z0-9 ,&%'/()+^-]{3,}$/.test(text)) ??
+      "HOLDINGS";
     const accountKey = accountKeys[i];
     // F1-53. One per table, not per position: every position under this
     // header shares the same account-number line.
-    const accountLocator = accountSpanLocator(lines, markerLines, i, kind, textMeta);
+    const accountLocator = accountSpanLocator(
+      lines,
+      markerLines,
+      i,
+      kind,
+      textMeta,
+    );
 
     const headerText = lines[i].text;
     let block = [];
@@ -894,7 +1137,14 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
     }
     flushCarried();
 
-    const context = { kind, asOf, section, accountKey, accountLocator, textMeta };
+    const context = {
+      kind,
+      asOf,
+      section,
+      accountKey,
+      accountLocator,
+      textMeta,
+    };
     const flush = () => {
       emit(block, columns, { ...context, section, description });
       block = [];
@@ -904,11 +1154,14 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
     // a security's (F1-61, `SECTION_SUMMARY`).
     let inSummary = false;
     let interruptedByPageFooter = false;
+    let finalPageFooter = false;
     for (let j = i + 1; j < lines.length; j += 1) {
       const text = lines[j].text;
       const trimmed = text.trim();
       if (TABLE_END.test(trimmed) || HOLDINGS_HEADER.test(text)) {
         interruptedByPageFooter = PAGE_FOOTER.test(trimmed);
+        const footer = /^Page\s+(\d+)\s+of\s+(\d+)$/.exec(trimmed);
+        finalPageFooter = footer !== null && footer[1] === footer[2];
         break;
       }
       if (ASSET_CLASS.test(trimmed)) continue;
@@ -918,7 +1171,7 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
         i = j;
         continue;
       }
-      const { bound } = bindRow(text, columns);
+      const { bound, conflictingCells } = bindRow(text, columns);
       if (bound.size === 0) continue;
       // A line whose only cell is in the description column is an asset-class
       // heading or a footnote, not a row of the table.
@@ -944,11 +1197,27 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
         flush();
         description = bound.get("description").text;
       }
-      block.push({ bound, page: lines[j].page, start: lines[j].start });
+      block.push({
+        bound,
+        conflictingCells,
+        page: lines[j].page,
+        start: lines[j].start,
+      });
       i = j;
     }
     if (interruptedByPageFooter && block.length > 0) {
-      carried = { block, description, columns, context: { ...context, section }, headerText };
+      carried = {
+        block,
+        description,
+        columns,
+        context: {
+          ...context,
+          section,
+          description,
+          allowLotAggregation: finalPageFooter,
+        },
+        headerText,
+      };
     } else {
       flush();
     }
@@ -1062,7 +1331,14 @@ export function parseRealStatement(text, kind) {
   // and the liability too.
   const banner =
     sheets.length === 0
-      ? parseTotalValueBanner(lines, kind, period.end, accountKeys, markerLines, textMeta)
+      ? parseTotalValueBanner(
+          lines,
+          kind,
+          period.end,
+          accountKeys,
+          markerLines,
+          textMeta,
+        )
       : null;
   if (banner?.balance !== undefined) {
     // The same rule as above: on a statement that does name accounts, a
@@ -1096,7 +1372,9 @@ export function parseRealStatement(text, kind) {
     }
   }
   if (skipped.length > 0) {
-    notes.push(`${skipped.length} holdings block(s) left unparsed: ${skipped[0]}`);
+    notes.push(
+      `${skipped.length} holdings block(s) left unparsed: ${skipped[0]}`,
+    );
   }
 
   return {
@@ -1106,6 +1384,8 @@ export function parseRealStatement(text, kind) {
       balances: sheets.map((sheet) => sheet.balance),
       liabilities: sheets.flatMap((sheet) => sheet.liabilities),
     },
-    ...(notes.length > 0 ? { parseNote: `partially parsed: ${notes.join("; ")}` } : {}),
+    ...(notes.length > 0
+      ? { parseNote: `partially parsed: ${notes.join("; ")}` }
+      : {}),
   };
 }

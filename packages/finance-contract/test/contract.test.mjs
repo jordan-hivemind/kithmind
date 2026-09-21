@@ -724,6 +724,45 @@ describe("list_account_inventory (ADM-2)", () => {
     rejects("invalid_response", () => parseExchange(extra));
   });
 
+  it("carries balance dates newest first inside the activity range", () => {
+    const parsed = parseExchange(inventory());
+    assert.deepEqual(parsed.response.items[0].balanceDates, [
+      "2026-07-31",
+      "2026-06-30",
+      "2026-05-31",
+    ]);
+    assert.equal(parsed.response.items[0].latestBalanceHoldsSecurities, true);
+    assert.equal(parsed.response.items[1].balanceDates, undefined);
+
+    for (const dates of [
+      [],
+      ["2026-06-30", "2026-07-31"],
+      ["2026-07-31", "2026-07-31"],
+      ["2026-08-31"],
+      ["2025-12-31"],
+      ["2026-07-32"],
+      Array.from({ length: 13 }, (_, i) => `2026-07-${String(31 - i).padStart(2, "0")}`),
+    ]) {
+      const exchange = inventory();
+      exchange.response.items[0].balanceDates = dates;
+      rejects("invalid_response", () => parseExchange(exchange));
+    }
+
+    const unranged = inventory();
+    unranged.response.items[1].balanceDates = ["2026-07-31"];
+    rejects("invalid_response", () => parseExchange(unranged));
+  });
+
+  it("refuses a holds-securities flag without balances or of the wrong type", () => {
+    const orphan = inventory();
+    delete orphan.response.items[0].balanceDates;
+    rejects("invalid_response", () => parseExchange(orphan));
+
+    const text = inventory();
+    text.response.items[0].latestBalanceHoldsSecurities = "false";
+    rejects("invalid_response", () => parseExchange(text));
+  });
+
   it("keeps an empty account's row, with no dates rather than invented ones", () => {
     const parsed = parseExchange(inventory());
     assert.equal(parsed.response.items.length, 2);

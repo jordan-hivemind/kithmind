@@ -35,6 +35,7 @@ import {
   fromNumericText,
   importBatch,
   persistAcquiredDocument,
+  retainPayload,
   resolveRawTreeRoot,
   serveFinanceRead,
   storeRetainedText,
@@ -400,11 +401,11 @@ test(
   "every operation answers, and answers the contract",
   { skip },
   async (t) => {
-  const { reader: r, seeded } = await fixture(t);
-  const operations = [
-    { operation: "list_transactions" },
-    { operation: "list_holdings" },
-    { operation: "list_balances" },
+    const { reader: r, seeded } = await fixture(t);
+    const operations = [
+      { operation: "list_transactions" },
+      { operation: "list_holdings" },
+      { operation: "list_balances" },
       {
         operation: "aggregate_money",
         metric: "transaction_amount",
@@ -414,14 +415,14 @@ test(
         operation: "get_evidence",
         recordId: `txn:${seeded.citedTransactionId}`,
       },
-    { operation: "get_coverage" },
-  ];
-  for (const request of operations) {
-    const response = await serve(r, request);
-    assert.equal(response.operation, request.operation);
-    assert.ok(response.datasetRevision.startsWith("rev-"));
-    assert.ok(["complete", "partial"].includes(response.completeness));
-  }
+      { operation: "get_coverage" },
+    ];
+    for (const request of operations) {
+      const response = await serve(r, request);
+      assert.equal(response.operation, request.operation);
+      assert.ok(response.datasetRevision.startsWith("rev-"));
+      assert.ok(["complete", "partial"].includes(response.completeness));
+    }
   },
 );
 
@@ -469,15 +470,15 @@ test(
   "the dataset revision is stable, and moves when the archive does",
   { skip },
   async (t) => {
-  const { owner, reader: r, seeded } = await fixture(t);
-  const request = { operation: "get_coverage" };
-  const first = await serve(r, request);
-  const second = await serve(r, request);
-  assert.equal(
-    first.datasetRevision,
-    second.datasetRevision,
-    "two reads of an unchanged archive must report one revision, or pinning is useless",
-  );
+    const { owner, reader: r, seeded } = await fixture(t);
+    const request = { operation: "get_coverage" };
+    const first = await serve(r, request);
+    const second = await serve(r, request);
+    assert.equal(
+      first.datasetRevision,
+      second.datasetRevision,
+      "two reads of an unchanged archive must report one revision, or pinning is useless",
+    );
 
     const doc = await document(
       owner,
@@ -492,8 +493,8 @@ test(
       "2026-02-10",
       "-1.00",
     );
-  const third = await serve(r, request);
-  assert.notEqual(third.datasetRevision, first.datasetRevision);
+    const third = await serve(r, request);
+    assert.notEqual(third.datasetRevision, first.datasetRevision);
     await owner.query(
       "UPDATE accounts SET display_name = 'Changed synthetic label' WHERE id = $1",
       [seeded.settled.accountIds[0]],
@@ -525,34 +526,34 @@ test(
   "money crosses the wire as decimal strings and never crosses currencies",
   { skip },
   async (t) => {
-  const { reader: r } = await fixture(t);
-  const response = await serve(r, {
-    operation: "aggregate_money",
-    metric: "transaction_amount",
-    groupBy: "currency",
-    sourceId: sourceIdOf(SOURCES.settled),
-    from: "2026-01-01",
-    toExclusive: "2026-02-01",
-  });
+    const { reader: r } = await fixture(t);
+    const response = await serve(r, {
+      operation: "aggregate_money",
+      metric: "transaction_amount",
+      groupBy: "currency",
+      sourceId: sourceIdOf(SOURCES.settled),
+      from: "2026-01-01",
+      toExclusive: "2026-02-01",
+    });
 
-  for (const item of response.items) {
-    assert.equal(typeof item.total.decimal, "string");
-    assert.equal(item.total.currency, item.currency);
-  }
+    for (const item of response.items) {
+      assert.equal(typeof item.total.decimal, "string");
+      assert.equal(item.total.currency, item.currency);
+    }
     const byCurrency = new Map(
       response.items.map((item) => [item.currency, item]),
     );
-  // Two USD fees, summed exactly by the database, never by JavaScript.
-  assert.equal(byCurrency.get("USD").total.decimal, "-20");
-  assert.equal(byCurrency.get("USD").contributingRecordCount, 2);
-  // The EUR fee stays its own total. There is no request shape that adds it
-  // to the USD one: the grouping key always carries the currency.
-  assert.equal(byCurrency.get("EUR").total.decimal, "-5");
-  assert.equal(
-    new Set(response.items.map((item) => item.currency)).size,
-    response.items.length,
-    "one total per currency",
-  );
+    // Two USD fees, summed exactly by the database, never by JavaScript.
+    assert.equal(byCurrency.get("USD").total.decimal, "-20");
+    assert.equal(byCurrency.get("USD").contributingRecordCount, 2);
+    // The EUR fee stays its own total. There is no request shape that adds it
+    // to the USD one: the grouping key always carries the currency.
+    assert.equal(byCurrency.get("EUR").total.decimal, "-5");
+    assert.equal(
+      new Set(response.items.map((item) => item.currency)).size,
+      response.items.length,
+      "one total per currency",
+    );
   },
 );
 
@@ -560,18 +561,18 @@ test(
   "a currency outside the contract's registry is withheld, not coerced",
   { skip },
   async (t) => {
-  const { reader: r } = await fixture(t);
-  const response = await serve(r, {
-    operation: "aggregate_money",
-    metric: "transaction_amount",
-    groupBy: "currency",
-  });
-  assert.ok(
-    !response.items.some((item) => item.currency === "XTS"),
-    "an unregistered currency is never emitted",
-  );
-  assert.equal(response.completeness, "partial");
-  assert.ok(response.coverage.reasons.includes("unsupported_value"));
+    const { reader: r } = await fixture(t);
+    const response = await serve(r, {
+      operation: "aggregate_money",
+      metric: "transaction_amount",
+      groupBy: "currency",
+    });
+    assert.ok(
+      !response.items.some((item) => item.currency === "XTS"),
+      "an unregistered currency is never emitted",
+    );
+    assert.equal(response.completeness, "partial");
+    assert.ok(response.coverage.reasons.includes("unsupported_value"));
   },
 );
 
@@ -579,19 +580,19 @@ test(
   "a value past the 38 and 18 boundary is an explicit out-of-range outcome",
   { skip },
   async (t) => {
-  const { reader: r } = await fixture(t);
-  const response = await serve(r, {
-    operation: "aggregate_money",
-    metric: "transaction_amount",
-    groupBy: "currency",
-    currency: "JPY",
-  });
-  // The only JPY row is 40 significant digits. It is not rounded into range
-  // and it is not silently dropped: no total is offered and the response says
-  // a value was unsupported.
-  assert.equal(response.items.length, 0);
-  assert.equal(response.completeness, "partial");
-  assert.ok(response.coverage.reasons.includes("unsupported_value"));
+    const { reader: r } = await fixture(t);
+    const response = await serve(r, {
+      operation: "aggregate_money",
+      metric: "transaction_amount",
+      groupBy: "currency",
+      currency: "JPY",
+    });
+    // The only JPY row is 40 significant digits. It is not rounded into range
+    // and it is not silently dropped: no total is offered and the response says
+    // a value was unsupported.
+    assert.equal(response.items.length, 0);
+    assert.equal(response.completeness, "partial");
+    assert.ok(response.coverage.reasons.includes("unsupported_value"));
   },
 );
 
@@ -599,21 +600,21 @@ test(
   "a truncated page is marked truncated and carries a cursor",
   { skip },
   async (t) => {
-  const { reader: r } = await fixture(t);
+    const { reader: r } = await fixture(t);
     const response = await serve(r, {
       operation: "list_transactions",
       limit: 1,
     });
-  assert.equal(response.truncated, true);
-  assert.ok(response.nextCursor, "a truncated page is never silently short");
-  assert.equal(response.completeness, "partial");
+    assert.equal(response.truncated, true);
+    assert.ok(response.nextCursor, "a truncated page is never silently short");
+    assert.equal(response.completeness, "partial");
 
-  const next = await serve(r, {
-    operation: "list_transactions",
-    limit: 1,
-    cursor: response.nextCursor,
-  });
-  assert.equal(next.operation, "list_transactions");
+    const next = await serve(r, {
+      operation: "list_transactions",
+      limit: 1,
+      cursor: response.nextCursor,
+    });
+    assert.equal(next.operation, "list_transactions");
   },
 );
 
@@ -621,16 +622,17 @@ test(
   "a cursor this surface did not mint is an invalid request",
   { skip },
   async (t) => {
-  const { reader: r } = await fixture(t);
-  await assert.rejects(
-    () =>
-      serve(r, {
-        operation: "list_transactions",
-        cursor: "AAAAAAAAAAAAAAAAAAAAAAAA",
-      }),
-    (error) => error.code === "invalid_request",
-  );
-});
+    const { reader: r } = await fixture(t);
+    await assert.rejects(
+      () =>
+        serve(r, {
+          operation: "list_transactions",
+          cursor: "AAAAAAAAAAAAAAAAAAAAAAAA",
+        }),
+      (error) => error.code === "invalid_request",
+    );
+  },
+);
 
 test("zero rows never claims absence", { skip }, async (t) => {
   const { reader: r } = await fixture(t);
@@ -733,7 +735,7 @@ test(
       limit: 2,
       cursor: first.nextCursor,
       expectedDatasetRevision: first.datasetRevision,
-  });
+    });
     assert.equal(terminal.matchStatus, "ambiguous");
     assert.equal(terminal.totalMatches, first.totalMatches);
     assert.ok(terminal.items.length <= terminal.totalMatches);
@@ -1126,7 +1128,10 @@ test(
     const usd = response.summary.currencies.find(
       (item) => item.currency === "USD",
     );
-    assert.deepEqual(usd.marketValue.amount, { decimal: "80", currency: "USD" });
+    assert.deepEqual(usd.marketValue.amount, {
+      decimal: "80",
+      currency: "USD",
+    });
     assert.equal(usd.marketValue.contributingPositionCount, 1);
     assert.equal(usd.marketValue.missingPositionCount, 1);
     assert.equal(usd.statedAccountTotal.status, "ambiguous");
@@ -1437,27 +1442,27 @@ test(
   "get_evidence reports why it has no citation rather than inventing one",
   { skip },
   async (t) => {
-  const { reader: r, seeded } = await fixture(t);
-  // A record that exists. The archive holds a source document for it but no
-  // character span, so there is no contract evidence to return, and saying so
-  // is the only honest answer. See `retainedTextSpanEvidence` in pgRead.ts.
-  const known = await serve(r, {
-    operation: "get_evidence",
-    recordId: `txn:${seeded.citedTransactionId}`,
-  });
-  assert.equal(known.items.length, 0);
-  assert.equal(known.completeness, "partial");
-  assert.ok(known.coverage.reasons.includes("retained_evidence_unavailable"));
+    const { reader: r, seeded } = await fixture(t);
+    // A record that exists. The archive holds a source document for it but no
+    // character span, so there is no contract evidence to return, and saying so
+    // is the only honest answer. See `retainedTextSpanEvidence` in pgRead.ts.
+    const known = await serve(r, {
+      operation: "get_evidence",
+      recordId: `txn:${seeded.citedTransactionId}`,
+    });
+    assert.equal(known.items.length, 0);
+    assert.equal(known.completeness, "partial");
+    assert.ok(known.coverage.reasons.includes("retained_evidence_unavailable"));
 
-  // An id the archive has never heard of is a different answer: a gap, not a
-  // citation-free row.
-  const unknown = await serve(r, {
-    operation: "get_evidence",
-    recordId: "txn:not-a-record",
-  });
-  assert.equal(unknown.items.length, 0);
-  assert.ok(unknown.coverage.reasons.includes("source_gap"));
-  assert.equal(unknown.coverage.status, "unknown");
+    // An id the archive has never heard of is a different answer: a gap, not a
+    // citation-free row.
+    const unknown = await serve(r, {
+      operation: "get_evidence",
+      recordId: "txn:not-a-record",
+    });
+    assert.equal(unknown.items.length, 0);
+    assert.ok(unknown.coverage.reasons.includes("source_gap"));
+    assert.equal(unknown.coverage.status, "unknown");
   },
 );
 
@@ -1465,24 +1470,24 @@ test(
   "list operations withhold rows they cannot cite, and say so",
   { skip },
   async (t) => {
-  const { reader: r } = await fixture(t);
-  for (const operation of [
-    "list_transactions",
-    "list_holdings",
-    "list_balances",
-  ]) {
-    const response = await serve(r, { operation });
-    assert.equal(response.completeness, "partial", operation);
-    // list_holdings and list_balances have no seeded rows, so only
-    // list_transactions can prove the withholding is reported rather than
-    // being indistinguishable from an empty table.
-    if (operation === "list_transactions") {
-      assert.ok(
-        response.coverage.reasons.includes("retained_evidence_unavailable"),
-        "a withheld row is reported, never silently dropped",
-      );
+    const { reader: r } = await fixture(t);
+    for (const operation of [
+      "list_transactions",
+      "list_holdings",
+      "list_balances",
+    ]) {
+      const response = await serve(r, { operation });
+      assert.equal(response.completeness, "partial", operation);
+      // list_holdings and list_balances have no seeded rows, so only
+      // list_transactions can prove the withholding is reported rather than
+      // being indistinguishable from an empty table.
+      if (operation === "list_transactions") {
+        assert.ok(
+          response.coverage.reasons.includes("retained_evidence_unavailable"),
+          "a withheld row is reported, never silently dropped",
+        );
+      }
     }
-  }
   },
 );
 
@@ -1490,11 +1495,11 @@ test(
   "the surface reads through the reader role, not the owner",
   { skip },
   async (t) => {
-  const { reader: r } = await fixture(t);
-  const who = await one(r.client, "SELECT current_user AS name");
-  assert.equal(who.name, r.summary.role);
-  // And the read it just did is still a read: the reader cannot write.
-  await assert.rejects(() => r.client.query("DELETE FROM transactions"));
+    const { reader: r } = await fixture(t);
+    const who = await one(r.client, "SELECT current_user AS name");
+    assert.equal(who.name, r.summary.role);
+    // And the read it just did is still a read: the reader cannot write.
+    await assert.rejects(() => r.client.query("DELETE FROM transactions"));
   },
 );
 
@@ -1502,30 +1507,30 @@ test(
   "a holdings aggregate sums the latest snapshot, not every snapshot",
   { skip },
   async (t) => {
-  const owner = await archive(t);
-  const seeded = await seed(owner);
-  const account = seeded.settled.accountIds[0];
-  const doc = await document(owner, seeded.settled.id, account, "2026-02-28");
-  // Two statements, two stated cash balances for the same account. Summing
-  // both would count the same money twice and produce a plausible wrong
-  // number, which is the failure mode that matters here.
-  await owner.query(
-    `INSERT INTO balances (id, account_id, as_of, total_value, cash, currency, source_document_id)
+    const owner = await archive(t);
+    const seeded = await seed(owner);
+    const account = seeded.settled.accountIds[0];
+    const doc = await document(owner, seeded.settled.id, account, "2026-02-28");
+    // Two statements, two stated cash balances for the same account. Summing
+    // both would count the same money twice and produce a plausible wrong
+    // number, which is the failure mode that matters here.
+    await owner.query(
+      `INSERT INTO balances (id, account_id, as_of, total_value, cash, currency, source_document_id)
      VALUES ('bal_jan', $1, DATE '2026-01-31', '100.00', '40.00', 'USD', $2),
             ('bal_feb', $1, DATE '2026-02-28', '120.00', '55.00', 'USD', $2)`,
-    [account, doc],
-  );
-  const r = await reader(t, owner);
-  const response = await serve(r, {
-    operation: "aggregate_money",
-    metric: "cash",
-    groupBy: "account_currency",
-    accountId: account,
-  });
-  assert.equal(response.items.length, 1);
-  assert.equal(response.items[0].total.decimal, "55");
-  assert.equal(response.items[0].contributingRecordCount, 1);
-  assert.equal(response.items[0].accountId, account);
+      [account, doc],
+    );
+    const r = await reader(t, owner);
+    const response = await serve(r, {
+      operation: "aggregate_money",
+      metric: "cash",
+      groupBy: "account_currency",
+      accountId: account,
+    });
+    assert.equal(response.items.length, 1);
+    assert.equal(response.items[0].total.decimal, "55");
+    assert.equal(response.items[0].contributingRecordCount, 1);
+    assert.equal(response.items[0].accountId, account);
   },
 );
 
@@ -1533,18 +1538,18 @@ test(
   "an aggregate over more contributors than the contract carries offers a breakdown",
   { skip },
   async (t) => {
-  const owner = await archive(t);
-  const seeded = await seed(owner);
+    const owner = await archive(t);
+    const seeded = await seed(owner);
     const doc = await document(
       owner,
       seeded.settled.id,
       seeded.settled.accountIds[0],
       "2026-03-31",
     );
-  // The contract carries at most 25 contributor ids inline; past that it
-  // requires a breakdown reference rather than a shortened list presented as
-  // the whole one.
-  for (let index = 0; index < 30; index += 1) {
+    // The contract carries at most 25 contributor ids inline; past that it
+    // requires a breakdown reference rather than a shortened list presented as
+    // the whole one.
+    for (let index = 0; index < 30; index += 1) {
       await transaction(
         owner,
         seeded.settled.accountIds[0],
@@ -1553,23 +1558,23 @@ test(
         "-1.00",
         "CAD",
       );
-  }
-  const r = await reader(t, owner);
-  const response = await serve(r, {
-    operation: "aggregate_money",
-    metric: "transaction_amount",
-    groupBy: "currency",
-    currency: "CAD",
-  });
-  assert.equal(response.items.length, 1);
-  const item = response.items[0];
-  assert.equal(item.contributingRecordCount, 30);
-  assert.equal(item.contributorRecordIds.length, 25);
+    }
+    const r = await reader(t, owner);
+    const response = await serve(r, {
+      operation: "aggregate_money",
+      metric: "transaction_amount",
+      groupBy: "currency",
+      currency: "CAD",
+    });
+    assert.equal(response.items.length, 1);
+    const item = response.items[0];
+    assert.equal(item.contributingRecordCount, 30);
+    assert.equal(item.contributorRecordIds.length, 25);
     assert.ok(
       item.breakdown,
       "a shortened contributor list must carry a breakdown",
     );
-  assert.equal(item.total.decimal, "-30");
+    assert.equal(item.total.decimal, "-30");
   },
 );
 
@@ -1814,63 +1819,63 @@ test(
   "a cited record resolves in the retained bytes it names",
   { skip },
   async (t) => {
-  const { client, retainedPaths } = await importedPull(t);
-  const r = await reader(t, client);
+    const { client, retainedPaths } = await importedPull(t);
+    const r = await reader(t, client);
     const response = await serve(r, {
       operation: "list_transactions",
       limit: 100,
     });
 
-  // Exactly the rows whose tier can bind a datum, cited once each.
-  const citable = await count(
-    client,
-    "transactions t JOIN documents d ON d.id = t.source_document_id",
-    "WHERE d.media_type = ANY($1)",
-    [[JSON_TIER, TABULAR_TIER]],
-  );
-  assert.ok(citable > 0, "the fixture still has citable rows");
-  assert.equal(response.items.length, citable);
-
-  const formats = new Set();
-  for (const item of response.items) {
-    assert.equal(item.evidence.length, 1);
-    const [evidence] = item.evidence;
-    assert.equal(evidence.evidenceId, `ev:${item.recordId}:amount`);
-    assert.equal(
-    evidence.sourceObject.sourceId,
-    ADAPTER.institution.id,
-    "the cited source identity is the opaque institution id, not the slug (F1-34)",
-  );
-    assert.equal(
-      evidence.sourceObject.revisionId,
-      `sha256-${evidence.sourceObject.retainedSha256}`,
+    // Exactly the rows whose tier can bind a datum, cited once each.
+    const citable = await count(
+      client,
+      "transactions t JOIN documents d ON d.id = t.source_document_id",
+      "WHERE d.media_type = ANY($1)",
+      [[JSON_TIER, TABULAR_TIER]],
     );
-    assertCitationResolves(retainedPaths, evidence);
-    formats.add(evidence.locator.format);
-  }
-  assert.deepEqual(
-    [...formats].sort(),
-    ["delimited_row_v1", "json_pointer_v1"],
-    "both bindable tiers are represented",
-  );
-  assert.ok(
-    !response.items.some(
-      (item) => item.evidence[0].sourceObject.mediaType === PDF_TIER,
-    ),
-    "the PDF tier binds nothing, so it is never cited",
-  );
-  assert.equal(response.completeness, "partial");
+    assert.ok(citable > 0, "the fixture still has citable rows");
+    assert.equal(response.items.length, citable);
+
+    const formats = new Set();
+    for (const item of response.items) {
+      assert.equal(item.evidence.length, 1);
+      const [evidence] = item.evidence;
+      assert.equal(evidence.evidenceId, `ev:${item.recordId}:amount`);
+      assert.equal(
+        evidence.sourceObject.sourceId,
+        ADAPTER.institution.id,
+        "the cited source identity is the opaque institution id, not the slug (F1-34)",
+      );
+      assert.equal(
+        evidence.sourceObject.revisionId,
+        `sha256-${evidence.sourceObject.retainedSha256}`,
+      );
+      assertCitationResolves(retainedPaths, evidence);
+      formats.add(evidence.locator.format);
+    }
+    assert.deepEqual(
+      [...formats].sort(),
+      ["delimited_row_v1", "json_pointer_v1"],
+      "both bindable tiers are represented",
+    );
+    assert.ok(
+      !response.items.some(
+        (item) => item.evidence[0].sourceObject.mediaType === PDF_TIER,
+      ),
+      "the PDF tier binds nothing, so it is never cited",
+    );
+    assert.equal(response.completeness, "partial");
     assert.ok(
       response.coverage.reasons.includes("retained_evidence_unavailable"),
     );
 
-  // `get_evidence` for a returned record answers with that same item.
-  const [first] = response.items;
-  const evidence = await serve(r, {
-    operation: "get_evidence",
-    recordId: first.recordId,
-  });
-  assert.deepEqual(evidence.items, first.evidence);
+    // `get_evidence` for a returned record answers with that same item.
+    const [first] = response.items;
+    const evidence = await serve(r, {
+      operation: "get_evidence",
+      recordId: first.recordId,
+    });
+    assert.deepEqual(evidence.items, first.evidence);
   },
 );
 
@@ -1963,6 +1968,319 @@ async function bindPdfPositionToRetainedText(client, rawTreeRoot) {
     quantityQuote,
   };
 }
+
+async function bindPdfPositionToExactSpanSum(client, rawTreeRoot) {
+  const row = await one(
+    client,
+    `SELECT p.id
+       FROM positions p JOIN documents d ON d.id = p.source_document_id
+      WHERE d.media_type = $1
+      LIMIT 1`,
+    [PDF_TIER],
+  );
+  const quotes = ["$10.25", "19.75"];
+  const text = `HOLDINGS\nSynthetic Neutral Fund lot 1   ${quotes[0]}\nSynthetic Neutral Fund lot 2   ${quotes[1]}\n`;
+  const written = writeRetainedText(rawTreeRoot, text);
+  const terms = quotes.map((quote) => {
+    const start = text.indexOf(quote);
+    return {
+      format: "retained_text_span_v1",
+      textSha256: written.sha256,
+      textByteLength: Buffer.byteLength(text, "utf8"),
+      textCodepointLength: Array.from(text).length,
+      start,
+      end: start + quote.length,
+      quote,
+    };
+  });
+  await client.query(
+    `UPDATE positions SET market_value = '30', quantity = '2', source_locator = $2 WHERE id = $1`,
+    [
+      row.id,
+      JSON.stringify({
+        row: { source: "pdf_statement", index: 1 },
+        marketValue: {
+          source: "pdf_statement",
+          index: 1,
+          field: "HOLDINGS / Market Value / sum of 2 dated lots",
+          calculation: { format: "decimal_sum_v1", terms },
+        },
+      }),
+    ],
+  );
+  return { recordId: `pos:${row.id}`, terms };
+}
+
+function retainedSpanBinding(text, quote) {
+  const start = text.indexOf(quote);
+  assert.notEqual(start, -1, "the synthetic quote is present in retained text");
+  return {
+    format: "retained_text_span_v1",
+    textSha256: createHash("sha256").update(text, "utf8").digest("hex"),
+    textByteLength: Buffer.byteLength(text, "utf8"),
+    textCodepointLength: Array.from(text).length,
+    start,
+    end: start + quote.length,
+    quote,
+  };
+}
+
+async function importLotOnlyAggregatePosition(t) {
+  const directory = mkdtempSync(join(tmpdir(), "kith-finance-lot-mcp-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const rawTreeRoot = resolveRawTreeRoot({
+    FINANCE_ARCHIVE_RAW_TREE_ROOT: join(directory, "raw"),
+    FINANCE_ARCHIVE_SPACE_ID: ADAPTER.spaceId,
+  });
+
+  const client = await archive(t);
+  await client.query(
+    "INSERT INTO institutions (id, name, slug) VALUES ($1, $2, $3)",
+    [
+      ADAPTER.institution.id,
+      ADAPTER.institution.name,
+      ADAPTER.institution.slug,
+    ],
+  );
+  await client.query(
+    `INSERT INTO accounts (id, institution_id, acct_last4, base_currency)
+     VALUES ($1, $2, $3, 'USD')`,
+    [
+      ADAPTER.accounts[0].id,
+      ADAPTER.institution.id,
+      ADAPTER.accounts[0].last4,
+    ],
+  );
+
+  const quotes = ["$10.25", "19.75"];
+  const text =
+    "HOLDINGS\n" +
+    `Synthetic Aggregate Fund lot 1   ${quotes[0]}\n` +
+    `Synthetic Aggregate Fund lot 2   ${quotes[1]}\n`;
+  await storeRetainedText(client, text);
+  const retained = retainPayload(
+    {
+      kind: "opaque",
+      version: "test-pdf-lot-aggregate-1",
+      note: "synthetic statement text for aggregate lot evidence",
+    },
+    new TextEncoder().encode(text),
+    "pdf_statement",
+  );
+  const acquired = {
+    bytes: retained.bytes,
+    retention: retained.record,
+    manifest: {
+      kind: "pdf_statement",
+      periodStart: "2026-02-01",
+      periodEnd: "2026-02-28",
+      capturedAt: "2026-03-01T00:00:00.000Z",
+      contentHash: retained.sha256,
+      mediaType: "text/plain; charset=utf-8",
+      reportedRowCount: null,
+      gaps: [],
+    },
+  };
+  const persisted = persistAcquiredDocument(
+    rawTreeRoot,
+    {
+      institutionId: ADAPTER.institution.id,
+      accountId: ADAPTER.accounts[0].id,
+      institutionSlug: ADAPTER.institution.slug,
+      accountLast4: ADAPTER.accounts[0].last4,
+      docType: "pdf_statement",
+      acquired,
+    },
+    text,
+  );
+  const terms = quotes.map((quote) => retainedSpanBinding(text, quote));
+  const locators = {
+    row: {
+      source: "pdf_statement",
+      index: 1,
+      field: "HOLDINGS / Synthetic Aggregate Fund",
+    },
+    "marketValue.lot.1": {
+      source: "pdf_statement",
+      index: 1,
+      field: "HOLDINGS / Market Value / lot 1",
+      binding: terms[0],
+    },
+    "marketValue.lot.2": {
+      source: "pdf_statement",
+      index: 1,
+      field: "HOLDINGS / Market Value / lot 2",
+      binding: terms[1],
+    },
+  };
+  const documents = await adapterPullToImportDocuments(client, {
+    institutionId: ADAPTER.institution.id,
+    accountId: ADAPTER.accounts[0].id,
+    acquired,
+    rows: [],
+    holdings: {
+      positions: [
+        {
+          sourceDocument: "statement",
+          asOf: "2026-02-28",
+          instrument: {
+            symbol: "SAGG",
+            cusip: null,
+            isin: null,
+            name: "SYNTHETIC AGGREGATE FUND",
+          },
+          quantity: "2",
+          price: null,
+          marketValue: "30",
+          marketValueNote: null,
+          costBasis: null,
+          unrealized: null,
+          currency: "USD",
+          valuationBasis: "market_price",
+          valuationNote: "Synthetic aggregate lot statement",
+          locators,
+        },
+      ],
+      balances: [],
+      liabilities: [],
+    },
+    docType: "pdf_statement",
+    docDate: "2026-02-28",
+    persisted,
+  });
+  await importBatch(
+    client,
+    { source: ADAPTER.institution.slug, documents },
+    new Date("2026-03-01"),
+  );
+  return { client, terms };
+}
+
+test(
+  "an exact sum over constituent retained spans serves the calculated holding with every term as evidence",
+  { skip },
+  async (t) => {
+    const { client, rawTreeRoot } = await importedPull(t);
+    const r = await reader(t, client);
+    const { recordId, terms } = await bindPdfPositionToExactSpanSum(
+      client,
+      rawTreeRoot,
+    );
+
+    const listed = await serve(r, { operation: "list_holdings", limit: 100 });
+    const item = listed.items.find(
+      (candidate) => candidate.recordId === recordId,
+    );
+    assert.ok(item, "the exactly verified calculated position is served");
+    assert.equal(item.marketValue.decimal, "30");
+    assert.deepEqual(
+      item.evidence.map(({ locator }) => locator.quote),
+      terms.map(({ quote }) => quote),
+    );
+    assert.equal(
+      new Set(item.evidence.map(({ evidenceId }) => evidenceId)).size,
+      2,
+    );
+
+    const evidence = await serve(
+      r,
+      { operation: "get_evidence", recordId },
+      { rawTreeRoot },
+    );
+    assert.deepEqual(
+      evidence.items.map(({ locator }) => locator.quote),
+      terms.map(({ quote }) => quote),
+    );
+
+    await client.query(
+      "UPDATE positions SET market_value = '30.01' WHERE id = $1",
+      [recordId.slice("pos:".length)],
+    );
+    const mismatched = await serve(r, {
+      operation: "list_holdings",
+      limit: 100,
+    });
+    assert.ok(
+      !mismatched.items.some((candidate) => candidate.recordId === recordId),
+    );
+    assert.ok(
+      mismatched.coverage.reasons.includes("retained_evidence_unavailable"),
+    );
+  },
+);
+
+test(
+  "a lot-only aggregate holding imports and is served through MCP with retained evidence",
+  { skip },
+  async (t) => {
+    const { client: archiveClient, terms } =
+      await importLotOnlyAggregatePosition(t);
+    const r = await reader(t, archiveClient);
+    const trusted = {
+      principalId: TRUSTED.principalId,
+      authorizedSpaceIds: [ADAPTER.spaceId],
+    };
+    const { server } = createFinanceArchiveMcpServer(
+      r.client,
+      ADAPTER.spaceId,
+      trusted,
+      "synthetic-finance-cursor-secret-at-least-32-bytes",
+    );
+    const client = new Client({ name: "aggregate-finance-client", version: "1" });
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([
+        server.connect(serverTransport),
+        client.connect(clientTransport),
+      ]);
+      const listed = await client.callTool({
+        name: "finance_read",
+        arguments: {
+          request: {
+            contractVersion: 1,
+            spaceId: ADAPTER.spaceId,
+            operation: "list_holdings",
+            sourceId: ADAPTER.institution.id,
+            limit: 100,
+          },
+        },
+      });
+      assert.notEqual(listed.isError, true);
+      const response = JSON.parse(listed.content[0].text);
+      assert.equal(response.operation, "list_holdings");
+      assert.equal(response.items.length, 1);
+      const [item] = response.items;
+      assert.equal(item.marketValue.decimal, "30");
+      assert.deepEqual(
+        item.evidence.map(({ locator }) => locator.quote),
+        terms.map(({ quote }) => quote),
+      );
+
+      const evidence = await client.callTool({
+        name: "finance_read",
+        arguments: {
+          request: {
+            contractVersion: 1,
+            spaceId: ADAPTER.spaceId,
+            operation: "get_evidence",
+            recordId: item.recordId,
+            limit: 10,
+          },
+        },
+      });
+      assert.notEqual(evidence.isError, true);
+      const evidenceResponse = JSON.parse(evidence.content[0].text);
+      assert.deepEqual(
+        evidenceResponse.items.map(({ locator }) => locator.quote),
+        terms.map(({ quote }) => quote),
+      );
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  },
+);
 
 test(
   "a PDF-tier position with a retained-text-span binding is served, and get_evidence verifies it against the retained text on disk",
@@ -2075,11 +2393,15 @@ test(
     );
     assert.ok(
       item.evidence.every((expected) =>
-        response.items.some((actual) => actual.evidenceId === expected.evidenceId),
+        response.items.some(
+          (actual) => actual.evidenceId === expected.evidenceId,
+        ),
       ),
     );
     assert.ok(
-      response.items.some((evidence) => evidence.evidenceId.endsWith(":quantity")),
+      response.items.some((evidence) =>
+        evidence.evidenceId.endsWith(":quantity"),
+      ),
     );
     assert.ok(
       !(response.coverage.reasons ?? []).includes(
@@ -2129,33 +2451,33 @@ test(
   "a document whose retained bytes were never recorded cites nothing",
   { skip },
   async (t) => {
-  const { client } = await importedPull(t);
-  const r = await reader(t, client);
+    const { client } = await importedPull(t);
+    const r = await reader(t, client);
     const before = await serve(r, {
       operation: "list_transactions",
       limit: 100,
     });
-  // What a document imported before F1-29 looks like: four nulls, all or
-  // nothing, which is what the `documents` CHECK enforces.
-  await client.query(
-    `UPDATE documents
+    // What a document imported before F1-29 looks like: four nulls, all or
+    // nothing, which is what the `documents` CHECK enforces.
+    await client.query(
+      `UPDATE documents
         SET retained_sha256 = NULL, retained_byte_length = NULL,
             media_type = NULL, capture_id = NULL
       WHERE media_type = $1`,
-    [TABULAR_TIER],
-  );
+      [TABULAR_TIER],
+    );
     const after = await serve(r, {
       operation: "list_transactions",
       limit: 100,
     });
-  assert.ok(after.items.length < before.items.length);
-  assert.ok(
-    after.items.every(
-      (item) => item.evidence[0].sourceObject.mediaType === JSON_TIER,
-    ),
-    "a row whose document names no bytes is withheld, never cited to nothing",
-  );
-  assert.ok(after.coverage.reasons.includes("retained_evidence_unavailable"));
+    assert.ok(after.items.length < before.items.length);
+    assert.ok(
+      after.items.every(
+        (item) => item.evidence[0].sourceObject.mediaType === JSON_TIER,
+      ),
+      "a row whose document names no bytes is withheld, never cited to nothing",
+    );
+    assert.ok(after.coverage.reasons.includes("retained_evidence_unavailable"));
   },
 );
 
@@ -2163,28 +2485,28 @@ test(
   "a binding that disagrees with the stored amount withholds its row",
   { skip },
   async (t) => {
-  const { client } = await importedPull(t);
-  const r = await reader(t, client);
+    const { client } = await importedPull(t);
+    const r = await reader(t, client);
     const before = await serve(r, {
       operation: "list_transactions",
       limit: 100,
     });
-  const [target] = before.items;
-  // The stored value moves and the binding does not. The citation would still
-  // resolve in the retained bytes; it would just cite a different number than
-  // the row asserts, which is the wrong-bytes failure the cross-check exists
-  // to catch.
-  await client.query(
-    "UPDATE transactions SET amount = amount + 1 WHERE id = $1",
-    [target.recordId.slice("txn:".length)],
-  );
+    const [target] = before.items;
+    // The stored value moves and the binding does not. The citation would still
+    // resolve in the retained bytes; it would just cite a different number than
+    // the row asserts, which is the wrong-bytes failure the cross-check exists
+    // to catch.
+    await client.query(
+      "UPDATE transactions SET amount = amount + 1 WHERE id = $1",
+      [target.recordId.slice("txn:".length)],
+    );
     const after = await serve(r, {
       operation: "list_transactions",
       limit: 100,
     });
-  assert.equal(after.items.length, before.items.length - 1);
-  assert.ok(!after.items.some((item) => item.recordId === target.recordId));
-  assert.ok(after.coverage.reasons.includes("retained_evidence_unavailable"));
+    assert.equal(after.items.length, before.items.length - 1);
+    assert.ok(!after.items.some((item) => item.recordId === target.recordId));
+    assert.ok(after.coverage.reasons.includes("retained_evidence_unavailable"));
   },
 );
 
@@ -2228,32 +2550,32 @@ test(
   "two bindings on one record are told apart by name, not by key order",
   { skip },
   async (t) => {
-  const { client, reader: r, target } = await boundTransaction(t);
-  const cited = target.evidence[0].locator.pointer;
-  // Two bound locators whose rawValues are identical -- a price that happens
-  // to equal the amount -- so the decimal cross-check cannot separate them,
-  // with the wrong one first in key order.
-  await rebind(client, target.recordId, (binding) => ({
-    price: {
-      source: "structured_api",
-      index: 0,
-      field: "price",
-      binding: { ...binding, pointer: cited.replace(/amount$/, "price") },
-    },
-    amount: { source: "structured_api", index: 0, field: "amount", binding },
-  }));
+    const { client, reader: r, target } = await boundTransaction(t);
+    const cited = target.evidence[0].locator.pointer;
+    // Two bound locators whose rawValues are identical -- a price that happens
+    // to equal the amount -- so the decimal cross-check cannot separate them,
+    // with the wrong one first in key order.
+    await rebind(client, target.recordId, (binding) => ({
+      price: {
+        source: "structured_api",
+        index: 0,
+        field: "price",
+        binding: { ...binding, pointer: cited.replace(/amount$/, "price") },
+      },
+      amount: { source: "structured_api", index: 0, field: "amount", binding },
+    }));
 
     const after = await serve(r, {
       operation: "list_transactions",
       limit: 100,
     });
-  const item = after.items.find((row) => row.recordId === target.recordId);
-  assert.ok(item, "a record whose amount is bound is still citable");
-  assert.equal(
-    item.evidence[0].locator.pointer,
-    cited,
-    "the binding named for the load-bearing field is the cited one",
-  );
+    const item = after.items.find((row) => row.recordId === target.recordId);
+    assert.ok(item, "a record whose amount is bound is still citable");
+    assert.equal(
+      item.evidence[0].locator.pointer,
+      cited,
+      "the binding named for the load-bearing field is the cited one",
+    );
   },
 );
 
@@ -2261,27 +2583,27 @@ test(
   "several bindings and none for the money field withholds the row",
   { skip },
   async (t) => {
-  const { client, reader: r, before, target } = await boundTransaction(t);
-  const cited = target.evidence[0].locator.pointer;
-  // Neither key names the record's load-bearing field, so which binding the
-  // amount belongs to is not stated anywhere. Withheld beats guessing.
-  await rebind(client, target.recordId, (binding) => ({
-    row: { source: "structured_api", index: 0, binding },
-    quantity: {
-      source: "structured_api",
-      index: 0,
-      field: "quantity",
-      binding: { ...binding, pointer: cited.replace(/amount$/, "quantity") },
-    },
-  }));
+    const { client, reader: r, before, target } = await boundTransaction(t);
+    const cited = target.evidence[0].locator.pointer;
+    // Neither key names the record's load-bearing field, so which binding the
+    // amount belongs to is not stated anywhere. Withheld beats guessing.
+    await rebind(client, target.recordId, (binding) => ({
+      row: { source: "structured_api", index: 0, binding },
+      quantity: {
+        source: "structured_api",
+        index: 0,
+        field: "quantity",
+        binding: { ...binding, pointer: cited.replace(/amount$/, "quantity") },
+      },
+    }));
 
     const after = await serve(r, {
       operation: "list_transactions",
       limit: 100,
     });
-  assert.equal(after.items.length, before.items.length - 1);
-  assert.ok(!after.items.some((row) => row.recordId === target.recordId));
-  assert.ok(after.coverage.reasons.includes("retained_evidence_unavailable"));
+    assert.equal(after.items.length, before.items.length - 1);
+    assert.ok(!after.items.some((row) => row.recordId === target.recordId));
+    assert.ok(after.coverage.reasons.includes("retained_evidence_unavailable"));
   },
 );
 
@@ -2368,31 +2690,47 @@ test(
  * Replaces one account's money rows with exactly the scenario named, so a
  * `currentValue` assertion is about the rule under test and nothing else.
  *
- * `balances` are `[asOf, totalValue, currency]` and `positions` are
- * `[asOf, marketValue, currency, valuationBasis]`, both with `null` allowed
- * wherever the column is nullable, which is the whole point: an archive whose
- * every column is populated is not the archive this rule exists for.
+ * `balances` are `[asOf, totalValue, currency, cash]` and `positions` are
+ * `[asOf, marketValue, currency, valuationBasis, sourceDocumentId]`, both
+ * with `null` allowed wherever the column is nullable, which is the whole
+ * point: an archive whose every column is populated is not the archive this
+ * rule exists for.
  */
 async function moneyRows(owner, accountId, { balances = [], positions = [] }) {
   await owner.query("DELETE FROM positions WHERE account_id = $1", [accountId]);
   await owner.query("DELETE FROM balances WHERE account_id = $1", [accountId]);
   let index = 0;
-  for (const [asOf, totalValue, currency] of balances) {
+  for (const [asOf, totalValue, currency, cash = null] of balances) {
     index += 1;
     await owner.query(
-      `INSERT INTO balances (id, account_id, as_of, total_value, currency)
-       VALUES ($1, $2, $3::date, $4::numeric, $5)`,
-      [`cv-balance-${index}`, accountId, asOf, totalValue, currency],
+      `INSERT INTO balances (id, account_id, as_of, total_value, currency, cash)
+       VALUES ($1, $2, $3::date, $4::numeric, $5, $6::numeric)`,
+      [`cv-balance-${index}`, accountId, asOf, totalValue, currency, cash],
     );
   }
   index = 0;
-  for (const [asOf, marketValue, currency, basis = "market_price"] of positions) {
+  for (const [
+    asOf,
+    marketValue,
+    currency,
+    basis = "market_price",
+    sourceDocumentId = null,
+  ] of positions) {
     index += 1;
     await owner.query(
       `INSERT INTO positions
-         (id, account_id, as_of, market_value, currency, valuation_basis)
-       VALUES ($1, $2, $3::date, $4::numeric, $5, $6)`,
-      [`cv-position-${index}`, accountId, asOf, marketValue, currency, basis],
+         (id, account_id, as_of, market_value, currency, valuation_basis,
+          source_document_id)
+       VALUES ($1, $2, $3::date, $4::numeric, $5, $6, $7)`,
+      [
+        `cv-position-${index}`,
+        accountId,
+        asOf,
+        marketValue,
+        currency,
+        basis,
+        sourceDocumentId,
+      ],
     );
   }
 }
@@ -2551,6 +2889,214 @@ test(
 );
 
 test(
+  "list_account_inventory reports balance dates, the all-cash flag, and one total from agreeing duplicate balances (FIN-FRESHNESS-1)",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const accountId = seeded.settled.accountIds[0];
+    const inventory = async () =>
+      (
+        await serve(r, { operation: "list_account_inventory", limit: 100 })
+      ).items.find((item) => item.account.accountId === accountId);
+
+    // One statement imported as two balance rows with the same total, one of
+    // them also stating cash: the same answer twice is not a choice.
+    await moneyRows(owner, accountId, {
+      balances: [
+        ["2026-03-31", "1000", "USD", "10"],
+        ["2026-03-31", "1000", "USD"],
+        ["2025-12-31", "900", "USD", "10"],
+        ["2025-09-30", "800", "USD", "10"],
+      ],
+      positions: [["2026-03-31", "990", "USD"]],
+    });
+    let row = await inventory();
+    assert.deepEqual(row.currentValue, {
+      value: { decimal: "1000", currency: "USD" },
+      asOf: "2026-03-31",
+      source: "balance",
+    });
+    assert.deepEqual(row.balanceDates, [
+      "2026-03-31",
+      "2025-12-31",
+      "2025-09-30",
+    ]);
+    assert.equal(row.latestBalanceHoldsSecurities, true);
+
+    // All cash on the latest date: nothing besides cash is held.
+    await moneyRows(owner, accountId, {
+      balances: [
+        ["2026-03-31", "25", "USD", "25"],
+        ["2025-12-31", "900", "USD", "10"],
+      ],
+      positions: [["2025-12-31", "890", "USD"]],
+    });
+    row = await inventory();
+    assert.equal(row.latestBalanceHoldsSecurities, false);
+    assert.equal(row.latestSnapshotAsOf, "2025-12-31");
+
+    // The latest date states no cash: the flag is absent, never carried
+    // forward from an older date.
+    await moneyRows(owner, accountId, {
+      balances: [
+        ["2026-03-31", "1000", "USD"],
+        ["2025-12-31", "25", "USD", "25"],
+      ],
+    });
+    row = await inventory();
+    assert.equal(row.latestBalanceHoldsSecurities, undefined);
+    assert.deepEqual(row.balanceDates, ["2026-03-31", "2025-12-31"]);
+
+    // Rows on the latest date that disagree about holding securities: absent.
+    await moneyRows(owner, accountId, {
+      balances: [
+        ["2026-03-31", "1000", "USD", "1000"],
+        ["2026-03-31", "1000", "USD", "10"],
+      ],
+    });
+    assert.equal((await inventory()).latestBalanceHoldsSecurities, undefined);
+
+    // At most twelve dates, newest first; no balances at all is no field.
+    await moneyRows(owner, accountId, {
+      balances: Array.from({ length: 14 }, (_, i) => [
+        `2025-${String(i < 12 ? 12 - i : 1).padStart(2, "0")}-${i < 12 ? "01" : String(10 + i)}`,
+        "1",
+        "USD",
+      ]),
+    });
+    row = await inventory();
+    assert.equal(row.balanceDates.length, 12);
+    assert.equal(row.balanceDates[0], "2025-12-01");
+    await moneyRows(owner, accountId, {});
+    row = await inventory();
+    assert.equal(row.balanceDates, undefined);
+    assert.equal(row.latestBalanceHoldsSecurities, undefined);
+  },
+);
+
+test(
+  "list_account_inventory does not advance the holdings snapshot from an incomplete latest statement (FIN-FRESHNESS-1)",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const accountId = seeded.settled.accountIds[0];
+    const priorDoc = await document(
+      owner,
+      seeded.settled.id,
+      accountId,
+      "2026-03-31",
+    );
+    const latestDoc = await document(
+      owner,
+      seeded.settled.id,
+      accountId,
+      "2026-04-30",
+    );
+    const inventory = async () =>
+      (
+        await serve(r, { operation: "list_account_inventory", limit: 100 })
+      ).items.find((item) => item.account.accountId === accountId);
+
+    await moneyRows(owner, accountId, {
+      positions: [
+        ["2026-03-31", "100", "USD", "market_price", priorDoc],
+        ["2026-04-30", "5", "USD", "market_price", latestDoc],
+      ],
+    });
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES ('snapshot-review-latest', 'weak_instrument_match', $1, $2,
+               'unresolved holding', 'latest statement has unresolved holdings', 'open')`,
+      [accountId, latestDoc],
+    );
+
+    let row = await inventory();
+    assert.equal(row.latestSnapshotAsOf, "2026-03-31");
+    assert.deepEqual(row.currentValue, {
+      value: { decimal: "100", currency: "USD" },
+      asOf: "2026-03-31",
+      source: "positions",
+    });
+    assert.equal(row.openReviewCount, 1);
+
+    await owner.query(
+      "UPDATE review_items SET status = 'resolved' WHERE id = 'snapshot-review-latest'",
+    );
+    row = await inventory();
+    assert.equal(row.latestSnapshotAsOf, "2026-04-30");
+    assert.deepEqual(row.currentValue, {
+      value: { decimal: "5", currency: "USD" },
+      asOf: "2026-04-30",
+      source: "positions",
+    });
+  },
+);
+
+test(
+  "list_account_inventory does not advance the holdings snapshot from a failed position gate (FIN-FRESHNESS-1)",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const accountId = seeded.settled.accountIds[0];
+    const priorDoc = await document(
+      owner,
+      seeded.settled.id,
+      accountId,
+      "2026-03-31",
+    );
+    const latestDoc = await document(
+      owner,
+      seeded.settled.id,
+      accountId,
+      "2026-04-30",
+    );
+    const inventory = async () =>
+      (
+        await serve(r, { operation: "list_account_inventory", limit: 100 })
+      ).items.find((item) => item.account.accountId === accountId);
+
+    await owner.query(
+      `INSERT INTO instruments (id, symbol, name)
+       VALUES ('snapshot-gate-instrument', 'SGI', 'Synthetic Gate Instrument')
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    await moneyRows(owner, accountId, {
+      positions: [
+        ["2026-03-31", "100", "USD", "market_price", priorDoc],
+        ["2026-04-30", "105", "USD", "market_price", latestDoc],
+      ],
+    });
+    await owner.query(
+      `INSERT INTO position_reconciliations
+         (id, account_id, instrument_id, period_start, period_end, status)
+       VALUES ('snapshot-gate-unverified', $1, 'snapshot-gate-instrument',
+               '2026-03-31'::date, '2026-04-30'::date, 'unverified')`,
+      [accountId],
+    );
+
+    let row = await inventory();
+    assert.equal(row.latestSnapshotAsOf, "2026-03-31");
+    assert.deepEqual(row.currentValue, {
+      value: { decimal: "100", currency: "USD" },
+      asOf: "2026-03-31",
+      source: "positions",
+    });
+
+    await owner.query(
+      "UPDATE position_reconciliations SET status = 'pass' WHERE id = 'snapshot-gate-unverified'",
+    );
+    row = await inventory();
+    assert.equal(row.latestSnapshotAsOf, "2026-04-30");
+    assert.deepEqual(row.currentValue, {
+      value: { decimal: "105", currency: "USD" },
+      asOf: "2026-04-30",
+      source: "positions",
+    });
+  },
+);
+
+test(
   "list_account_inventory withholds a holdings value unless every position is marked at market price (ADM-2)",
   { skip },
   async (t) => {
@@ -2589,7 +3135,11 @@ test(
           ["2026-03-31", "5000", "USD", basis],
         ],
       });
-      assert.equal((await inventory()).currentValue, undefined, `${basis} mixed`);
+      assert.equal(
+        (await inventory()).currentValue,
+        undefined,
+        `${basis} mixed`,
+      );
     }
 
     // An unstated basis is the same refusal `financeHoldingRecord` already
@@ -2720,8 +3270,8 @@ test(
     // An institution with accounts and nothing acquired is a row of zeros and
     // no dates, never an absent row: that is the whole point of the screen
     // this operation feeds.
-    const empty = response.items.filter(
-      (item) => item.account.institutionName.includes("quiet-harbor"),
+    const empty = response.items.filter((item) =>
+      item.account.institutionName.includes("quiet-harbor"),
     );
     assert.equal(empty.length, 1);
     assert.equal(empty[0].statementCount, 0);

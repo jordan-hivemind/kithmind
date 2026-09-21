@@ -2,11 +2,10 @@
 
 import { describe, expect, test } from "vitest";
 
+import { valueIsStale } from "@/lib/kith/account-freshness";
 import {
-  freshness,
   friendlyAccountName,
   groupInstitutions,
-  valueIsStale,
 } from "@/lib/kith/institutions";
 
 const NOW = Date.parse("2026-09-18T12:00:00Z");
@@ -74,23 +73,48 @@ describe("last four", () => {
   });
 });
 
-describe("freshness", () => {
+describe("freshness on the account row", () => {
+  const child = (overrides: Record<string, unknown>) =>
+    groupInstitutions([record(overrides)], NOW)[0]!.children![0]!;
+
   test("nothing held is empty, not stale", () => {
-    expect(freshness("2020-01-01", false, NOW, null).status).toBe("empty");
+    expect(
+      child({
+        statementCount: 0,
+        recordCount: 0,
+        activityFrom: undefined,
+        activityTo: undefined,
+        latestSnapshotAsOf: undefined,
+      }).status,
+    ).toBe("empty");
   });
 
-  test("records with no snapshot are fresh: a cash account has none", () => {
-    expect(freshness(null, true, NOW, "2026-08-31")).toEqual({
-      status: "fresh",
-      statusDetail: "no snapshot",
-    });
+  test("records with no snapshot and no balance are fresh: nothing to hold them to", () => {
+    const row = child({ latestSnapshotAsOf: undefined });
+    expect(row.status).toBe("fresh");
+    expect(row.freshnessReason).toBe("no_balance");
   });
 
-  test("a snapshot past the statement interval is stale, with its age", () => {
-    expect(freshness("2026-09-01", true, NOW, "2026-09-01").status).toBe("fresh");
-    const stale = freshness("2026-06-01", true, NOW, "2026-08-31");
+  test("a snapshot past its next month end and grace is stale, with its date", () => {
+    expect(child({ latestSnapshotAsOf: "2026-08-31" }).status).toBe("fresh");
+    const stale = child({ latestSnapshotAsOf: "2026-06-30" });
     expect(stale.status).toBe("stale");
-    expect(stale.statusDetail).toMatch(/latest holdings statement 2026-06-01, 109 days ago/);
+    expect(stale.freshnessReason).toBe("holdings_behind");
+    expect(stale.statusDetail).toMatch(/holdings last recorded 2026-06-30/);
+  });
+
+  test("the row carries the balance date, cadence and expectation beside the snapshot", () => {
+    const row = child({
+      activityTo: "2026-08-31",
+      latestSnapshotAsOf: "2026-06-30",
+      balanceDates: ["2026-06-30", "2026-03-31", "2025-12-31", "2025-09-30"],
+      latestBalanceHoldsSecurities: true,
+    });
+    expect(row.latestBalanceAsOf).toBe("2026-06-30");
+    expect(row.latestSnapshotAsOf).toBe("2026-06-30");
+    expect(row.cadence).toBe("quarterly");
+    expect(row.expectedBy).toBe("2026-10-20");
+    expect(row.status).toBe("fresh");
   });
 });
 
@@ -135,11 +159,34 @@ describe("the owner's overrides", () => {
 
   test("closed makes an account inactive whatever its dates say, but never fills an empty one", () => {
     const [group] = groupInstitutions(
-      [record(), record({ account: account({ accountId: "b" }), statementCount: 0, recordCount: 0 })],
+      [
+        record(),
+        record({
+          account: account({ accountId: "b" }),
+          statementCount: 0,
+          recordCount: 0,
+        }),
+      ],
       NOW,
       new Map([
-        ["account-1", { displayName: null, accountLast4: null, accountType: null, closed: true }],
-        ["b", { displayName: null, accountLast4: null, accountType: null, closed: true }],
+        [
+          "account-1",
+          {
+            displayName: null,
+            accountLast4: null,
+            accountType: null,
+            closed: true,
+          },
+        ],
+        [
+          "b",
+          {
+            displayName: null,
+            accountLast4: null,
+            accountType: null,
+            closed: true,
+          },
+        ],
       ]) as never,
     );
     expect(group!.children![0]!.status).toBe("inactive");
@@ -233,13 +280,18 @@ describe("current value", () => {
 
   test("a closed account with no value is left out of the total, and cannot hold it back", () => {
     const overrides = new Map([
-      ["b", { displayName: null, accountLast4: null, accountType: null, closed: true }],
+      [
+        "b",
+        {
+          displayName: null,
+          accountLast4: null,
+          accountType: null,
+          closed: true,
+        },
+      ],
     ]);
     const [group] = groupInstitutions(
-      [
-        record(value("100")),
-        record({ account: account({ accountId: "b" }) }),
-      ],
+      [record(value("100")), record({ account: account({ accountId: "b" }) })],
       NOW,
       overrides,
     );
@@ -269,16 +321,21 @@ describe("current value", () => {
     );
     expect(group!.currentValue).toBeNull();
     // The account's own row still shows what it holds.
-    expect(group!.children!.find((child) => child.id === "b")!.currentValue).toBe(
-      500000,
-    );
+    expect(
+      group!.children!.find((child) => child.id === "b")!.currentValue,
+    ).toBe(500000);
   });
 
   test("a closed account holding a balance blanks the total", () => {
     const closed = new Map([
       [
         "b",
-        { displayName: null, accountLast4: null, accountType: null, closed: true },
+        {
+          displayName: null,
+          accountLast4: null,
+          accountType: null,
+          closed: true,
+        },
       ],
     ]);
     const [group] = groupInstitutions(
@@ -296,11 +353,21 @@ describe("current value", () => {
     const closed = new Map([
       [
         "b",
-        { displayName: null, accountLast4: null, accountType: null, closed: true },
+        {
+          displayName: null,
+          accountLast4: null,
+          accountType: null,
+          closed: true,
+        },
       ],
       [
         "c",
-        { displayName: null, accountLast4: null, accountType: null, closed: true },
+        {
+          displayName: null,
+          accountLast4: null,
+          accountType: null,
+          closed: true,
+        },
       ],
     ]);
     const [group] = groupInstitutions(
@@ -436,16 +503,24 @@ describe("a value older than the inactivity threshold is not a current one", () 
 });
 
 describe("inactive", () => {
+  const child = (overrides: Record<string, unknown>) =>
+    groupInstitutions([record(overrides)], NOW)[0]!.children![0]!;
+
   test("an account with no activity for a quarter has stopped, not fallen behind", () => {
-    const quiet = freshness("2022-10-31", true, NOW, "2022-12-31");
+    const quiet = child({
+      latestSnapshotAsOf: "2022-10-31",
+      activityTo: "2022-12-31",
+    });
     expect(quiet.status).toBe("inactive");
+    expect(quiet.freshnessReason).toBe("dormant");
     expect(quiet.statusDetail).toMatch(/no activity since 2022-12-31/);
   });
 
   test("recent activity with an old snapshot is still stale", () => {
-    expect(freshness("2022-10-31", true, NOW, "2026-09-10").status).toBe(
-      "stale",
-    );
+    expect(
+      child({ latestSnapshotAsOf: "2022-10-31", activityTo: "2026-09-10" })
+        .status,
+    ).toBe("stale");
   });
 
   test("an institution of only inactive and empty accounts is inactive", () => {
@@ -528,7 +603,110 @@ describe("grouping", () => {
     // The group's own latest snapshot column is still the recent one.
     expect(group!.latestSnapshotAsOf).toBe("2026-08-31");
     expect(group!.status).toBe("stale");
-    expect(group!.statusDetail).toMatch(/1 stale, oldest IRA/);
+    expect(group!.statusDetail).toMatch(
+      /1 stale \(1 holdings behind\), oldest IRA/,
+    );
+  });
+
+  test("a group counts its stale accounts by reason and names the oldest", () => {
+    const [group] = groupInstitutions(
+      [
+        record(),
+        // Statements stopped: the latest balance is past its next month end.
+        record({
+          account: account({ accountId: "b", displayLabel: "Overdue" }),
+          activityTo: "2026-06-30",
+          latestSnapshotAsOf: "2026-06-30",
+          balanceDates: ["2026-06-30", "2026-05-31"],
+          latestBalanceHoldsSecurities: true,
+        }),
+        // Statements current, holdings not recorded since last year.
+        record({
+          account: account({ accountId: "c", displayLabel: "Behind" }),
+          activityTo: "2026-08-31",
+          latestSnapshotAsOf: "2025-09-30",
+          balanceDates: ["2026-08-31", "2026-07-31"],
+          latestBalanceHoldsSecurities: true,
+        }),
+        // Quarterly and current: not counted.
+        record({
+          account: account({ accountId: "d", displayLabel: "Quarterly" }),
+          activityTo: "2026-06-30",
+          latestSnapshotAsOf: "2026-06-30",
+          balanceDates: [
+            "2026-06-30",
+            "2026-03-31",
+            "2025-12-31",
+            "2025-09-30",
+          ],
+          latestBalanceHoldsSecurities: true,
+        }),
+      ],
+      NOW,
+    );
+    expect(group!.status).toBe("stale");
+    expect(group!.statusDetail).toMatch(
+      /^2 stale \(1 statement overdue, 1 holdings behind\), oldest Behind/,
+    );
+    expect(group!.latestBalanceAsOf).toBe("2026-08-31");
+    expect(group!.cadence).toBeNull();
+    expect(group!.freshnessReason).toBeNull();
+  });
+
+  test("a fresh group says how many accounts are current and how many are quiet", () => {
+    const [group] = groupInstitutions(
+      [
+        record(),
+        record({
+          account: account({ accountId: "b" }),
+          activityTo: "2022-12-31",
+          latestSnapshotAsOf: "2022-10-31",
+        }),
+      ],
+      NOW,
+    );
+    expect(group!.status).toBe("fresh");
+    expect(group!.statusDetail).toBe("1 current, 1 inactive");
+  });
+
+  test("a quarterly account's quarter-end value does not make the total stale", () => {
+    const [group] = groupInstitutions(
+      [
+        record({
+          currentValue: {
+            value: { decimal: "10", currency: "USD" },
+            asOf: "2026-08-31",
+            source: "balance",
+          },
+        }),
+        record({
+          account: account({ accountId: "b" }),
+          activityTo: "2026-06-30",
+          latestSnapshotAsOf: "2026-06-30",
+          balanceDates: [
+            "2026-06-30",
+            "2026-03-31",
+            "2025-12-31",
+            "2025-09-30",
+          ],
+          latestBalanceHoldsSecurities: true,
+          // The latest balance states no total, so the value is the older
+          // quarter's.
+          currentValue: {
+            value: { decimal: "20", currency: "USD" },
+            asOf: "2026-03-31",
+            source: "balance",
+          },
+        }),
+      ],
+      NOW,
+    );
+    // 171 days old: past a monthly account's 100, inside a quarterly one's.
+    expect(group!.children![1]!.cadence).toBe("quarterly");
+    expect(group!.children![1]!.currentValueStale).toBe(false);
+    expect(group!.currentValue).toBe(30);
+    expect(group!.currentValueAsOf).toBe("2026-03-31");
+    expect(group!.currentValueStale).toBe(false);
   });
 
   test("an institution the archive holds nothing for is a row, not an omission", () => {

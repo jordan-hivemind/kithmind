@@ -13,28 +13,21 @@
 
 import type { FinanceAccountInventoryRecord } from "@repo/finance-contract";
 
+import {
+  accountFreshness,
+  type FreshnessReason,
+  type FreshnessStatus,
+  type StatementCadence,
+  valueIsStale,
+} from "@/lib/kith/account-freshness";
 import { mergeFinanceAccountOverride } from "@/lib/kith/finance-account-overrides";
 
 /**
  * What a statement archive can be: holding nothing, gone quiet (closed or
- * dormant, nothing to file), live but behind on statements, or current.
+ * dormant, nothing to file), live but behind on statements or holdings, or
+ * current. The rule is `accountFreshness` in `account-freshness.ts`.
  */
-export type InstitutionStatus = "fresh" | "stale" | "inactive" | "empty";
-
-/**
- * A statement is filed monthly or quarterly, so an archive whose latest
- * snapshot is a quarter old is missing a statement rather than merely waiting
- * for one. Same threshold the health screen's finance check uses for
- * `attention`, and deliberately the same number in both places.
- */
-const STALE_AFTER_DAYS = 45;
-/**
- * An account with no activity of any kind for this long is not waiting on a
- * statement, it has stopped. A quarter plus a month's lag, and the same number
- * the health screen uses for a statement that was never filed.
- */
-const INACTIVE_AFTER_DAYS = 100;
-const DAY = 24 * 60 * 60 * 1000;
+export type InstitutionStatus = FreshnessStatus;
 
 /** The owner's own values for an account, from `kith.finance_account_overrides`. */
 export type AccountOverrideValues = {
@@ -65,6 +58,17 @@ export type InstitutionRow = {
   activityFrom: string | null;
   activityTo: string | null;
   latestSnapshotAsOf: string | null;
+  /** The account's latest statement balance date. Never merged with
+   * `latestSnapshotAsOf`: a balance says a statement arrived, a snapshot says
+   * its holdings were recorded. On a group, the latest of its accounts'. */
+  latestBalanceAsOf: string | null;
+  /** The statement cadence the archive's balance dates show. Null on a group. */
+  cadence: StatementCadence | null;
+  /** Why the account has its status. Null on a group. */
+  freshnessReason: FreshnessReason | null;
+  /** When the next statement becomes overdue, an expectation and not data.
+   * Null when none is expected, and on a group. */
+  expectedBy: string | null;
   openReviews: number;
   /** The account's latest reported value in `currentValueCurrency`, dated
    * `currentValueAsOf`. On a group: the sum of its live accounts, and null
@@ -73,9 +77,9 @@ export type InstitutionRow = {
   currentValue: number | null;
   currentValueCurrency: string | null;
   currentValueAsOf: string | null;
-  /** The figure is older than the inactivity threshold, so the screen shows
-   * its date beside it and mutes it rather than letting it read as today's.
-   * See `valueIsStale`. */
+  /** The figure is older than the account's dormancy threshold for its
+   * cadence, so the screen shows its date beside it and mutes it rather than
+   * letting it read as today's. See `valueIsStale`. */
   currentValueStale: boolean;
   /** What the archive itself says, and the owner's override of it. On an
    * account row only: the edit panel shows the first as what clearing the
@@ -124,61 +128,6 @@ function last4Reason(
   return found === undefined ? null : LAST4_REASON[found.reason];
 }
 
-function ageDays(asOf: string | null, now: number): number | null {
-  if (asOf === null) return null;
-  return Math.floor(Math.max(now - Date.parse(`${asOf}T00:00:00Z`), 0) / DAY);
-}
-
-/**
- * Whether a reported value is too old to read as the account's value now.
- *
- * The same threshold that makes an account inactive, applied to the figure
- * rather than to the activity: an account can be perfectly fresh -- monthly
- * statements arriving, holdings updated last week -- while the only total the
- * archive will state for it is a balance from 2019. That number is correct and
- * it is not current, and `$900` shown in a live-looking row with the date
- * hidden in a tooltip reads as today's.
- *
- * Exactly the threshold is still current; a day past it is not. `null` is
- * nothing to judge, and there is no figure beside it either.
- */
-export function valueIsStale(
-  currentValueAsOf: string | null,
-  now: number,
-): boolean {
-  const age = ageDays(currentValueAsOf, now);
-  return age !== null && age > INACTIVE_AFTER_DAYS;
-}
-
-/** One row's tag, plus the age the tooltip explains it with. */
-export function freshness(
-  latestSnapshotAsOf: string | null,
-  hasContent: boolean,
-  now: number,
-  activityTo: string | null,
-  closed = false,
-): { status: InstitutionStatus; statusDetail: string | null } {
-  if (!hasContent) return { status: "empty", statusDetail: null };
-  if (closed) return { status: "inactive", statusDetail: "marked closed" };
-  const quiet = ageDays(activityTo, now);
-  if (quiet !== null && quiet > INACTIVE_AFTER_DAYS) {
-    return {
-      status: "inactive",
-      statusDetail: `no activity since ${activityTo}, ${quiet} days ago`,
-    };
-  }
-  const age = ageDays(latestSnapshotAsOf, now);
-  if (age === null) {
-    // Records but no snapshot: a cash account has balances and transactions
-    // and never a position. Not stale, and not something to flag.
-    return { status: "fresh", statusDetail: "no snapshot" };
-  }
-  return {
-    status: age > STALE_AFTER_DAYS ? "stale" : "fresh",
-    statusDetail: `latest holdings statement ${latestSnapshotAsOf}, ${age} days ago`,
-  };
-}
-
 function earlier(left: string | null, right: string | null): string | null {
   if (left === null) return right;
   if (right === null) return left;
@@ -220,6 +169,19 @@ export function groupInstitutions(
       shownAccount.ownerOverride?.displayName ??
       friendlyAccountName(record.account);
     const accountLast4 = shownAccount.accountLast4 ?? null;
+    const judged = accountFreshness(
+      {
+        hasContent,
+        closed: shownAccount.closed === true,
+        accountType: shownAccount.accountType ?? null,
+        activityTo: record.activityTo ?? null,
+        latestSnapshotAsOf: record.latestSnapshotAsOf ?? null,
+        balanceDates: record.balanceDates ?? [],
+        latestBalanceHoldsSecurities:
+          record.latestBalanceHoldsSecurities ?? null,
+      },
+      now,
+    );
     const child: InstitutionRow = {
       id: record.account.accountId,
       name: shownName,
@@ -239,7 +201,11 @@ export function groupInstitutions(
           : Number(record.currentValue.value.decimal),
       currentValueCurrency: record.currentValue?.value.currency ?? null,
       currentValueAsOf: record.currentValue?.asOf ?? null,
-      currentValueStale: valueIsStale(record.currentValue?.asOf ?? null, now),
+      currentValueStale: valueIsStale(
+        record.currentValue?.asOf ?? null,
+        now,
+        judged.cadence,
+      ),
       accountType: shownAccount.accountType ?? null,
       accounts: null,
       statements: record.statementCount,
@@ -247,14 +213,13 @@ export function groupInstitutions(
       activityFrom: record.activityFrom ?? null,
       activityTo: record.activityTo ?? null,
       latestSnapshotAsOf: record.latestSnapshotAsOf ?? null,
+      latestBalanceAsOf: record.balanceDates?.[0] ?? null,
+      cadence: judged.cadence,
+      freshnessReason: judged.reason,
+      expectedBy: judged.expectedBy,
       openReviews: record.openReviewCount,
-      ...freshness(
-        record.latestSnapshotAsOf ?? null,
-        hasContent,
-        now,
-        record.activityTo ?? null,
-        shownAccount.closed === true,
-      ),
+      status: judged.status,
+      statusDetail: judged.statusDetail,
     };
     const name = record.account.institutionName;
     const group = groups.get(name) ?? {
@@ -277,6 +242,10 @@ export function groupInstitutions(
       activityFrom: null,
       activityTo: null,
       latestSnapshotAsOf: null,
+      latestBalanceAsOf: null,
+      cadence: null,
+      freshnessReason: null,
+      expectedBy: null,
       openReviews: 0,
       status: "empty" as InstitutionStatus,
       statusDetail: null,
@@ -292,6 +261,10 @@ export function groupInstitutions(
       group.latestSnapshotAsOf,
       child.latestSnapshotAsOf,
     );
+    group.latestBalanceAsOf = later(
+      group.latestBalanceAsOf,
+      child.latestBalanceAsOf,
+    );
     group.children!.push(child);
     groups.set(name, group);
   }
@@ -299,7 +272,7 @@ export function groupInstitutions(
     .map((group) => ({
       ...group,
       ...groupFreshness(group),
-      ...groupValue(group, now),
+      ...groupValue(group),
     }))
     .sort((left, right) => left.name.localeCompare(right.name));
 }
@@ -314,27 +287,47 @@ export function groupInstitutions(
  * tag built on the latest would report the first and hide the second. The
  * tooltip names the account behind the tag.
  *
- * No `now` of its own: each child already carries the tag `freshness` gave it
- * against the same clock, so re-deriving here could only disagree with the row
- * beneath it.
+ * The stale accounts are counted by reason, because "statement overdue" and
+ * "holdings behind" call for different actions (fetch a statement, or repair
+ * what reads one), and a group that said only "2 stale" would hide which.
+ *
+ * No `now` of its own: each child already carries the tag `accountFreshness`
+ * gave it against the same clock, so re-deriving here could only disagree
+ * with the row beneath it.
  */
+const STALE_REASON_LABEL: Partial<Record<FreshnessReason, string>> = {
+  statement_overdue: "statement overdue",
+  holdings_behind: "holdings behind",
+  holdings_missing: "holdings missing",
+};
+
 function groupFreshness(group: InstitutionRow): {
   status: InstitutionStatus;
   statusDetail: string | null;
 } {
   const children = group.children ?? [];
+  const staleDate = (child: InstitutionRow) =>
+    child.freshnessReason === "statement_overdue"
+      ? (child.latestBalanceAsOf ?? "")
+      : (child.latestSnapshotAsOf ?? "");
   const stale = children
     .filter((child) => child.status === "stale")
-    .sort((left, right) =>
-      (left.latestSnapshotAsOf ?? "").localeCompare(
-        right.latestSnapshotAsOf ?? "",
-      ),
-    );
+    .sort((left, right) => staleDate(left).localeCompare(staleDate(right)));
   if (stale.length > 0) {
+    // Always in the label table's order, so the same accounts read the same.
+    const breakdown = Object.entries(STALE_REASON_LABEL)
+      .map(([reason, label]) => {
+        const count = stale.filter(
+          (child) => child.freshnessReason === reason,
+        ).length;
+        return count === 0 ? null : `${count} ${label}`;
+      })
+      .filter((part) => part !== null)
+      .join(", ");
     const oldest = stale[0]!;
     return {
       status: "stale",
-      statusDetail: `${stale.length} stale, oldest ${oldest.name} (${
+      statusDetail: `${stale.length} stale (${breakdown}), oldest ${oldest.name} (${
         oldest.statusDetail ?? ""
       })`,
     };
@@ -345,12 +338,11 @@ function groupFreshness(group: InstitutionRow): {
   if (children.every((child) => child.status !== "fresh")) {
     return { status: "inactive", statusDetail: "no recent activity" };
   }
+  const fresh = children.filter((child) => child.status === "fresh").length;
+  const quiet = children.filter((child) => child.status === "inactive").length;
   return {
     status: "fresh",
-    statusDetail:
-      group.latestSnapshotAsOf === null
-        ? "no snapshot"
-        : `latest snapshot ${group.latestSnapshotAsOf}`,
+    statusDetail: `${fresh} current${quiet > 0 ? `, ${quiet} inactive` : ""}`,
   };
 }
 
@@ -392,12 +384,11 @@ const NO_VALUE = {
  * The date is the OLDEST component's, never the newest. A total dated by its
  * newest part claims every other part was still true that day. The oldest is
  * the honest answer: no part of this figure is older than this. The total is
- * judged stale by that same oldest date.
+ * stale when any part of it is stale, each part judged against its own
+ * account's cadence: a quarterly account's quarter-end figure is not stale on
+ * the day a monthly one's would be.
  */
-function groupValue(
-  group: InstitutionRow,
-  now: number,
-): {
+function groupValue(group: InstitutionRow): {
   currentValue: number | null;
   currentValueCurrency: string | null;
   currentValueAsOf: string | null;
@@ -429,6 +420,6 @@ function groupValue(
     currentValue: live.reduce((sum, child) => sum + child.currentValue!, 0),
     currentValueCurrency: live[0]!.currentValueCurrency,
     currentValueAsOf: asOf,
-    currentValueStale: valueIsStale(asOf, now),
+    currentValueStale: live.some((child) => child.currentValueStale),
   };
 }
