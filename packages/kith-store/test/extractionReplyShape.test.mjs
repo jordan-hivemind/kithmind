@@ -23,6 +23,7 @@ import {
 } from "../dist/index.js";
 import {
   EXTRACTION_REPLY_UNREADABLE,
+  STARTER_DOCUMENT_TYPES,
   buildRequest,
   extractionSchema,
   parseModelReading,
@@ -68,6 +69,19 @@ const INVOICE = [
   "  45.00",
   "Subtotal $165.00",
   "Amount due $165.00",
+].join("\n");
+
+const MEMBERSHIP_DUES = [
+  "Juniper Circle Membership Agreement",
+  "Annual dues: $1,600.00",
+  "Membership provides events, introductions, and community access.",
+  "Juniper Circle is not an investment fund and acquires no ownership interest.",
+].join("\n");
+
+const LLC_EQUITY_MEMBERSHIP = [
+  "Northstar Workshop LLC Membership Interest Purchase Agreement",
+  "The investor purchases 20 membership units for a $25,000.00 capital contribution.",
+  "The units carry the member's economic share of profits and losses.",
 ].join("\n");
 
 /** The shape the prompt and the schema both ask for. */
@@ -189,6 +203,65 @@ function fakeModel(reading) {
     },
   };
 }
+
+function classificationPrompt(text) {
+  const lines = text.split("\n").map((line, index) => ({
+    id: index + 1,
+    text: line,
+    start: 0,
+    end: line.length,
+    cutStart: false,
+    cutEnd: false,
+  }));
+  const page = { id: "synthetic-page", ordinal: 0, shown: 1, text, lines };
+  const types = STARTER_DOCUMENT_TYPES.map((type, index) => ({
+    ...type,
+    id: `synthetic-type-${index}`,
+    version: 1,
+    model: null,
+    dateOrder: null,
+    maxPages: null,
+    maxChars: null,
+    fields: type.fields.map((field) => ({
+      ...field,
+      required: field.required === true,
+      check: field.check ?? null,
+      example: field.example ?? null,
+    })),
+  }));
+  return buildRequest({
+    spaceId: "synthetic-space",
+    userId: "synthetic-user",
+    sourceAccountId: "synthetic-account",
+    sourceItemId: "synthetic-item",
+    sourceRevisionId: "synthetic-revision",
+    sourceTextVersionId: "synthetic-text-version",
+    processingGenerationId: "synthetic-generation",
+    pages: [page],
+    pagesTotal: 1,
+    pagesWithText: 1,
+    allWithText: [page],
+    types,
+    ownerKind: null,
+    priorKind: null,
+  }).prompt;
+}
+
+test("investment classification separates membership dues from LLC equity", { skip: false }, () => {
+  const duesPrompt = classificationPrompt(MEMBERSHIP_DUES);
+  const equityPrompt = classificationPrompt(LLC_EQUITY_MEMBERSHIP);
+
+  for (const prompt of [duesPrompt, equityPrompt]) {
+    assert.match(prompt, /operative legal effect, not its title/i);
+    assert.match(prompt, /LLC and partnership membership or subscription agreements count/i);
+    assert.match(prompt, /dues or fees for access, services, an association/i);
+    assert.match(prompt, /conveys no security or ownership interest/i);
+  }
+  assert.match(duesPrompt, /Annual dues: \$1,600\.00/);
+  assert.match(duesPrompt, /not an investment fund/);
+  assert.match(equityPrompt, /purchases 20 membership units/);
+  assert.match(equityPrompt, /economic share of profits and losses/);
+});
 
 async function fixture(t) {
   const database = await identityDatabase(t);

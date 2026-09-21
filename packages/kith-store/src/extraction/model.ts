@@ -801,6 +801,7 @@ Reply with JSON only, in exactly this shape:
     "lines": [<line number>]}]}
 
 Rules:${classificationRule}
+- Choose a kind from what the document itself does, not its title, folder, or general topic. A document that merely relates to an investment is not an investment agreement unless it creates or acquires an investment commitment, security, or ownership interest.
 - Every statement names a field in "field". Never leave it out, never rename it, and never use the field name as a key of its own.
 - "lines" holds one to three line numbers from the page named in "page". Cite the line that prints the value. You may also cite the line that prints its label, even if it is far away; they do not need to be next to each other.
 - Only use fields listed under the kind you chose. Omit a field the document does not state: leave it out entirely rather than returning an empty string, a null or a blank.
