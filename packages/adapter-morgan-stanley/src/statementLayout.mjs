@@ -1567,6 +1567,11 @@ function parseHoldings(
     nextHeaderIndex = null,
   ) => {
     if (carried === null) return;
+    const independentlyComplete =
+      positionFromBlock(carried.block, carried.columns, {
+        ...carried.context,
+        allowLotAggregation: false,
+      }).position !== null;
     if (nextMarker !== null && nextAccountKey !== carried.context.accountKey) {
       carried.table.end = lineSpanLocator(
         lines[nextMarker],
@@ -1574,16 +1579,25 @@ function parseHoldings(
         "holdings table account boundary",
         textMeta,
       );
+      const contiguousGlobalRun =
+        nextHeaderIndex !== null &&
+        continuesOnAdjacentPrintedPage(
+          carried,
+          lines[nextHeaderIndex],
+          printedByPage,
+          populatedPages,
+        );
+      // A new account's own Page 1 can start a valid local run, but it cannot
+      // prove that the prior account's declared successor page was retained.
+      // A final declaration or a contiguous global run can.
+      if (!carried.finalPageFooter && !contiguousGlobalRun) {
+        carried.table.gapCodes.add("page_sequence_gap");
+      }
     } else if (nextHeaderIndex !== null) {
       // A different recognized table header closes a complete preceding
       // security block even when a leading page declaration caused the old
       // row parser to carry it until seeing this header. This affects proof
       // bounds only; `emit` below is the same established row path.
-      const independentlyComplete =
-        positionFromBlock(carried.block, carried.columns, {
-          ...carried.context,
-          allowLotAggregation: false,
-        }).position !== null;
       if (independentlyComplete) {
         carried.table.end = lineSpanLocator(
           lines[nextHeaderIndex],
@@ -1712,8 +1726,6 @@ function parseHoldings(
       if (TABLE_END.test(trimmed) || HOLDINGS_HEADER.test(text)) {
         terminalIndex = j;
         interruptedByPageFooter = PAGE_FOOTER.test(trimmed);
-        const footer = /^Page\s+(\d+)\s+of\s+(\d+)$/.exec(trimmed);
-        finalPageFooter = footer !== null && footer[1] === footer[2];
         break;
       }
       if (ASSET_CLASS.test(trimmed)) continue;
@@ -1752,6 +1764,11 @@ function parseHoldings(
     }
     if (terminalIndex !== null) table.lastLineIndex = terminalIndex;
     if (interruptedByPageFooter) {
+      const contentPageDeclaration = printedByPage.get(lines[i].page);
+      finalPageFooter =
+        contentPageDeclaration !== null &&
+        contentPageDeclaration !== undefined &&
+        contentPageDeclaration.number === contentPageDeclaration.total;
       carried = {
         block,
         description,

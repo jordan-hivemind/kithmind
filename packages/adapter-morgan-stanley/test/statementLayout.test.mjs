@@ -1099,6 +1099,41 @@ test("a consolidated statement proves each account position scope from bounded t
   }
 });
 
+test("a new account page-one reset cannot hide the prior account's missing page", () => {
+  const [firstPage, secondPage] = CONSOLIDATED_LAYOUT_TEXT.split(
+    `\n${PAGE_SEPARATOR}\n`,
+  );
+  const text = `${firstPage}\n${PAGE_SEPARATOR}\n${secondPage.replace(
+    "Page 2 of 2",
+    "Page 1 of 1",
+  )}`;
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(
+    parsed.holdings.positions.length,
+    2,
+    "scope proof does not alter established row emission",
+  );
+  assert.deepEqual(
+    parsed.holdings.positionScopes.map((scope) => ({
+      accountExternalKey: scope.accountExternalKey,
+      status: scope.status,
+      gapCodes: scope.gapCodes,
+    })),
+    [
+      {
+        accountExternalKey: CONSOLIDATED_ACCOUNT_ONE,
+        status: "partial",
+        gapCodes: ["page_sequence_gap"],
+      },
+      {
+        accountExternalKey: CONSOLIDATED_ACCOUNT_TWO,
+        status: "complete",
+        gapCodes: [],
+      },
+    ],
+  );
+});
+
 test("one consolidated account can be complete while another has a zero-emitted typed gap", () => {
   const [firstPage, originalSecondPage] = CONSOLIDATED_LAYOUT_TEXT.split(
     `\n${PAGE_SEPARATOR}\n`,
