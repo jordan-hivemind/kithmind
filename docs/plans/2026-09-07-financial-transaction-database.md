@@ -487,6 +487,24 @@ use `NO_DEFAULT_SELECT`, so rollout applies the migration as the archive owner,
 then grants the existing finance reader `SELECT` on those three tables without
 rotating its password. Historical position, balance and liability evidence is
 verified through the reader credential before any correction is activated.
+The adapter contract can additionally return optional positive position-scope
+observations for later persistence. A scope names the exact document-local
+account and statement date, emitted position count, closed parser-gap codes and
+retained-text evidence for each table header and end. Complete status requires
+a positively bounded account section, every observed table accounted for and
+an anchored continuous printed-page run. A complete zero-position scope also
+requires the statement's own explicit assertion that the account holds none;
+no rows and no rejected blocks are never enough. Consolidated tables before an
+account marker produce no account scope. Older adapters and documents omit the
+optional field and keep the conservative document-wide behavior above. Until
+the account-scope persistence migration and reader integration land, these
+adapter observations do not relax `documents.parsed_ok` or any read gate.
+Adding or tightening this metadata must preserve the adapter's emitted
+holdings unless a separate parser defect and its intended correction are
+demonstrated. Regression fixtures cover printed page declarations at both the
+bottom of the preceding physical page and the top of the following page, and
+assert the same semantic holdings output rather than relying only on passing
+fixture counts.
 
 Coverage is reported at the same granularity as the record contract requires,
 so the later Kith Mind adapter wraps this surface rather than re-deriving it.
