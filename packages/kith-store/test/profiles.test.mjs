@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import * as memory from "../dist/memory/index.js";
-import { newKithId } from "../dist/index.js";
+import { coverage, newKithId } from "../dist/index.js";
 import { webPrincipal } from "../dist/identity/index.js";
 import {
   identityDatabase,
@@ -539,6 +539,162 @@ test(
         [finalTarget.id, finalTarget.id],
         "repeat merges flatten old IDs to the final survivor",
       );
+    });
+  },
+);
+
+test(
+  "entity merge preserves coverage occurrences and accepts repeated detection through old IDs",
+  { skip },
+  async (t) => {
+    const db = await identityDatabase(t);
+    await db.tx(async (ctx) => {
+      const userId = await makeUser(ctx);
+      const spaceId = await makeSpace(ctx, {
+        createdBy: userId,
+        role: "owner",
+      });
+      const principal = webPrincipal(userId);
+      const source = await memory.createNamedEntity(ctx, {
+        principal,
+        spaceId,
+        kind: "person",
+        name: "Alex One",
+      });
+      const target = await memory.createNamedEntity(ctx, {
+        principal,
+        spaceId,
+        kind: "person",
+        name: "Alex Two",
+      });
+      const accountId = newKithId();
+      await ctx.client.query(
+        "INSERT INTO kith.source_accounts(id,space_id,created_at,name,connector,account_id,enabled,freshness_ms) VALUES($1,$2,transaction_timestamp(),'Synthetic','filesystem','synthetic',true,1000)",
+        [accountId, spaceId],
+      );
+      const input = {
+        spaceId,
+        sourceAccountId: accountId,
+        recordType: "lab",
+        from: 0,
+        to: 100,
+        reason: "missing_period",
+        detectedAt: ctx.now - 10,
+      };
+      const oldGap = await coverage.openCoverageGap(ctx, {
+        ...input,
+        entityId: source.entity.id,
+      });
+      await coverage.acknowledgeCoverageGap(ctx, {
+        principal,
+        gapId: oldGap,
+        action: "mark_unavailable",
+      });
+      const a = await coverage.openCoverageGap(ctx, {
+        ...input,
+        entityId: source.entity.id,
+      });
+      const b = await coverage.openCoverageGap(ctx, {
+        ...input,
+        entityId: target.entity.id,
+      });
+      const window = {
+        spaceId,
+        sourceAccountId: accountId,
+        recordType: "lab",
+        from: 0,
+        to: 100,
+        state: "partial",
+        lastEnumeratedAt: ctx.now,
+        lastProcessedAt: ctx.now,
+        discoveredCount: 2,
+        indexedCount: 1,
+        skippedCount: 1,
+      };
+      const w1 = await coverage.upsertCoverageWindow(ctx, {
+        ...window,
+        entityId: source.entity.id,
+      });
+      const w2 = await coverage.upsertCoverageWindow(ctx, {
+        ...window,
+        entityId: target.entity.id,
+      });
+      await memory.mergeEntities(ctx, {
+        principal,
+        sourceEntityId: source.entity.id,
+        targetEntityId: target.entity.id,
+      });
+      const gaps = await ctx.client.query(
+        "SELECT id, entity_id, status, condition_key FROM kith.coverage_gaps WHERE space_id=$1",
+        [spaceId],
+      );
+      assert.equal(gaps.rowCount, 3);
+      assert.ok(gaps.rows.every((gap) => gap.entity_id === target.entity.id));
+      assert.equal(gaps.rows.filter((gap) => gap.status === "open").length, 2);
+      assert.equal(
+        new Set(
+          gaps.rows
+            .filter((gap) => gap.status === "open")
+            .map((gap) => gap.condition_key),
+        ).size,
+        2,
+      );
+      const actions = await ctx.client.query(
+        "SELECT coverage_gap_id, action FROM kith.coverage_gap_actions WHERE space_id=$1",
+        [spaceId],
+      );
+      assert.deepEqual(actions.rows, [
+        { coverage_gap_id: oldGap, action: "mark_unavailable" },
+      ]);
+      const detected = await coverage.openCoverageGap(ctx, {
+        ...input,
+        entityId: source.entity.id,
+        detectedAt: ctx.now,
+      });
+      assert.ok([a, b].includes(detected));
+      assert.equal(
+        await coverage.openCoverageGap(ctx, {
+          ...input,
+          entityId: target.entity.id,
+          detectedAt: ctx.now,
+        }),
+        detected,
+      );
+      await coverage.upsertCoverageWindow(ctx, {
+        ...window,
+        entityId: source.entity.id,
+        state: "complete",
+        indexedCount: 2,
+        skippedCount: 0,
+      });
+      const windows = await ctx.client.query(
+        "SELECT id, state FROM kith.coverage_windows WHERE space_id=$1 ORDER BY id",
+        [spaceId],
+      );
+      assert.deepEqual(
+        windows.rows.map((row) => row.id),
+        [w1, w2].sort(),
+      );
+      assert.ok(windows.rows.every((row) => row.state === "complete"));
+      const args = {
+        spaceId,
+        sourceAccountIds: [accountId],
+        recordType: "lab",
+        from: 0,
+        to: 100,
+        now: ctx.now,
+        snapshotAt: ctx.now,
+      };
+      const throughOld = await coverage.calculateCoverage(ctx, {
+        ...args,
+        entityId: source.entity.id,
+      });
+      const throughNew = await coverage.calculateCoverage(ctx, {
+        ...args,
+        entityId: target.entity.id,
+      });
+      assert.deepEqual(throughOld, throughNew);
+      assert.equal(throughOld.knownGaps.length, 2);
     });
   },
 );

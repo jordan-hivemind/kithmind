@@ -1,3 +1,4 @@
+import { repointCoverageEntity } from "../coverage/model.js";
 import {
   type Principal,
   requireSpaceAccess,
@@ -1106,9 +1107,11 @@ export async function mergeEntities(
     "coverageWindows",
     "UPDATE kith.coverage_windows SET entity_id = $1 WHERE entity_id = $2 AND space_id = $3",
   );
-  await repoint(
-    "coverageGaps",
-    "UPDATE kith.coverage_gaps SET entity_id = $1 WHERE entity_id = $2 AND space_id = $3",
+  repointed.coverageGaps = await repointCoverageEntity(
+    ctx,
+    source.space_id,
+    sourceId,
+    targetId,
   );
   await repoint(
     "factSubjects",

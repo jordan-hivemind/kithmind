@@ -10,6 +10,7 @@ import {
 import type { IdentityCtx } from "../identity/db.js";
 import { IdentityError } from "../identity/errors.js";
 import { assertKithId, newKithId } from "../ids.js";
+import { getEntity } from "../memory/entities.js";
 import { spacePredicate } from "../spaces.js";
 
 const MAX_ACCOUNTS = 32;
@@ -134,6 +135,38 @@ function covered(r: CoverageRange, windows: CoverageRange[]) {
   }
   return false;
 }
+async function canonicalEntityId(ctx: Ctx, spaceId: string, entityId?: string) {
+  if (entityId === undefined) return undefined;
+  const entity = await getEntity(ctx, entityId);
+  if (!entity || entity.spaceId !== spaceId)
+    throw new Error("Entity not found");
+  return entity.id;
+}
+
+/** Called inside the authorized entity-merge transaction. Retain every gap
+ * occurrence and its actions, including unresolved duplicates. A suffix keeps
+ * formerly distinct open occurrences collision-free, as for legacy duplicates.
+ * Detection uses the condition's fields, not a particular occurrence's key. */
+export async function repointCoverageEntity(
+  ctx: Ctx,
+  spaceId: string,
+  sourceId: string,
+  targetId: string,
+): Promise<number> {
+  const result = await ctx.client.query(
+    `UPDATE kith.coverage_gaps
+        SET entity_id = $1::text,
+            condition_key = md5(concat_ws(E'\\x1f', source_account_id::text,
+              record_type, $1::text,
+              coalesce((extract(epoch FROM "from") * 1000)::bigint::text, ''),
+              coalesce((extract(epoch FROM "to") * 1000)::bigint::text, ''), reason))
+              || CASE WHEN status = 'open' THEN ':entity-merge:' || id::text ELSE '' END
+      WHERE entity_id = $2 AND space_id = $3`,
+    [targetId, sourceId, spaceId],
+  );
+  return result.rowCount ?? 0;
+}
+
 async function parent(
   ctx: Ctx,
   spaceId: string,
@@ -176,6 +209,7 @@ export async function upsertCoverageWindow(
   ctx: Ctx,
   f: CoverageWindowInput,
 ): Promise<string> {
+  f = { ...f, entityId: await canonicalEntityId(ctx, f.spaceId, f.entityId) };
   await parent(ctx, f.spaceId, f.sourceAccountId, f.entityId);
   const rt = recordType(f.recordType);
   if (!(["complete", "partial", "unknown"] as const).includes(f.state))
@@ -216,12 +250,10 @@ export async function upsertCoverageWindow(
     ].join("\u001f"),
   ]);
   const existing = await ctx.client.query<QueryResultRow>(
-    'SELECT id,space_id FROM kith.coverage_windows WHERE source_account_id=$1 AND record_type=$2 AND entity_id IS NOT DISTINCT FROM $3 AND "from"=$4 AND "to"=$5 LIMIT 2',
+    'SELECT id,space_id FROM kith.coverage_windows WHERE source_account_id=$1 AND record_type=$2 AND entity_id IS NOT DISTINCT FROM $3 AND "from"=$4 AND "to"=$5 ORDER BY id',
     [f.sourceAccountId, rt, f.entityId ?? null, date(f.from), date(f.to)],
   );
-  if (existing.rows.length > 1)
-    throw new Error("Duplicate coverage window identity");
-  if (existing.rows[0] && existing.rows[0].space_id !== f.spaceId)
+  if (existing.rows.some((row) => row.space_id !== f.spaceId))
     throw new Error("Coverage window identity is corrupt");
   const id = existing.rows[0]?.id ?? newKithId();
   await ctx.client.query(
@@ -242,12 +274,32 @@ export async function upsertCoverageWindow(
       f.skippedCount,
     ],
   );
+  if (existing.rows.length > 1) {
+    // A merge can bring two retained window IDs onto one identity. Refresh
+    // both so an obsolete partial window cannot keep the profile incomplete.
+    await ctx.client.query(
+      `UPDATE kith.coverage_windows SET state=$3, last_enumerated_at=$4,
+         last_processed_at=$5, discovered_count=$6, indexed_count=$7, skipped_count=$8
+       WHERE id = ANY($1::text[]) AND space_id=$2`,
+      [
+        existing.rows.slice(1).map((row) => row.id),
+        f.spaceId,
+        f.state,
+        date(f.lastEnumeratedAt),
+        date(f.lastProcessedAt),
+        f.discoveredCount,
+        f.indexedCount,
+        f.skippedCount,
+      ],
+    );
+  }
   return id;
 }
 export async function openCoverageGap(
   ctx: Ctx,
   f: CoverageGapInput,
 ): Promise<string> {
+  f = { ...f, entityId: await canonicalEntityId(ctx, f.spaceId, f.entityId) };
   await parent(ctx, f.spaceId, f.sourceAccountId, f.entityId);
   const rt = recordType(f.recordType);
   if ((f.from === undefined) !== (f.to === undefined))
@@ -268,7 +320,7 @@ export async function openCoverageGap(
         AND "from" IS NOT DISTINCT FROM $5
         AND "to" IS NOT DISTINCT FROM $6
         AND reason = $7 AND status = 'open'
-      ORDER BY detected_at DESC, id DESC LIMIT 2`,
+      ORDER BY detected_at DESC, id DESC LIMIT 1`,
     [
       f.spaceId,
       f.sourceAccountId,
@@ -279,8 +331,8 @@ export async function openCoverageGap(
       reason,
     ],
   );
-  if (existing.rows.length > 1)
-    throw new Error("Duplicate open coverage gap condition");
+  // Legacy imports and explicit entity merges may retain duplicate occurrences.
+  // Refresh one deterministically without clearing the others or creating more.
   if (existing.rows[0]) {
     await ctx.client.query(
       `UPDATE kith.coverage_gaps
@@ -505,6 +557,10 @@ export async function calculateCoverage(
     snapshotAt: number;
   },
 ): Promise<QueryCoverage> {
+  args = {
+    ...args,
+    entityId: await canonicalEntityId(ctx, args.spaceId, args.entityId),
+  };
   range(args.from, args.to);
   const rt = recordType(args.recordType);
   finite(args.now, "now");
