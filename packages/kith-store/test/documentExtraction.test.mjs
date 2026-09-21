@@ -33,6 +33,7 @@ import {
   scheduleReextraction,
   seedDocumentTypes,
   setDocumentClassification,
+  upgradeInvestmentAgreementClassification,
 } from "../dist/extraction/index.js";
 import { executeRecordQuery } from "../dist/records/index.js";
 import { workerCtx } from "../dist/workers/index.js";
@@ -296,6 +297,114 @@ test("the seed is idempotent and never walks back an edited kind", { skip }, asy
     [1, 2],
   );
   assert.equal(versions[1].guidance, "Edited guidance");
+});
+
+test("the investment classifier upgrade versions shipped guidance only", { skip }, async (t) => {
+  const f = await fixture(t);
+  await f.seed();
+  await f.client.query(
+    `UPDATE kith.document_types
+        SET description = $3, guidance = $4,
+            examples = '[{"model":"synthetic-specialist"}]'::jsonb
+      WHERE space_id = $1 AND kind = $2 AND version = 1`,
+    [
+      f.spaceId,
+      "investment_agreement",
+      "A subscription agreement, SAFE, or convertible note for an investment.",
+      "An agreement to invest in a company. Read the parties, the date it was signed, the amount committed, and the instrument terms if they are stated.",
+    ],
+  );
+
+  const dryRun = await f.run(NOW + 1_000, (ctx) =>
+    upgradeInvestmentAgreementClassification(ctx, {
+      spaceId: f.spaceId,
+      apply: false,
+    }),
+  );
+  assert.deepEqual(dryRun, {
+    kind: "investment_agreement",
+    status: "eligible",
+    fromVersion: 1,
+    toVersion: 2,
+  });
+  assert.equal((await f.rows(
+    `SELECT count(*)::int AS count FROM kith.document_types
+      WHERE space_id = $1 AND kind = 'investment_agreement'`,
+    [f.spaceId],
+  ))[0].count, 1);
+
+  const applied = await f.run(NOW + 2_000, (ctx) =>
+    upgradeInvestmentAgreementClassification(ctx, {
+      spaceId: f.spaceId,
+      apply: true,
+    }),
+  );
+  assert.deepEqual(applied, {
+    kind: "investment_agreement",
+    status: "applied",
+    fromVersion: 1,
+    toVersion: 2,
+  });
+  const versions = await f.rows(
+    `SELECT id, version, description, guidance, examples
+       FROM kith.document_types
+      WHERE space_id = $1 AND kind = 'investment_agreement'
+      ORDER BY version`,
+    [f.spaceId],
+  );
+  assert.equal(versions.length, 2);
+  assert.match(versions[1].description, /LP or LLC membership interest/);
+  assert.match(versions[1].guidance, /dues or fees for access/i);
+  assert.deepEqual(versions[1].examples, [{ model: "synthetic-specialist" }]);
+  const fieldCounts = await f.rows(
+    `SELECT document_type_id, count(*)::int AS count
+       FROM kith.document_type_fields
+      WHERE space_id = $1 AND document_type_id = ANY($2::kith.kith_id[])
+      GROUP BY document_type_id ORDER BY document_type_id`,
+    [f.spaceId, versions.map((version) => version.id)],
+  );
+  assert.equal(fieldCounts.length, 2);
+  assert.equal(fieldCounts[0].count, fieldCounts[1].count);
+
+  const again = await f.run(NOW + 3_000, (ctx) =>
+    upgradeInvestmentAgreementClassification(ctx, {
+      spaceId: f.spaceId,
+      apply: true,
+    }),
+  );
+  assert.deepEqual(again, {
+    kind: "investment_agreement",
+    status: "current",
+    fromVersion: 2,
+    toVersion: 2,
+  });
+});
+
+test("the investment classifier upgrade preserves owner guidance", { skip }, async (t) => {
+  const f = await fixture(t);
+  await f.seed();
+  await f.client.query(
+    `UPDATE kith.document_types SET guidance = 'Owner classifier guidance'
+      WHERE space_id = $1 AND kind = 'investment_agreement'`,
+    [f.spaceId],
+  );
+  const result = await f.run(NOW + 1_000, (ctx) =>
+    upgradeInvestmentAgreementClassification(ctx, {
+      spaceId: f.spaceId,
+      apply: true,
+    }),
+  );
+  assert.deepEqual(result, {
+    kind: "investment_agreement",
+    status: "customized",
+    fromVersion: 1,
+    toVersion: null,
+  });
+  assert.equal((await f.rows(
+    `SELECT count(*)::int AS count FROM kith.document_types
+      WHERE space_id = $1 AND kind = 'investment_agreement'`,
+    [f.spaceId],
+  ))[0].count, 1);
 });
 
 test("activation schedules extraction in the publication's own transaction", { skip }, async (t) => {
@@ -825,6 +934,109 @@ test("a human correction outlives re-extraction and wins the read", { skip }, as
   assert.deepEqual(vendor.value, { type: "text", value: "Acme Hardware LLC" });
   // The model's newer reading is kept beside the fix, not instead of it.
   assert.deepEqual(vendor.originalValue, { type: "text", value: "Acme Hardware" });
+});
+
+test("a correction stays historical outside the document's current kind", { skip }, async (t) => {
+  const f = await fixture(t);
+  await f.seed();
+  const ingested = await f.ingest();
+  await f.extract(
+    stubModel(goodReading()),
+    ingested.sourceItemId,
+    ingested.generationId,
+  );
+  await withKithTransaction(f.pool, (client) =>
+    applyCorrection(client, {
+      spaceId: f.spaceId,
+      sourceItemId: ingested.sourceItemId,
+      fieldName: "total",
+      correctedValue: { type: "money", amount: "16.50", currency: "USD" },
+      actorUserId: f.userId,
+      reason: "corrected total",
+      now: NOW + 3_000,
+    }),
+  );
+
+  await f.run(NOW + 4_000, (ctx) =>
+    setDocumentClassification(ctx, {
+      principal: f.principal,
+      spaceId: f.spaceId,
+      sourceItemId: ingested.sourceItemId,
+      kind: "letter_or_notice",
+    }),
+  );
+  await f.extract(
+    stubModel({
+      kind: "letter_or_notice",
+      summary: "A notice from Acme Hardware.",
+      statements: [
+        {
+          field: "sender",
+          value: "Acme Hardware",
+          page: 1,
+          quote: "Acme Hardware",
+        },
+        {
+          field: "letter_date",
+          value: "2026-09-01",
+          page: 1,
+          quote: "Date: 2026-09-01",
+        },
+      ],
+    }),
+    ingested.sourceItemId,
+    ingested.generationId,
+    NOW + 5_000,
+  );
+
+  const afterReclassification = await f.rows(
+    `SELECT observation_type FROM kith.observations
+      WHERE space_id = $1 AND source_item_id = $2
+      ORDER BY observation_type`,
+    [f.spaceId, ingested.sourceItemId],
+  );
+  assert.deepEqual(
+    afterReclassification.map((row) => row.observation_type),
+    ["letter_date", "sender"],
+  );
+  const correction = (await f.rows(
+    `SELECT field_name, state, corrected_value FROM kith.corrections
+      WHERE space_id = $1 AND target_id = $2 AND field_name = 'total'`,
+    [f.spaceId, ingested.sourceItemId],
+  ))[0];
+  assert.deepEqual(correction, {
+    field_name: "total",
+    state: "resolved",
+    corrected_value: { type: "money", amount: "16.50", currency: "USD" },
+  });
+
+  // The owner correction was preserved as history. If the owner restores the
+  // compatible kind, it becomes current again after that extraction.
+  await f.run(NOW + 6_000, (ctx) =>
+    setDocumentClassification(ctx, {
+      principal: f.principal,
+      spaceId: f.spaceId,
+      sourceItemId: ingested.sourceItemId,
+      kind: "receipt",
+    }),
+  );
+  await f.extract(
+    stubModel(goodReading()),
+    ingested.sourceItemId,
+    ingested.generationId,
+    NOW + 7_000,
+  );
+  const restored = (await f.rows(
+    `SELECT value FROM kith.observations
+      WHERE space_id = $1 AND source_item_id = $2
+        AND observation_key = 'total'`,
+    [f.spaceId, ingested.sourceItemId],
+  ))[0];
+  assert.deepEqual(restored.value, {
+    type: "money",
+    amount: "16.5",
+    currency: "USD",
+  });
 });
 
 test("a kind added as a row is used with no code change", { skip }, async (t) => {

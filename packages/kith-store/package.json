@@ -77,6 +77,7 @@
     "kith-deferred-work": "./dist/deferred/cli.js",
     "kith-discovery-reset": "./dist/workers/cli.js",
     "kith-extraction-backfill": "./dist/extraction/cli.js",
+    "kith-extraction-classification-upgrade": "./dist/extraction/classificationUpgradeCli.js",
     "kith-extraction-diagnose": "./dist/extraction/diagnoseCli.js",
     "kith-extraction-span-cleanup": "./dist/extraction/spanCleanupCli.js",
     "kith-investment-link-backfill": "./dist/admin/investmentLinkCli.js",

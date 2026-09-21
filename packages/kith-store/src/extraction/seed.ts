@@ -92,7 +92,7 @@ export const STARTER_DOCUMENT_TYPES: readonly SeedDocumentType[] = [
     description:
       "A transaction instrument that commits capital or acquires stock, units, a SAFE, a note, an LP or LLC membership interest, or another security.",
     guidance:
-      "Classify by the document's operative legal effect, not its title. Use this kind only when the document itself creates an investment commitment or acquires equity, debt, or another security. LLC and partnership membership or subscription agreements count when they convey units, a membership interest, capital or profit rights, or other economic ownership. A membership that charges dues or fees for access, services, an association, a network, a community, or renewal benefits is not an investment agreement when it conveys no security or ownership interest. Read the parties, the date it was signed, the amount committed, and the instrument terms if they are stated.",
+      "Classify by operative legal effect, not title. Use when it creates an investment commitment or acquires equity, debt, or another security. LLC or partnership membership agreements count when they convey units or economic ownership. Dues or fees for access, services, association, community, or renewal do not count without a security or ownership interest. Read stated parties and terms.",
     fields: [
       required(org("company")),
       text("investor_as_written"),

@@ -2343,16 +2343,18 @@ async function store(
     sourceItemId: loaded.sourceItemId,
   });
 
-  // A human fix outlives this replace. The observations above are the model's
-  // newest reading of every field, including fields the owner has already
-  // corrected, so without this line a re-extraction silently reverts a
-  // correction on the exact-arithmetic side -- `latest_observation` and
-  // `sum_money` back to the model's number -- while `get_document` goes on
-  // showing the owner's. Re-applied inside the same transaction as the
+  // A human fix outlives this replace when its field belongs to the current
+  // kind. The observations above are the model's newest reading of every such
+  // field, so without this line a re-extraction silently reverts a correction
+  // on the exact-arithmetic side -- `latest_observation` and `sum_money` back
+  // to the model's number -- while `get_document` goes on showing the owner's.
+  // A correction from a former kind stays in history without recreating an
+  // out-of-schema observation. Re-applied inside the same transaction as the
   // replace, so no reader ever sees the reverted state.
   await reapplyCorrections(client, {
     spaceId: loaded.spaceId,
     sourceItemId: loaded.sourceItemId,
+    declaredFields: new Set(type?.fields.map((field) => field.name) ?? []),
   });
 
   // Corrections. A field a human already fixed does not get a new open item:

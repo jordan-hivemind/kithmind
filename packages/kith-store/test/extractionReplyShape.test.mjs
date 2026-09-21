@@ -252,10 +252,10 @@ test("investment classification separates membership dues from LLC equity", { sk
   const equityPrompt = classificationPrompt(LLC_EQUITY_MEMBERSHIP);
 
   for (const prompt of [duesPrompt, equityPrompt]) {
-    assert.match(prompt, /operative legal effect, not its title/i);
-    assert.match(prompt, /LLC and partnership membership or subscription agreements count/i);
-    assert.match(prompt, /dues or fees for access, services, an association/i);
-    assert.match(prompt, /conveys no security or ownership interest/i);
+    assert.match(prompt, /operative legal effect, not title/i);
+    assert.match(prompt, /LLC or partnership membership agreements count/i);
+    assert.match(prompt, /dues or fees for access, services, association/i);
+    assert.match(prompt, /without a security or ownership interest/i);
   }
   assert.match(duesPrompt, /Annual dues: \$1,600\.00/);
   assert.match(duesPrompt, /not an investment fund/);
