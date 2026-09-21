@@ -80,6 +80,9 @@ export const MCP_TOOL_ANNOTATIONS = {
   [MCP_TOOL_NAMES.getKithHelp]: readOnly,
   [MCP_TOOL_NAMES.getKithCapabilities]: readOnly,
   [MCP_TOOL_NAMES.listEntities]: readOnly,
+  [MCP_TOOL_NAMES.listProfileFields]: readOnly,
+  [MCP_TOOL_NAMES.getProfile]: readOnly,
+  [MCP_TOOL_NAMES.manageProfileEntity]: managedWrite,
   [MCP_TOOL_NAMES.manageEntityAliases]: managedWrite,
   [MCP_TOOL_NAMES.manageInvestment]: managedWrite,
   [MCP_TOOL_NAMES.manageInvestmentEntry]: destructiveWrite,
@@ -118,6 +121,8 @@ export const MCP_MEMORY_TOOL_NAMES = [
   MCP_TOOL_NAMES.getInvestment,
   MCP_TOOL_NAMES.getKithHelp,
   MCP_TOOL_NAMES.getKithCapabilities,
+  MCP_TOOL_NAMES.listProfileFields,
+  MCP_TOOL_NAMES.getProfile,
 ] as const;
 
 export type McpToolProfile = "memory" | "full";

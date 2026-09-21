@@ -89,7 +89,7 @@ export type FactValueArg =
 
 export type EntitySelectorArg = {
   key?: string;
-  kind: "person" | "organization" | "project" | "place" | "other";
+  kind: "person" | "organization" | "project" | "place" | "vehicle" | "other";
   name: string;
   aliases?: string[];
 };

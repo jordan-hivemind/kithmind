@@ -354,6 +354,11 @@ export type McpReads = {
   getThoughts(args: ReadSpaces & { ids: string[] }): Promise<FullThought[]>;
   timelineThoughts(args: TimelineArgs): Promise<TimelineRow[]>;
   getStats(args: ReadSpaces): Promise<unknown>;
+  listProfileFields(args: { kind?: memory.ProfileKind }): Promise<unknown>;
+  getProfile(args: {
+    spaceId: string;
+    selector: memory.ProfileSelector;
+  }): Promise<unknown>;
   /** Live finance membership and that exact space's account overrides. */
   financeContext(spaceId: string): Promise<{
     authorizedSpaceIds: string[];
@@ -689,6 +694,15 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
           },
         }));
       });
+    },
+    async listProfileFields({ kind }) {
+      return { fields: memory.listProfilePredicates(kind) };
+    },
+    async getProfile({ spaceId, selector }) {
+      return await read(
+        async ({ ctx, principal }) =>
+          await memory.getEntityProfile(ctx, principal, spaceId, selector),
+      );
     },
     async queryRecords(query) {
       // The one read tool that is not read-only. The Convex original is a

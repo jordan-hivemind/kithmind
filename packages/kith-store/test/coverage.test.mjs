@@ -315,7 +315,7 @@ test(
 );
 
 test(
-  "window upserts reject duplicate and foreign identities",
+  "window upserts refresh retained duplicate identities and reject foreign identities",
   { skip },
   async (t) => {
     const f = await setup(t);
@@ -339,7 +339,13 @@ test(
       'INSERT INTO kith.coverage_windows(id,space_id,created_at,source_account_id,record_type,"from","to",state,last_enumerated_at,last_processed_at,discovered_count,indexed_count,skipped_count) SELECT $1,space_id,transaction_timestamp(),source_account_id,record_type,"from","to",state,last_enumerated_at,last_processed_at,discovered_count,indexed_count,skipped_count FROM kith.coverage_windows WHERE id=$2',
       [newKithId(), id],
     );
-    await assert.rejects(complete(f), /Duplicate coverage window identity/);
+    await complete(f, { discoveredCount: 3, indexedCount: 3 });
+    const duplicates = await f.client.query(
+      "SELECT indexed_count FROM kith.coverage_windows WHERE source_account_id=$1",
+      [f.accountId],
+    );
+    assert.equal(duplicates.rowCount, 2);
+    assert.ok(duplicates.rows.every((row) => Number(row.indexed_count) === 3));
     await f.client.query("DELETE FROM kith.coverage_windows WHERE id<>$1", [
       id,
     ]);
@@ -453,7 +459,10 @@ test(
     const listed = await tx(f, (ctx) =>
       coverage.listCoverageGaps(ctx, { principal: webPrincipal(f.userId) }),
     );
-    assert.deepEqual(listed.items.map((item) => item.id), [recurrent]);
+    assert.deepEqual(
+      listed.items.map((item) => item.id),
+      [recurrent],
+    );
     assert.equal(listed.items[0].sourceName, "Synthetic statements");
   },
 );
@@ -538,7 +547,9 @@ test(
       ).rows[0].status,
       "resolved",
     );
-    const after = await tx(f, (ctx) => coverage.calculateCoverage(ctx, args(f)));
+    const after = await tx(f, (ctx) =>
+      coverage.calculateCoverage(ctx, args(f)),
+    );
     assert.deepEqual(after.knownGaps, []);
   },
 );

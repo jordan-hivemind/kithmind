@@ -300,6 +300,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
       import.meta.url,
     ),
   },
+  {
+    version: 39,
+    name: "people and vehicle profiles with retained merged entity identities",
+    url: new URL("../migrations/039_profiles.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
