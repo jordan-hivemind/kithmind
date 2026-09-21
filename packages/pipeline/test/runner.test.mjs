@@ -8033,3 +8033,227 @@ test("the seal check re-enumerates from the same roots the scan was planned from
     await rm(setup.base, { recursive: true, force: true });
   }
 });
+
+for (const parserProfileId of ["pdf_docqa_v1", "spreadsheet_v1"]) {
+  test(`new ${parserProfileId} intents use worker time while retaining future source metadata`, async () => {
+    const setup = await fixture(0);
+    const future = Date.UTC(2036, 0, 1);
+    const plan = pdfPlan({ sourceModifiedAt: future, parserProfileId });
+    const checkpoint = archivedCheckpoint(plan, {
+      step: "intent",
+      preflightAction: undefined,
+      originalCatalogId: undefined,
+      expectedOriginalRevision: undefined,
+      processingCatalogId: undefined,
+      expectedProcessingRevision: undefined,
+    });
+    const journal = await openJournal(setup.journalDir, checkpoint);
+    let dirs = ["capture", "output", "spool"].map((name) =>
+      join(setup.base, name),
+    );
+    await Promise.all(dirs.map((path) => mkdir(path, { mode: 0o700 })));
+    dirs = await Promise.all(dirs.map((path) => realpath(path)));
+    const runner = new PipelineRunner(
+      {
+        ...setup.config,
+        pdfDocQa: {
+          captureDirectory: dirs[0],
+          parserOutputRoot: dirs[1],
+          spoolDirectory: dirs[2],
+          archive: { primary: {}, independentBackup: {} },
+        },
+      },
+      journal,
+      {
+        async call() {
+          throw new Error("no transport for intents");
+        },
+      },
+    );
+    const stored = [];
+    runner.archiveCatalog = {
+      findOriginalExact() {},
+      findProcessingExact() {},
+      async createOriginalIntent(row) {
+        stored.push(row);
+        return { ...row, rowRevision: 1 };
+      },
+      async createProcessingIntent(row) {
+        stored.push(row);
+        return { ...row, rowRevision: 1 };
+      },
+    };
+    try {
+      const before = Date.now();
+      const next = await runner.createArchivedIntents(checkpoint);
+      const after = Date.now();
+      assert.equal(stored.length, 2);
+      for (const row of stored)
+        assert.ok(row.createdAt >= before && row.createdAt <= after);
+      assert.equal(stored[0].createdAt, stored[1].createdAt);
+      assert.equal(next.files[0].sourceModifiedAt, future);
+      assert.equal(next.step, "preflight");
+    } finally {
+      await journal.close();
+      await rm(setup.base, { recursive: true, force: true });
+    }
+  });
+}
+
+test("legacy future admission replays exactly, then renews and admits without repeating archive work", async () => {
+  const setup = await fixture(0);
+  const future = Date.UTC(2036, 0, 1);
+  const plan = pdfPlan({ sourceModifiedAt: future });
+  const checkpoint = admitCheckpoint(plan);
+  checkpoint.discoveryLease.leaseExpiresAt = 1;
+  let journal = await openJournal(setup.journalDir, checkpoint);
+  let rows = durableProviderRows(checkpoint, Date.now());
+  rows.original.createdAt = future;
+  rows.processing.createdAt = future;
+  const originalBefore = structuredClone(rows.original);
+  const processingBefore = structuredClone(rows.processing);
+  const sent = [];
+  const transport = {
+    async call(body) {
+      sent.push(structuredClone(body));
+      if (sent.length === 1) return { error: { code: "lease_conflict" } };
+      if (body.operation === "discovery.reserveArchived")
+        return {
+          operation: body.operation,
+          ...checkpoint.discoveryLease,
+          reused: false,
+          leaseEpoch: 2,
+          leaseExpiresAt: Date.now() + 60_000,
+        };
+      assert.equal(body.operation, "discovery.admitArchived");
+      return admittedResponse(plan);
+    },
+  };
+  const configure = () => {
+    const r = new PipelineRunner(setup.config, journal, transport);
+    r.archivedRows = () => rows;
+    r.mappedProcessing = async () => ({
+      ...rows,
+      declaration: parsedDeclaration(),
+    });
+    r.archiveCatalog = admissionCatalog(
+      () => rows,
+      (value) => {
+        rows = value;
+      },
+    );
+    r.recordArchiveAction = async () => {
+      throw new Error("must not repeat archive work");
+    };
+    return r;
+  };
+  let runner = configure();
+  const provider = runner.admissionProvider(checkpoint, rows.original, false);
+  const selections = runner.admissionSelections(
+    checkpoint,
+    rows,
+    provider.providerOriginal,
+  );
+  const legacy = {
+    protocolVersion: 1,
+    operation: "discovery.admitArchived",
+    spaceId: "space",
+    sourceAccountId: "source",
+    requestId: randomUUID(),
+    workId: checkpoint.discoveryLease.workId,
+    leaseEpoch: 1,
+    leaseToken: TOKEN,
+    parserArtifact: { ...selections.parserArtifact, createdAt: future },
+    archives: selections.archives.map((value) => ({
+      ...value,
+      createdAt: future,
+    })),
+    providerOriginal: { ...provider.providerOriginal, createdAt: future },
+    parsedText: parsedDeclaration(),
+  };
+  await journal.planRequest({
+    operation: legacy.operation,
+    requestId: legacy.requestId,
+    requestBody: JSON.stringify(legacy),
+    createdAt: Date.now(),
+  });
+  await journal.close();
+  journal = await openJournal(setup.journalDir);
+  runner = configure();
+  try {
+    for (const tampered of [
+      {
+        ...legacy,
+        providerOriginal: { ...legacy.providerOriginal, createdAt: future - 1 },
+      },
+      {
+        ...legacy,
+        parserArtifact: {
+          ...legacy.parserArtifact,
+          outputHash: "b".repeat(64),
+        },
+      },
+      {
+        ...legacy,
+        archives: legacy.archives.map((a, i) =>
+          i === 0 ? { ...a, createdAt: future - 1 } : a,
+        ),
+      },
+    ])
+      await assert.rejects(
+        () => runner.validatePendingBody(legacy.operation, tampered),
+        (error) => error.code === "journal_phase_conflict",
+      );
+    await runner.driveArchivedAdmit();
+    assert.deepEqual(sent, [legacy]);
+    assert.equal(journal.pending, undefined);
+    assert.equal(journal.checkpoint.step, "reserve");
+    await runner.driveArchivedReserve();
+    await runner.driveArchivedAdmit();
+    assert.equal(sent.length, 3);
+    const fresh = sent[2];
+    assert.notEqual(fresh.requestId, legacy.requestId);
+    assert.equal(fresh.leaseEpoch, 2);
+    assert.ok(
+      fresh.providerOriginal.createdAt <= fresh.providerOriginal.verifiedAt,
+    );
+    assert.ok(
+      fresh.providerOriginal.createdAt <=
+        fresh.providerOriginal.locatorBundle.readbackVerifiedAt,
+    );
+    for (const receipt of fresh.archives) {
+      assert.ok(receipt.createdAt <= receipt.readbackVerifiedAt);
+      if (receipt.subjectKind === "parser_output")
+        assert.ok(fresh.parserArtifact.createdAt <= receipt.readbackVerifiedAt);
+    }
+    assert.equal(journal.pending, undefined);
+    assert.equal(journal.checkpoint.step, "parsed_reserve");
+    assert.equal(rows.original.createdAt, future);
+    assert.equal(rows.processing.createdAt, future);
+    assert.deepEqual(
+      rows.original.providerOriginal,
+      originalBefore.providerOriginal,
+    );
+    assert.equal(
+      rows.original.originalCatalogId,
+      originalBefore.originalCatalogId,
+    );
+    assert.equal(
+      rows.processing.processingCatalogId,
+      processingBefore.processingCatalogId,
+    );
+    for (const [name, before] of [
+      ["original", originalBefore],
+      ["processing", processingBefore],
+    ]) {
+      for (const [role, copy] of Object.entries(before.copies)) {
+        const { cloudReceipt, ...remaining } = rows[name].copies[role];
+        assert.ok(cloudReceipt);
+        assert.deepEqual(remaining, copy);
+      }
+    }
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});

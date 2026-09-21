@@ -150,3 +150,57 @@ test("archive receipt selection survives a partial cloud-receipt catalog update"
   );
   assert.equal(pendingSelection.readbackVerifiedAt, 200);
 });
+
+test("legacy future provenance is bounded by immutable readbacks without mutating catalogs", async () => {
+  const { createParserArtifactSelection, provenanceCreatedAt } =
+    await import("../dist/archivedRequestMapping.js");
+  const future = Date.UTC(2036, 0, 1);
+  const proof = Date.UTC(2026, 0, 1);
+  const durable = (role, time) => ({
+    ...copy(role),
+    published: { ciphertext: { sha256: hash, byteLength: 20 } },
+    backup: {},
+    readbackVerifiedAt: time,
+  });
+  const row = {
+    createdAt: future,
+    parserIntent: { parserArtifactClientId: "artifact" },
+    parserOutput: {
+      rawArtifact: {
+        sha256: hash,
+        byteLength: 10,
+        mediaType: "application/vnd.docling+json",
+      },
+    },
+    copies: {
+      primary: durable("primary", proof + 10),
+      independent_backup: durable("independent_backup", proof),
+    },
+  };
+  const before = structuredClone(row);
+  assert.equal(createParserArtifactSelection(row).createdAt, proof);
+  assert.equal(
+    createArchiveReceiptSelection("parser_output", row, "primary").createdAt,
+    proof + 10,
+  );
+  assert.equal(
+    createArchiveReceiptSelection("parser_output", row, "independent_backup")
+      .createdAt,
+    proof,
+  );
+  assert.deepEqual(row, before);
+  row.createdAt = proof - 100;
+  assert.equal(createParserArtifactSelection(row).createdAt, proof - 100);
+  for (const invalid of [NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(
+      () => provenanceCreatedAt(invalid, proof),
+      /Invalid provenance/,
+    );
+    assert.throws(
+      () => provenanceCreatedAt(proof, invalid),
+      /Invalid provenance/,
+    );
+  }
+  delete row.copies.primary.readbackVerifiedAt;
+  assert.throws(() => createParserArtifactSelection(row), /not durable/);
+});
