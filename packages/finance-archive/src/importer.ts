@@ -1923,6 +1923,15 @@ export async function importBatch(
             member.accountId === scope.accountId && member.asOf === scope.asOf,
         );
       const distinctHashes = new Set(members.map((member) => member.hash));
+      const completeEvidence =
+        scope.status !== "complete" ||
+        (scope.evidence.scopeEnd !== undefined &&
+          (scope.emittedPositionCount === 0
+            ? scope.evidence.explicitNone !== undefined
+            : scope.evidence.tables.length > 0 &&
+              scope.evidence.tables.every(
+                (table) => table.headers.length > 0 && table.end !== undefined,
+              )));
       const structural =
         ISO_DATE.test(scope.asOf) &&
         Number.isSafeInteger(scope.emittedPositionCount) &&
@@ -1936,13 +1945,14 @@ export async function importBatch(
           : scope.zeroBasis === undefined) &&
         members.length === scope.emittedPositionCount &&
         distinctHashes.size === members.length &&
+        completeEvidence &&
         !seen.has(key);
       if (!structural) {
         openReview(scope.accountId, documentId, null, {
           kind: "position_scope_mismatch",
           rawValue: `${scope.asOf}:${scope.proofVersion}`,
           reason:
-            "position scope proof was not stored because its account/date emitted count, gap state, zero basis, or distinct prepared membership did not match the mapped source positions",
+            "position scope proof was not stored because its account/date emitted count, gap state, positive boundary evidence, zero basis, or distinct prepared membership did not match the mapped source positions",
         });
         continue;
       }

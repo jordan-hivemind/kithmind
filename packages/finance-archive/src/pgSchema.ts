@@ -1115,7 +1115,10 @@ CREATE TABLE position_scope_observations (
   emitted_position_count BIGINT NOT NULL CHECK (emitted_position_count >= 0),
   gap_codes TEXT[] NOT NULL,
   zero_basis TEXT CHECK (zero_basis IS NULL OR zero_basis = 'source_stated_none'),
-  evidence JSONB NOT NULL CHECK (jsonb_typeof(evidence) = 'object'),
+  evidence JSONB NOT NULL CHECK (
+    jsonb_typeof(evidence) = 'object'
+    AND jsonb_typeof(evidence->'tables') IS NOT DISTINCT FROM 'array'
+  ),
   created_at TIMESTAMPTZ NOT NULL,
   UNIQUE (source_document_id, id),
   UNIQUE (source_document_id, id, account_id, as_of),
@@ -1140,6 +1143,19 @@ CREATE TABLE position_scope_observations (
     OR (status = 'complete' AND emitted_position_count > 0
       AND zero_basis IS NULL)
     OR (status = 'partial' AND zero_basis IS NULL)
+  ),
+  CHECK (
+    status <> 'complete'
+    OR (
+      jsonb_typeof(evidence->'scopeEnd') IS NOT DISTINCT FROM 'object'
+      AND (
+        (emitted_position_count = 0
+          AND jsonb_typeof(evidence->'explicitNone')
+            IS NOT DISTINCT FROM 'object')
+        OR (emitted_position_count > 0
+          AND jsonb_array_length(evidence->'tables') > 0)
+      )
+    )
   )
 );
 

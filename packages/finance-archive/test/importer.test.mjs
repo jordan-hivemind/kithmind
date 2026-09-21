@@ -887,8 +887,16 @@ test(
                         headers: [
                           { source: "synthetic_statement", index: 700 },
                         ],
+                        end: {
+                          source: "synthetic_statement",
+                          index: 701,
+                        },
                       },
                     ],
+                    scopeEnd: {
+                      source: "synthetic_statement",
+                      index: 702,
+                    },
                   },
                 }),
               ],
@@ -910,6 +918,7 @@ test(
     const client = await archive(t);
     await seed(client);
     const mismatchSha = "93".padEnd(64, "0");
+    const unprovedZeroSha = "95".padEnd(64, "0");
     const zeroSha = "94".padEnd(64, "0");
 
     const mismatch = await importBatch(
@@ -935,6 +944,28 @@ test(
       ).kind,
       "position_scope_mismatch",
     );
+
+    const unprovedZero = await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(unprovedZeroSha, {
+            positions: [],
+            positionScopes: [
+              positionScope({
+                emittedPositionCount: 0,
+                zeroBasis: "source_stated_none",
+                evidence: { tables: [] },
+              }),
+            ],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(unprovedZero.reviewItemsOpened, 1);
+    assert.equal(await count(client, "position_scope_observations"), 0);
 
     await importBatch(
       client,

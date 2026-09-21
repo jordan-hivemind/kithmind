@@ -554,7 +554,7 @@ test(
        VALUES ('collapse-scope-proof', 'doc-scope-a', $1, $2,
                DATE '2026-03-31', 'position_scope_v1', 'complete', 0,
                '{}', 'source_stated_none',
-               '{"tables":[],"explicitNone":{"source":"synthetic","index":1}}',
+               '{"tables":[],"explicitNone":{"source":"synthetic","index":1},"scopeEnd":{"source":"synthetic","index":2}}',
                now())`,
       [revision.retained_sha256, ACCOUNT_ID],
     );

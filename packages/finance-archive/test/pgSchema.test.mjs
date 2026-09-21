@@ -159,10 +159,26 @@ test(
               emitted_position_count, gap_codes, evidence, created_at)
            VALUES ('wrong-generation', 'scope-doc', 'other-generation', $1,
                    $2, DATE '2026-03-31', 'position_scope_v1', 'complete',
-                   1, '{}', '{"tables":[]}', now())`,
+                   1, '{}',
+                   '{"tables":[{"headers":[{}],"end":{}}],"scopeEnd":{}}',
+                   now())`,
           ["a".repeat(64), accountId],
         ),
         /foreign key/i,
+      );
+
+      await assert.rejects(
+        client.query(
+          `INSERT INTO position_scope_observations
+             (id, source_document_id, retained_sha256, account_id, as_of,
+              proof_version, status, emitted_position_count, gap_codes,
+              zero_basis, evidence, created_at)
+           VALUES ('unproved-zero', 'scope-doc', $1, $2,
+                   DATE '2026-02-28', 'position_scope_v1', 'complete', 0,
+                   '{}', 'source_stated_none', '{"tables":[]}', now())`,
+          ["a".repeat(64), accountId],
+        ),
+        /check constraint/i,
       );
 
       await client.query(
@@ -172,7 +188,8 @@ test(
             zero_basis, evidence, created_at)
          VALUES ('scope-1', 'scope-doc', $1, $2, DATE '2026-03-31',
                  'position_scope_v1', 'complete', 1, '{}', NULL,
-                 '{"tables":[]}', now())`,
+                 '{"tables":[{"headers":[{}],"end":{}}],"scopeEnd":{}}',
+                 now())`,
         ["a".repeat(64), accountId],
       );
       await client.query(
