@@ -330,14 +330,14 @@ export function AttentionTable({
   const [detail, setDetail] = useState<UnifiedItem | null>(null);
   const [document, setDocument] = useState<DocumentReference | null>(null);
   const [beforeDate, setBeforeDate] = useState("");
-  const [confirmBeforeDate, setConfirmBeforeDate] = useState(false);
+  const [cutoffOpen, setCutoffOpen] = useState(false);
 
   // The confirm dialog below states a real count rather than "some": the
   // action is unbounded and owner-visible. Fetched live as the date
   // changes, from the same filter the dismiss itself will use.
   const { data: beforeDateCount } = useQuery({
     queryKey: ["attention-before-date-count", beforeDate, spaceId],
-    enabled: beforeDate !== "" && spaceId !== null,
+    enabled: cutoffOpen && beforeDate !== "" && spaceId !== null,
     queryFn: async (): Promise<number> => {
       const response = await fetch("/api/kith/attention/count", {
         method: "POST",
@@ -784,48 +784,6 @@ export function AttentionTable({
   return (
     <div className="flex flex-col gap-2">
       <PageHeader title="Needs Attention" />
-      <div className="flex items-center gap-2">
-        <button
-          type="button"
-          aria-pressed={showInfo}
-          onClick={() => setShowInfo((current) => !current)}
-          className={`rounded-tag border px-1.5 py-0.5 text-meta leading-none ${
-            showInfo
-              ? "border-accent-600 bg-accent-600 text-white"
-              : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"
-          }`}
-        >
-          {showInfo ? "Hide info" : "Show info"}
-        </button>
-        <button
-          type="button"
-          aria-pressed={showEverything}
-          onClick={() => setShowEverything((current) => !current)}
-          className={`rounded-tag border px-1.5 py-0.5 text-meta leading-none ${
-            showEverything
-              ? "border-accent-600 bg-accent-600 text-white"
-              : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"
-          }`}
-        >
-          {showEverything ? "Hide history" : "Show history"}
-        </button>
-        {toast === null ? null : (
-          <span
-            role="status"
-            className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-meta text-amber-800"
-          >
-            {toast}
-          </span>
-        )}
-        {financeError === null ? null : (
-          <span
-            role="alert"
-            className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-meta text-amber-800"
-          >
-            Finance reviews unavailable
-          </span>
-        )}
-      </div>
 
       <DataTable
         id="admin-attention"
@@ -846,21 +804,54 @@ export function AttentionTable({
         }
         toolbar={
           <>
-            <input
-              type="date"
-              value={beforeDate}
-              onChange={(event) => setBeforeDate(event.target.value)}
-              className={`${inputClass} w-32`}
-              aria-label="Documents dated before"
-            />
+            <button
+              type="button"
+              aria-pressed={showInfo}
+              onClick={() => setShowInfo((current) => !current)}
+              className={`${buttonClass} ${
+                showInfo
+                  ? "border-accent-600 bg-accent-600 text-white hover:bg-accent-700"
+                  : ""
+              }`}
+            >
+              Include informational
+            </button>
+            <button
+              type="button"
+              aria-pressed={showEverything}
+              onClick={() => setShowEverything((current) => !current)}
+              className={`${buttonClass} ${
+                showEverything
+                  ? "border-accent-600 bg-accent-600 text-white hover:bg-accent-700"
+                  : ""
+              }`}
+            >
+              Include all states
+            </button>
             <button
               type="button"
               className={buttonClass}
-              disabled={beforeDate === "" || spaceId === null}
-              onClick={() => setConfirmBeforeDate(true)}
+              disabled={spaceId === null}
+              onClick={() => setCutoffOpen(true)}
             >
-              Mark older items not needed
+              Older documents…
             </button>
+            {toast === null ? null : (
+              <span
+                role="status"
+                className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-meta text-amber-800"
+              >
+                {toast}
+              </span>
+            )}
+            {financeError === null ? null : (
+              <span
+                role="alert"
+                className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-meta text-amber-800"
+              >
+                Finance reviews unavailable
+              </span>
+            )}
           </>
         }
       />
@@ -921,24 +912,30 @@ export function AttentionTable({
         }}
       />
 
-      <AlertDialog.Root
-        open={confirmBeforeDate}
-        onOpenChange={setConfirmBeforeDate}
-      >
+      <AlertDialog.Root open={cutoffOpen} onOpenChange={setCutoffOpen}>
         <AlertDialog.Portal>
           <AlertDialog.Overlay className="fixed inset-0 z-50 bg-kith-overlay" />
           <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
             <AlertDialog.Title className="kith-section-title">
-              Mark {beforeDateCount ?? "…"} item
-              {beforeDateCount === 1 ? "" : "s"} for documents dated before{" "}
-              {beforeDate}?
+              Mark older items not needed
             </AlertDialog.Title>
             <AlertDialog.Description className="mt-1 text-sm text-kith-text-secondary">
-              Every open item for a document dated before this date -- by its
-              own extracted date, or its file&apos;s modified date when the
-              document states none -- is marked not needed. You can restore an
-              individual item from the history view.
+              This marks {beforeDateCount ?? "…"} open or snoozed attention item
+              {beforeDateCount === 1 ? "" : "s"} as not needed. It includes
+              every severity and ignores the table filters. A document qualifies
+              when its extracted date, or its source modified date, is before
+              the cutoff. Documents with neither date are unchanged. You can
+              restore an item from All states.
             </AlertDialog.Description>
+            <label className="mt-3 flex flex-col gap-1 text-sm text-kith-text-secondary">
+              <span>Document date before</span>
+              <input
+                type="date"
+                value={beforeDate}
+                onChange={(event) => setBeforeDate(event.target.value)}
+                className={`${inputClass} w-40`}
+              />
+            </label>
             <div className="mt-3 flex justify-end gap-2">
               <AlertDialog.Cancel className={buttonClass}>
                 Cancel
@@ -949,12 +946,13 @@ export function AttentionTable({
                     { kind: "beforeDate", beforeDate },
                     "not_worth_backfilling",
                   );
-                  setConfirmBeforeDate(false);
+                  setCutoffOpen(false);
                   setBeforeDate("");
                 }}
+                disabled={beforeDate === "" || spaceId === null}
                 className={primaryButtonClass}
               >
-                Mark not needed
+                Mark {beforeDateCount ?? "…"} not needed
               </AlertDialog.Action>
             </div>
           </AlertDialog.Content>
