@@ -51,6 +51,13 @@ const TRUSTED = {
   authorizedSpaceIds: [SPACE],
 };
 
+// This production-shaped performance regression runs once after every package
+// suite has finished. Running it inside finance-archive's parallel Turbo task
+// measures unrelated database contention against the read surface's five
+// second production timeout instead of measuring this query.
+const inventoryScaleSkip =
+  skip || process.env.FINANCE_ARCHIVE_INVENTORY_SCALE !== "1";
+
 /**
  * Four synthetic institutions, one per coverage state the surface has to keep
  * distinct, plus the two money edge cases.
@@ -3499,6 +3506,86 @@ test(
     row = await inventory();
     assert.equal(row.balanceDates, undefined);
     assert.equal(row.latestBalanceHoldsSecurities, undefined);
+  },
+);
+
+test(
+  "list_account_inventory evaluates many position dates and attributed reviews without changing eligibility",
+  { skip: inventoryScaleSkip },
+  async (t) => {
+    const { owner, reader: r } = await fixture(t);
+    // Match the production query shape closely enough that the former
+    // per-date correlated gates exceed the read surface's existing timeout:
+    // Nine accounts, 648 account/dates, roughly 93k positions and 115k reviews.
+    const source = await institution(owner, "inventory-eligibility-scale", {
+      accounts: 9,
+    });
+    const accountId = source.accountIds[0];
+
+    await owner.query(
+      `INSERT INTO documents
+         (id, institution_id, account_id, doc_type, doc_date, file_path, sha256,
+          parsed_ok)
+       SELECT 'inventory-scale-doc-' || a.id || '-' || g::text, $1,
+              CASE WHEN g = 72 THEN NULL ELSE a.id END,
+              'statement', DATE '2025-01-01' + g,
+              'documents/synthetic/inventory-scale-' || a.id || '-' || g::text,
+              md5('inventory-scale-doc-' || a.id || '-' || g::text) ||
+                md5('inventory-scale-doc-' || a.id || '-' || g::text),
+              g = 71
+         FROM accounts a
+        CROSS JOIN generate_series(1, 72) AS g
+        WHERE a.institution_id = $1`,
+      [source.id],
+    );
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, quantity, market_value, cost_basis, currency,
+          valuation_basis, source_document_id)
+       SELECT 'inventory-scale-position-' || a.id || '-' || g::text || '-' ||
+                n::text,
+              a.id, DATE '2025-01-01' + g, '1', '1', '1', 'USD',
+              'market_price',
+              'inventory-scale-doc-' || a.id || '-' || g::text
+         FROM accounts a
+        CROSS JOIN generate_series(1, 72) AS g
+        CROSS JOIN generate_series(1, 144) AS n
+        WHERE a.institution_id = $1`,
+      [source.id],
+    );
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       SELECT 'inventory-scale-review-' || a.id || '-' || g::text || '-' ||
+                n::text,
+              'ambiguous_amount', a.id,
+              'inventory-scale-doc-' || a.id || '-' || g::text,
+              'synthetic scale review ' || n::text, 'synthetic scale review',
+              CASE WHEN g < 71 THEN 'open' ELSE 'resolved' END
+         FROM accounts a
+        CROSS JOIN generate_series(1, 72) AS g
+        CROSS JOIN generate_series(1, 180) AS n
+        WHERE a.institution_id = $1 AND g <> 71`,
+      [source.id],
+    );
+    await owner.query(
+      "ANALYZE accounts, documents, positions, review_items, position_reconciliations",
+    );
+
+    const inventory = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 100,
+    });
+    const row = inventory.items.find(
+      (item) => item.account.accountId === accountId,
+    );
+    assert.equal(row.openReviewCount, 12600);
+    assert.equal(row.latestSnapshotAsOf, "2025-03-13");
+    assert.deepEqual(row.currentValue, {
+      value: { decimal: "144", currency: "USD" },
+      asOf: "2025-03-13",
+      source: "positions",
+    });
   },
 );
 

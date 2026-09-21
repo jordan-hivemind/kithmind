@@ -1475,10 +1475,10 @@ function currentValueOf(
  * than one currency, give no value rather than a pick or a crossed total.
  * Upgrade path if that turns up in real data: report a value per currency.
  *
- * ponytail: correlated subqueries, one set per account row on the page, rather
- * than five grouped joins. The page is at most 100 accounts and each subquery
- * is an index lookup on `(account_id, date)`. Upgrade path if an archive ever
- * has thousands of accounts: group each aggregate once and join on account_id.
+ * The holdings safety facts are grouped once for the requested account page.
+ * In particular, source and review attribution must not be re-evaluated for
+ * every position date: a long account history otherwise turns the safety gate
+ * into repeated scans of that same history.
  */
 async function listAccountInventory(
   client: pg.ClientBase,
@@ -1487,9 +1487,127 @@ async function listAccountInventory(
   options: FinanceReadOptions,
 ): Promise<FinanceReadResponse> {
   const cursorKey = readCursorKey(scope, request, options);
-  const eligibility = holdingsDatePredicates("d.account_id", "p.as_of");
   const result = await client.query<AccountInventoryRow>(
-    `${ACCOUNT_DESCRIPTOR_CTES}
+    `${ACCOUNT_DESCRIPTOR_CTES},
+     inventory_accounts AS MATERIALIZED (
+       SELECT d.*
+         FROM account_descriptors d
+        WHERE ($1::text IS NULL OR d.account_id > $1)
+        ORDER BY d.account_id
+        LIMIT $2
+     ),
+     inventory_position_source_dates AS MATERIALIZED (
+       SELECT DISTINCT p.source_document_id, p.account_id, p.as_of
+         FROM positions p
+         JOIN inventory_accounts ia ON ia.account_id = p.account_id
+        WHERE p.source_document_id IS NOT NULL
+     ),
+     inventory_review_sources AS MATERIALIZED (
+       SELECT r.account_id, r.source_document_id,
+              bool_or(r.status = 'open') AS has_open
+         FROM review_items r
+         JOIN inventory_accounts ia ON ia.account_id = r.account_id
+        WHERE r.source_document_id IS NOT NULL
+        GROUP BY r.account_id, r.source_document_id
+     ),
+     inventory_partial_source_dates AS MATERIALIZED (
+       SELECT pd.account_id, pd.doc_date AS as_of
+         FROM documents pd
+         JOIN inventory_accounts ia ON ia.account_id = pd.account_id
+        WHERE pd.parsed_ok = FALSE
+          AND pd.superseded_by IS NULL
+          AND pd.doc_date IS NOT NULL
+       UNION
+       SELECT partial_p.account_id, partial_p.as_of
+         FROM documents pd
+         JOIN inventory_position_source_dates partial_p
+           ON partial_p.source_document_id = pd.id
+         JOIN inventory_accounts ia ON ia.account_id = partial_p.account_id
+        WHERE pd.parsed_ok = FALSE
+          AND pd.superseded_by IS NULL
+       UNION
+       SELECT partial_r.account_id, pd.doc_date
+         FROM documents pd
+         JOIN inventory_review_sources partial_r
+           ON partial_r.source_document_id = pd.id
+         JOIN inventory_accounts ia ON ia.account_id = partial_r.account_id
+        WHERE pd.parsed_ok = FALSE
+          AND pd.superseded_by IS NULL
+          AND pd.doc_date IS NOT NULL
+     ),
+     inventory_open_review_dates AS MATERIALIZED (
+       SELECT open_r.account_id, open_d.doc_date AS as_of
+         FROM inventory_review_sources open_r
+         JOIN documents open_d ON open_d.id = open_r.source_document_id
+        WHERE open_r.has_open
+          AND open_d.superseded_by IS NULL
+          AND open_d.doc_date IS NOT NULL
+       UNION
+       SELECT open_r.account_id, open_p.as_of
+         FROM inventory_review_sources open_r
+         JOIN documents open_d ON open_d.id = open_r.source_document_id
+         JOIN inventory_position_source_dates open_p
+           ON open_p.source_document_id = open_r.source_document_id
+          AND open_p.account_id = open_r.account_id
+        WHERE open_r.has_open
+          AND open_d.superseded_by IS NULL
+     ),
+     inventory_reconciliation_dates AS MATERIALIZED (
+       SELECT pr.account_id, pr.period_end AS as_of,
+              bool_or(pr.status = 'fail') AS failed,
+              bool_or(pr.status = 'unverified') AS pending
+         FROM position_reconciliations pr
+         JOIN inventory_accounts ia ON ia.account_id = pr.account_id
+        WHERE pr.status IN ('fail', 'unverified')
+        GROUP BY pr.account_id, pr.period_end
+     ),
+     inventory_position_dates AS MATERIALIZED (
+       SELECT p.account_id, p.as_of,
+              sum(p.market_value) AS value,
+              count(*) FILTER (WHERE p.market_value IS NULL) AS missing,
+              count(DISTINCT p.currency) AS currency_count,
+              min(p.currency::text) AS currency,
+              count(*) FILTER (
+                WHERE p.valuation_basis IS DISTINCT FROM 'market_price'
+              ) AS not_marked
+         FROM positions p
+         JOIN inventory_accounts ia ON ia.account_id = p.account_id
+        GROUP BY p.account_id, p.as_of
+     ),
+     inventory_latest_holdings AS (
+       SELECT DISTINCT ON (p.account_id)
+              p.account_id, p.as_of, p.value, p.missing,
+              p.currency_count, p.currency, p.not_marked
+         FROM inventory_position_dates p
+         LEFT JOIN inventory_partial_source_dates partial
+           ON partial.account_id = p.account_id AND partial.as_of = p.as_of
+         LEFT JOIN inventory_open_review_dates open_review
+           ON open_review.account_id = p.account_id
+          AND open_review.as_of = p.as_of
+         LEFT JOIN inventory_reconciliation_dates reconciliation
+           ON reconciliation.account_id = p.account_id
+          AND reconciliation.as_of = p.as_of
+        WHERE partial.account_id IS NULL
+          AND open_review.account_id IS NULL
+          AND coalesce(reconciliation.failed, FALSE) = FALSE
+          AND coalesce(reconciliation.pending, FALSE) = FALSE
+          AND p.missing = 0
+          AND p.currency_count = 1
+          AND p.not_marked = 0
+        ORDER BY p.account_id, p.as_of DESC
+     ),
+     inventory_open_review_counts AS MATERIALIZED (
+       SELECT r.account_id, count(*)::text AS open_review_count
+         FROM review_items r
+         JOIN inventory_accounts ia ON ia.account_id = r.account_id
+         LEFT JOIN documents review_d ON review_d.id = r.source_document_id
+        WHERE r.status = 'open'
+          AND (
+            r.source_document_id IS NULL
+            OR (review_d.id IS NOT NULL AND review_d.superseded_by IS NULL)
+          )
+        GROUP BY r.account_id
+     )
      SELECT d.*,
             (SELECT count(*) FROM documents doc
               WHERE doc.account_id = d.account_id)::text AS statement_count,
@@ -1508,27 +1626,17 @@ async function listAccountInventory(
               (SELECT max(b.as_of) FROM balances b WHERE b.account_id = d.account_id)
             )::text AS activity_to,
             hs.as_of::text AS latest_snapshot_as_of,
-            (SELECT count(*) FROM review_items r
-              WHERE r.account_id = d.account_id
-                AND r.status = 'open'
-                AND (
-                  r.source_document_id IS NULL
-                  OR EXISTS (
-                    SELECT 1 FROM documents review_d
-                     WHERE review_d.id = r.source_document_id
-                       AND review_d.superseded_by IS NULL
-                  )
-                ))::text AS open_review_count,
+            coalesce(review_counts.open_review_count, '0') AS open_review_count,
             lb.as_of::text AS balance_as_of,
             lb.total_value::text AS balance_value,
             lb.currency::text AS balance_currency,
             coalesce(lb.n, 0)::text AS balance_count,
-            hv.as_of::text AS holdings_as_of,
-            hv.value::text AS holdings_value,
-            coalesce(hv.missing, 0)::text AS holdings_missing,
-            coalesce(hv.currency_count, 0)::text AS holdings_currency_count,
-            hv.currency::text AS holdings_currency,
-            coalesce(hv.not_marked, 0)::text AS holdings_not_marked,
+            hs.as_of::text AS holdings_as_of,
+            hs.value::text AS holdings_value,
+            coalesce(hs.missing, 0)::text AS holdings_missing,
+            coalesce(hs.currency_count, 0)::text AS holdings_currency_count,
+            hs.currency::text AS holdings_currency,
+            coalesce(hs.not_marked, 0)::text AS holdings_not_marked,
             (SELECT array_agg(bd.as_of::text ORDER BY bd.as_of DESC)
                FROM (SELECT DISTINCT b.as_of FROM balances b
                       WHERE b.account_id = d.account_id
@@ -1543,7 +1651,9 @@ async function listAccountInventory(
                 AND b.as_of = (SELECT max(y.as_of) FROM balances y
                                 WHERE y.account_id = d.account_id)
             ) AS latest_balance_holds_securities
-       FROM account_descriptors d
+       FROM inventory_accounts d
+       LEFT JOIN inventory_open_review_counts review_counts
+         ON review_counts.account_id = d.account_id
        -- n counts distinct stated totals, not rows: one statement imported as
        -- two balance rows that print the same total is one answer, not a
        -- choice between two.
@@ -1558,48 +1668,12 @@ async function listAccountInventory(
                               AND x.total_value IS NOT NULL)
           GROUP BY b.as_of
        ) lb ON true
-       -- Latest holdings date that is safe to use as a freshness marker.
-       -- A newer partial import must remain visible as a gap: open review
-       -- items for the same statement date, or a failed/unverified position
-       -- gate ending on that date, keep the snapshot date on the last clean
-       -- holdings statement instead of letting one parsed row make it fresh.
-       LEFT JOIN LATERAL (
-         SELECT p.as_of
-           FROM positions p
-          WHERE p.account_id = d.account_id
-            AND NOT ${eligibility.partialSource}
-            AND NOT ${eligibility.openReview}
-            AND NOT ${eligibility.failedReconciliation}
-            AND NOT ${eligibility.pendingReconciliation}
-          GROUP BY p.as_of
-          HAVING count(*) FILTER (WHERE p.market_value IS NULL) = 0
-             AND count(DISTINCT p.currency) = 1
-             AND count(*) FILTER (
-                   WHERE p.valuation_basis IS DISTINCT FROM 'market_price'
-                 ) = 0
-          ORDER BY p.as_of DESC
-          LIMIT 1
-       ) hs ON true
-       -- Every position on the account's latest holdings date, valued or not.
-       -- Filtering the unvalued ones out here is what made the sum a fragment
-       -- and hid their currencies from the count: the counts below have to see
-       -- the whole date to be able to refuse it.
-       LEFT JOIN LATERAL (
-         SELECT max(p.as_of) AS as_of,
-                sum(p.market_value) AS value,
-                count(*) FILTER (WHERE p.market_value IS NULL) AS missing,
-                count(DISTINCT p.currency) AS currency_count,
-                min(p.currency::text) AS currency,
-                count(*) FILTER (
-                  WHERE p.valuation_basis IS DISTINCT FROM 'market_price'
-                ) AS not_marked
-           FROM positions p
-          WHERE p.account_id = d.account_id
-            AND p.as_of = hs.as_of
-       ) hv ON true
-      WHERE ($1::text IS NULL OR d.account_id > $1)
+       -- All safety facts and value facts for each date were grouped once
+       -- above. This join selects the latest eligible summary without running
+       -- source-attribution subqueries once per historical position date.
+       LEFT JOIN inventory_latest_holdings hs ON hs.account_id = d.account_id
       ORDER BY d.account_id
-      LIMIT $2`,
+      `,
     [cursorKey?.[0] ?? null, request.limit + 1],
   );
   const page = result.rows.slice(0, request.limit);
