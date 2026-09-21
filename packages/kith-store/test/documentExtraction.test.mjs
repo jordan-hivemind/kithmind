@@ -24,11 +24,15 @@ import {
 } from "../dist/ingestion/index.js";
 import {
   applyCorrection,
+  getDocumentExtractionStatuses,
+  listDocumentSchemas,
+  reprocessDocuments,
   runDocumentExtractionJob,
   scheduleDocumentExtraction,
   scheduleExtractionBackfill,
   scheduleReextraction,
   seedDocumentTypes,
+  setDocumentClassification,
 } from "../dist/extraction/index.js";
 import { executeRecordQuery } from "../dist/records/index.js";
 import { workerCtx } from "../dist/workers/index.js";
@@ -321,6 +325,89 @@ test("activation schedules extraction in the publication's own transaction", { s
     (await f.rows("SELECT id FROM kith.deferred_work WHERE kind = 'document_extraction'")).length,
     1,
   );
+});
+
+test("owner classification survives extraction and running work gets a follow-up", { skip }, async (t) => {
+  const f = await fixture(t);
+  await f.seed();
+  const ingested = await f.ingest();
+  const initial = (await f.rows(
+    `SELECT id FROM kith.deferred_work
+      WHERE kind = 'document_extraction' AND payload->>'sourceItemId' = $1`,
+    [ingested.sourceItemId],
+  ))[0];
+  await f.client.query(
+    `UPDATE kith.deferred_work SET state = 'running', lease_token = $2,
+            lease_expires_at = transaction_timestamp() + interval '1 minute'
+      WHERE id = $1`,
+    [initial.id, newKithId()],
+  );
+  const managed = await f.run(NOW + 2_000, (ctx) =>
+    setDocumentClassification(ctx, {
+      principal: f.principal,
+      spaceId: f.spaceId,
+      sourceItemId: ingested.sourceItemId,
+      kind: "receipt",
+    }),
+  );
+  assert.equal(managed.state, "followup_queued");
+  const jobs = await f.rows(
+    `SELECT state, dedupe_key FROM kith.deferred_work
+      WHERE kind = 'document_extraction' AND payload->>'sourceItemId' = $1
+      ORDER BY created_at, id`,
+    [ingested.sourceItemId],
+  );
+  assert.equal(jobs.length, 2);
+  assert.equal(jobs[1].dedupe_key,
+    `document_extraction:${ingested.sourceItemId}:after:${initial.id}`);
+
+  const model = stubModel(goodReading({ kind: "other" }));
+  const outcome = await f.extract(model, ingested.sourceItemId, ingested.generationId);
+  assert.equal(outcome.kind, "receipt");
+  assert.deepEqual(model.requests[0].kinds, ["receipt"]);
+  assert.match(model.requests[0].prompt, /owner classified this document as receipt/i);
+  assert.equal((await f.rows(
+    "SELECT owner_document_kind FROM kith.source_items WHERE id = $1",
+    [ingested.sourceItemId],
+  ))[0].owner_document_kind, "receipt");
+
+  const schemas = await listDocumentSchemas(f.client, [f.spaceId], { limit: 1 });
+  assert.equal(schemas.rows.length, 1);
+  assert.equal(schemas.isDone, false);
+  assert.ok(schemas.cursor);
+  const statuses = await getDocumentExtractionStatuses(
+    f.client,
+    [f.spaceId],
+    [ingested.sourceItemId, newKithId()],
+  );
+  assert.equal(statuses[0].extraction.kind, "receipt");
+  assert.equal(statuses[1].state, "unavailable");
+});
+
+test("reprocess refreshes a queued job to the current generation", { skip }, async (t) => {
+  const f = await fixture(t);
+  await f.seed();
+  const ingested = await f.ingest(RECEIPT, "synthetic-current-generation");
+  await f.client.query(
+    `UPDATE kith.deferred_work
+        SET payload = jsonb_set(payload, '{processingGenerationId}', to_jsonb($2::text))
+      WHERE kind = 'document_extraction' AND payload->>'sourceItemId' = $1`,
+    [ingested.sourceItemId, newKithId()],
+  );
+  const result = await f.run(NOW + 2_000, (ctx) =>
+    reprocessDocuments(ctx, {
+      principal: f.principal,
+      spaceId: f.spaceId,
+      sourceItemIds: [ingested.sourceItemId],
+    }),
+  );
+  assert.equal(result.outcomes[0].state, "already_queued");
+  const queued = (await f.rows(
+    `SELECT payload FROM kith.deferred_work
+      WHERE kind = 'document_extraction' AND payload->>'sourceItemId' = $1`,
+    [ingested.sourceItemId],
+  ))[0];
+  assert.equal(queued.payload.processingGenerationId, ingested.generationId);
 });
 
 test("storing an investment kind's extraction enqueues its link job", { skip }, async (t) => {

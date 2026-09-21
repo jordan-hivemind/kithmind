@@ -88,6 +88,8 @@ describe("MCP space routing", () => {
           "queryRecords",
           "searchDocuments",
           "getDocument",
+          "listDocumentSchemas",
+          "getDocumentExtractionStatus",
           "listSources",
           "listInventory",
           "listReviewQueue",
@@ -113,6 +115,8 @@ describe("MCP space routing", () => {
     mocks.reads.timelineThoughts!.mockResolvedValue([]);
     mocks.reads.getStats!.mockResolvedValue({});
     mocks.reads.getDocument!.mockResolvedValue({});
+    mocks.reads.listDocumentSchemas!.mockResolvedValue({ rows: [], isDone: true });
+    mocks.reads.getDocumentExtractionStatus!.mockResolvedValue({ items: [] });
     mocks.reads.searchDocuments!.mockResolvedValue({ results: [] });
     mocks.reads.listSources!.mockResolvedValue({ sources: {} });
     mocks.reads.listInventory!.mockResolvedValue({});
@@ -170,10 +174,29 @@ describe("MCP space routing", () => {
     ]);
   });
 
+  test("get_document bridges a stable source item without calling it a document id", async () => {
+    mocks.reads.getDocument!.mockResolvedValue({
+      sourceItemId: "source-item",
+      documents: [],
+    });
+    const result = await call("get_document", { sourceItemId: "source-item" });
+    expect(result.isError).not.toBe(true);
+    expect(mocks.reads.getDocument).toHaveBeenCalledWith({
+      sourceItemId: "source-item",
+      spaceIds: undefined,
+    });
+  });
+
   test.each([
     ["search_facts", { query: "clinic" }, "searchFacts"],
     ["search_documents", { query: "clinic" }, "searchDocuments"],
     ["get_document", { documentId: "document" }, "getDocument"],
+    ["list_document_schemas", {}, "listDocumentSchemas"],
+    [
+      "get_document_extraction_status",
+      { sourceItemIds: ["source-item"] },
+      "getDocumentExtractionStatus",
+    ],
     ["list_sources", {}, "listSources"],
     ["list_inventory", { sourceAccountId: "account" }, "listInventory"],
     ["list_review_queue", { sourceAccountId: "account" }, "listReviewQueue"],

@@ -1,5 +1,9 @@
 import { admin, memory } from "@repo/kith-store";
-import { applyAuthorizedCorrection } from "@repo/kith-store/extraction";
+import {
+  applyAuthorizedCorrection,
+  reprocessDocuments,
+  setDocumentClassification,
+} from "@repo/kith-store/extraction";
 import {
   getAuthorizedReadSpaceIds,
   requireSpaceAccess,
@@ -371,6 +375,37 @@ export function postgresManagement(withPrincipal: WithMcpPrincipal) {
             ...args,
           }),
       ),
+
+    manageDocumentExtraction: async (
+      args:
+        | {
+            action: "set_classification";
+            spaceId: string;
+            sourceItemId: string;
+            kind: string;
+          }
+        | {
+            action: "clear_classification";
+            spaceId: string;
+            sourceItemId: string;
+          }
+        | {
+            action: "reprocess";
+            spaceId: string;
+            sourceItemIds: readonly string[];
+          },
+    ) =>
+      await withPrincipal(async ({ ctx, principal }) => {
+        if (args.action === "reprocess") {
+          return await reprocessDocuments(ctx, { principal, ...args });
+        }
+        return await setDocumentClassification(ctx, {
+          principal,
+          spaceId: args.spaceId,
+          sourceItemId: args.sourceItemId,
+          kind: args.action === "set_classification" ? args.kind : null,
+        });
+      }),
   };
 }
 
