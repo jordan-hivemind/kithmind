@@ -800,6 +800,25 @@ function holdingsHeaderSignature(columns) {
   return JSON.stringify(columns.map(({ name, text }) => [name, text]));
 }
 
+// Explicit table titles documented by the statement layout. A repeated
+// column schema does not make a different asset-class table a continuation.
+// Generic running headings (including HOLDINGS) are not section boundaries.
+const HOLDINGS_SECTION_TITLES = new Set([
+  "CASH, BANK DEPOSIT PROGRAM AND MONEY MARKET FUNDS",
+  "STOCKS",
+  "COMMON STOCKS",
+  "MUTUAL FUNDS",
+  "GOVERNMENT SECURITIES",
+  "CORPORATE FIXED INCOME",
+  "USD SAVINGS DEPOSITS",
+  "OPTIONS",
+]);
+
+function explicitHoldingsSection(text) {
+  const title = text.trim().replace(/\s+\(CONTINUED\)$/, "");
+  return HOLDINGS_SECTION_TITLES.has(title) ? title : null;
+}
+
 /** "CUSIP 00000WNF1" on a bond's detail line. */
 const CUSIP_LABEL = /\bCUSIP\s+([A-Z0-9]{9})\b/;
 
@@ -1201,6 +1220,10 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
         .map(({ text }) => text.trim())
         .find((text) => /^[A-Z][A-Z0-9 ,&%'/()+^-]{3,}$/.test(text)) ??
       "HOLDINGS";
+    const explicitSection = lines
+      .slice(Math.max(0, i - 6), i)
+      .map(({ text }) => explicitHoldingsSection(text))
+      .findLast((title) => title !== null);
     const accountKey = accountKeys[i];
     // F1-53. One per table, not per position: every position under this
     // header shares the same account-number line.
@@ -1223,6 +1246,8 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
       carried !== null &&
       carried.headerSignature === headerSignature &&
       carried.context.accountKey === accountKey &&
+      (explicitSection === undefined ||
+        explicitSection === explicitHoldingsSection(carried.context.section)) &&
       continuesOnAdjacentPrintedPage(
         carried,
         lines[i],

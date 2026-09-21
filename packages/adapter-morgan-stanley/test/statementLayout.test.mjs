@@ -527,6 +527,33 @@ test("an unnumbered cover can anchor a complete adjacent printed-page run", () =
   assert.equal(parsed.holdings.positions[0].marketValue, "4776");
 });
 
+test("matching columns cannot join an explicitly different holdings section", () => {
+  for (const printedTotal of [false, true]) {
+    for (const section of ["MUTUAL FUNDS", "COMMON STOCKS (CONTINUED)"]) {
+      const pages = pageSplitEquityPages().map((page) =>
+        printedTotal ? page : page.filter((line) => !/\bTotal\s+\d/.test(line)),
+      );
+      const header = pages[1].findIndex((line) =>
+        line.includes("Security Description"),
+      );
+      pages[1].splice(header, 0, `        ${section}`);
+      const parsed = parseStatementLines(
+        pages.map((page) => page.join("\n")).join(`\n${PAGE_SEPARATOR}\n`),
+        kind,
+      );
+      const joined = parsed.holdings.positions.find(
+        (position) => position.instrument?.symbol === "WNDF",
+      );
+      if (section === "MUTUAL FUNDS") {
+        assert.equal(joined, undefined);
+        assert.match(parsed.parseNote, /holdings block\(s\) left unparsed/);
+      } else {
+        assert.equal(joined.marketValue, "4776");
+      }
+    }
+  }
+});
+
 test("page topology and semantic changes cannot complete an interrupted lot block", () => {
   const cases = [
     {
