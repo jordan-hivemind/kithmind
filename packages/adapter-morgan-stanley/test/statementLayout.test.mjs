@@ -7,6 +7,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { positionHash } from "@repo/finance-archive";
 import adapter, {
   extractStatementText,
   parseStatementLines,
@@ -18,7 +19,7 @@ import { buildMinimalPdf } from "../fixtures/pdf.mjs";
 import { STATEMENT_LINES } from "../fixtures/statementLines.mjs";
 import {
   ACTIVITY_SUMMARY_TEXT,
-  ambiguousBlockLines,
+  lotsWithoutTotalLines,
   balanceSheetLines,
   bondBlockLines,
   CONSOLIDATED_ACCOUNT_ONE,
@@ -270,18 +271,146 @@ test("an asset-class heading is not read as a security", () => {
 
 // --- review routing ---------------------------------------------------------
 
-test("two valued lots with no Total row are refused, with the reason on the pull", () => {
-  const text = [
+function noTotalStatement(options = {}, trailing = []) {
+  return [
     "        Page 1 of 1",
     "        CLIENT STATEMENT   For the Period March 1-31, 2026",
     "        Synthetic Active Assets Account    123-456789-012",
     "        HOLDINGS",
-    ...ambiguousBlockLines(),
+    "        123-456789-012",
+    ...lotsWithoutTotalLines(options),
+    ...trailing,
   ].join("\n");
+}
+
+test("complete dated lots without Total produce one summed position with source evidence", () => {
+  const text = noTotalStatement();
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [position] = parsed.holdings.positions;
+  assert.equal(position.quantity, "12");
+  assert.equal(position.marketValue, "240");
+  assert.equal(position.costBasis, "240");
+  assert.equal(position.price, "20");
+  assert.equal(position.unrealized, null);
+  assert.equal(position.accountExternalKey, "123-456789-012");
+  assert.equal(position.instrument.symbol, "CSHZ");
+  assert.equal(position.asOf, "2026-03-31");
+  assert.equal(position.valuationBasis, "market_price");
+  assert.match(position.valuationNote, /summed from 2 dated lots/);
+  assert.equal(position.locators.marketValue.binding, undefined);
+  assert.match(position.locators.marketValue.field, /sum of 2 dated lots/);
+  for (const field of ["quantity", "marketValue", "costBasis"]) {
+    for (const lot of [1, 2]) {
+      const { binding } = position.locators[`${field}.lot.${lot}`];
+      assert.equal(text.slice(binding.start, binding.end), binding.quote);
+      assert.equal(binding.textSha256, createHash("sha256").update(text).digest("hex"));
+    }
+  }
+  assert.doesNotMatch(parsed.parseNote ?? "", /holdings block/);
+  assert.deepEqual(parseStatementLines(text, kind), parsed);
+});
+
+test("lot aggregation preserves exact fractional quantities and signed amounts", () => {
+  const text = noTotalStatement({
+    first: { quantity: "0.1", marketValue: "$2.00", totalCost: "$3.00", gainLoss: "(1.00)" },
+    second: { quantity: "0.2", marketValue: "4.00", totalCost: "2.50", gainLoss: "1.50" },
+  });
+  const [position] = parseStatementLines(text, kind).holdings.positions;
+  assert.equal(position.quantity, "0.3");
+  assert.equal(position.marketValue, "6");
+  assert.equal(position.costBasis, "5.5");
+  assert.equal(position.unrealized, "0.5");
+});
+
+test("summed lots and a printed Total have the same downstream position identity", () => {
+  const lines = equityBlockLines();
+  const parse = (rows) => parseStatementLines([
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026", ...rows,
+  ].join("\n"), kind).holdings.positions[0];
+  const withTotal = parse(lines);
+  const withoutTotal = parse(lines.filter((line) => !/\bTotal\s+\d/.test(line)));
+  for (const field of ["quantity", "price", "marketValue", "costBasis", "unrealized"]) {
+    assert.equal(withoutTotal[field], withTotal[field]);
+  }
+  const hash = (position) => positionHash({
+    ...position, accountId: "synthetic-account", instrumentId: "synthetic-instrument",
+    sourceLocator: JSON.stringify(position.locators),
+  });
+  assert.equal(hash(withoutTotal), hash(withTotal));
+});
+
+test("missing or unreadable secondary lot fields remain null, never a partial sum", () => {
+  for (const totalCost of ["", "—", "1S0.00"]) {
+    const [position] = parseStatementLines(noTotalStatement({ second: { totalCost } }), kind).holdings.positions;
+    assert.equal(position.marketValue, "240");
+    assert.equal(position.costBasis, null);
+    assert.equal(position.locators.costBasis, undefined);
+  }
+});
+
+test("incomplete or conflicting lots without Total still route to review", () => {
+  for (const second of [
+    { quantity: "" }, { quantity: "7S" }, { marketValue: "" },
+    { marketValue: "—" }, { marketValue: "14S.00" },
+    { sharePrice: "" }, { sharePrice: "21.00" },
+    { tradeDate: "" }, { tradeDate: "subtotal" },
+  ]) {
+    const parsed = parseStatementLines(noTotalStatement({ second }), kind);
+    assert.deepEqual(parsed.holdings.positions, [], JSON.stringify(second));
+    assert.match(parsed.parseNote, /1 holdings block\(s\) left unparsed/);
+    assert.match(parsed.parseNote, /not a complete set of dated lots/);
+  }
+});
+
+test("an undated extra value row cannot silently enter a lot sum", () => {
+  const extraRow = lotsWithoutTotalLines({ second: { tradeDate: "" } }).at(-1);
+  const parsed = parseStatementLines(noTotalStatement({}, [extraRow]), kind);
+  assert.deepEqual(parsed.holdings.positions, []);
+  assert.match(parsed.parseNote, /holdings block\(s\) left unparsed/);
+});
+
+test("two cells bound to one lot column are refused instead of choosing the first", () => {
+  const text = noTotalStatement().replace("       7.000", "   1   7.000");
+  assert.notEqual(text, noTotalStatement());
   const parsed = parseStatementLines(text, kind);
   assert.deepEqual(parsed.holdings.positions, []);
+  assert.match(parsed.parseNote, /holdings block\(s\) left unparsed/);
+});
+
+test("section totals and the next security stay outside a lot sum", () => {
+  const parsed = parseStatementLines(noTotalStatement({}, [
+    ...sectionSummaryLines({ named: true }), ...bondBlockLines(),
+  ]), kind);
+  assert.equal(parsed.holdings.positions.length, 2);
+  assert.equal(parsed.holdings.positions[0].marketValue, "240");
+});
+
+test("page continuations without Total aggregate only after the block completes", () => {
+  const pages = pageSplitEquityPages().map((page) =>
+    page.filter((line) => !/\bTotal\s+\d/.test(line)),
+  );
+  pages[1].push("        Page 2 of 2");
+  const parsed = parseStatementLines(pages.map((page) => page.join("\n")).join(`\n${PAGE_SEPARATOR}\n`), kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [position] = parsed.holdings.positions;
+  assert.equal(position.quantity, "15");
+  assert.equal(position.marketValue, "4776");
+  assert.equal(position.locators["marketValue.lot.1"].index, 1);
+  assert.equal(position.locators["marketValue.lot.3"].index, 2);
+  const firstOnly = parseStatementLines(pages[0].join("\n"), kind);
+  assert.deepEqual(firstOnly.holdings.positions, []);
+});
+
+test("a continuation for another account cannot complete a lot block", () => {
+  const text = noTotalStatement({}, [
+    "        Page 1 of 2", PAGE_SEPARATOR, "        987-654321-098",
+    ...lotsWithoutTotalLines(), "        Page 2 of 2",
+  ]);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  assert.equal(parsed.holdings.positions[0].accountExternalKey, "987-654321-098");
   assert.match(parsed.parseNote, /1 holdings block\(s\) left unparsed/);
-  assert.match(parsed.parseNote, /neither a Total row nor a single valued lot/);
 });
 
 test("an unreadable market value is null with a note and a marketValue locator", () => {

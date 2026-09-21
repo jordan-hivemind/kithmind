@@ -488,7 +488,7 @@ totals row that repeats the section's name in the description column and its
 share of holdings where a lot would print its trade date. Only a row stating a
 real date starts a security there.
 
-Four security-block shapes occur, and all four are read:
+The parser reads these security-block shapes:
 
 - An equity or fund prints one row per tax lot and a `Total` row carrying the
   aggregate, followed by `Next Dividend Payable MM/YYYY; Asset Class: <class>`.
@@ -496,6 +496,14 @@ Four security-block shapes occur, and all four are read:
   price, which is per-lot in the printing) is filled from the lots **only when
   every lot states the same number**; compared as numbers, since the first lot
   prints `$318.400` and the rest print `318.400`.
+- When no `Total` is printed, two or more complete dated lots under one
+  security are summed with exact decimal arithmetic. Every row must state a
+  trade date, quantity, market value and the same readable market price.
+  Quantity and market value are summed. Cost basis and unrealized gain/loss
+  are summed only when every lot states a readable value in that column;
+  otherwise that field stays null. The valuation note labels the sum, and
+  separate lot locators retain each contributing cell's exact text span.
+  The calculated total has no fabricated source-text binding.
 - A bond prints the security on one row and its market value on the detail row
   beneath it (`Coupon Rate x%; Matures MM/DD/YYYY; CUSIP nnnnnnnnn`), with no
   `Total` row. The block's rows are merged under the same agree-or-leave-null
@@ -549,10 +557,13 @@ Ambiguity is always a null with a note and a locator, never a guess:
   Only the second is a parser gap. `ParsedPosition` carries no note field for
   quantity, price, cost basis or unrealized, so the same three absences are
   not told apart for those.
-- A security block with several valued lots and no `Total` row -> no position,
-  and a `parseNote` counting the blocks and naming the first reason. Once the
-  page-split and section-totals shapes above are read, this is about 0.6% of
-  blocks across the live corpus.
+- A security block with several valued rows and no `Total` that does not meet
+  the complete dated-lot rule -> no position, and a `parseNote` counting the
+  blocks and naming the first reason. Undated value rows, unreadable required
+  cells, competing cells bound to one column and conflicting prices remain
+  refused. A nonfinal page footer must
+  be followed by the same table for the same account before its interrupted
+  block can be summed.
 - A holdings table with no value column this parser reads -> no position, and a
   `parseNote` saying the table states no value, which is a different failure
   from a block whose valued lots disagree.
