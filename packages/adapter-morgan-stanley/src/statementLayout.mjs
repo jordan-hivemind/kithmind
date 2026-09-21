@@ -1224,19 +1224,17 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
     if (REALIZED_TABLE.test(lines[i].text)) continue;
     const columns = resolveValueColumn(headerColumns(lines[i].text));
     if (!columns.some((column) => column.name === "description")) continue;
-    // The section title is the nearest preceding all-caps line -- or, for a
-    // block carried across a page break, the title the security was first
-    // printed under (F1-61).
-    let section =
-      [...lines.slice(Math.max(0, i - 6), i)]
-        .reverse()
-        .map(({ text }) => text.trim())
-        .find((text) => /^[A-Z][A-Z0-9 ,&%'/()+^-]{3,}$/.test(text)) ??
-      "HOLDINGS";
-    const explicitSection = lines
-      .slice(Math.max(0, i - 6), i)
+    // Account-page furniture precedes the page's bare account marker. It
+    // can contain uppercase labels but cannot name this holdings table.
+    // Restrict titles to this physical page and the current account body.
+    const marker = markerLines[i];
+    const sectionLines = lines
+      .slice(Math.max(0, i - 6, marker === null ? 0 : marker + 1), i)
+      .filter((line) => line.page === lines[i].page);
+    const explicitSection = sectionLines
       .map(({ text }) => explicitHoldingsSection(text))
       .findLast((title) => title !== null);
+    let section = explicitSection ?? "HOLDINGS";
     const accountKey = accountKeys[i];
     // F1-53. One per table, not per position: every position under this
     // header shares the same account-number line.

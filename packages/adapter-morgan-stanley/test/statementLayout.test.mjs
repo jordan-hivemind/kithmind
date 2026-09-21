@@ -527,6 +527,58 @@ test("an unnumbered cover can anchor a complete adjacent printed-page run", () =
   assert.equal(parsed.holdings.positions[0].marketValue, "4776");
 });
 
+test("uppercase account-page furniture is not a holdings section boundary", () => {
+  for (const printedTotal of [false, true]) {
+    const pages = pageSplitEquityPages().map((page) =>
+      printedTotal ? page : page.filter((line) => !/\bTotal\s+\d/.test(line)),
+    );
+    for (const page of pages) {
+      const accountLine = page.findIndex((line) =>
+        line.includes("Synthetic Active"),
+      );
+      page.splice(
+        accountLine,
+        1,
+        "                                                                 SYNTHETIC ACCOUNT LABEL",
+        "                                                                 123-456789-012",
+        "        Account Synthetic Example",
+      );
+    }
+    pages[1] = pages[1].map((line) =>
+      /Security Description|02\/20\/26|\bTotal\s+15/.test(line)
+        ? `   ${line}`
+        : line,
+    );
+    const text = pages
+      .map((page) => page.join("\n"))
+      .join(`\n${PAGE_SEPARATOR}\n`);
+    const parsed = parseStatementLines(text, kind);
+    assert.equal(parsed.holdings.positions.length, 1);
+    const [position] = parsed.holdings.positions;
+    assert.equal(position.instrument.symbol, "WNDF");
+    assert.equal(position.accountExternalKey, "123-456789-012");
+    assert.equal(position.marketValue, "4776");
+    assert.match(position.valuationNote, /COMMON STOCKS holdings table/);
+    assert.doesNotMatch(position.valuationNote, /SYNTHETIC ACCOUNT LABEL/);
+    assert.deepEqual(
+      parseStatementLines(pages[0].join("\n"), kind).holdings.positions,
+      [],
+    );
+    // The same all-caps text after the account marker is an explicit new
+    // section, even when it happens to equal the running account label.
+    const header = pages[1].findIndex((line) =>
+      line.includes("Security Description"),
+    );
+    pages[1].splice(header, 0, "        SYNTHETIC ACCOUNT LABEL");
+    const changed = parseStatementLines(
+      pages.map((page) => page.join("\n")).join(`\n${PAGE_SEPARATOR}\n`),
+      kind,
+    );
+    assert.deepEqual(changed.holdings.positions, []);
+    assert.match(changed.parseNote, /holdings block\(s\) left unparsed/);
+  }
+});
+
 test("matching columns cannot join an explicitly different holdings section", () => {
   for (const printedTotal of [false, true]) {
     for (const section of [
