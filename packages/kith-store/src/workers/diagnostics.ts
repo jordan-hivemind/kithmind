@@ -374,6 +374,21 @@ export async function recordWorkerHeartbeat(
     "SELECT id FROM kith.source_accounts WHERE id = $1 FOR UPDATE",
     [source.account.id],
   );
+  if (request.allowedRootAliases !== undefined) {
+    await exec(
+      ctx,
+      `UPDATE kith.source_accounts
+          SET allowed_root_aliases = $2::jsonb,
+              allowed_roots_reported_at = $3
+        WHERE id = $1
+          AND allowed_root_aliases IS DISTINCT FROM $2::jsonb`,
+      [
+        source.account.id,
+        JSON.stringify(request.allowedRootAliases),
+        at(ctx.now),
+      ],
+    );
+  }
   const current = await watcherForSource(ctx, source.account.id, true);
   if (current) {
     validateWatcher(current, source);
@@ -613,10 +628,7 @@ export function isWatcherOverdue(nextExpectedAt: number, now: number): boolean {
 }
 
 export type WatcherStaleness =
-  | "not_configured"
-  | "awaiting_heartbeat"
-  | "current"
-  | "overdue";
+  "not_configured" | "awaiting_heartbeat" | "current" | "overdue";
 
 /**
  * The read-time predicate itself, over one watcher row (or its absence). This
@@ -721,7 +733,13 @@ export async function recordMissingWorkerIncidents(
          (id, space_id, created_at, source_account_id, watcher_id, kind, state,
           opened_at, observed_at)
          VALUES ($1, $2, transaction_timestamp(), $3, $4, 'missing_worker', 'open', $5, $5)`,
-      [newKithId(), watcher.spaceId, watcher.sourceAccountId, watcher.watcherId, at(ctx.now)],
+      [
+        newKithId(),
+        watcher.spaceId,
+        watcher.sourceAccountId,
+        watcher.watcherId,
+        at(ctx.now),
+      ],
     );
     recorded += 1;
   }
@@ -914,9 +932,11 @@ export async function resetWorkerWatcher(
     }
     if (args.nextWatcherId === null) {
       if (current) {
-        await exec(ctx, "DELETE FROM kith.worker_watcher_states WHERE id = $1", [
-          current.id,
-        ]);
+        await exec(
+          ctx,
+          "DELETE FROM kith.worker_watcher_states WHERE id = $1",
+          [current.id],
+        );
       }
     } else if (current) {
       await exec(
@@ -933,7 +953,13 @@ export async function resetWorkerWatcher(
         `INSERT INTO kith.worker_watcher_states
           (id, space_id, created_at, source_account_id, watcher_id, state, created_at_field, updated_at)
           VALUES ($1, $2, transaction_timestamp(), $3, $4, 'awaiting_heartbeat', $5, $5)`,
-        [newKithId(), account.spaceId, account.id, args.nextWatcherId, at(ctx.now)],
+        [
+          newKithId(),
+          account.spaceId,
+          account.id,
+          args.nextWatcherId,
+          at(ctx.now),
+        ],
       );
     }
   }
@@ -1010,9 +1036,11 @@ export async function reregisterWorkerWatcher(
     id: string;
     space_id: string;
     enabled: boolean | null;
-  }>(ctx, "SELECT id, space_id, enabled FROM kith.source_accounts WHERE id = $1", [
-    args.sourceAccountId,
-  ]);
+  }>(
+    ctx,
+    "SELECT id, space_id, enabled FROM kith.source_accounts WHERE id = $1",
+    [args.sourceAccountId],
+  );
   if (!account) throw new Error("Source account not found");
   let membership;
   try {
