@@ -403,8 +403,16 @@ function keepFirstBalancePerAccountDate(
   return accepted;
 }
 
+function mappingIssueCount(document: ImportDocument): number {
+  // The importer records accepted same-institution matches as resolved audit
+  // items. They are not unresolved mapping gaps. Unknown kinds stay blocking.
+  return (document.reviewItems ?? []).filter(
+    (item) => item.kind !== "institution_symbol_match",
+  ).length;
+}
+
 function prepareCandidate(document: ImportDocument): CandidateBuild {
-  let issueCount = document.reviewItems?.length ?? 0;
+  let issueCount = mappingIssueCount(document);
   let rejectedRows = 0;
   const issue = () => {
     issueCount += 1;
@@ -600,10 +608,7 @@ export function buildHoldingCorrectionCandidateManifest(input: {
     "adapter_has_no_holding_completeness_attestation",
   ]);
   if (input.candidate.parseNote) reasons.add("parse_gap");
-  if ((input.candidate.reviewItems?.length ?? 0) > 0) {
-    reasons.add("adapter_mapping_review_required");
-  }
-  if (built.issueCount > (input.candidate.reviewItems?.length ?? 0)) {
+  if (built.issueCount > 0) {
     reasons.add("adapter_mapping_review_required");
   }
   if (built.rejectedRows > 0) reasons.add("candidate_row_rejected");

@@ -389,3 +389,29 @@ test("semantic duplicate matching preserves exact locators before deterministic 
     }
   }
 });
+
+test("accepted instrument-match audit items do not invent a mapping gap", () => {
+  const review = {
+    kind: "institution_symbol_match", accountId: null,
+    institutionId: "inst-1", matchedInstrumentId: "inst-a",
+    reasonCode: "same_institution_symbol_v1", rawValue: "synthetic",
+    reason: "accepted by the institution symbol rule",
+  };
+  const input = {
+    documentId: "doc-5", retainedSha256: SHA, stored: emptyTables,
+    candidate: candidate({reviewItems: [review]}),
+  };
+  const accepted = buildHoldingCorrectionCandidateManifest(input);
+  assert.equal(accepted.completeness.state, "unproven");
+  assert.equal(accepted.completeness.issueCount, 0);
+  assert.equal(accepted.completeness.removalsAuthorized, false);
+  assert.deepEqual(accepted.completeness.reasons, ["adapter_has_no_holding_completeness_attestation"]);
+  for (const kind of ["weak_instrument_match", "future_unknown_review"]) {
+    const blocked = buildHoldingCorrectionCandidateManifest({
+      ...input, candidate: candidate({reviewItems: [review, {...review, kind}]}),
+    });
+    assert.equal(blocked.completeness.state, "partial");
+    assert.equal(blocked.completeness.issueCount, 1);
+    assert.ok(blocked.completeness.reasons.includes("adapter_mapping_review_required"));
+  }
+});
