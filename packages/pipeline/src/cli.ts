@@ -23,6 +23,7 @@ import {
 } from "./journal.js";
 import { initialCheckpoint, journalCodec, PipelineRunner } from "./runner.js";
 import { HttpWorkerTransport } from "./transport.js";
+import { reprioritizeFromPaths } from "./reprioritize.js";
 import type {
   PipelineConfig,
   PipelineRunResult,
@@ -33,7 +34,7 @@ import type { RunnerCheckpoint } from "./runnerState.js";
 
 function usage(): never {
   throw new Error(
-    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked [--operator-clear --max-clears <n>]] and [--accept-retirement <root_selection_would_retire_items|root_contents_collapsed|journal_behind_server>], or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
+    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked [--operator-clear --max-clears <n>]] and [--accept-retirement <root_selection_would_retire_items|root_contents_collapsed|journal_behind_server>], or reprioritize --config <path> --manifest <private-json>, or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
   );
 }
 export function argumentsFor(argv: string[]):
@@ -47,6 +48,7 @@ export function argumentsFor(argv: string[]):
     }
   | { command: "watch"; configPath: string }
   | { command: "doctor"; configPath: string; json: boolean }
+  | { command: "reprioritize"; configPath: string; manifestPath: string }
   | {
       command: "reconcile-receipts";
       configPath: string;
@@ -62,6 +64,22 @@ export function argumentsFor(argv: string[]):
       json: boolean;
     } {
   const forwarded = argv[0] === "--" ? argv.slice(1) : argv;
+  if (forwarded[0] === "reprioritize") {
+    const values = new Map<string, string>();
+    for (let index = 1; index < forwarded.length; index += 1) {
+      const flag = forwarded[index];
+      if (flag !== "--config" && flag !== "--manifest") usage();
+      if (values.has(flag)) usage();
+      const value = forwarded[index + 1];
+      if (!value || value.startsWith("--")) usage();
+      values.set(flag, value);
+      index += 1;
+    }
+    const configPath = values.get("--config");
+    const manifestPath = values.get("--manifest");
+    if (!configPath || !manifestPath) usage();
+    return { command: "reprioritize", configPath, manifestPath };
+  }
   if (forwarded[0] === "forget-archive") {
     const values = new Map<string, string>();
     let json = false;
@@ -443,6 +461,12 @@ export async function runWatch(
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const parsed = argumentsFor(argv);
   const { command, configPath } = parsed;
+  if (command === "reprioritize") {
+    const result = await reprioritizeFromPaths(configPath, parsed.manifestPath);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (result.state !== "reprioritized") process.exitCode = 1;
+    return;
+  }
   if (command === "forget-archive") {
     const result = await executeForget(parsed);
     process.stdout.write(

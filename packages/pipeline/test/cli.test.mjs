@@ -43,6 +43,46 @@ test("the root pnpm alias forwarding separator is consumed exactly once", () => 
   );
 });
 
+test("reprioritize requires one config and one private manifest path", () => {
+  assert.deepEqual(
+    argumentsFor([
+      "reprioritize",
+      "--config",
+      "/tmp/config.json",
+      "--manifest",
+      "/tmp/priority.json",
+    ]),
+    {
+      command: "reprioritize",
+      configPath: "/tmp/config.json",
+      manifestPath: "/tmp/priority.json",
+    },
+  );
+  for (const args of [
+    ["reprioritize", "--config", "/tmp/config.json"],
+    ["reprioritize", "--manifest", "/tmp/priority.json"],
+    [
+      "reprioritize",
+      "--config",
+      "/tmp/config.json",
+      "--manifest",
+      "/tmp/priority.json",
+      "--json",
+    ],
+    [
+      "reprioritize",
+      "--config",
+      "/tmp/config.json",
+      "--config",
+      "/tmp/other.json",
+      "--manifest",
+      "/tmp/priority.json",
+    ],
+  ]) {
+    assert.throws(() => argumentsFor(args));
+  }
+});
+
 // P2-31f: the operator release, on `run` and nowhere else.
 test("run takes --retry-parked and no other command does", () => {
   assert.deepEqual(
