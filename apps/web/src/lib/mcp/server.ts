@@ -168,6 +168,9 @@ const CLIENT_SAFE_IDENTITY_ERROR_CODES: ReadonlySet<string> = new Set([
   "invalid_input",
   "invalid_cursor",
   "duplicate_investment",
+  "tax_payment_identifier_conflict",
+  "tax_payment_identifier_required",
+  "invalid_tax_payment_transition",
   "document_not_found",
   "already_resolved",
   "already_dismissed",
@@ -588,7 +591,7 @@ export function createMcpServer(
   const server = new McpServer(
     {
       name: "open-brain",
-      version: "1.0.0",
+      version: "1.1.0",
     },
     { instructions: SERVER_INSTRUCTIONS },
   );
@@ -1767,6 +1770,24 @@ export function createMcpServer(
     },
   );
 
+  const listTaxPaymentsTool = registerTool(
+    MCP_TOOL_NAMES.listTaxPayments,
+    "List structured manual tax payments for one exact tax year, with exact totals grouped by currency and current status. taxYear is independent from the submission date. Read get_kith_help topic tax_payments for lifecycle and identifier rules.",
+    {
+      spaceIds: readSpacesSchema,
+      taxYear: z.number().int().min(1900).max(3000),
+    },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listTaxPayments],
+    async (args) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(await management.listTaxPayments(args)),
+        },
+      ],
+    }),
+  );
+
   const getKithHelpTool = registerTool(
     MCP_TOOL_NAMES.getKithHelp,
     "Return the compact contract, ID relationships, examples and known gaps for one Kith Mind topic. Mirrors kith://help resources for clients without resource support.",
@@ -2025,6 +2046,59 @@ export function createMcpServer(
         {
           type: "text" as const,
           text: JSON.stringify(await management.manageEntry(request)),
+        },
+      ],
+    }),
+  );
+
+  const paymentIdentifierSchema = z
+    .string()
+    .trim()
+    .min(1)
+    .max(200)
+    .nullable()
+    .optional();
+  const manageTaxPaymentTool = registerTool(
+    MCP_TOOL_NAMES.manageTaxPayment,
+    "Create one structured manual tax payment or update its settlement lifecycle on the same record. Create is retry-safe by payer, authority and confirmation number or EFT trace. Read get_kith_help topic tax_payments before writing.",
+    {
+      request: z.discriminatedUnion("action", [
+        z.object({
+          action: z.literal("create"),
+          spaceId: spaceIdSchema,
+          payer: entitySelectorSchema,
+          authority: z.literal("us_federal"),
+          paymentKind: z.literal("estimated_income"),
+          taxYear: z.number().int().min(1900).max(3000),
+          amount: z.string().trim().min(1).max(80),
+          currency: z.string().regex(/^[A-Z]{3}$/),
+          submittedOn: factDateSchema,
+          confirmationNumber: paymentIdentifierSchema,
+          eftTrace: paymentIdentifierSchema,
+          evidenceSpanId: spaceIdSchema.nullable().optional(),
+        }),
+        z.object({
+          action: z.literal("set_status"),
+          paymentId: spaceIdSchema,
+          status: z.enum([
+            "submitted_processing",
+            "settled",
+            "rejected",
+            "reversed",
+          ]),
+          effectiveOn: factDateSchema,
+          reason: z.string().trim().min(1).max(500),
+          correction: z.boolean().optional(),
+          evidenceSpanId: spaceIdSchema.nullable().optional(),
+        }),
+      ]),
+    },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.manageTaxPayment],
+    async ({ request }) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(await management.manageTaxPayment(request)),
         },
       ],
     }),
@@ -2446,6 +2520,7 @@ export function createMcpServer(
     [MCP_TOOL_NAMES.captureThought]: captureThoughtTool,
     [MCP_TOOL_NAMES.listInvestments]: listInvestmentsTool,
     [MCP_TOOL_NAMES.getInvestment]: getInvestmentTool,
+    [MCP_TOOL_NAMES.listTaxPayments]: listTaxPaymentsTool,
     [MCP_TOOL_NAMES.getKithHelp]: getKithHelpTool,
     [MCP_TOOL_NAMES.getKithCapabilities]: getKithCapabilitiesTool,
     [MCP_TOOL_NAMES.listEntities]: listEntitiesTool,
@@ -2455,6 +2530,7 @@ export function createMcpServer(
     [MCP_TOOL_NAMES.manageEntityAliases]: manageEntityAliasesTool,
     [MCP_TOOL_NAMES.manageInvestment]: manageInvestmentTool,
     [MCP_TOOL_NAMES.manageInvestmentEntry]: manageInvestmentEntryTool,
+    [MCP_TOOL_NAMES.manageTaxPayment]: manageTaxPaymentTool,
     [MCP_TOOL_NAMES.listSupportingDocumentLinks]:
       listSupportingDocumentLinksTool,
     [MCP_TOOL_NAMES.manageSupportingDocumentLink]:

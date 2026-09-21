@@ -49,6 +49,31 @@ type EntryAction =
     }
   | { action: "delete"; investmentId: string; entryId: string };
 
+type TaxPaymentAction =
+  | {
+      action: "create";
+      spaceId: string;
+      payer: memory.EntitySelector;
+      authority: admin.TaxAuthority;
+      paymentKind: admin.TaxPaymentKind;
+      taxYear: number;
+      amount: string;
+      currency: string;
+      submittedOn: string;
+      confirmationNumber?: string | null;
+      eftTrace?: string | null;
+      evidenceSpanId?: string | null;
+    }
+  | {
+      action: "set_status";
+      paymentId: string;
+      status: admin.TaxPaymentStatus;
+      effectiveOn: string;
+      reason: string;
+      correction?: boolean;
+      evidenceSpanId?: string | null;
+    };
+
 export function postgresManagement(withPrincipal: WithMcpPrincipal) {
   return {
     capabilities: async () =>
@@ -207,6 +232,36 @@ export function postgresManagement(withPrincipal: WithMcpPrincipal) {
           action: args.action,
           investmentId: args.investmentId,
           entryId: args.entryId,
+        };
+      }),
+
+    listTaxPayments: async (args: {
+      spaceIds?: readonly string[];
+      taxYear: number;
+    }) =>
+      await withPrincipal(
+        async ({ ctx, principal }) => {
+          const spaces = await getAuthorizedReadSpaceIds(
+            ctx,
+            principal,
+            args.spaceIds,
+          );
+          return await admin.listTaxPayments(ctx, spaces, args.taxYear);
+        },
+        { readOnly: true },
+      ),
+
+    manageTaxPayment: async (args: TaxPaymentAction) =>
+      await withPrincipal(async ({ ctx, principal }) => {
+        if (args.action === "create") {
+          return {
+            action: args.action,
+            ...(await admin.createTaxPayment(ctx, { principal, ...args })),
+          };
+        }
+        return {
+          action: args.action,
+          ...(await admin.setTaxPaymentStatus(ctx, { principal, ...args })),
         };
       }),
 

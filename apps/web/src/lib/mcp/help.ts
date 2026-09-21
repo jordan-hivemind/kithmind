@@ -6,6 +6,7 @@ export const KITH_HELP_TOPICS = [
   "capabilities",
   "investments",
   "entries",
+  "tax_payments",
   "document_links",
   "entities",
   "profiles",
@@ -23,7 +24,7 @@ export type KithHelpTopic = (typeof KITH_HELP_TOPICS)[number];
 const HELP: Record<KithHelpTopic, string> = {
   start: `Kith Mind stores facts, narrative thoughts, indexed documents, investments and exact records.
 
-Use get_kith_capabilities first when a task may write or ingest. Use get_kith_help only for the domain you need. Available topics: recall_capture, capabilities, investments, entries, document_links, entities, profiles, attention, memory, accounts, corrections, documents, finance_reviews, coverage.
+Use get_kith_capabilities first when a task may write or ingest. Use get_kith_help only for the domain you need. Available topics: recall_capture, capabilities, investments, entries, tax_payments, document_links, entities, profiles, attention, memory, accounts, corrections, documents, finance_reviews, coverage.
 
 Use list_spaces before choosing a space. Authentication, credential capabilities, current membership, space grants, source-account grants and sensitivity ceilings are enforced on every call. A userId is an author, not the owner of a shared-space row. Never infer that similarly named IDs are interchangeable.`,
 
@@ -46,6 +47,14 @@ Use list_investments or get_investment before manage_investment. Actions are cre
 Delete is the store's existing real delete. It also removes link rows that depend on the entry and has no MCP undo. Use it only when the owner asked to remove the mistaken entry. An entryId is not an investmentId, accountId, entityId, sourceItemId or documentId. Create optionally accepts importKey for retryable imports: the same non-null key in a space returns the existing entry. It is a source-row identity, not a general confirmation key and not required for ordinary owner writes.
 
 Example create arguments: {"request":{"action":"create","investmentId":"<investmentId>","entryType":"capital_call_paid","entryDate":"2026-09-20","amount":"2500.00","currency":"USD","dateIsEstimated":false}}`,
+
+  tax_payments: `Tax payments are structured manual records, never Thoughts. list_tax_payments requires an exact taxYear and returns payments plus exact totals grouped by currency and current status. taxYear is the year the payment applies to and is independent from submittedOn.
+
+manage_tax_payment create currently supports estimated_income paid to us_federal. Supply the payer entity selector, exact positive decimal amount, currency, submittedOn, and at least one confirmationNumber or eftTrace. Retrying the same identifier and details reuses the payment. A conflicting reuse fails closed. Receipt evidenceSpanId is optional.
+
+set_status updates that same payment. Normal moves are submitted_processing to settled or rejected, and settled to reversed. A mistaken terminal status can be corrected on the same record only with correction true and a reason. rejected and reversed remain explicit and are never counted as settled.
+
+Example create arguments: {"request":{"action":"create","spaceId":"<spaceId>","payer":{"key":"person:owner","kind":"person","name":"Owner"},"authority":"us_federal","paymentKind":"estimated_income","taxYear":2026,"amount":"1234.56","currency":"USD","submittedOn":"2026-09-21","confirmationNumber":"<confirmation>"}}`,
 
   document_links: `list_supporting_document_links reads persisted links between investment entries and source items. Link states are suggested, auto_linked, confirmed and rejected. manage_supporting_document_link confirms or rejects one link. Rejection is remembered and the same pair is not proposed again.
 
@@ -97,7 +106,7 @@ Scheduling results are queued, already_queued, followup_queued, already_followup
 
 Act from the recorded evidence. confirm_instrument_match is supported only when that evidence identifies the target instrument. map_account_key records an api_key or statement_number alias for future account identification; it does not mean historical transactions or positions were repaired. acknowledge_safeguard records that the supported safeguard review was handled. dismiss requires a note. Unsupported actions stay open and report their next action rather than being forced into one of these operations. The agent may complete an evidence-supported repair without asking the owner to repeat the decision.`,
 
-  coverage: `This release manages investments, investment entries, persisted supporting-document decisions, entity aliases, attention actions and mutes, facts, thoughts, finance account display overrides, supported finance review actions, extracted-value corrections, document classification and selected re-extraction. It does not expose space membership, credential creation/revocation, source-root changes, arbitrary database access, trades or transfers.
+  coverage: `This release manages investments, investment entries, manual tax payments and their settlement status, persisted supporting-document decisions, entity aliases, attention actions and mutes, facts, thoughts, finance account display overrides, supported finance review actions, extracted-value corrections, document classification and selected re-extraction. It does not expose space membership, credential creation/revocation, source-root changes, arbitrary database access, trades or transfers.
 
 Document search and exact-record answers remain bounded by reported source coverage. A missing match does not prove an event did not happen. Follow cursors and report truncation, coverage reasons, stale state and exclusions. Entity and attention reads are paginated. Supporting-link reads use the store's bounded candidate limit and currently return no cursor.`,
 };
