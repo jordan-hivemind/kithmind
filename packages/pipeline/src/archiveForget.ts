@@ -22,7 +22,10 @@ import {
   inspectParserOutputIntent,
   removeParserOutputExact,
 } from "./parserProcess.js";
-import { providerOriginalReferenceFingerprint } from "./archivedRequestMapping.js";
+import {
+  providerOriginalReferenceFingerprint,
+  provenanceCreatedAt,
+} from "./archivedRequestMapping.js";
 import { removeProviderBindingExact } from "./providerRegistry.js";
 import {
   inspectSpoolIntentState,
@@ -84,7 +87,7 @@ type AckResult = CloudAck & {
   reused: boolean;
 };
 
-type ProviderAck = {
+type ProviderAckV1 = {
   detachId: string;
   referenceId: string;
   forgetEpoch: number;
@@ -96,7 +99,17 @@ type ProviderAck = {
   completedAt: number;
 };
 
-type ProviderTarget = {
+type ProviderAckV2 = {
+  referenceVersion: "provider_original_v2";
+  detachId: string;
+  referenceId: string;
+  forgetEpoch: number;
+  referenceOutcome: "detached" | "already_detached";
+  providerSourceOutcome: "retained_unchanged";
+  completedAt: number;
+};
+
+type ProviderTargetV1 = {
   referenceId: string;
   referenceFingerprint: string;
   locatorBindingId: string;
@@ -106,8 +119,27 @@ type ProviderTarget = {
   locatorCiphertextHash: string;
   locatorCiphertextByteLength: number;
   forgetEpoch: number;
-  ack?: ProviderAck;
+  ack?: ProviderAckV1;
 };
+
+type ProviderTargetV2 = {
+  referenceVersion: "provider_original_v2";
+  referenceId: string;
+  referenceFingerprint: string;
+  forgetEpoch: number;
+  ack?: ProviderAckV2;
+};
+
+type ProviderTarget = ProviderTargetV1 | ProviderTargetV2;
+
+function isProviderV2Target(
+  target: ProviderTarget,
+): target is ProviderTargetV2 {
+  return (
+    "referenceVersion" in target &&
+    target.referenceVersion === "provider_original_v2"
+  );
+}
 
 type ProviderForgetPage = {
   operation: "providerOriginal.forgetTargets";
@@ -172,6 +204,22 @@ const defaultCommands: ArchiveForgetCommands = {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function stableUuid(...parts: readonly unknown[]): string {
+  const bytes = createHash("sha256").update(JSON.stringify(parts)).digest();
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.subarray(0, 16).toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function providerDetachId(target: ProviderTargetV2): string {
+  return stableUuid(
+    "provider-original-detach:v2",
+    target.referenceId,
+    target.forgetEpoch,
+  );
 }
 
 function operationalFailure(error: unknown): ArchiveForgetResult {
@@ -476,17 +524,9 @@ function reconcileTargets(rows: SelectedRow[], targets: CloudTarget[]) {
 function providerDeclarationForForget(row: OriginalCatalogRow) {
   const provider = row.providerOriginal;
   const verified = provider?.verified;
-  const locator = provider?.locator;
-  if (
-    !provider ||
-    !verified ||
-    !locator?.published ||
-    !locator.backup ||
-    locator.readbackVerifiedAt === undefined
-  )
+  if (!provider || !verified)
     throw { code: "provider_locator_incomplete" };
-  return {
-    referenceVersion: "provider_original_v1" as const,
+  const base = {
     providerKind: "dropbox_v1" as const,
     clientReferenceId: provider.clientReferenceId,
     sourceContentHash: verified.sourceContentHash,
@@ -497,6 +537,24 @@ function providerDeclarationForForget(row: OriginalCatalogRow) {
     providerRevision: verified.providerRevision,
     providerContentHash: verified.providerContentHash,
     verifiedAt: verified.verifiedAt,
+  };
+  if (provider.referenceVersion === "provider_original_v2") {
+    return {
+      referenceVersion: "provider_original_v2" as const,
+      ...base,
+      createdAt: provenanceCreatedAt(row.createdAt, verified.verifiedAt),
+    };
+  }
+  const locator = provider.locator;
+  if (
+    !locator.published ||
+    !locator.backup ||
+    locator.readbackVerifiedAt === undefined
+  )
+    throw { code: "provider_locator_incomplete" };
+  return {
+    referenceVersion: "provider_original_v1" as const,
+    ...base,
     locatorBundle: {
       bindingId: provider.bindingId,
       manifestFingerprint: verified.manifestFingerprint,
@@ -522,8 +580,7 @@ function reconcileProviderTargets(
       selected,
     ): selected is { subject: "original_bytes"; row: OriginalCatalogRow } =>
       selected.subject === "original_bytes" &&
-      selected.row.providerOriginal !== undefined &&
-      selected.row.providerOriginal.referenceVersion !== "provider_original_v2",
+      selected.row.providerOriginal !== undefined,
   );
   const matched = new Map<string, OriginalCatalogRow>();
   for (const target of targets) {
@@ -536,9 +593,15 @@ function reconcileProviderTargets(
       )
         return false;
       const declaration = providerDeclarationForForget(row);
+      if (
+        providerOriginalReferenceFingerprint(declaration) !==
+        target.referenceFingerprint
+      )
+        return false;
+      if (isProviderV2Target(target))
+        return declaration.referenceVersion === "provider_original_v2";
       return (
-        providerOriginalReferenceFingerprint(declaration) ===
-          target.referenceFingerprint &&
+        declaration.referenceVersion === "provider_original_v1" &&
         declaration.locatorBundle.bindingId === target.locatorBindingId &&
         declaration.locatorBundle.repositoryId === target.locatorRepositoryId &&
         declaration.locatorBundle.snapshotId === target.locatorSnapshotId &&
@@ -551,32 +614,43 @@ function reconcileProviderTargets(
     });
     if (candidates.length !== 1)
       throw { code: "provider_target_identity_mismatch" };
-    const provider = candidates[0]!.row.providerOriginal;
-    if (!provider || provider.referenceVersion === "provider_original_v2")
-      throw { code: "provider_target_identity_mismatch" };
-    const providerCopy = provider.locator;
-    if (
-      providerCopy.reviewCode ||
-      !providerCopy.prepared ||
-      !providerCopy.published ||
-      !providerCopy.backup ||
-      (providerCopy.deletion &&
-        (providerCopy.deletion.reason !== "forget" ||
-          providerCopy.deletion.forgetEpoch !== target.forgetEpoch))
-    )
-      throw { code: "provider_locator_incomplete" };
     matched.set(target.referenceId, candidates[0]!.row);
-    const deletion = providerCopy.deletion;
-    if (
-      target.ack &&
-      (!deletion ||
-        deletion.state !== "complete" ||
-        deletion.reason !== "forget" ||
-        deletion.forgetEpoch !== target.forgetEpoch ||
-        deletion.deletionId !== target.ack.detachId ||
-        deletion.backup !== target.ack.locatorBundleOutcome)
-    )
-      throw { code: "provider_ack_identity_mismatch" };
+    if (isProviderV2Target(target)) {
+      if (
+        target.ack &&
+        (target.ack.detachId !== providerDetachId(target) ||
+          target.ack.referenceId !== target.referenceId ||
+          target.ack.forgetEpoch !== target.forgetEpoch ||
+          target.ack.providerSourceOutcome !== "retained_unchanged")
+      )
+        throw { code: "provider_ack_identity_mismatch" };
+    } else {
+      const provider = candidates[0]!.row.providerOriginal;
+      if (!provider || provider.referenceVersion === "provider_original_v2")
+        throw { code: "provider_target_identity_mismatch" };
+      const providerCopy = provider.locator;
+      if (
+        providerCopy.reviewCode ||
+        !providerCopy.prepared ||
+        !providerCopy.published ||
+        !providerCopy.backup ||
+        (providerCopy.deletion &&
+          (providerCopy.deletion.reason !== "forget" ||
+            providerCopy.deletion.forgetEpoch !== target.forgetEpoch))
+      )
+        throw { code: "provider_locator_incomplete" };
+      const deletion = providerCopy.deletion;
+      if (
+        target.ack &&
+        (!deletion ||
+          deletion.state !== "complete" ||
+          deletion.reason !== "forget" ||
+          deletion.forgetEpoch !== target.forgetEpoch ||
+          deletion.deletionId !== target.ack.detachId ||
+          deletion.backup !== target.ack.locatorBundleOutcome)
+      )
+        throw { code: "provider_ack_identity_mismatch" };
+    }
   }
   for (const { row } of originals) {
     if (
@@ -765,7 +839,7 @@ async function deleteProviderLocator(input: {
   pdf: PdfDocQaConfig;
   catalog: ArchiveCatalog;
   row: OriginalCatalogRow;
-  target: ProviderTarget;
+  target: ProviderTargetV1;
   forgetEpoch: number;
   commands: ArchiveForgetCommands;
   now: () => number;
@@ -1105,11 +1179,8 @@ export async function runArchiveForget(input: {
     }
     let localCopyCount = 0;
     for (const selected of rows) {
-      const roles =
-        selected.subject === "original_bytes" && selected.row.providerOriginal
-          ? (["primary"] as const)
-          : (["primary", "independent_backup"] as const);
-      for (const role of roles) {
+      for (const role of ["primary", "independent_backup"] as const) {
+        if (!selected.row.copies[role]) continue;
         if (
           await deleteCopy({
             config: input.config.pdfDocQa,
@@ -1130,6 +1201,63 @@ export async function runArchiveForget(input: {
     }
     for (const target of providerFirst?.targets ?? []) {
       const row = providerMatches.get(target.referenceId)!;
+      if (isProviderV2Target(target)) {
+        const provider = row.providerOriginal;
+        if (
+          provider?.referenceVersion !== "provider_original_v2" ||
+          !provider.verified
+        )
+          throw { code: "provider_target_identity_mismatch" };
+        const detachId = providerDetachId(target);
+        await authorizeProvider();
+        await commands.removeProviderBinding({
+          registryDirectory: input.config.pdfDocQa.providerOriginal!
+            .registryDirectory,
+          bindingId: provider.bindingId,
+          manifestFingerprint: provider.verified.manifestFingerprint,
+          manifestByteLength: provider.verified.manifestByteLength,
+        });
+        if (target.ack) {
+          if (
+            target.ack.detachId !== detachId ||
+            target.ack.referenceId !== target.referenceId ||
+            target.ack.forgetEpoch !== input.forgetEpoch ||
+            target.ack.providerSourceOutcome !== "retained_unchanged"
+          )
+            throw { code: "provider_ack_identity_mismatch" };
+          continue;
+        }
+        const response = await input.transport.call({
+          protocolVersion: 1,
+          operation: "providerOriginal.ackDetach",
+          spaceId: input.config.spaceId,
+          sourceAccountId: input.config.sourceAccountId,
+          requestId: detachId,
+          sourceItemId: input.sourceItemId,
+          expectedForgetEpoch: input.forgetEpoch,
+          referenceVersion: "provider_original_v2",
+          detachId,
+          referenceId: target.referenceId,
+          referenceOutcome: "detached",
+          providerSourceOutcome: "retained_unchanged",
+        });
+        if (isWorkerError(response)) throw { code: response.error.code };
+        const ack = response as ProviderAckV2 & {
+          operation: "providerOriginal.ackDetach";
+          reused: boolean;
+        };
+        if (
+          ack.operation !== "providerOriginal.ackDetach" ||
+          ack.referenceVersion !== "provider_original_v2" ||
+          ack.detachId !== detachId ||
+          ack.referenceId !== target.referenceId ||
+          ack.forgetEpoch !== input.forgetEpoch ||
+          ack.referenceOutcome !== "detached" ||
+          ack.providerSourceOutcome !== "retained_unchanged"
+        )
+          throw { code: "provider_ack_identity_mismatch" };
+        continue;
+      }
       const local = await deleteProviderLocator({
         pdf: input.config.pdfDocQa,
         catalog: input.catalog,
@@ -1174,7 +1302,7 @@ export async function runArchiveForget(input: {
         providerSourceOutcome: "retained_unchanged",
       });
       if (isWorkerError(response)) throw { code: response.error.code };
-      const ack = response as ProviderAck & {
+      const ack = response as ProviderAckV1 & {
         operation: "providerOriginal.ackDetach";
         reused: boolean;
       };

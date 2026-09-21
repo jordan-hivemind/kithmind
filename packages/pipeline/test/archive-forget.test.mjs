@@ -1195,3 +1195,173 @@ test("provider forget deletes only Kith locator metadata and reports the retaine
     await rm(f.directory, { recursive: true, force: true });
   }
 });
+
+test("provider v2 forget detaches the reference without locator or backup work", async () => {
+  const f = await setup();
+  try {
+    const sourceExternalId = randomUUID();
+    const sourceItemId = "source_item_v2";
+    const bindingId = randomUUID();
+    const clientReferenceId = randomUUID();
+    const verified = {
+      providerAccountIdHash: hash("dbid:account"),
+      providerRootDirectoryIdHash: hash("id:root"),
+      providerFileIdHash: hash("id:file"),
+      providerRevision: "rev2",
+      providerContentHash: repeatedHash("5"),
+      sourceContentHash: repeatedHash("1"),
+      sourceByteLength: 100,
+      verifiedAt: 2,
+      manifestFingerprint: repeatedHash("6"),
+      manifestByteLength: 300,
+    };
+    let row = await f.catalog.createOriginalIntent({
+      originalCatalogId: randomUUID(),
+      sourceExternalId,
+      origin: {
+        scanId: "scan_1",
+        observationEpoch: 1,
+        sha256: verified.sourceContentHash,
+        byteLength: verified.sourceByteLength,
+        mediaType: "application/pdf",
+      },
+      copies: {},
+      providerOriginal: {
+        referenceVersion: "provider_original_v2",
+        clientReferenceId,
+        bindingId,
+        verified,
+      },
+      createdAt: 1,
+    });
+    const referenceId = "provider_reference_v2";
+    row = await f.catalog.recordOriginalCloud({
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      cloud: {
+        sourceItemId,
+        sourceRevisionId: "revision_v2",
+        providerReferenceId: referenceId,
+        providerBindingEpoch: 1,
+        admittedAt: 3,
+      },
+    });
+    delete f.config.pdfDocQa.archive.independentBackup;
+    f.config.pdfDocQa.providerOriginal = {
+      rootAlias: "root",
+      providerRootDirectoryId: "id:root",
+      providerAccountIdHash: verified.providerAccountIdHash,
+      providerRootDirectoryIdHash: verified.providerRootDirectoryIdHash,
+      refreshPath: "Kith Mind/Inbox",
+      registryDirectory: join(f.directory, "provider-registry"),
+      remoteName: "dropbox",
+      rcloneBinary: "/tools/rclone",
+      configPath: "/private/rclone.conf",
+      configIdentityFingerprint: repeatedHash("c"),
+    };
+    const declaration = {
+      referenceVersion: "provider_original_v2",
+      providerKind: "dropbox_v1",
+      clientReferenceId,
+      sourceContentHash: verified.sourceContentHash,
+      sourceByteLength: verified.sourceByteLength,
+      providerAccountIdHash: verified.providerAccountIdHash,
+      providerRootDirectoryIdHash: verified.providerRootDirectoryIdHash,
+      providerFileIdHash: verified.providerFileIdHash,
+      providerRevision: verified.providerRevision,
+      providerContentHash: verified.providerContentHash,
+      verifiedAt: verified.verifiedAt,
+      createdAt: 1,
+    };
+    const target = {
+      referenceVersion: "provider_original_v2",
+      referenceId,
+      referenceFingerprint: providerOriginalReferenceFingerprint(declaration),
+      forgetEpoch: 7,
+    };
+    let providerAck;
+    const requests = [];
+    const worker = {
+      async call(request) {
+        requests.push(structuredClone(request));
+        if (request.operation === "archive.forgetTargets") {
+          return {
+            operation: request.operation,
+            sourceItemId,
+            sourceExternalIdHash: hash(sourceExternalId),
+            forgetEpoch: 7,
+            targets: [],
+            isDone: true,
+            continueCursor: "done",
+          };
+        }
+        if (request.operation === "providerOriginal.forgetTargets") {
+          return {
+            operation: request.operation,
+            sourceItemId,
+            sourceExternalIdHash: hash(sourceExternalId),
+            forgetEpoch: 7,
+            targets: [{ ...target, ...(providerAck ? { ack: providerAck } : {}) }],
+            isDone: true,
+            continueCursor: "done",
+          };
+        }
+        assert.equal(request.operation, "providerOriginal.ackDetach");
+        assert.equal(request.referenceVersion, "provider_original_v2");
+        for (const key of [
+          "locatorBindingId",
+          "locatorRepositoryId",
+          "locatorSnapshotId",
+          "locatorObjectName",
+          "locatorBundleOutcome",
+        ])
+          assert.equal(key in request, false);
+        providerAck = {
+          referenceVersion: "provider_original_v2",
+          detachId: request.detachId,
+          referenceId,
+          forgetEpoch: 7,
+          referenceOutcome: "detached",
+          providerSourceOutcome: "retained_unchanged",
+          completedAt: 10,
+        };
+        return { operation: request.operation, ...providerAck, reused: false };
+      },
+    };
+    const calls = [];
+    const result = await runArchiveForget({
+      config: f.config,
+      catalog: f.catalog,
+      transport: worker,
+      sourceItemId,
+      sourceExternalId,
+      forgetEpoch: 7,
+      commands: commands(f.catalog, calls),
+      now: () => 5,
+    });
+    assert.deepEqual(result, {
+      state: "owner_finalization_required",
+      sourceItemId,
+      forgetEpoch: 7,
+      receiptCount: 0,
+      acknowledgedCount: 0,
+      localCopyCount: 0,
+      providerReferenceCount: 1,
+      providerOriginalOutcome:
+        "provider_original_reference_detached_source_retained",
+      nextAction: "run_authenticated_owner_continue_forget",
+    });
+    assert.deepEqual(
+      calls.map(([kind]) => kind),
+      ["provider-binding"],
+    );
+    assert.equal(
+      requests.filter((request) => request.operation === "providerOriginal.ackDetach")
+        .length,
+      1,
+    );
+  } finally {
+    await f.journal.close();
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
