@@ -11,13 +11,15 @@ WITH keyed AS (
   SELECT id,
          md5(concat_ws(E'\x1f', source_account_id::text, record_type,
                        coalesce(entity_id::text, ''),
-                       coalesce("from"::text, ''), coalesce("to"::text, ''),
+                       coalesce((extract(epoch FROM "from") * 1000)::bigint::text, ''),
+                       coalesce((extract(epoch FROM "to") * 1000)::bigint::text, ''),
                        reason)) AS base_key,
          row_number() OVER (
            PARTITION BY space_id,
              md5(concat_ws(E'\x1f', source_account_id::text, record_type,
                            coalesce(entity_id::text, ''),
-                           coalesce("from"::text, ''), coalesce("to"::text, ''),
+                           coalesce((extract(epoch FROM "from") * 1000)::bigint::text, ''),
+                           coalesce((extract(epoch FROM "to") * 1000)::bigint::text, ''),
                            reason))
            ORDER BY detected_at DESC, id DESC
          ) AS duplicate_number
@@ -29,8 +31,9 @@ WITH keyed AS (
            WHEN k.duplicate_number IS NULL OR k.duplicate_number = 1
              THEN md5(concat_ws(E'\x1f', g.source_account_id::text,
                                 g.record_type, coalesce(g.entity_id::text, ''),
-                                coalesce(g."from"::text, ''),
-                                coalesce(g."to"::text, ''), g.reason))
+                                coalesce((extract(epoch FROM g."from") * 1000)::bigint::text, ''),
+                                coalesce((extract(epoch FROM g."to") * 1000)::bigint::text, ''),
+                                g.reason))
            ELSE k.base_key || ':legacy-duplicate:' || g.id::text
          END AS condition_key
     FROM kith.coverage_gaps g
@@ -49,6 +52,29 @@ ALTER TABLE kith.coverage_gaps
 CREATE UNIQUE INDEX coverage_gaps_open_condition_idx
   ON kith.coverage_gaps (space_id, condition_key)
   WHERE status = 'open';
+
+-- Legacy CSV imports predate condition_key and COPY only their mapped
+-- columns. Derive the same identity for those rows before NOT NULL is
+-- enforced; current writers supply the value explicitly.
+CREATE FUNCTION kith.fill_coverage_gap_condition_key()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.condition_key IS NULL THEN
+    NEW.condition_key := md5(concat_ws(E'\x1f', NEW.source_account_id::text,
+      NEW.record_type, coalesce(NEW.entity_id::text, ''),
+      coalesce((extract(epoch FROM NEW."from") * 1000)::bigint::text, ''),
+      coalesce((extract(epoch FROM NEW."to") * 1000)::bigint::text, ''),
+      NEW.reason));
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER coverage_gaps_condition_key_trg
+  BEFORE INSERT OR UPDATE OF condition_key ON kith.coverage_gaps
+  FOR EACH ROW EXECUTE FUNCTION kith.fill_coverage_gap_condition_key();
 
 CREATE TABLE kith.coverage_gap_actions (
   id kith.kith_id PRIMARY KEY,
