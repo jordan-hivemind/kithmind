@@ -665,6 +665,45 @@ test("a printed Total after a page gap cannot complete the interrupted security"
   assert.match(parsed.parseNote, /holdings block\(s\) left unparsed/);
 });
 
+test("an earlier topology defect cannot become a physical-number anchor", () => {
+  for (const priorPage of [
+    ["        prior page", "        Page 2 of 5"],
+    ["        prior page with no footer"],
+  ]) {
+    for (const printedTotal of [false, true]) {
+      const pages = pageSplitEquityPages().map((page) =>
+        printedTotal ? page : page.filter((line) => !/\bTotal\s+\d/.test(line)),
+      );
+      pages[0] = pages[0].map((line) =>
+        line.replace(/Page 1 of 2/g, "Page 3 of 4"),
+      );
+      pages[1] = pages[1].map((line) =>
+        line.replace(/Page 2 of 2/g, "Page 4 of 4"),
+      );
+      const cover = [
+        "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      ];
+      const parsed = parseStatementLines(
+        [cover, priorPage, ...pages]
+          .map((page) => page.join("\n"))
+          .join(`\n${PAGE_SEPARATOR}\n`),
+        kind,
+      );
+      assert.equal(
+        parsed.holdings.positions.some(
+          (position) => position.instrument?.symbol === "WNDF",
+        ),
+        false,
+      );
+      assert.match(
+        parsed.parseNote,
+        /holdings block\(s\) left unparsed/,
+        "a balance-sheet note alone must not satisfy this assertion",
+      );
+    }
+  }
+});
+
 test("a continuation for another account cannot complete a lot block", () => {
   const text = noTotalStatement({}, [
     "        Page 1 of 2",
@@ -674,12 +713,8 @@ test("a continuation for another account cannot complete a lot block", () => {
     "        Page 2 of 2",
   ]);
   const parsed = parseStatementLines(text, kind);
-  assert.equal(parsed.holdings.positions.length, 1);
-  assert.equal(
-    parsed.holdings.positions[0].accountExternalKey,
-    "987-654321-098",
-  );
-  assert.match(parsed.parseNote, /1 holdings block\(s\) left unparsed/);
+  assert.deepEqual(parsed.holdings.positions, []);
+  assert.match(parsed.parseNote, /holdings block\(s\) left unparsed/);
 });
 
 test("an unreadable market value is null with a note and a marketValue locator", () => {

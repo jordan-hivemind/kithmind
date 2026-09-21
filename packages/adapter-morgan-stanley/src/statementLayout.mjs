@@ -667,7 +667,12 @@ function printedPages(lines) {
   );
 }
 
-function continuesOnAdjacentPrintedPage(carried, headerLine, printedByPage) {
+function continuesOnAdjacentPrintedPage(
+  carried,
+  headerLine,
+  printedByPage,
+  populatedPages,
+) {
   if (headerLine.page !== carried.page + 1) return false;
   const before = printedByPage.get(carried.page);
   const after = printedByPage.get(headerLine.page);
@@ -680,16 +685,21 @@ function continuesOnAdjacentPrintedPage(carried, headerLine, printedByPage) {
     before.number + 1 === after.number &&
     before.number < before.total &&
     after.number <= after.total &&
-    printedPageSequenceIsAnchored(headerLine.page, printedByPage)
+    printedPageSequenceIsAnchored(
+      headerLine.page,
+      printedByPage,
+      populatedPages,
+    )
   );
 }
 
 /** Trace a local printed-page run to positive evidence of its beginning. A
  * `Page 1` can begin an account-local run anywhere. An unnumbered cover is
- * also supported when the later printed number agrees with the extracted
- * physical page index. A missing cover cannot make physical page 1's
- * `Page 2` look complete. */
-function printedPageSequenceIsAnchored(page, printedByPage) {
+ * also supported only when populated physical page 1 has no declaration and
+ * physical page 2 says `Page 2`. A missing or contradictory predecessor later
+ * in the document can never become a new anchor merely because its physical
+ * and printed page numbers happen to agree. */
+function printedPageSequenceIsAnchored(page, printedByPage, populatedPages) {
   let physicalPage = page;
   let declaration = printedByPage.get(physicalPage);
   if (declaration === null || declaration === undefined) return false;
@@ -701,7 +711,12 @@ function printedPageSequenceIsAnchored(page, printedByPage) {
       previous.total !== declaration.total ||
       previous.number + 1 !== declaration.number
     ) {
-      return declaration.number === physicalPage;
+      return (
+        physicalPage === 2 &&
+        declaration.number === 2 &&
+        populatedPages.has(1) &&
+        !printedByPage.has(1)
+      );
     }
     physicalPage -= 1;
     declaration = previous;
@@ -1165,6 +1180,7 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
   // never continued is still read exactly as before.
   let carried = null;
   const printedByPage = printedPages(lines);
+  const populatedPages = new Set(lines.map(({ page }) => page));
   const flushCarried = () => {
     if (carried === null) return;
     emit(carried.block, carried.columns, carried.context);
@@ -1207,7 +1223,12 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
       carried !== null &&
       carried.headerSignature === headerSignature &&
       carried.context.accountKey === accountKey &&
-      continuesOnAdjacentPrintedPage(carried, lines[i], printedByPage)
+      continuesOnAdjacentPrintedPage(
+        carried,
+        lines[i],
+        printedByPage,
+        populatedPages,
+      )
     ) {
       block = carried.block;
       description = carried.description;
@@ -1295,7 +1316,11 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
           description,
           allowLotAggregation:
             finalPageFooter &&
-            printedPageSequenceIsAnchored(lines[i].page, printedByPage),
+            printedPageSequenceIsAnchored(
+              lines[i].page,
+              printedByPage,
+              populatedPages,
+            ),
         },
         headerSignature,
         page: lines[i].page,
