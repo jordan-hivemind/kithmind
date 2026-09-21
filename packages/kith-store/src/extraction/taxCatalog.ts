@@ -19,6 +19,12 @@ const number = (name: string, required = false): SeedField => ({
   ...(required ? { required: true as const } : {}),
 });
 
+const date = (name: string): SeedField => ({
+  name,
+  valueType: "date",
+  check: "exact",
+});
+
 const text = (name: string): SeedField => ({
   name,
   valueType: "text",
@@ -48,7 +54,7 @@ export const FEDERAL_INDIVIDUAL_RETURN: SeedDocumentType = {
     text("jurisdiction"),
     text("filer_name_as_written"),
     text("preparer_name"),
-    text("signature_date"),
+    date("signature_date"),
     text("filing_channel"),
 
     money("wages_total"),

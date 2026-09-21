@@ -21,7 +21,7 @@ test("federal tax starter catalog is one valid, stable form kind", () => {
     assert.match(field.name, FIELD_NAME);
     assert.equal(names.has(field.name), false, `duplicate field ${field.name}`);
     names.add(field.name);
-    assert.ok(["text", "money", "number"].includes(field.valueType));
+    assert.ok(["text", "money", "number", "date"].includes(field.valueType));
     assert.ok(["on_page", "exact"].includes(field.check));
     assert.equal(field.name.includes("line"), false);
     if (SCHEDULE_PREFIX.test(field.name))
@@ -50,7 +50,7 @@ test("federal tax starter catalog is one valid, stable form kind", () => {
     FEDERAL_INDIVIDUAL_RETURN.fields.find(
       (field) => field.name === "signature_date",
     ).valueType,
-    "text",
+    "date",
   );
   assert.match(
     FEDERAL_INDIVIDUAL_RETURN.guidance,

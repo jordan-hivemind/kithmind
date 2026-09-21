@@ -444,7 +444,7 @@ Every slice is testable against synthetic fixtures: public blank IRS forms
 filled with invented numbers, checked into the repository. No real return is
 needed to prove any of it, and none is committed.
 
-## Current implementation (PR #357, not deployed until merged)
+## Current implementation (PR #357)
 
 The first bounded federal-return pass is implemented through the existing
 typed document extraction path. New spaces receive the `tax_return_1040`
@@ -456,8 +456,12 @@ selected source pages for evidence spans, and stops before a page that
 identifies itself as a K-1, W-2, 1099 or brokerage attachment. A reference to
 one of those forms on a 1040 or schedule page does not end the pass.
 
-Accepted totals remain ordinary cited `document_statement` observations, so
-the existing document reader and `query_records` can retrieve them. The
+Accepted totals remain ordinary cited `document_statement` observations.
+The existing `get_document` structured extraction read returns each stored
+tax year, total and citation, including unsigned returns. An agent can compare
+those saved totals across years without downloading the original PDFs.
+Date-filtered `query_records` excludes returns without a full document date;
+the tax year is never converted into an invented signing or filing date. The
 runner records a real page or character bound as missing coverage, while an
 intentional attachment boundary does not create a false truncation warning.
 The dedicated `tax_facts` projection and `query_tax_facts` remain future
