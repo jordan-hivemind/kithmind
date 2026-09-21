@@ -1,25 +1,6 @@
 "use client";
 
-// Screen 2 (Sources): every folder, institution and manual source, expanding
-// into the watched folders under it.
-//
-// Two kinds of row in one table, the way ADM-3's investments table holds
-// investments over their entries: a source account, and each `source_roots`
-// row that hangs off it. They share the columns because a root answers the
-// same questions the account does -- where it points, how much it holds, when
-// it was last read, and whether the last pass was clean -- only for one
-// subtree instead of all of them.
-//
-// Every value comes from the database. A root's status pill and its tooltip
-// are the latest `source_root_reports` row for it, written by the watcher host
-// through `source.rootReport`; a root with no report yet is `pending` rather
-// than a guess.
-//
-// The three writes (add, pause/resume, remove) apply to the cache before the
-// request is sent and roll back with a message if the server refuses, so the
-// table never waits on a round trip. Changes made anywhere else -- the
-// watcher, another tab -- arrive through the change feed.
-
+import * as AlertDialog from "@radix-ui/react-alert-dialog";
 import type { admin } from "@repo/kith-store";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ColumnDef } from "@tanstack/react-table";
@@ -43,115 +24,24 @@ import { useLiveChanges } from "@/lib/kith/use-live-changes";
 
 type Source = admin.SourceInventoryRow;
 type Root = admin.SourceRoot;
-
-/** The tables this screen's data is read from. A change on any of them
- * invalidates `["sources"]`. */
-const WATCHED = {
-  sources: [
-    "source_accounts",
-    "source_roots",
-    "source_root_reports",
-    "source_items",
-    "worker_watcher_states",
-    "worker_processing_assessments",
-  ],
-} as const;
-
-const SOURCES_KEY = ["sources"] as const;
-
 type Page = { sources: Source[]; roots: Root[] };
-
 type Tone = "neutral" | "accent" | "warn";
-
-const STATUS_TONE: Record<Source["status"], Tone> = {
-  ok: "accent",
-  pending: "neutral",
-  disabled: "neutral",
-  overdue: "warn",
-  problem: "warn",
-};
-
-/** One table row, of either kind, behind one set of column accessors. */
 type Row = {
-  rowKind: "source" | "root";
+  rowKind: "connection" | "location";
   id: string;
-  name: string;
-  /** The hover detail behind the name. */
-  detail: string | null;
-  connector: string;
-  kind: string | null;
+  connection: string;
+  connectionType: string;
+  location: string | null;
   area: string | null;
   itemCount: number;
-  skippedCount: number;
   lastReadAt: number | null;
   status: string;
+  statusDetail: string;
   tone: Tone;
-  /** The status pill's tooltip. */
-  note: string | null;
-  /** Set on a root row: which of pause and resume it offers. */
+  enabled: boolean;
   rootState: Root["state"] | null;
   children?: Row[];
 };
-
-function when(value: number | null): string {
-  return tableDateTime(value);
-}
-
-function rootLocation(root: Root): string | null {
-  if (root.rootAlias === null || root.relativePath === null) {
-    return root.lastKnownPath;
-  }
-  return `${root.rootAlias}/${root.relativePath}`;
-}
-
-/**
- * A root's pill: what the owner set, or failing that what the host last saw.
- *
- * A paused root says so and nothing else -- its last report is about a pass
- * that ran before it was paused, and showing that as the current state would
- * be a stale fact dressed as a live one.
- */
-function rootStatus(root: Root): { status: string; tone: Tone; note: string } {
-  const seen =
-    root.reportedAt === null
-      ? "never read"
-      : `read ${when(root.reportedAt)}, ${root.reportItemCount ?? 0} items`;
-  if (root.state === "paused") {
-    return { status: "paused", tone: "neutral", note: seen };
-  }
-  if (root.state === "retired") {
-    return { status: "retired", tone: "neutral", note: seen };
-  }
-  if (root.reportState === null) {
-    return { status: "pending", tone: "neutral", note: seen };
-  }
-  return {
-    status: root.reportState,
-    tone: root.reportState === "ok" ? "accent" : "warn",
-    note: seen,
-  };
-}
-
-function toRootRow(root: Root): Row {
-  const { status, tone, note } = rootStatus(root);
-  return {
-    rowKind: "root",
-    id: root.id,
-    name: rootLocation(root) ?? root.kind,
-    detail: root.providerFolderId,
-    connector: "",
-    kind: root.kind,
-    area: root.area,
-    itemCount: root.reportItemCount ?? 0,
-    skippedCount: 0,
-    lastReadAt: root.reportedAt,
-    status,
-    tone,
-    note,
-    rootState: root.state,
-  };
-}
-
 type Draft = {
   sourceAccountId: string;
   rootAlias: string;
@@ -159,6 +49,16 @@ type Draft = {
   area: string;
 };
 
+const SOURCES_KEY = ["sources"] as const;
+const WATCHED = {
+  sources: [
+    "source_accounts",
+    "source_roots",
+    "source_root_reports",
+    "source_items",
+    "worker_watcher_states",
+  ],
+} as const;
 const EMPTY_DRAFT: Draft = {
   sourceAccountId: "",
   rootAlias: "",
@@ -166,18 +66,96 @@ const EMPTY_DRAFT: Draft = {
   area: "",
 };
 
-async function send(method: string, body: unknown): Promise<unknown> {
-  const response = await fetch("/api/kith/source-roots", {
+function connectionType(connector: string): string {
+  return connector === "fs"
+    ? "Local files"
+    : connector === "mcp-client"
+      ? "MCP client"
+      : connector;
+}
+function location(root: Root): string | null {
+  return root.rootAlias === null || root.relativePath === null
+    ? root.lastKnownPath
+    : `${root.rootAlias}/${root.relativePath}`;
+}
+function rootProgress(
+  root: Root,
+): Pick<Row, "status" | "statusDetail" | "tone"> {
+  if (root.state === "paused")
+    return {
+      status: "Paused",
+      statusDetail:
+        "Resume watching when this location should be scanned again.",
+      tone: "neutral",
+    };
+  if (root.reportState === null)
+    return {
+      status: "Waiting for worker",
+      statusDetail:
+        "No worker has reported this location yet. Check that its connection is enabled and the worker is running.",
+      tone: "neutral",
+    };
+  if (root.reportState === "missing")
+    return {
+      status: "Action needed",
+      statusDetail:
+        "The configured host root or folder is unavailable. Check the location on the connected host.",
+      tone: "warn",
+    };
+  if (root.reportState === "unreadable")
+    return {
+      status: "Action needed",
+      statusDetail:
+        "The worker cannot read this folder. Check access on the connected host.",
+      tone: "warn",
+    };
+  if (root.reportState === "over_limit")
+    return {
+      status: "Action needed",
+      statusDetail:
+        "The folder is too large to scan. Choose a narrower location.",
+      tone: "warn",
+    };
+  return {
+    status: "Up to date",
+    statusDetail:
+      root.reportedAt === null
+        ? "The next scan is queued."
+        : `Last successful read ${tableDateTime(root.reportedAt)}.`,
+    tone: "accent",
+  };
+}
+function toLocation(root: Root): Row {
+  return {
+    rowKind: "location",
+    id: root.id,
+    connection: "",
+    connectionType: "",
+    location: location(root),
+    area: root.area,
+    itemCount: root.reportItemCount ?? 0,
+    lastReadAt: root.reportedAt,
+    enabled: true,
+    rootState: root.state,
+    ...rootProgress(root),
+  };
+}
+async function request(
+  url: string,
+  method: string,
+  body?: unknown,
+): Promise<unknown> {
+  const response = await fetch(url, {
     method,
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (response.status === 204) return undefined;
   const parsed: unknown = await response.json().catch(() => undefined);
-  if (!response.ok) {
-    const failure = (parsed ?? {}) as { error?: string };
-    throw new Error(failure.error ?? "Request failed");
-  }
+  if (!response.ok)
+    throw new Error(
+      (parsed as { error?: string } | undefined)?.error ?? "Request failed",
+    );
   return parsed;
 }
 
@@ -186,33 +164,23 @@ export function SourcesTable({
   areas,
 }: {
   initial: Page;
-  /** The life areas the Add dialog offers. Passed in from the page: this file
-   * is a client component and the list lives in the store. */
   areas: readonly string[];
 }) {
   useLiveChanges(WATCHED);
   const queryClient = useQueryClient();
   const [failure, setFailure] = useState<string | null>(null);
-  /** Set when Add folder named a folder this space already watches. A pill,
-   * because the add otherwise looks like it did nothing. */
-  const [alreadyWatched, setAlreadyWatched] = useState(false);
-  const [draft, setDraft] = useState<Draft | null>(null);
-
+  const [watchDraft, setWatchDraft] = useState<Draft | null>(null);
+  const [editing, setEditing] = useState<Source | null>(null);
+  const [editingRoot, setEditingRoot] = useState<Root | null>(null);
+  const [deleteRoot, setDeleteRoot] = useState<Root | null>(null);
+  const [disconnecting, setDisconnecting] = useState<Source | null>(null);
   const { data } = useQuery({
     queryKey: SOURCES_KEY,
-    queryFn: async (): Promise<Page> => {
-      const response = await fetch("/api/kith/sources", {
-        headers: { "Content-Type": "application/json" },
-        cache: "no-store",
-      });
-      if (!response.ok) throw new Error("sources fetch failed");
-      return (await response.json()) as Page;
-    },
+    queryFn: async (): Promise<Page> =>
+      request("/api/kith/sources", "GET") as Promise<Page>,
     initialData: initial,
   });
-
-  /** One optimistic mutation shape for all three writes. */
-  const optimistic = useMutation<
+  const mutate = useMutation<
     void,
     Error,
     { apply: (page: Page) => Page; run: () => Promise<unknown> },
@@ -224,125 +192,178 @@ export function SourcesTable({
     onMutate: async ({ apply }) => {
       await queryClient.cancelQueries({ queryKey: SOURCES_KEY });
       const previous = queryClient.getQueryData<Page>(SOURCES_KEY);
-      if (previous !== undefined) {
+      if (previous)
         queryClient.setQueryData<Page>(SOURCES_KEY, apply(previous));
-      }
       return { previous };
     },
-    onError: (error, _variables, context) => {
-      if (context?.previous !== undefined) {
-        queryClient.setQueryData<Page>(SOURCES_KEY, context.previous);
-      }
+    onError: (error, _v, context) => {
+      if (context?.previous)
+        queryClient.setQueryData(SOURCES_KEY, context.previous);
       setFailure(error.message);
-      setTimeout(() => setFailure(null), 6_000);
     },
-    onSettled: () => {
-      void queryClient.invalidateQueries({ queryKey: SOURCES_KEY });
-    },
+    onSettled: () =>
+      void queryClient.invalidateQueries({ queryKey: SOURCES_KEY }),
   });
-
-  const setState = useCallback(
-    (id: string, state: "active" | "paused") => {
-      optimistic.mutate({
+  const updateConnection = useCallback(
+    (source: Source, patch: Partial<Pick<Source, "name" | "enabled">>) =>
+      mutate.mutate({
+        apply: (page) => ({
+          ...page,
+          sources: page.sources.map((item) =>
+            item.id === source.id ? { ...item, ...patch } : item,
+          ),
+        }),
+        run: () =>
+          request(`/api/kith/source-accounts/${source.id}`, "PATCH", patch),
+      }),
+    [mutate],
+  );
+  const updateRoot = useCallback(
+    (id: string, state: "active" | "paused") =>
+      mutate.mutate({
         apply: (page) => ({
           ...page,
           roots: page.roots.map((root) =>
             root.id === id ? { ...root, state } : root,
           ),
         }),
-        run: () => send("PATCH", { sourceRootId: id, state }),
-      });
-    },
-    [optimistic],
+        run: () =>
+          request("/api/kith/source-roots", "PATCH", {
+            sourceRootId: id,
+            state,
+          }),
+      }),
+    [mutate],
   );
-
-  /** Remove is retire: the row leaves this list, the server keeps it. */
-  const remove = useCallback(
-    (id: string) => {
-      optimistic.mutate({
+  const retireRoot = useCallback(
+    (id: string) =>
+      mutate.mutate({
         apply: (page) => ({
           ...page,
           roots: page.roots.filter((root) => root.id !== id),
         }),
-        run: () => send("DELETE", { sourceRootId: id }),
-      });
-    },
-    [optimistic],
+        run: () =>
+          request("/api/kith/source-roots", "DELETE", { sourceRootId: id }),
+      }),
+    [mutate],
   );
-
-  const add = useCallback(
-    (values: Draft) => {
-      setDraft(null);
-      setAlreadyWatched(false);
-      optimistic.mutate({
-        // The row's id is the server's to mint, and a placeholder row would
-        // flicker a different row than the one that lands. The refetch in
-        // `onSettled` is what shows it.
+  const editRoot = useCallback(
+    (root: Root, draft: Draft) => {
+      setEditingRoot(null);
+      mutate.mutate({
         apply: (page) => page,
-        run: async () => {
-          const result = (await send("POST", {
-            sourceAccountId: values.sourceAccountId,
-            rootAlias: values.rootAlias.trim(),
-            relativePath: values.relativePath.trim(),
-            ...(values.area === "" ? {} : { area: values.area }),
-          })) as { created?: boolean } | undefined;
-          // Adding a folder already on the list changes nothing, which without
-          // this reads as a dialog that closed and did not work.
-          if (result?.created === false) {
-            setAlreadyWatched(true);
-            setTimeout(() => setAlreadyWatched(false), 6_000);
-          }
-        },
+        run: () =>
+          request("/api/kith/source-roots", "PATCH", {
+            sourceRootId: root.id,
+            rootAlias: draft.rootAlias,
+            relativePath: draft.relativePath,
+            area: draft.area,
+          }),
       });
     },
-    [optimistic],
+    [mutate],
   );
-
+  const disconnect = useCallback(
+    (source: Source) => {
+      setDisconnecting(null);
+      mutate.mutate({
+        apply: (page) => ({
+          ...page,
+          sources: page.sources.filter((item) => item.id !== source.id),
+          roots: page.roots.filter(
+            (root) => root.sourceAccountId !== source.id,
+          ),
+        }),
+        run: () => request(`/api/kith/source-accounts/${source.id}`, "DELETE"),
+      });
+    },
+    [mutate],
+  );
+  const createWatch = useCallback(
+    (draft: Draft) => {
+      setWatchDraft(null);
+      mutate.mutate({
+        apply: (page) => page,
+        run: () =>
+          request("/api/kith/source-roots", "POST", {
+            sourceAccountId: draft.sourceAccountId,
+            rootAlias: draft.rootAlias,
+            relativePath: draft.relativePath,
+            ...(draft.area ? { area: draft.area } : {}),
+          }),
+      });
+    },
+    [mutate],
+  );
   const rows = useMemo<Row[]>(
     () =>
       data.sources.map((source) => ({
-        rowKind: "source" as const,
+        rowKind: "connection",
         id: source.id,
-        name: source.name,
-        detail: source.location,
-        connector: source.connector,
-        kind: source.kind,
-        area: source.area,
+        connection: source.name,
+        connectionType: connectionType(source.connector),
+        location: null,
+        area: null,
         itemCount: source.itemCount,
-        skippedCount: source.skippedCount,
         lastReadAt: source.lastReadAt,
-        status: source.status,
-        tone: STATUS_TONE[source.status],
-        note: source.problem,
+        enabled: source.enabled,
         rootState: null,
+        status: source.enabled
+          ? source.status === "pending"
+            ? "Waiting for worker"
+            : source.status === "ok"
+              ? "Up to date"
+              : "Action needed"
+          : "Disabled",
+        statusDetail: !source.enabled
+          ? "Enable this connection before its watched locations can be scanned."
+          : (source.problem ??
+            (source.status === "pending"
+              ? "No worker has reported this connection yet. Check that the worker is running."
+              : "")),
+        tone:
+          !source.enabled || source.status === "pending"
+            ? "neutral"
+            : source.status === "ok"
+              ? "accent"
+              : "warn",
         children: data.roots
           .filter((root) => root.sourceAccountId === source.id)
-          .map(toRootRow),
+          .map(toLocation),
       })),
     [data],
   );
-
   const columns = useMemo<ColumnDef<Row, unknown>[]>(
     () => [
       {
-        id: "name",
-        accessorKey: "name",
-        header: "Source",
-        cell: ({ row }) => (
-          <span
-            className={row.original.rowKind === "root" ? "text-gray-600" : ""}
-          >
-            <Detail label={row.original.name} detail={row.original.detail} />
-          </span>
-        ),
-      },
-      { id: "connector", accessorKey: "connector", header: "Type" },
-      {
-        id: "kind",
-        accessorKey: "kind",
-        header: "Kind",
+        id: "connection",
+        accessorKey: "connection",
+        header: "Connection",
         cell: ({ row }) =>
-          row.original.kind === null ? null : <Tag>{row.original.kind}</Tag>,
+          row.original.rowKind === "connection" ? (
+            <Detail label={row.original.connection} detail={null} />
+          ) : null,
+      },
+      {
+        id: "connectionType",
+        accessorKey: "connectionType",
+        header: "Type",
+        cell: ({ row }) =>
+          row.original.rowKind === "connection"
+            ? row.original.connectionType
+            : null,
+      },
+      {
+        id: "location",
+        accessorKey: "location",
+        header: "Watched location",
+        cell: ({ row }) =>
+          row.original.rowKind === "location" ? (
+            <Detail
+              label={row.original.location ?? "Unknown location"}
+              detail={null}
+            />
+          ) : null,
       },
       {
         id: "area",
@@ -355,6 +376,7 @@ export function SourcesTable({
         id: "itemCount",
         accessorKey: "itemCount",
         header: "Items",
+        meta: { align: "right", nowrap: true },
         cell: ({ row }) => (
           <span className="tabular-nums">
             {tableInteger(row.original.itemCount)}
@@ -362,22 +384,13 @@ export function SourcesTable({
         ),
       },
       {
-        id: "skippedCount",
-        accessorKey: "skippedCount",
-        header: "Skipped",
-        cell: ({ row }) => (
-          <span className="tabular-nums">
-            {tableInteger(row.original.skippedCount)}
-          </span>
-        ),
-      },
-      {
         id: "lastReadAt",
         accessorKey: "lastReadAt",
-        header: "Last read",
+        header: "Last successful read",
+        meta: { align: "right", nowrap: true },
         cell: ({ row }) => (
           <span className="tabular-nums text-gray-600">
-            {when(row.original.lastReadAt)}
+            {tableDateTime(row.original.lastReadAt)}
           </span>
         ),
       },
@@ -386,7 +399,7 @@ export function SourcesTable({
         accessorKey: "status",
         header: "Status",
         cell: ({ row }) => (
-          <Tag tone={row.original.tone} title={row.original.note ?? undefined}>
+          <Tag tone={row.original.tone} title={row.original.statusDetail}>
             {row.original.status}
           </Tag>
         ),
@@ -394,29 +407,72 @@ export function SourcesTable({
     ],
     [],
   );
-
   const actions = useMemo<RowAction<Row>[]>(
     () => [
       {
+        label: "Edit",
+        hidden: (row) => row.rowKind !== "connection",
+        onSelect: (row) =>
+          setEditing(
+            data.sources.find((source) => source.id === row.id) ?? null,
+          ),
+      },
+      {
+        label: "Disable",
+        hidden: (row) => row.rowKind !== "connection" || !row.enabled,
+        onSelect: (row) => {
+          const source = data.sources.find((item) => item.id === row.id);
+          if (source) updateConnection(source, { enabled: false });
+        },
+      },
+      {
+        label: "Enable",
+        hidden: (row) => row.rowKind !== "connection" || row.enabled,
+        onSelect: (row) => {
+          const source = data.sources.find((item) => item.id === row.id);
+          if (source) updateConnection(source, { enabled: true });
+        },
+      },
+      {
+        label: "Disconnect",
+        danger: true,
+        hidden: (row) => row.rowKind !== "connection",
+        onSelect: (row) =>
+          setDisconnecting(
+            data.sources.find((source) => source.id === row.id) ?? null,
+          ),
+      },
+      {
+        label: "Edit",
+        hidden: (row) => row.rowKind !== "location",
+        onSelect: (row) =>
+          setEditingRoot(data.roots.find((root) => root.id === row.id) ?? null),
+      },
+      {
         label: "Pause",
-        hidden: (row) => row.rowKind !== "root" || row.rootState !== "active",
-        onSelect: (row) => setState(row.id, "paused"),
+        hidden: (row) =>
+          row.rowKind !== "location" || row.rootState !== "active",
+        onSelect: (row) => updateRoot(row.id, "paused"),
       },
       {
         label: "Resume",
-        hidden: (row) => row.rowKind !== "root" || row.rootState !== "paused",
-        onSelect: (row) => setState(row.id, "active"),
+        hidden: (row) =>
+          row.rowKind !== "location" || row.rootState !== "paused",
+        onSelect: (row) => updateRoot(row.id, "active"),
       },
       {
-        label: "Remove",
+        label: "Delete",
         danger: true,
-        hidden: (row) => row.rowKind !== "root",
-        onSelect: (row) => remove(row.id),
+        hidden: (row) => row.rowKind !== "location",
+        onSelect: (row) =>
+          setDeleteRoot(data.roots.find((root) => root.id === row.id) ?? null),
       },
     ],
-    [remove, setState],
+    [data.roots, data.sources, updateConnection, updateRoot],
   );
-
+  const canWatch = data.sources.some(
+    (source) => source.enabled && source.allowedRootAliases.length > 0,
+  );
   return (
     <>
       <DataTable
@@ -425,41 +481,130 @@ export function SourcesTable({
         columns={columns}
         getSubRows={(row) => row.children}
         actions={actions}
-        filterColumns={["status", "connector", "area"]}
-        initialSorting={[{ id: "name", desc: false }]}
-        searchPlaceholder="Search sources"
-        empty="No sources"
+        initialSorting={[{ id: "connection", desc: false }]}
+        showSearch={false}
+        filterColumns={[]}
+        empty="No data sources"
         toolbar={
-          <>
-            {alreadyWatched ? <Tag>already watched</Tag> : null}
-            <button
-              type="button"
-              className={primaryButtonClass}
-              disabled={data.sources.length === 0}
-              onClick={() => setDraft(EMPTY_DRAFT)}
-            >
-              Add folder
-            </button>
-          </>
+          <button
+            type="button"
+            className={primaryButtonClass}
+            disabled={!canWatch}
+            onClick={() => setWatchDraft(EMPTY_DRAFT)}
+          >
+            Watch a folder
+          </button>
         }
       />
-      {failure === null ? null : (
+      {!canWatch && data.sources.length > 0 ? (
+        <p className="mt-2 text-xs text-kith-text-muted">
+          Waiting for an enabled connection's worker to report allowed roots.
+        </p>
+      ) : null}
+      {failure ? (
         <p role="alert" className="mt-2 text-xs text-red-700">
           {failure}
         </p>
-      )}
-      <AddFolderDrawer
-        draft={draft}
+      ) : null}
+      <WatchFolderDrawer
+        draft={watchDraft}
         sources={data.sources}
         areas={areas}
-        onChange={setDraft}
-        onSave={add}
+        onChange={setWatchDraft}
+        onSave={createWatch}
       />
+      <EditRootDrawer
+        root={editingRoot}
+        sources={data.sources}
+        areas={areas}
+        onClose={() => setEditingRoot(null)}
+        onSave={editRoot}
+      />
+      <EditConnectionDrawer
+        source={editing}
+        onClose={() => setEditing(null)}
+        onSave={(name) => {
+          if (editing) updateConnection(editing, { name });
+          setEditing(null);
+        }}
+      />
+      <AlertDialog.Root
+        open={deleteRoot !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteRoot(null);
+        }}
+      >
+        <AlertDialog.Portal>
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-kith-overlay" />
+          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
+            <AlertDialog.Title className="kith-section-title">
+              Stop watching this folder?
+            </AlertDialog.Title>
+            <AlertDialog.Description className="mt-1 text-sm text-kith-text-secondary">
+              New and changed files will no longer be imported. Already indexed
+              documents and records will remain available.
+            </AlertDialog.Description>
+            <div className="mt-3 flex justify-end gap-2">
+              <AlertDialog.Cancel className={buttonClass}>
+                Cancel
+              </AlertDialog.Cancel>
+              <AlertDialog.Action
+                className={primaryButtonClass}
+                onClick={() => {
+                  if (deleteRoot) retireRoot(deleteRoot.id);
+                  setDeleteRoot(null);
+                }}
+              >
+                Stop watching
+              </AlertDialog.Action>
+            </div>
+          </AlertDialog.Content>
+        </AlertDialog.Portal>
+      </AlertDialog.Root>
+      <AlertDialog.Root
+        open={disconnecting !== null}
+        onOpenChange={(open) => {
+          if (!open) setDisconnecting(null);
+        }}
+      >
+        <AlertDialog.Portal>
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-kith-overlay" />
+          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
+            <AlertDialog.Title className="kith-section-title">
+              Disconnect this connection?
+            </AlertDialog.Title>
+            <AlertDialog.Description className="mt-1 text-sm text-kith-text-secondary">
+              This stops and retires{" "}
+              {disconnecting
+                ? data.roots.filter(
+                    (root) => root.sourceAccountId === disconnecting.id,
+                  ).length
+                : 0}{" "}
+              watched locations. Worker access grants remain saved but cannot
+              scan this disconnected connection. Already indexed documents,
+              records, and provenance remain available.
+            </AlertDialog.Description>
+            <div className="mt-3 flex justify-end gap-2">
+              <AlertDialog.Cancel className={buttonClass}>
+                Cancel
+              </AlertDialog.Cancel>
+              <AlertDialog.Action
+                className={primaryButtonClass}
+                onClick={() => {
+                  if (disconnecting) disconnect(disconnecting);
+                }}
+              >
+                Disconnect
+              </AlertDialog.Action>
+            </div>
+          </AlertDialog.Content>
+        </AlertDialog.Portal>
+      </AlertDialog.Root>
     </>
   );
 }
 
-function AddFolderDrawer({
+function WatchFolderDrawer({
   draft,
   sources,
   areas,
@@ -472,54 +617,74 @@ function AddFolderDrawer({
   onChange: (draft: Draft | null) => void;
   onSave: (draft: Draft) => void;
 }) {
+  const aliases =
+    draft === null
+      ? []
+      : (sources.find((source) => source.id === draft.sourceAccountId)
+          ?.allowedRootAliases ?? []);
   const valid =
     draft !== null &&
     draft.sourceAccountId !== "" &&
-    draft.rootAlias.trim() !== "" &&
-    draft.relativePath.trim() !== "";
+    draft.rootAlias !== "" &&
+    draft.relativePath.trim() !== "" &&
+    draft.area !== "";
   return (
     <Drawer
       open={draft !== null}
       onOpenChange={(open) => onChange(open ? draft : null)}
-      title="Add folder"
+      title="Watch a folder"
     >
-      {draft === null ? null : (
-        <>
-          <Field label="Source">
+      {draft && (
+        <div className="flex flex-col gap-3">
+          <Field label="Connection">
             <select
               className={inputClass}
               value={draft.sourceAccountId}
               onChange={(event) =>
-                onChange({ ...draft, sourceAccountId: event.target.value })
+                onChange({
+                  ...draft,
+                  sourceAccountId: event.target.value,
+                  rootAlias: "",
+                })
               }
             >
               <option value="" />
-              {sources.map((source) => (
-                <option key={source.id} value={source.id}>
-                  {source.name}
-                </option>
-              ))}
+              {sources
+                .filter((source) => source.enabled)
+                .map((source) => (
+                  <option key={source.id} value={source.id}>
+                    {source.name}
+                  </option>
+                ))}
             </select>
           </Field>
-          <Field label="Host root">
-            <input
+          <Field label="Folder">
+            <select
               className={inputClass}
               value={draft.rootAlias}
               onChange={(event) =>
                 onChange({ ...draft, rootAlias: event.target.value })
               }
-            />
+            >
+              <option value="">Choose an allowed root</option>
+              {aliases.map((alias) => (
+                <option key={alias} value={alias}>
+                  {alias}
+                </option>
+              ))}
+            </select>
           </Field>
-          <Field label="Path">
+          <Field label="Folder path">
             <input
               className={inputClass}
               value={draft.relativePath}
               onChange={(event) =>
                 onChange({ ...draft, relativePath: event.target.value })
               }
+              placeholder="Documents"
             />
           </Field>
-          <Field label="Area">
+          <Field label="Organize as">
             <select
               className={inputClass}
               value={draft.area}
@@ -535,6 +700,14 @@ function AddFolderDrawer({
               ))}
             </select>
           </Field>
+          <div className="rounded-control border border-kith-border-subtle p-3 text-xs text-kith-text-secondary">
+            First scan:{" "}
+            {draft.rootAlias && draft.relativePath
+              ? `${draft.rootAlias}/${draft.relativePath}`
+              : "choose a location"}
+            . Subfolders are included. New items are saved in the
+            connection&apos;s space.
+          </div>
           <div className="flex justify-end gap-2">
             <button
               type="button"
@@ -549,10 +722,161 @@ function AddFolderDrawer({
               disabled={!valid}
               onClick={() => onSave(draft)}
             >
-              Add
+              Start watching
             </button>
           </div>
-        </>
+        </div>
+      )}
+    </Drawer>
+  );
+}
+
+function EditRootDrawer({
+  root,
+  sources,
+  areas,
+  onClose,
+  onSave,
+}: {
+  root: Root | null;
+  sources: Source[];
+  areas: readonly string[];
+  onClose: () => void;
+  onSave: (root: Root, draft: Draft) => void;
+}) {
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const value =
+    root && (!draft || draft.sourceAccountId !== root.sourceAccountId)
+      ? {
+          sourceAccountId: root.sourceAccountId,
+          rootAlias: root.rootAlias ?? "",
+          relativePath: root.relativePath ?? "",
+          area: root.area ?? "",
+        }
+      : draft;
+  const aliases = root
+    ? (sources.find((source) => source.id === root.sourceAccountId)
+        ?.allowedRootAliases ?? [])
+    : [];
+  return (
+    <Drawer
+      open={root !== null}
+      onOpenChange={(open) => {
+        if (!open) {
+          setDraft(null);
+          onClose();
+        }
+      }}
+      title="Edit watched location"
+    >
+      {root && value ? (
+        <div className="flex flex-col gap-3">
+          <Field label="Folder">
+            <select
+              className={inputClass}
+              value={value.rootAlias}
+              onChange={(event) =>
+                setDraft({ ...value, rootAlias: event.target.value })
+              }
+            >
+              <option value="">Choose an allowed root</option>
+              {aliases.map((alias) => (
+                <option key={alias} value={alias}>
+                  {alias}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Folder path">
+            <input
+              className={inputClass}
+              value={value.relativePath}
+              onChange={(event) =>
+                setDraft({ ...value, relativePath: event.target.value })
+              }
+            />
+          </Field>
+          <Field label="Organize as">
+            <select
+              className={inputClass}
+              value={value.area}
+              onChange={(event) =>
+                setDraft({ ...value, area: event.target.value })
+              }
+            >
+              <option value="" />
+              {areas.map((area) => (
+                <option key={area} value={area}>
+                  {area}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <div className="flex justify-end gap-2">
+            <button type="button" className={buttonClass} onClick={onClose}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className={primaryButtonClass}
+              disabled={!value.rootAlias || !value.relativePath || !value.area}
+              onClick={() => onSave(root, value)}
+            >
+              Save
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </Drawer>
+  );
+}
+
+function EditConnectionDrawer({
+  source,
+  onClose,
+  onSave,
+}: {
+  source: Source | null;
+  onClose: () => void;
+  onSave: (name: string) => void;
+}) {
+  const [name, setName] = useState("");
+  const open = source !== null;
+  const displayName = open && name === "" ? source.name : name;
+  return (
+    <Drawer
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) {
+          setName("");
+          onClose();
+        }
+      }}
+      title="Edit connection"
+    >
+      {source && (
+        <div className="flex flex-col gap-3">
+          <Field label="Connection name">
+            <input
+              className={inputClass}
+              value={displayName}
+              onChange={(event) => setName(event.target.value)}
+            />
+          </Field>
+          <div className="flex justify-end gap-2">
+            <button type="button" className={buttonClass} onClick={onClose}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className={primaryButtonClass}
+              disabled={!displayName.trim()}
+              onClick={() => onSave(displayName.trim())}
+            >
+              Save
+            </button>
+          </div>
+        </div>
       )}
     </Drawer>
   );

@@ -173,8 +173,50 @@ async function storedWatcher(f, sourceAccountId = f.sourceAccountId) {
   return found.rows[0];
 }
 
+async function storedAllowedRoots(f) {
+  const found = await f.client.query(
+    `SELECT allowed_root_aliases, allowed_roots_reported_at
+       FROM kith.source_accounts WHERE id = $1`,
+    [f.sourceAccountId],
+  );
+  return found.rows[0];
+}
+
 /** 32 lowercase hex, the shape the wire and the column both require. */
 const nonce = (seed) => seed.repeat(32).slice(0, 32);
+
+test("a heartbeat persists changed worker-reported root aliases", { skip }, async (t) => {
+  const f = await fixture(t);
+  await recordWorkerHeartbeat(
+    workerCtx(f.client, NOW),
+    f.worker,
+    heartbeat(f, { allowedRootAliases: ["documents", "photos"] }),
+  );
+  const first = await storedAllowedRoots(f);
+  assert.deepEqual(first.allowed_root_aliases, ["documents", "photos"]);
+  assert.equal(first.allowed_roots_reported_at.getTime(), NOW);
+
+  await recordWorkerHeartbeat(
+    workerCtx(f.client, NOW + MINUTE),
+    f.worker,
+    heartbeat(f, { allowedRootAliases: ["documents", "photos"] }),
+  );
+  const unchanged = await storedAllowedRoots(f);
+  assert.equal(
+    unchanged.allowed_roots_reported_at.getTime(),
+    NOW,
+    "an unchanged capability report does not rewrite the account",
+  );
+
+  await recordWorkerHeartbeat(
+    workerCtx(f.client, NOW + 2 * MINUTE),
+    f.worker,
+    heartbeat(f, { allowedRootAliases: ["archive"] }),
+  );
+  const changed = await storedAllowedRoots(f);
+  assert.deepEqual(changed.allowed_root_aliases, ["archive"]);
+  assert.equal(changed.allowed_roots_reported_at.getTime(), NOW + 2 * MINUTE);
+});
 
 test(
   "a watcher registered under its legacy id keeps its registration",

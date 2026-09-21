@@ -15,7 +15,12 @@ import {
   inputClass,
   primaryButtonClass,
 } from "@/components/ui/drawer";
-import { label } from "@/lib/kith/format";
+import {
+  archiveDate,
+  label,
+  tableInteger,
+  tableMoney,
+} from "@/lib/kith/format";
 import type { InstitutionRow } from "@/lib/kith/institutions";
 
 const TYPES = [
@@ -71,24 +76,28 @@ function AccountForm({
   const initial = draftOf(row);
   const dirty = JSON.stringify(draft) !== JSON.stringify(initial);
   const lastFourValid = /^([0-9]{4})?$/.test(draft.accountLast4);
-  const types = TYPES.includes(draft.accountType) || draft.accountType === ""
-    ? TYPES
-    : [...TYPES, draft.accountType];
+  const types =
+    TYPES.includes(draft.accountType) || draft.accountType === ""
+      ? TYPES
+      : [...TYPES, draft.accountType];
 
   const save = async () => {
     setSaving(true);
     setError("");
     try {
-      const response = await fetch(`/api/kith/finance-accounts/${encodeURIComponent(row.id)}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          displayName: draft.displayName.trim() || null,
-          accountLast4: draft.accountLast4 || null,
-          accountType: draft.accountType || null,
-          closed: draft.closed,
-        }),
-      });
+      const response = await fetch(
+        `/api/kith/finance-accounts/${encodeURIComponent(row.id)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            displayName: draft.displayName.trim() || null,
+            accountLast4: draft.accountLast4 || null,
+            accountType: draft.accountType || null,
+            closed: draft.closed,
+          }),
+        },
+      );
       if (!response.ok) throw new Error("save failed");
       await queryClient.invalidateQueries({ queryKey: ["institutions"] });
       onClose();
@@ -107,6 +116,44 @@ function AccountForm({
       title={archive.name}
       dirty={dirty}
     >
+      <div className="grid grid-cols-2 gap-2 rounded-control border border-kith-border-subtle bg-kith-surface-muted p-3 text-sm">
+        <span className="text-kith-text-muted">Statements</span>
+        <span className="text-right tabular-nums">
+          {tableInteger(row.statements)}
+        </span>
+        <span className="text-kith-text-muted">Records</span>
+        <span className="text-right tabular-nums">
+          {tableInteger(row.records)}
+        </span>
+        <span className="text-kith-text-muted">Value as of</span>
+        <span className="text-right tabular-nums">
+          {archiveDate(row.currentValueAsOf)}
+        </span>
+        <span className="text-kith-text-muted">Latest snapshot</span>
+        <span className="text-right tabular-nums">
+          {archiveDate(row.latestSnapshotAsOf)}
+        </span>
+        <span className="text-kith-text-muted">Status</span>
+        <span className="text-right">{label(row.status)}</span>
+        {row.currentValueStale ? (
+          <span className="col-span-2 text-kith-text-muted">
+            Current value is stale and may not reflect the latest activity.
+          </span>
+        ) : null}
+        {row.statusDetail ? (
+          <span className="col-span-2 text-kith-text-muted">
+            {row.statusDetail}
+          </span>
+        ) : null}
+        {row.currentValue !== null && row.currentValueCurrency !== null ? (
+          <>
+            <span className="text-kith-text-muted">Current value</span>
+            <span className="text-right tabular-nums">
+              {tableMoney(row.currentValue, row.currentValueCurrency)}
+            </span>
+          </>
+        ) : null}
+      </div>
       <Field label="Name">
         <input
           className={inputClass}

@@ -30,17 +30,15 @@ import { loadAttentionCounts } from "@/lib/kith/attention-data";
 import { loadAdminAccess } from "@/lib/kith/sources-data";
 
 const SCREENS = [
-  { href: "/admin/health", label: "Health", ready: true },
-  { href: "/admin/sources", label: "Sources", ready: true },
-  { href: "/admin/institutions", label: "Institutions", ready: true },
-  { href: "/admin/coverage", label: "Coverage", ready: true },
-  { href: "/admin/investments", label: "Investments", ready: true },
-  { href: "/admin/types", label: "Types and fields", ready: false },
+  { href: "/admin/institutions", label: "Investment Accounts", ready: true },
+  { href: "/admin/investments", label: "Private Investments", ready: true },
+  { href: "/admin/sources", label: "Data Sources", ready: true },
+  { href: "/admin/health", label: "System Health", ready: true },
   // ADM-8a: the corrections table widened into the single attention queue
   // (section 5 of docs/plans/2026-09-19-investment-document-matching.md),
   // so this screen replaces the earlier "Corrections" placeholder rather
   // than sitting beside it.
-  { href: "/admin/attention", label: "Attention", ready: true },
+  { href: "/admin/attention", label: "Needs Attention", ready: true },
 ] as const;
 
 export default async function AdminLayout({
@@ -59,7 +57,7 @@ export default async function AdminLayout({
       <AdminShell
         nav={
           <nav
-            aria-label="Admin"
+            aria-label="Operations"
             className="border-b border-kith-border-subtle pb-3 md:h-full md:border-r md:border-b-0 md:pr-2 md:pb-0"
           >
             <ul className="flex flex-wrap gap-1 text-sm md:flex-col">

@@ -44,11 +44,7 @@ const execFileAsync = promisify(execFile);
 const AUDIT_SCHEMA = "kith_migrate_audit";
 
 export type ConstraintKind =
-  | "not_null"
-  | "domain_check"
-  | "check"
-  | "foreign_key"
-  | "unique";
+  "not_null" | "domain_check" | "check" | "foreign_key" | "unique";
 
 export type ConstraintViolation = {
   table: string;
@@ -111,7 +107,11 @@ function stripCheckWrapper(def: string): string {
   return match[1]!;
 }
 
-type ColumnInfo = { pgType: string; isNullable: boolean; domainName: string | null };
+type ColumnInfo = {
+  pgType: string;
+  isNullable: boolean;
+  domainName: string | null;
+};
 
 async function fetchColumnInfo(
   client: pg.ClientBase,
@@ -143,7 +143,9 @@ async function fetchColumnInfo(
 /** Every domain declared under `kith` and its own `CHECK`, keyed by domain
  * name (`kith_id` today; any later domain migration 018+ adds is picked up
  * the same way, with no change here). */
-async function fetchDomainChecks(client: pg.ClientBase): Promise<Map<string, string>> {
+async function fetchDomainChecks(
+  client: pg.ClientBase,
+): Promise<Map<string, string>> {
   const result = await client.query<{ domain_name: string; def: string }>(
     `SELECT dt.typname AS domain_name, pg_get_constraintdef(c.oid) AS def
        FROM pg_type dt
@@ -151,7 +153,8 @@ async function fetchDomainChecks(client: pg.ClientBase): Promise<Map<string, str
       WHERE dt.typtype = 'd' AND dt.typnamespace = 'kith'::regnamespace`,
   );
   const map = new Map<string, string>();
-  for (const row of result.rows) map.set(row.domain_name, stripCheckWrapper(row.def));
+  for (const row of result.rows)
+    map.set(row.domain_name, stripCheckWrapper(row.def));
   return map;
 }
 
@@ -167,7 +170,10 @@ async function fetchCheckConstraints(
       WHERE conrelid = $1::regclass AND contype = 'c'`,
     [`kith.${table}`],
   );
-  return result.rows.map((row) => ({ name: row.conname, expr: stripCheckWrapper(row.def) }));
+  return result.rows.map((row) => ({
+    name: row.conname,
+    expr: stripCheckWrapper(row.def),
+  }));
 }
 
 type ForeignKeyConstraint = {
@@ -214,7 +220,11 @@ async function fetchForeignKeys(
   }));
 }
 
-type UniqueIndex = { name: string; columns: string[]; predicate: string | null };
+type UniqueIndex = {
+  name: string;
+  columns: string[];
+  predicate: string | null;
+};
 
 /** Every unique index on the table, whether it backs a named `UNIQUE`/
  * `PRIMARY KEY` constraint or was created bare (this schema uses both --
@@ -245,10 +255,17 @@ async function fetchUniqueIndexes(
     [`kith.${table}`],
   );
   return result.rows
-    .filter((row): row is { name: string; columns: string[]; predicate: string | null } =>
-      Array.isArray(row.columns),
+    .filter(
+      (
+        row,
+      ): row is { name: string; columns: string[]; predicate: string | null } =>
+        Array.isArray(row.columns),
     )
-    .map((row) => ({ name: row.name, columns: row.columns, predicate: row.predicate }));
+    .map((row) => ({
+      name: row.name,
+      columns: row.columns,
+      predicate: row.predicate,
+    }));
 }
 
 type AuditTable = {
@@ -268,7 +285,11 @@ function collectDataTables(presentFiles: Set<string>): Map<string, AuditTable> {
   for (const t of TABLES) {
     if (t.migrated && presentFiles.has(`${t.pg}.csv`)) {
       const name = currentPgName(t.pg);
-      tables.set(name, { name, csvFile: `${t.pg}.csv`, columns: columnOrder(t) });
+      tables.set(name, {
+        name,
+        csvFile: `${t.pg}.csv`,
+        columns: columnOrder(t),
+      });
     }
     for (const child of t.children ?? []) {
       if (!presentFiles.has(`${child.pg}.csv`)) continue;
@@ -287,7 +308,9 @@ function buildCreateTableSql(
   columns: string[],
   types: Map<string, ColumnInfo>,
 ): string {
-  const colDefs = columns.map((col) => `${quote(col)} ${types.get(col)?.pgType ?? "text"}`);
+  const colDefs = columns.map(
+    (col) => `${quote(col)} ${types.get(col)?.pgType ?? "text"}`,
+  );
   return `CREATE TABLE ${quote(AUDIT_SCHEMA)}.${quote(table)} (${colDefs.join(", ")})`;
 }
 
@@ -329,9 +352,14 @@ async function copyCsvIntoStaging(
   ]);
 }
 
-function describeColumns(row: Record<string, unknown>, columns: string[]): string {
+function describeColumns(
+  row: Record<string, unknown>,
+  columns: string[],
+): string {
   if (!columns.length) return "(constraint reaches no single mapped column)";
-  return columns.map((c) => `${c}=${JSON.stringify(row[c] ?? null)}`).join(", ");
+  return columns
+    .map((c) => `${c}=${JSON.stringify(row[c] ?? null)}`)
+    .join(", ");
 }
 
 /**
@@ -355,7 +383,10 @@ export async function auditCsvDirectory(
   const skipped: SkippedConstraint[] = [];
   const rowsAudited: Record<string, number> = {};
 
-  const pool = new pg.Pool({ connectionString: config.connectionString, max: 2 });
+  const pool = new pg.Pool({
+    connectionString: config.connectionString,
+    max: 2,
+  });
   pool.on("error", () => {
     // A connection torn down after `client.release()` (or by the server)
     // must not become an unhandled rejection under this function's control.
@@ -375,7 +406,11 @@ export async function auditCsvDirectory(
       const shellTables = new Map<string, AuditTable>();
       for (const fks of fksByTable.values()) {
         for (const fk of fks) {
-          if (dataTables.has(fk.foreignTable) || shellTables.has(fk.foreignTable)) continue;
+          if (
+            dataTables.has(fk.foreignTable) ||
+            shellTables.has(fk.foreignTable)
+          )
+            continue;
           shellTables.set(fk.foreignTable, {
             name: fk.foreignTable,
             csvFile: null,
@@ -384,9 +419,14 @@ export async function auditCsvDirectory(
         }
       }
 
-      const allTables = new Map<string, AuditTable>([...dataTables, ...shellTables]);
+      const allTables = new Map<string, AuditTable>([
+        ...dataTables,
+        ...shellTables,
+      ]);
 
-      await client.query(`DROP SCHEMA IF EXISTS ${quote(AUDIT_SCHEMA)} CASCADE`);
+      await client.query(
+        `DROP SCHEMA IF EXISTS ${quote(AUDIT_SCHEMA)} CASCADE`,
+      );
       await client.query(`CREATE SCHEMA ${quote(AUDIT_SCHEMA)}`);
 
       const columnTypesByTable = new Map<string, Map<string, ColumnInfo>>();
@@ -404,7 +444,11 @@ export async function auditCsvDirectory(
         await client.query(buildCreateTableSql(name, table.columns, types));
       }
 
-      await copyCsvIntoStaging(config.connectionString, csvDir, dataTables.values());
+      await copyCsvIntoStaging(
+        config.connectionString,
+        csvDir,
+        dataTables.values(),
+      );
 
       const domainChecks = await fetchDomainChecks(client);
 
@@ -438,10 +482,14 @@ export async function auditCsvDirectory(
         // typed to it: id, space_id, and every `ref` column.
         for (const col of table.columns) {
           const info = types.get(col);
-          const domainExpr = info?.domainName ? domainChecks.get(info.domainName) : undefined;
+          const domainExpr = info?.domainName
+            ? domainChecks.get(info.domainName)
+            : undefined;
           if (!info?.domainName || !domainExpr) continue;
           const expr = domainExpr.replaceAll(/\bVALUE\b/g, quote(col));
-          const rows = await client.query<Record<string, unknown> & { id: string }>(
+          const rows = await client.query<
+            Record<string, unknown> & { id: string }
+          >(
             `SELECT id, ${quote(col)} FROM ${quote(AUDIT_SCHEMA)}.${quote(name)}
               WHERE ${quote(col)} IS NOT NULL AND NOT (${expr})`,
           );
@@ -497,6 +545,18 @@ export async function auditCsvDirectory(
         // referencing column NULL is not checked, matching what a deferred
         // FK would accept at COMMIT in the real load.
         for (const fk of fksByTable.get(name) ?? []) {
+          const unmappedColumns = fk.localColumns.filter(
+            (column) => !table.columns.includes(column),
+          );
+          if (unmappedColumns.length > 0) {
+            skipped.push({
+              table: name,
+              constraint: fk.name,
+              kind: "foreign_key",
+              reason: `foreign key uses columns not present in the transform: ${unmappedColumns.join(", ")}`,
+            });
+            continue;
+          }
           if (!allTables.has(fk.foreignTable)) {
             skipped.push({
               table: name,
@@ -512,8 +572,12 @@ export async function auditCsvDirectory(
           const joinClause = fk.localColumns
             .map((c, i) => `f.${quote(fk.foreignColumns[i]!)} = t.${quote(c)}`)
             .join(" AND ");
-          const selectCols = fk.localColumns.map((c) => `t.${quote(c)}`).join(", ");
-          const rows = await client.query<Record<string, unknown> & { id: string }>(
+          const selectCols = fk.localColumns
+            .map((c) => `t.${quote(c)}`)
+            .join(", ");
+          const rows = await client.query<
+            Record<string, unknown> & { id: string }
+          >(
             `SELECT t.id, ${selectCols}
                FROM ${quote(AUDIT_SCHEMA)}.${quote(name)} t
               WHERE ${notNullClause}
@@ -536,10 +600,28 @@ export async function auditCsvDirectory(
         // UNIQUE (constraint-backed or bare index): every duplicate group
         // among non-NULL values, honoring a partial index's predicate.
         for (const uniq of await fetchUniqueIndexes(client, name)) {
-          const notNullClause = uniq.columns.map((c) => `${quote(c)} IS NOT NULL`).join(" AND ");
-          const predicateClause = uniq.predicate ? ` AND (${uniq.predicate})` : "";
+          const unmappedColumns = uniq.columns.filter(
+            (column) => !table.columns.includes(column),
+          );
+          if (unmappedColumns.length > 0) {
+            skipped.push({
+              table: name,
+              constraint: uniq.name,
+              kind: "unique",
+              reason: `index uses columns not present in the transform: ${unmappedColumns.join(", ")}`,
+            });
+            continue;
+          }
+          const notNullClause = uniq.columns
+            .map((c) => `${quote(c)} IS NOT NULL`)
+            .join(" AND ");
+          const predicateClause = uniq.predicate
+            ? ` AND (${uniq.predicate})`
+            : "";
           const groupCols = uniq.columns.map(quote).join(", ");
-          const rows = await client.query<Record<string, unknown> & { ids: string[] }>(
+          const rows = await client.query<
+            Record<string, unknown> & { ids: string[] }
+          >(
             `SELECT array_agg(id ORDER BY id) AS ids, ${groupCols}
                FROM ${quote(AUDIT_SCHEMA)}.${quote(name)}
               WHERE ${notNullClause}${predicateClause}
@@ -549,7 +631,9 @@ export async function auditCsvDirectory(
           for (const row of rows.rows) {
             const detail = describeColumns(row, uniq.columns);
             for (const id of row.ids) {
-              const siblings = row.ids.filter((other) => other !== id).join(", ");
+              const siblings = row.ids
+                .filter((other) => other !== id)
+                .join(", ");
               violations.push({
                 table: name,
                 id,
@@ -562,7 +646,9 @@ export async function auditCsvDirectory(
         }
       }
     } finally {
-      await client.query(`DROP SCHEMA IF EXISTS ${quote(AUDIT_SCHEMA)} CASCADE`).catch(() => {});
+      await client
+        .query(`DROP SCHEMA IF EXISTS ${quote(AUDIT_SCHEMA)} CASCADE`)
+        .catch(() => {});
       client.release();
     }
   } finally {

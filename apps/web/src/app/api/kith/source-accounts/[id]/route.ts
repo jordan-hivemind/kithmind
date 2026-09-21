@@ -3,7 +3,12 @@
 
 import { sources } from "@repo/kith-store";
 
-import { noContent, problem, readJsonBody, withPrincipal } from "@/lib/kith/api-route";
+import {
+  noContent,
+  problem,
+  readJsonBody,
+  withPrincipal,
+} from "@/lib/kith/api-route";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -19,7 +24,8 @@ export async function PATCH(
     const body = await readJsonBody(request);
     if (body === null) return problem(400, "Invalid request");
     const name = typeof body.name === "string" ? body.name : undefined;
-    const enabled = typeof body.enabled === "boolean" ? body.enabled : undefined;
+    const enabled =
+      typeof body.enabled === "boolean" ? body.enabled : undefined;
     const freshnessMs =
       typeof body.freshnessMs === "number" ? body.freshnessMs : undefined;
     await sources.updateSourceAccount(ctx, {
@@ -30,5 +36,25 @@ export async function PATCH(
       ...(freshnessMs === undefined ? {} : { freshnessMs }),
     });
     return noContent();
+  });
+}
+
+export async function DELETE(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> },
+): Promise<Response> {
+  const { id } = await params;
+  return withPrincipal(request, async ({ ctx, principal }) => {
+    const result = await sources.disconnectSourceAccount(ctx, {
+      principal,
+      sourceAccountId: id,
+    });
+    return new Response(JSON.stringify(result), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      },
+    });
   });
 }

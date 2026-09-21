@@ -30,10 +30,15 @@ import {
   type FactDraft,
   FactDrawer,
 } from "@/components/kith-fact-drawer";
+import { KithQuickCapture } from "@/components/kith-quick-capture";
 import { KithThoughtSearch } from "@/components/kith-thought-search";
 import { inputClass, PageHeader } from "@/components/ui/controls";
 import { DataTable, type RowAction, Tag } from "@/components/ui/data-table";
 import type { BrowseData, BrowseView } from "@/lib/kith/browse";
+import {
+  type CaptureResponse,
+  captureThought,
+} from "@/lib/kith/capture-client";
 import { label, shortDate } from "@/lib/kith/format";
 import { mutateJson } from "@/lib/kith/optimistic";
 import {
@@ -51,6 +56,8 @@ const THOUGHT_TYPES = [
 ] as const;
 
 const LIVE_TABLES = ["thoughts", "facts"] as const;
+
+type CaptureVars = { content: string };
 
 /** Editable value types only -- `entity` and `datetime` facts get no Edit
  * action (see `actions` below), so `FactDrawer` never has to render one.
@@ -391,6 +398,27 @@ export function KithBrowse({
   );
   const data = useServerData<BrowseData>(queryKey, server, LIVE_TABLES);
 
+  const capture = useOptimisticMutation<BrowseData, CaptureVars>({
+    queryKey,
+    mutationFn: async ({ content }) => {
+      const result = await captureThought(content);
+      if (result.disposition !== "stored") {
+        throw new Error(
+          result.operationSummary ??
+            "This was not stored. Try one coherent durable narrative, or use a structured fact.",
+        );
+      }
+      return result;
+    },
+    apply: (current) => ({
+      ...current,
+      stats: {
+        ...current.stats,
+        totalThoughts: current.stats.totalThoughts + 1,
+      },
+    }),
+  });
+
   const editFact = useOptimisticMutation<
     BrowseData,
     {
@@ -491,7 +519,30 @@ export function KithBrowse({
 
   return (
     <div>
-      <PageHeader title="Browse" />
+      <PageHeader title="Thoughts & Facts">
+        <KithQuickCapture
+          onCapture={async (content): Promise<CaptureResponse> =>
+            (await capture.mutateAsync({
+              content,
+            })) as CaptureResponse
+          }
+        />
+      </PageHeader>
+
+      <div
+        className="mb-4 flex flex-wrap gap-x-3 gap-y-1 text-meta text-kith-text-secondary"
+        aria-label="Summary"
+      >
+        <span className="tabular-nums">
+          {data.stats.totalThoughts} Thoughts
+        </span>
+        <span className="tabular-nums">{data.stats.totalFacts} Facts</span>
+        {data.stats.byType.slice(0, 3).map((entry) => (
+          <span key={entry.type} className="tabular-nums">
+            {entry.count} {label(entry.type)}
+          </span>
+        ))}
+      </div>
 
       <section
         aria-label="Browse inventory"
@@ -501,14 +552,14 @@ export function KithBrowse({
           <Segment
             options={[
               {
-                href: href("facts", includeHistorical),
-                label: "Facts",
-                active: data.view === "facts",
-              },
-              {
                 href: href("thoughts", includeHistorical, type),
                 label: "Thoughts",
                 active: data.view === "thoughts",
+              },
+              {
+                href: href("facts", includeHistorical),
+                label: "Facts",
+                active: data.view === "facts",
               },
             ]}
           />
