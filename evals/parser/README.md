@@ -69,6 +69,26 @@ Environment offline flags are defense in depth and are not described as an OS
 sandbox. Linux scored conversion is refused because equivalent network
 isolation has not been implemented or verified.
 
+## Run a bounded document preview
+
+The production launcher also exposes a preview child mode for an already
+captured PDF or XLSX source. The parent must invoke it inside the same local
+sandbox and enforce its wall-clock and memory limits. The child verifies the
+exact source SHA-256 and stable file identity before parsing. It does not load
+Docling, OCR, or model assets.
+
+PDF requests contain one to four closed windows with at most eight total
+original pages. The response reports the source's actual PDF page count and
+the exact original page numbers inspected. Native text is byte bounded and
+each inspected page is typed as `text_available`, `image_only`, or `unknown`.
+The source itself is not treated as complete when every page was not
+inspected. XLSX preview reads bounded ZIP directory metadata and
+`xl/workbook.xml` only. It returns sheet names and visibility without reading
+worksheet cells.
+
+Preview results are provisional routing inputs. They are not facts, citations,
+or proof that a source was fully indexed.
+
 The report retains normalized per-page text, verified UTF-16 evidence spans,
 parser locators, full Docling JSON, table cells, model and dependency identity,
 resources, and every scored failure. Docling item-local character spans and
