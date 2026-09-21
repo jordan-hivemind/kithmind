@@ -51,6 +51,13 @@ const TRUSTED = {
   authorizedSpaceIds: [SPACE],
 };
 
+// This production-shaped performance regression runs once after every package
+// suite has finished. Running it inside finance-archive's parallel Turbo task
+// measures unrelated database contention against the read surface's five
+// second production timeout instead of measuring this query.
+const inventoryScaleSkip =
+  skip || process.env.FINANCE_ARCHIVE_INVENTORY_SCALE !== "1";
+
 /**
  * Four synthetic institutions, one per coverage state the surface has to keep
  * distinct, plus the two money edge cases.
@@ -3504,7 +3511,7 @@ test(
 
 test(
   "list_account_inventory evaluates many position dates and attributed reviews without changing eligibility",
-  { skip },
+  { skip: inventoryScaleSkip },
   async (t) => {
     const { owner, reader: r } = await fixture(t);
     // Match the production query shape closely enough that the former
