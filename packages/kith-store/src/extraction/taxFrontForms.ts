@@ -63,11 +63,33 @@ const SUPPORTING_ATTACHMENT =
 const AMENDED_RETURN =
   /\b(form\s+1040\s*-\s*x|amended\s+u\.?s\.?\s+individual\s+income\s+tax\s+return)\b/i;
 
+function isSupportingAttachment(text: string): boolean {
+  // A schedule often refers to a K-1 or 1099 in its body. Only a page which
+  // identifies itself that way is an attachment boundary. The form matcher
+  // also keeps a Schedule E front page from being mistaken for an attachment
+  // when its heading mentions its K-1 reporting line.
+  const heading = text.split(/\r?\n/).slice(0, 8).join("\n");
+  return (
+    SUPPORTING_ATTACHMENT.test(heading) && formsOnPage(heading).length === 0
+  );
+}
+
 function formsOnPage(text: string): TaxFrontForm[] {
   return FORM_MATCHERS.flatMap(([form, matcher]) =>
     matcher.test(text) && (form !== "form_1040" || !AMENDED_RETURN.test(text))
       ? [form]
       : [],
+  );
+}
+
+function isForm1040FrontPage(text: string): boolean {
+  // A cover or contents page can list “Form 1040” without being the return.
+  // The return identifies itself in its heading; require that opening context
+  // and refuse an explicit contents heading.
+  const heading = text.split(/\r?\n/).slice(0, 12).join("\n");
+  return (
+    !/\b(?:table of )?contents\b/i.test(heading) &&
+    formsOnPage(heading).includes("form_1040")
   );
 }
 
@@ -95,8 +117,7 @@ export function selectTaxFrontForms(
     DEFAULT_MAX_INITIAL_PAGES,
   );
   const frontIndex = pages.findIndex(
-    (page, index) =>
-      index < maxInitialPages && formsOnPage(page.text).includes("form_1040"),
+    (page, index) => index < maxInitialPages && isForm1040FrontPage(page.text),
   );
   if (frontIndex < 0) {
     return {
@@ -118,7 +139,7 @@ export function selectTaxFrontForms(
       truncated = true;
       break;
     }
-    if (selected.length > frontIndex && SUPPORTING_ATTACHMENT.test(page.text)) {
+    if (selected.length > frontIndex && isSupportingAttachment(page.text)) {
       stoppedAtAttachment = true;
       break;
     }

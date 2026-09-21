@@ -86,6 +86,31 @@ test("front return selection keeps original citation pages and stops before supp
   assert.equal(selection.truncated, false);
 });
 
+test("front return selection keeps form references on return pages and ignores contents", () => {
+  const selection = selectTaxFrontForms([
+    {
+      pageNumber: 1,
+      text: "Contents\nForm 1040\nForm W-2\nForm 1099-DIV",
+    },
+    {
+      pageNumber: 2,
+      text: "Form 1040\nU.S. Individual Income Tax Return\nWages from Form W-2",
+    },
+    {
+      pageNumber: 3,
+      text: "Schedule E\nSupplemental Income and Loss\nSchedule K-1 income",
+    },
+    { pageNumber: 4, text: "Form W-2\nWage and Tax Statement" },
+  ]);
+
+  assert.deepEqual(
+    selection.pages.map((page) => page.pageNumber),
+    [1, 2, 3],
+  );
+  assert.deepEqual(selection.forms, ["form_1040", "schedule_e"]);
+  assert.equal(selection.stoppedAtAttachment, true);
+});
+
 test("front return selection stays bounded and refuses a late or amended form", () => {
   const pages = Array.from({ length: 14 }, (_, index) => ({
     pageNumber: index + 1,

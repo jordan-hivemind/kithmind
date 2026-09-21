@@ -27,6 +27,7 @@ import type {
 import { newKithId } from "../ids.js";
 import { exec, row, type DeferredCtx } from "../deferred/core.js";
 import type { SensitivityLevel } from "../sensitivity/model.js";
+import { FEDERAL_TAX_STARTER_CATALOG } from "./taxCatalog.js";
 
 export type SeedField = {
   name: string;
@@ -322,6 +323,7 @@ export const STARTER_DOCUMENT_TYPES: readonly SeedDocumentType[] = [
       identifier("reference_number"),
     ],
   },
+  ...FEDERAL_TAX_STARTER_CATALOG,
 ];
 
 const FIELD_NAME = /^[a-z][a-z0-9_]{0,63}$/;
