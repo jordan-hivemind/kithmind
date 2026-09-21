@@ -1443,7 +1443,12 @@ function recordedPreview(value: Record<string, unknown>): void {
   digest(value.observedContentHash, "observedContentHash");
   digest(value.previewFingerprint, "previewFingerprint");
   optionalId(value.sourceRevisionId, "sourceRevisionId");
-  enumValue(value.state, "preview state", ["provisional", "retained"] as const);
+  const state = enumValue(value.state, "preview state", [
+    "provisional",
+    "retained",
+  ] as const);
+  if ((state === "retained") !== (value.sourceRevisionId !== undefined))
+    failure("preview retention state is invalid");
   boolean(value.reused, "reused");
 }
 

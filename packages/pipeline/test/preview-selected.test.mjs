@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -113,6 +113,13 @@ function previewFor(item, windows) {
   };
 }
 
+function persistedFingerprint(method, methodFingerprint, units) {
+  return createHash("sha256")
+    .update("kithmind-triage-preview:v1\0")
+    .update(JSON.stringify([method, methodFingerprint, units]))
+    .digest("hex");
+}
+
 test("records bounded PDF and spreadsheet previews without changing the active checkpoint", async () => {
   const current = plan("current", "1");
   const pdf = plan("tax", "2");
@@ -169,7 +176,11 @@ test("records bounded PDF and spreadsheet previews without changing the active c
     assert.equal(JSON.stringify(state.journal.checkpoint), before);
     assert.equal(state.journal.pending, undefined);
     assert.deepEqual(requests[0].preview, {
-      previewFingerprint: "e".repeat(64),
+      previewFingerprint: persistedFingerprint(
+        "pdf_native_text_v1",
+        "e".repeat(64),
+        [1, 90],
+      ),
       previewMethod: "pdf_native_text_v1",
       sourceFormat: "pdf",
       sourceUnitCount: 90,
@@ -178,7 +189,11 @@ test("records bounded PDF and spreadsheet previews without changing the active c
       confidence: null,
     });
     assert.deepEqual(requests[1].preview, {
-      previewFingerprint: "f".repeat(64),
+      previewFingerprint: persistedFingerprint(
+        "spreadsheet_manifest_v1",
+        "f".repeat(64),
+        [1, 2],
+      ),
       previewMethod: "spreadsheet_manifest_v1",
       sourceFormat: "spreadsheet",
       sourceUnitCount: 2,
@@ -198,6 +213,20 @@ test("records bounded PDF and spreadsheet previews without changing the active c
     assert.equal(second.reusedCount, 2);
     assert.equal(requests[0].requestId, requests[2].requestId);
     assert.equal(requests[1].requestId, requests[3].requestId);
+    await previewSelectedJournal({
+      journal: state.journal,
+      config: { spaceId: "space", sourceAccountId: "source" },
+      manifest: manifest([
+        { plan: pdf, windows: [{ startPage: 2, pageCount: 2 }] },
+      ]),
+      manifestSha256: "8".repeat(64),
+      transport,
+      executePreview: async (item, windows) => previewFor(item, windows),
+    });
+    assert.notEqual(
+      requests[0].preview.previewFingerprint,
+      requests[4].preview.previewFingerprint,
+    );
   } finally {
     await state.journal.close();
     await rm(state.directory, { recursive: true, force: true });

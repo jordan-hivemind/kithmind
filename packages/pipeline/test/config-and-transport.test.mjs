@@ -703,7 +703,7 @@ test("preview persistence responses are closed and identity-bound", () => {
     observedContentHash: "a".repeat(64),
     previewFingerprint: "b".repeat(64),
     sourceRevisionId: "revision_1",
-    state: "provisional",
+    state: "retained",
     reused: false,
   };
   assert.deepEqual(
@@ -713,6 +713,7 @@ test("preview persistence responses are closed and identity-bound", () => {
   for (const invalid of [
     { ...response, observedContentHash: "short" },
     { ...response, state: "complete" },
+    { ...response, state: "provisional" },
     { ...response, extra: true },
   ])
     assert.throws(() =>

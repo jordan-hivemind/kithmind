@@ -270,7 +270,16 @@ function declaration(preview: DocumentPreviewResult): TriagePreviewDeclaration {
   )
     uncertaintyCodes.push("insufficient_text");
   return {
-    previewFingerprint: preview.methodFingerprint,
+    previewFingerprint: createHash("sha256")
+      .update("kithmind-triage-preview:v1\0")
+      .update(
+        JSON.stringify([
+          preview.method,
+          preview.methodFingerprint,
+          preview.inspectedOriginalUnits,
+        ]),
+      )
+      .digest("hex"),
     previewMethod: preview.method,
     sourceFormat:
       preview.mediaType === "application/pdf" ? "pdf" : "spreadsheet",
