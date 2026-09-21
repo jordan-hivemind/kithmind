@@ -469,6 +469,62 @@ test(
 );
 
 test(
+  "refuses a selected duplicate group that owns immutable holding projection history",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    const root = rawTree(t);
+    await seed(client);
+
+    await writeCapture(client, root, {
+      id: "doc-history-a",
+      rendering: "first",
+      capturedAt: "2026-04-01T10:00:00.000Z",
+    });
+    await writeCapture(client, root, {
+      id: "doc-history-b",
+      rendering: "second",
+      capturedAt: "2026-04-02T10:00:00.000Z",
+    });
+    const revisions = await all(
+      client,
+      `SELECT id, retained_sha256 FROM documents
+        WHERE id IN ('doc-history-a', 'doc-history-b') ORDER BY id`,
+    );
+    await client.query(
+      `INSERT INTO holding_projection_generations
+         (id, document_id, generation_number, generation_kind,
+          retained_sha256, projection_digest, created_at, activated_at)
+       VALUES ('history-generation', 'doc-history-a', 1, 'baseline',
+               $1, $2, now(), now())`,
+      [revisions[0].retained_sha256, "d".repeat(64)],
+    );
+    await client.query(
+      `INSERT INTO holding_projection_assertions
+         (assertion_kind, record_id, source_document_id, retained_sha256,
+          assertion_digest, account_id, as_of, currency, total_value)
+       VALUES ('balance', 'history-balance', 'doc-history-b', $1, $2,
+               $3, DATE '2026-03-31', 'USD', 1234.56)`,
+      [revisions[1].retained_sha256, "e".repeat(64), ACCOUNT_ID],
+    );
+
+    await assert.rejects(
+      collapseDuplicateDocuments(client, { rawTreeRoot: root }),
+      /owns immutable holding projection history/,
+    );
+    assert.deepEqual(
+      await all(client, "SELECT id, superseded_by FROM documents ORDER BY id"),
+      [
+        { id: "doc-history-a", superseded_by: null },
+        { id: "doc-history-b", superseded_by: null },
+      ],
+    );
+    assert.equal(await count(client, "holding_projection_generations"), 1);
+    assert.equal(await count(client, "holding_projection_assertions"), 1);
+  },
+);
+
+test(
   "refuses to run against a schema whose references to documents it does not know",
   { skip },
   async (t) => {
