@@ -176,10 +176,7 @@ test(
     );
     for (const row of documentRows) {
       assert.equal(row.retained_sha256, acquired.manifest.contentHash);
-      assert.equal(
-        row.retained_byte_length,
-        String(acquired.bytes.byteLength),
-      );
+      assert.equal(row.retained_byte_length, String(acquired.bytes.byteLength));
       assert.equal(row.media_type, "application/json");
       assert.equal(row.capture_id, persisted.captureId);
       // A page row's identity is derived, so it is never the bytes' hash.
@@ -1187,7 +1184,12 @@ test(
     await client.query(
       "INSERT INTO instruments (id, symbol) VALUES ('instr_zephyr', 'ZEPHYR')",
     );
-    const instrument = { symbol: "ZEPHYR", cusip: null, isin: null, name: null };
+    const instrument = {
+      symbol: "ZEPHYR",
+      cusip: null,
+      isin: null,
+      name: null,
+    };
 
     async function publishStatement(label, docDate) {
       const acquired = buildTabularPull(label);
@@ -1219,7 +1221,10 @@ test(
           "FROM review_items WHERE kind = 'weak_instrument_match'",
       );
 
-    const first = await publishStatement("f1-58 january statement", "2025-01-31");
+    const first = await publishStatement(
+      "f1-58 january statement",
+      "2025-01-31",
+    );
     assert.equal(
       await count(client, "review_items", "WHERE kind = $1", [
         "weak_instrument_match",
@@ -1228,11 +1233,17 @@ test(
     );
     const afterFirst = await weakMatchRow();
     assert.equal(afterFirst.occurrence_count, 1);
-    assert.equal(afterFirst.last_seen_document_id, afterFirst.source_document_id);
+    assert.equal(
+      afterFirst.last_seen_document_id,
+      afterFirst.source_document_id,
+    );
     assert.equal(first.reviewItemsOpened, 1);
     const firstDocId = afterFirst.source_document_id;
 
-    const second = await publishStatement("f1-58 february statement", "2025-02-28");
+    const second = await publishStatement(
+      "f1-58 february statement",
+      "2025-02-28",
+    );
     assert.equal(
       await count(client, "review_items", "WHERE kind = $1", [
         "weak_instrument_match",
@@ -1276,7 +1287,12 @@ test(
     await client.query(
       "INSERT INTO instruments (id, symbol) VALUES ('instr_zephyr', 'ZEPHYR')",
     );
-    const instrument = { symbol: "ZEPHYR", cusip: null, isin: null, name: null };
+    const instrument = {
+      symbol: "ZEPHYR",
+      cusip: null,
+      isin: null,
+      name: null,
+    };
 
     async function publishStatement(label, docDate) {
       const acquired = buildTabularPull(label);
@@ -1315,7 +1331,10 @@ test(
     assert.equal(beforeSecond.status, "resolved");
     assert.equal(beforeSecond.occurrence_count, 1);
 
-    const second = await publishStatement("f1-58 resolved february", "2025-02-28");
+    const second = await publishStatement(
+      "f1-58 resolved february",
+      "2025-02-28",
+    );
 
     // Still exactly one item, still resolved, still counting its original
     // sighting: resolving the mapping decides it for every row that shares
@@ -1353,7 +1372,12 @@ test(
 
     const acquired = buildTabularPull("f1-58 retried document");
     const persisted = persist(t, acquired, "tabular_export");
-    const instrument = { symbol: "ZEPHYR", cusip: null, isin: null, name: null };
+    const instrument = {
+      symbol: "ZEPHYR",
+      cusip: null,
+      isin: null,
+      name: null,
+    };
     const buildDocuments = () =>
       adapterPullToImportDocuments(client, {
         institutionId: INSTITUTION.id,
@@ -1363,9 +1387,7 @@ test(
         // document never reaches parsed_ok, so a rerun reprocesses it in
         // full rather than taking the whole-document skip -- the same setup
         // F1-65's own reimport-idempotence test above uses.
-        rows: [
-          activityRow({ instrument, processDate: "not-a-real-date" }),
-        ],
+        rows: [activityRow({ instrument, processDate: "not-a-real-date" })],
         docType: "tabular_export",
         docDate: "2025-02-01",
         persisted,
@@ -1522,7 +1544,11 @@ test(
       docDate: "2025-02-01",
       persisted: persist(t, acquired, "tabular_export"),
       activityTaxonomy: {
-        sell: { movesCash: true, movesQuantity: true, quantitySign: "negative" },
+        sell: {
+          movesCash: true,
+          movesQuantity: true,
+          quantitySign: "negative",
+        },
       },
     });
 
@@ -1609,7 +1635,13 @@ test(
       await client.query(
         `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
          VALUES ($1, $2, $3, $4, $5)`,
-        [account.id, INSTITUTION.id, account.last4, "Discovered account", "USD"],
+        [
+          account.id,
+          INSTITUTION.id,
+          account.last4,
+          "Discovered account",
+          "USD",
+        ],
       );
     }
     const accountsByExternalKey = new Map([
@@ -1655,16 +1687,22 @@ test(
       "WHERE account_id = $1",
       [BROKERAGE.id],
     );
-    const trustCount = await count(client, "transactions", "WHERE account_id = $1", [
-      TRUST.id,
-    ]);
+    const trustCount = await count(
+      client,
+      "transactions",
+      "WHERE account_id = $1",
+      [TRUST.id],
+    );
     const fallbackCount = await count(
       client,
       "transactions",
       "WHERE account_id = $1",
       [ACCOUNT.id],
     );
-    assert.ok(brokerageCount > 0, "rows keyed to the brokerage account land there");
+    assert.ok(
+      brokerageCount > 0,
+      "rows keyed to the brokerage account land there",
+    );
     assert.ok(trustCount > 0, "rows keyed to the trust account land there");
     // Exactly the one row whose key does not resolve falls back to the
     // pull's own account, never silently dropped.
@@ -1697,7 +1735,13 @@ test(
       await client.query(
         `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
          VALUES ($1, $2, $3, $4, $5)`,
-        [account.id, INSTITUTION.id, account.last4, "Discovered account", "USD"],
+        [
+          account.id,
+          INSTITUTION.id,
+          account.last4,
+          "Discovered account",
+          "USD",
+        ],
       );
     }
     const accountsByExternalKey = new Map([
@@ -1751,12 +1795,18 @@ test(
       "WHERE account_id = $1",
       [BROKERAGE.id],
     );
-    const trustCount = await count(client, "transactions", "WHERE account_id = $1", [
-      TRUST.id,
-    ]);
+    const trustCount = await count(
+      client,
+      "transactions",
+      "WHERE account_id = $1",
+      [TRUST.id],
+    );
     assert.ok(brokerageCount > 0);
     assert.ok(trustCount > 0);
-    assert.equal(brokerageCount + trustCount, acquired.manifest.reportedRowCount);
+    assert.equal(
+      brokerageCount + trustCount,
+      acquired.manifest.reportedRowCount,
+    );
   },
 );
 
@@ -1774,7 +1824,9 @@ test(
 async function acquirePdfStatementForHoldings() {
   const session = createSyntheticSession();
   const { documents: discovered } = await syntheticAdapter.discover(session);
-  const statement = discovered.items.find((doc) => doc.kind === "pdf_statement");
+  const statement = discovered.items.find(
+    (doc) => doc.kind === "pdf_statement",
+  );
   return syntheticAdapter.acquire({
     kind: "pdf_statement",
     session,
@@ -1794,7 +1846,13 @@ test(
       await client.query(
         `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
          VALUES ($1, $2, $3, $4, $5)`,
-        [account.id, INSTITUTION.id, account.last4, "Discovered account", "USD"],
+        [
+          account.id,
+          INSTITUTION.id,
+          account.last4,
+          "Discovered account",
+          "USD",
+        ],
       );
     }
     const accountsByExternalKey = new Map([
@@ -1846,7 +1904,10 @@ test(
           position({ accountExternalKey: "acct-unknown-99" }),
         ],
         balances: [
-          balance({ accountExternalKey: "acct-brokerage-01", totalValue: "10000" }),
+          balance({
+            accountExternalKey: "acct-brokerage-01",
+            totalValue: "10000",
+          }),
           balance({ accountExternalKey: "acct-trust-01", totalValue: "25000" }),
         ],
         liabilities: [],
@@ -1870,9 +1931,12 @@ test(
       "WHERE account_id = $1",
       [BROKERAGE.id],
     );
-    const trustPositions = await count(client, "positions", "WHERE account_id = $1", [
-      TRUST.id,
-    ]);
+    const trustPositions = await count(
+      client,
+      "positions",
+      "WHERE account_id = $1",
+      [TRUST.id],
+    );
     const fallbackPositions = await count(
       client,
       "positions",
@@ -1903,7 +1967,10 @@ test(
       "SELECT kind, account_id, raw_value FROM review_items WHERE kind = $1",
       ["unknown_account_key"],
     );
-    assert.ok(review, "an unresolved key on a holding opens a review item, same as a row's");
+    assert.ok(
+      review,
+      "an unresolved key on a holding opens a review item, same as a row's",
+    );
     assert.equal(review.account_id, ACCOUNT.id);
     assert.equal(review.raw_value, "acct-unknown-99");
   },
@@ -1937,6 +2004,12 @@ test(
       field: "HOLDINGS / Market Value",
       binding,
     };
+    const calculatedCostBasisLocator = {
+      source: "pdf_statement",
+      index: 2,
+      field: "HOLDINGS / Cost Basis / sum of 2 dated lots",
+      calculation: { format: "decimal_sum_v1", terms: [binding, binding] },
+    };
 
     const pull = {
       institutionId: INSTITUTION.id,
@@ -1966,6 +2039,7 @@ test(
             locators: {
               row: { source: "pdf_statement", index: 2 },
               marketValue: marketValueLocator,
+              costBasis: calculatedCostBasisLocator,
             },
           },
         ],
@@ -1998,6 +2072,11 @@ test(
     );
     assert.equal(locators.marketValue.field, "HOLDINGS / Market Value");
     assert.equal(locators.marketValue.source, "pdf_statement");
+    assert.deepEqual(
+      locators.costBasis.calculation,
+      calculatedCostBasisLocator.calculation,
+      "calculated-field semantics and every constituent binding survive import unchanged",
+    );
   },
 );
 
@@ -2012,7 +2091,9 @@ test(
 async function acquireUnparseablePdfStatement(t, client) {
   const session = createSyntheticSession();
   const { documents: discovered } = await syntheticAdapter.discover(session);
-  const statement = discovered.items.find((doc) => doc.kind === "pdf_statement");
+  const statement = discovered.items.find(
+    (doc) => doc.kind === "pdf_statement",
+  );
   const acquired = await syntheticAdapter.acquire({
     kind: "pdf_statement",
     session,
@@ -2041,7 +2122,11 @@ test(
     await seedPg(client);
 
     const { documents } = await acquireUnparseablePdfStatement(t, client);
-    assert.equal(documents.length, 1, "a rowless pull is still one document, not zero");
+    assert.equal(
+      documents.length,
+      1,
+      "a rowless pull is still one document, not zero",
+    );
     assert.equal(documents[0].parseNote, "not parsed: extractor found no text");
     assert.equal(documents[0].rows.length, 0);
 
@@ -2077,10 +2162,18 @@ test(
     const { pull } = await acquireUnparseablePdfStatement(t, client);
     await importBatch(
       client,
-      { source: INSTITUTION.slug, documents: await adapterPullToImportDocuments(client, pull) },
+      {
+        source: INSTITUTION.slug,
+        documents: await adapterPullToImportDocuments(client, pull),
+      },
       new Date("2025-05-01"),
     );
-    assert.equal(await count(client, "review_items", "WHERE kind = $1", ["document_unparsed"]), 1);
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1", [
+        "document_unparsed",
+      ]),
+      1,
+    );
 
     // The identical bytes, re-parsed by the same still-broken extractor,
     // produce the identical parseNote -- exactly what a real rerun looks
@@ -2094,7 +2187,12 @@ test(
     );
     assert.equal(second.rowsInserted, 0);
     assert.equal(await count(client, "documents"), 1);
-    assert.equal(await count(client, "review_items", "WHERE kind = $1", ["document_unparsed"]), 1);
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1", [
+        "document_unparsed",
+      ]),
+      1,
+    );
   },
 );
 
@@ -2204,7 +2302,12 @@ async function seedOtherInstitution(client) {
   await client.query(
     `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
      VALUES ($1, $2, $3, $4, 'USD')`,
-    [OTHER_ACCOUNT.id, OTHER_INSTITUTION.id, OTHER_ACCOUNT.last4, "Other account"],
+    [
+      OTHER_ACCOUNT.id,
+      OTHER_INSTITUTION.id,
+      OTHER_ACCOUNT.last4,
+      "Other account",
+    ],
   );
 }
 
@@ -2271,7 +2374,13 @@ function feedPull(t, client, label, overrides = {}) {
     label,
     institutionId: INSTITUTION.id,
     accountId: ACCOUNT.id,
-    rows: [activityRow({ instrument: FEED, processDate: "2025-01-15", ...overrides })],
+    rows: [
+      activityRow({
+        instrument: FEED,
+        processDate: "2025-01-15",
+        ...overrides,
+      }),
+    ],
     docDate: "2025-01-31",
   });
 }
@@ -2293,9 +2402,8 @@ test(
     await seedPg(client);
 
     await feedPull(t, client, "f1-76 activity feed");
-    const instrumentId = (
-      await one(client, "SELECT id, name FROM instruments")
-    ).id;
+    const instrumentId = (await one(client, "SELECT id, name FROM instruments"))
+      .id;
 
     const summary = await publish(t, client, {
       label: "f1-76 march statement",
@@ -2337,8 +2445,11 @@ test(
     // instrument's name -- the same never-overwrite fill a cusip-strong match
     // performs.
     assert.equal(
-      (await one(client, "SELECT name FROM instruments WHERE id = $1", [instrumentId]))
-        .name,
+      (
+        await one(client, "SELECT name FROM instruments WHERE id = $1", [
+          instrumentId,
+        ])
+      ).name,
       STATEMENT.name,
     );
   },
@@ -2675,28 +2786,43 @@ test(
       docDate,
     });
 
-    const first = await publish(t, client, statement("f1-76 circular one", "2025-03-31"));
+    const first = await publish(
+      t,
+      client,
+      statement("f1-76 circular one", "2025-03-31"),
+    );
     assert.equal(
       first.instrumentMatches.refused.instrument_has_no_institution_evidence,
       1,
     );
     assert.ok((await count(client, "positions")) > 0);
 
-    const second = await publish(t, client, statement("f1-76 circular two", "2025-04-30"));
+    const second = await publish(
+      t,
+      client,
+      statement("f1-76 circular two", "2025-04-30"),
+    );
     assert.equal(second.instrumentMatches.accepted, 0);
     assert.equal(
       second.instrumentMatches.refused.instrument_has_no_institution_evidence,
       1,
     );
 
-    const reparse = await publish(t, client, statement("f1-76 circular one", "2025-03-31"));
+    const reparse = await publish(
+      t,
+      client,
+      statement("f1-76 circular one", "2025-03-31"),
+    );
     assert.equal(reparse.instrumentMatches.accepted, 0);
 
     const items = await matchItems(client);
     assert.equal(items.length, 1);
     assert.equal(items[0].kind, "weak_instrument_match");
     assert.equal(items[0].status, "open");
-    assert.equal(items[0].reason_code, "instrument_has_no_institution_evidence");
+    assert.equal(
+      items[0].reason_code,
+      "instrument_has_no_institution_evidence",
+    );
     assert.equal(await count(client, "instrument_identifier_sources"), 0);
   },
 );
@@ -2712,7 +2838,12 @@ test(
     // which of the two a holding means, so the rule must refuse rather than
     // read two unique symbols where there is one.
     await feedPull(t, client, "f1-76 case variant feed", {
-      instrument: { symbol: " zzz ", cusip: "222222ZZ2", isin: null, name: null },
+      instrument: {
+        symbol: " zzz ",
+        cusip: "222222ZZ2",
+        isin: null,
+        name: null,
+      },
       processDate: "2025-01-16",
     });
     assert.equal(await count(client, "instruments"), 2);
@@ -2750,7 +2881,12 @@ test(
       institutionId: INSTITUTION.id,
       accountId: ACCOUNT.id,
       positions: [
-        statementPosition({ symbol: "ZZZ", cusip: null, isin: null, name: null }),
+        statementPosition({
+          symbol: "ZZZ",
+          cusip: null,
+          isin: null,
+          name: null,
+        }),
       ],
       docDate: "2025-03-31",
     };
@@ -2763,8 +2899,12 @@ test(
     await feedPull(t, client, "f1-76 dismissal feed");
     await publish(t, client, statement);
     assert.equal(
-      (await one(client, "SELECT status FROM review_items WHERE kind = 'institution_symbol_match'"))
-        .status,
+      (
+        await one(
+          client,
+          "SELECT status FROM review_items WHERE kind = 'institution_symbol_match'",
+        )
+      ).status,
       "resolved",
     );
 
@@ -2819,8 +2959,11 @@ test(
     // The acceptance filled the name, so every later statement now matches on
     // (symbol AND name) and never reaches the rule again.
     assert.equal(
-      (await one(client, "SELECT name FROM instruments WHERE id = $1", [instrumentId]))
-        .name,
+      (
+        await one(client, "SELECT name FROM instruments WHERE id = $1", [
+          instrumentId,
+        ])
+      ).name,
       STATEMENT.name,
     );
 

@@ -222,7 +222,7 @@ function documentOf(row: EvidenceRow): RetainedSourceObject | null {
 }
 
 /**
- * The `FieldBinding` an adapter recorded for this record's load-bearing money
+ * The `FieldBinding` or exact calculation an adapter recorded for this record's load-bearing money
  * field, named by `field` as the parsers spell it ("amount", "marketValue",
  * "totalValue").
  *
@@ -235,7 +235,7 @@ function documentOf(row: EvidenceRow): RetainedSourceObject | null {
  * record whose load-bearing field is not among them is withheld rather than
  * cited from whichever binding happened to be first.
  */
-function bindingOf(sourceLocator: string | null, field: string): unknown {
+function evidenceDatumOf(sourceLocator: string | null, field: string): unknown {
   if (sourceLocator === null) return null;
   let parsed: unknown;
   try {
@@ -246,18 +246,35 @@ function bindingOf(sourceLocator: string | null, field: string): unknown {
     return null;
   }
   if (parsed === null || typeof parsed !== "object") return null;
-  const bound = Object.entries(parsed as Record<string, unknown>).filter(
-    ([, locator]) =>
-      locator !== null &&
-      typeof locator === "object" &&
-      typeof (locator as { binding?: unknown }).binding === "object" &&
-      (locator as { binding?: unknown }).binding !== null,
+  const bound = Object.entries(parsed as Record<string, unknown>).flatMap(
+    ([key, locator]) => {
+      if (locator === null || typeof locator !== "object") return [];
+      const candidate = locator as { binding?: unknown; calculation?: unknown };
+      const datum = candidate.binding ?? candidate.calculation;
+      return datum !== null && typeof datum === "object"
+        ? [[key, datum] as const]
+        : [];
+    },
   );
   const chosen =
     bound.length === 1 ? bound[0] : bound.find(([key]) => key === field);
-  return chosen === undefined
+  if (chosen !== undefined) return chosen[1];
+
+  const lotPrefix = `${field}.lot.`;
+  const lotTerms = bound
+    .flatMap(([key, datum]) => {
+      if (!key.startsWith(lotPrefix)) return [];
+      const index = Number(key.slice(lotPrefix.length));
+      if (!Number.isSafeInteger(index) || index < 1) return [];
+      if ((datum as { format?: unknown }).format !== "retained_text_span_v1")
+        return [];
+      return [[index, datum] as const];
+    })
+    .sort(([left], [right]) => left - right)
+    .map(([, datum]) => datum);
+  return lotTerms.length < 2
     ? null
-    : (chosen[1] as { binding: unknown }).binding;
+    : { format: "decimal_sum_v1", terms: lotTerms };
 }
 
 /**
@@ -430,6 +447,22 @@ function textSpanQuoteAgrees(
   }
 }
 
+/** A statement-formatted span as a canonical decimal, for exact calculations. */
+function decimalOfTextSpanQuote(quote: string): CanonicalFinanceDecimal | null {
+  const withoutFootnote = quote
+    .trim()
+    .replace(TEXT_SPAN_FOOTNOTE_SUFFIX, "")
+    .trim();
+  const negative = /^\(.*\)$/.test(withoutFootnote);
+  const digits = withoutFootnote.replace(/^\(|\)$/g, "").replace(/[$,\s]/g, "");
+  if (digits.length === 0) return null;
+  try {
+    return canonicalizeFinanceDecimal(negative ? `-${digits}` : digits);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * One record's evidence, or null when the archive cannot cite it.
  *
@@ -455,8 +488,33 @@ function evidenceFor(
 ): FinanceEvidence[] | null {
   if (document === null || record.money === null || record.currency === null)
     return null;
-  const binding = bindingOf(record.sourceLocator, record.field);
+  const binding = evidenceDatumOf(record.sourceLocator, record.field);
   if (binding === null || typeof binding !== "object") return null;
+  if ((binding as { format?: unknown }).format === "decimal_sum_v1") {
+    const terms = (binding as { terms?: unknown }).terms;
+    if (!Array.isArray(terms) || terms.length < 2) return null;
+    const resolved = terms.map((term) => {
+      if ((term as { format?: unknown })?.format !== "retained_text_span_v1")
+        return null;
+      const locator = textSpanLocator(term);
+      if (locator === null) return null;
+      const decimal = decimalOfTextSpanQuote(locator.quote);
+      return decimal === null ? null : { locator, decimal };
+    });
+    if (resolved.some((term) => term === null)) return null;
+    const total = resolved.reduce(
+      (sum, term) => addDecimal(sum, term!.decimal),
+      "0",
+    );
+    if (total !== record.money) return null;
+    return resolved.map((term, index) => ({
+      kind: "retained_text_span_v1" as const,
+      evidenceId:
+        `ev:${record.recordId}:${record.field}:term:${index + 1}` as FinanceEvidenceId,
+      sourceObject: document,
+      locator: term!.locator,
+    }));
+  }
   if ((binding as { format?: unknown }).format === "retained_text_span_v1") {
     const locator = textSpanLocator(binding);
     if (locator === null || !textSpanQuoteAgrees(locator.quote, record.money))
@@ -1298,8 +1356,7 @@ async function listAccountInventory(
               (SELECT max(p.as_of) FROM positions p WHERE p.account_id = d.account_id),
               (SELECT max(b.as_of) FROM balances b WHERE b.account_id = d.account_id)
             )::text AS activity_to,
-            (SELECT max(p.as_of) FROM positions p
-              WHERE p.account_id = d.account_id)::text AS latest_snapshot_as_of,
+            hs.as_of::text AS latest_snapshot_as_of,
             (SELECT count(*) FROM review_items r
               WHERE r.account_id = d.account_id
                 AND r.status = 'open')::text AS open_review_count,
@@ -1342,6 +1399,35 @@ async function listAccountInventory(
                               AND x.total_value IS NOT NULL)
           GROUP BY b.as_of
        ) lb ON true
+       -- Latest holdings date that is safe to use as a freshness marker.
+       -- A newer partial import must remain visible as a gap: open review
+       -- items for the same statement date, or a failed/unverified position
+       -- gate ending on that date, keep the snapshot date on the last clean
+       -- holdings statement instead of letting one parsed row make it fresh.
+       LEFT JOIN LATERAL (
+         SELECT p.as_of
+           FROM positions p
+          WHERE p.account_id = d.account_id
+            AND NOT EXISTS (
+              SELECT 1
+                FROM review_items r
+                JOIN documents rd ON rd.id = r.source_document_id
+               WHERE r.account_id = d.account_id
+                 AND r.status = 'open'
+                 AND rd.account_id = d.account_id
+                 AND rd.doc_date = p.as_of
+            )
+            AND NOT EXISTS (
+              SELECT 1
+                FROM position_reconciliations pr
+               WHERE pr.account_id = d.account_id
+                 AND pr.period_end = p.as_of
+                 AND pr.status <> 'pass'
+            )
+          GROUP BY p.as_of
+          ORDER BY p.as_of DESC
+          LIMIT 1
+       ) hs ON true
        -- Every position on the account's latest holdings date, valued or not.
        -- Filtering the unvalued ones out here is what made the sum a fragment
        -- and hid their currencies from the count: the counts below have to see
@@ -1357,8 +1443,7 @@ async function listAccountInventory(
                 ) AS not_marked
            FROM positions p
           WHERE p.account_id = d.account_id
-            AND p.as_of = (SELECT max(q.as_of) FROM positions q
-                            WHERE q.account_id = d.account_id)
+            AND p.as_of = hs.as_of
        ) hv ON true
       WHERE ($1::text IS NULL OR d.account_id > $1)
       ORDER BY d.account_id

@@ -79,7 +79,13 @@ describe("freshness on the account row", () => {
 
   test("nothing held is empty, not stale", () => {
     expect(
-      child({ statementCount: 0, recordCount: 0, activityFrom: undefined, activityTo: undefined, latestSnapshotAsOf: undefined }).status,
+      child({
+        statementCount: 0,
+        recordCount: 0,
+        activityFrom: undefined,
+        activityTo: undefined,
+        latestSnapshotAsOf: undefined,
+      }).status,
     ).toBe("empty");
   });
 
@@ -101,7 +107,7 @@ describe("freshness on the account row", () => {
     const row = child({
       activityTo: "2026-08-31",
       latestSnapshotAsOf: "2026-06-30",
-      balanceDates: ["2026-06-30", "2026-03-31", "2025-12-31"],
+      balanceDates: ["2026-06-30", "2026-03-31", "2025-12-31", "2025-09-30"],
       latestBalanceHoldsSecurities: true,
     });
     expect(row.latestBalanceAsOf).toBe("2026-06-30");
@@ -153,11 +159,34 @@ describe("the owner's overrides", () => {
 
   test("closed makes an account inactive whatever its dates say, but never fills an empty one", () => {
     const [group] = groupInstitutions(
-      [record(), record({ account: account({ accountId: "b" }), statementCount: 0, recordCount: 0 })],
+      [
+        record(),
+        record({
+          account: account({ accountId: "b" }),
+          statementCount: 0,
+          recordCount: 0,
+        }),
+      ],
       NOW,
       new Map([
-        ["account-1", { displayName: null, accountLast4: null, accountType: null, closed: true }],
-        ["b", { displayName: null, accountLast4: null, accountType: null, closed: true }],
+        [
+          "account-1",
+          {
+            displayName: null,
+            accountLast4: null,
+            accountType: null,
+            closed: true,
+          },
+        ],
+        [
+          "b",
+          {
+            displayName: null,
+            accountLast4: null,
+            accountType: null,
+            closed: true,
+          },
+        ],
       ]) as never,
     );
     expect(group!.children![0]!.status).toBe("inactive");
@@ -251,13 +280,18 @@ describe("current value", () => {
 
   test("a closed account with no value is left out of the total, and cannot hold it back", () => {
     const overrides = new Map([
-      ["b", { displayName: null, accountLast4: null, accountType: null, closed: true }],
+      [
+        "b",
+        {
+          displayName: null,
+          accountLast4: null,
+          accountType: null,
+          closed: true,
+        },
+      ],
     ]);
     const [group] = groupInstitutions(
-      [
-        record(value("100")),
-        record({ account: account({ accountId: "b" }) }),
-      ],
+      [record(value("100")), record({ account: account({ accountId: "b" }) })],
       NOW,
       overrides,
     );
@@ -287,16 +321,21 @@ describe("current value", () => {
     );
     expect(group!.currentValue).toBeNull();
     // The account's own row still shows what it holds.
-    expect(group!.children!.find((child) => child.id === "b")!.currentValue).toBe(
-      500000,
-    );
+    expect(
+      group!.children!.find((child) => child.id === "b")!.currentValue,
+    ).toBe(500000);
   });
 
   test("a closed account holding a balance blanks the total", () => {
     const closed = new Map([
       [
         "b",
-        { displayName: null, accountLast4: null, accountType: null, closed: true },
+        {
+          displayName: null,
+          accountLast4: null,
+          accountType: null,
+          closed: true,
+        },
       ],
     ]);
     const [group] = groupInstitutions(
@@ -314,11 +353,21 @@ describe("current value", () => {
     const closed = new Map([
       [
         "b",
-        { displayName: null, accountLast4: null, accountType: null, closed: true },
+        {
+          displayName: null,
+          accountLast4: null,
+          accountType: null,
+          closed: true,
+        },
       ],
       [
         "c",
-        { displayName: null, accountLast4: null, accountType: null, closed: true },
+        {
+          displayName: null,
+          accountLast4: null,
+          accountType: null,
+          closed: true,
+        },
       ],
     ]);
     const [group] = groupInstitutions(
@@ -458,7 +507,10 @@ describe("inactive", () => {
     groupInstitutions([record(overrides)], NOW)[0]!.children![0]!;
 
   test("an account with no activity for a quarter has stopped, not fallen behind", () => {
-    const quiet = child({ latestSnapshotAsOf: "2022-10-31", activityTo: "2022-12-31" });
+    const quiet = child({
+      latestSnapshotAsOf: "2022-10-31",
+      activityTo: "2022-12-31",
+    });
     expect(quiet.status).toBe("inactive");
     expect(quiet.freshnessReason).toBe("dormant");
     expect(quiet.statusDetail).toMatch(/no activity since 2022-12-31/);
@@ -466,7 +518,8 @@ describe("inactive", () => {
 
   test("recent activity with an old snapshot is still stale", () => {
     expect(
-      child({ latestSnapshotAsOf: "2022-10-31", activityTo: "2026-09-10" }).status,
+      child({ latestSnapshotAsOf: "2022-10-31", activityTo: "2026-09-10" })
+        .status,
     ).toBe("stale");
   });
 
@@ -550,7 +603,9 @@ describe("grouping", () => {
     // The group's own latest snapshot column is still the recent one.
     expect(group!.latestSnapshotAsOf).toBe("2026-08-31");
     expect(group!.status).toBe("stale");
-    expect(group!.statusDetail).toMatch(/1 stale \(1 holdings behind\), oldest IRA/);
+    expect(group!.statusDetail).toMatch(
+      /1 stale \(1 holdings behind\), oldest IRA/,
+    );
   });
 
   test("a group counts its stale accounts by reason and names the oldest", () => {
@@ -578,7 +633,12 @@ describe("grouping", () => {
           account: account({ accountId: "d", displayLabel: "Quarterly" }),
           activityTo: "2026-06-30",
           latestSnapshotAsOf: "2026-06-30",
-          balanceDates: ["2026-06-30", "2026-03-31", "2025-12-31"],
+          balanceDates: [
+            "2026-06-30",
+            "2026-03-31",
+            "2025-12-31",
+            "2025-09-30",
+          ],
           latestBalanceHoldsSecurities: true,
         }),
       ],
@@ -623,7 +683,12 @@ describe("grouping", () => {
           account: account({ accountId: "b" }),
           activityTo: "2026-06-30",
           latestSnapshotAsOf: "2026-06-30",
-          balanceDates: ["2026-06-30", "2026-03-31", "2025-12-31"],
+          balanceDates: [
+            "2026-06-30",
+            "2026-03-31",
+            "2025-12-31",
+            "2025-09-30",
+          ],
           latestBalanceHoldsSecurities: true,
           // The latest balance states no total, so the value is the older
           // quarter's.

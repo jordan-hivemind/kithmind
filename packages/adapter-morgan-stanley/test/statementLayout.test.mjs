@@ -72,13 +72,18 @@ test("a TJ-array, compressed content stream extracts through pdfjs (F1-55)", asy
 test("compressed and uncompressed bytes of the same content extract to the same text", async () => {
   const lines = STATEMENT_LINES.split("\n");
   const plain = await extractStatementText(buildMinimalPdf(lines));
-  const deflated = await extractStatementText(buildMinimalPdf(lines, { compress: true }));
+  const deflated = await extractStatementText(
+    buildMinimalPdf(lines, { compress: true }),
+  );
   assert.equal(plain, deflated);
 });
 
 test("extraction is deterministic: the same bytes give the same text", async () => {
   const pdf = buildMinimalPdf(statementPages(), { compress: true });
-  assert.equal(await extractStatementText(pdf), await extractStatementText(pdf));
+  assert.equal(
+    await extractStatementText(pdf),
+    await extractStatementText(pdf),
+  );
 });
 
 test("pages are separated by a form feed, and the separator is not a line", async () => {
@@ -109,17 +114,29 @@ test("a PDF with no text layer at all is reported, not silently parsed as empty"
 
 test("non-PDF bytes are decoded as UTF-8 unchanged", async () => {
   const text = "not a pdf, just text";
-  assert.equal(await extractStatementText(new TextEncoder().encode(text)), text);
+  assert.equal(
+    await extractStatementText(new TextEncoder().encode(text)),
+    text,
+  );
 });
 
 // --- money ------------------------------------------------------------------
 
 test("money is exact decimal text: parentheses are negative, an em dash is not zero", () => {
   // Canonical decimal: one spelling per number, so a trailing zero is dropped.
-  assert.deepEqual(resolveStatementMoney("$1,302,775.50"), { value: "1302775.5", note: null });
-  assert.deepEqual(resolveStatementMoney("(48,500.00)"), { value: "-48500", note: null });
+  assert.deepEqual(resolveStatementMoney("$1,302,775.50"), {
+    value: "1302775.5",
+    note: null,
+  });
+  assert.deepEqual(resolveStatementMoney("(48,500.00)"), {
+    value: "-48500",
+    note: null,
+  });
   // A footnote reference printed after a value is a reference, not a digit.
-  assert.deepEqual(resolveStatementMoney("$312.50 NA"), { value: "312.5", note: null });
+  assert.deepEqual(resolveStatementMoney("$312.50 NA"), {
+    value: "312.5",
+    note: null,
+  });
   assert.equal(resolveStatementMoney("—").value, null);
   assert.match(resolveStatementMoney("—").note, /no value stated/);
   assert.equal(resolveStatementMoney("1.2e5").value, null);
@@ -216,9 +233,15 @@ test("an unreadable TOTAL VALUE is null with a note and its own locator, never a
 
 test("an equity's Total row is the position; its lots are not each a holding", () => {
   const parsed = parseStatementLines(STATEMENT_LAYOUT_TEXT, kind);
-  const equity = parsed.holdings.positions.find((p) => p.instrument?.symbol === "WNDF");
+  const equity = parsed.holdings.positions.find(
+    (p) => p.instrument?.symbol === "WNDF",
+  );
   assert.ok(equity, "the equity block produced exactly one position");
-  assert.equal(parsed.holdings.positions.filter((p) => p.instrument?.symbol === "WNDF").length, 1);
+  assert.equal(
+    parsed.holdings.positions.filter((p) => p.instrument?.symbol === "WNDF")
+      .length,
+    1,
+  );
   assert.equal(equity.quantity, "10");
   assert.equal(equity.marketValue, "3184");
   assert.equal(equity.costBasis, "3000");
@@ -233,7 +256,9 @@ test("an equity's Total row is the position; its lots are not each a holding", (
 
 test("a price the Total row omits is filled only from lots that agree on it", () => {
   const parsed = parseStatementLines(STATEMENT_LAYOUT_TEXT, kind);
-  const equity = parsed.holdings.positions.find((p) => p.instrument?.symbol === "WNDF");
+  const equity = parsed.holdings.positions.find(
+    (p) => p.instrument?.symbol === "WNDF",
+  );
   // Both lots print the same Share Price, so the position's price is that
   // price -- read from a labelled column, not derived from value/quantity.
   assert.equal(equity.price, "318.4");
@@ -241,7 +266,9 @@ test("a price the Total row omits is filled only from lots that agree on it", ()
 
 test("a bond's market value is read off its detail line, and its CUSIP with it", () => {
   const parsed = parseStatementLines(STATEMENT_LAYOUT_TEXT, kind);
-  const bond = parsed.holdings.positions.find((p) => p.instrument?.cusip === "00000WNF1");
+  const bond = parsed.holdings.positions.find(
+    (p) => p.instrument?.cusip === "00000WNF1",
+  );
   assert.ok(bond, "the bond block produced one position");
   assert.equal(bond.instrument.name, "SYNTHETIC CAIRN MUNICIPAL SERIES A");
   assert.equal(bond.instrument.symbol, null);
@@ -300,11 +327,22 @@ test("complete dated lots without Total produce one summed position with source 
   assert.match(position.valuationNote, /summed from 2 dated lots/);
   assert.equal(position.locators.marketValue.binding, undefined);
   assert.match(position.locators.marketValue.field, /sum of 2 dated lots/);
+  assert.equal(
+    position.locators.marketValue.calculation.format,
+    "decimal_sum_v1",
+  );
+  assert.deepEqual(
+    position.locators.marketValue.calculation.terms.map(({ quote }) => quote),
+    ["$100.00", "140.00"],
+  );
   for (const field of ["quantity", "marketValue", "costBasis"]) {
     for (const lot of [1, 2]) {
       const { binding } = position.locators[`${field}.lot.${lot}`];
       assert.equal(text.slice(binding.start, binding.end), binding.quote);
-      assert.equal(binding.textSha256, createHash("sha256").update(text).digest("hex"));
+      assert.equal(
+        binding.textSha256,
+        createHash("sha256").update(text).digest("hex"),
+      );
     }
   }
   assert.doesNotMatch(parsed.parseNote ?? "", /holdings block/);
@@ -313,8 +351,18 @@ test("complete dated lots without Total produce one summed position with source 
 
 test("lot aggregation preserves exact fractional quantities and signed amounts", () => {
   const text = noTotalStatement({
-    first: { quantity: "0.1", marketValue: "$2.00", totalCost: "$3.00", gainLoss: "(1.00)" },
-    second: { quantity: "0.2", marketValue: "4.00", totalCost: "2.50", gainLoss: "1.50" },
+    first: {
+      quantity: "0.1",
+      marketValue: "$2.00",
+      totalCost: "$3.00",
+      gainLoss: "(1.00)",
+    },
+    second: {
+      quantity: "0.2",
+      marketValue: "4.00",
+      totalCost: "2.50",
+      gainLoss: "1.50",
+    },
   });
   const [position] = parseStatementLines(text, kind).holdings.positions;
   assert.equal(position.quantity, "0.3");
@@ -325,24 +373,43 @@ test("lot aggregation preserves exact fractional quantities and signed amounts",
 
 test("summed lots and a printed Total have the same downstream position identity", () => {
   const lines = equityBlockLines();
-  const parse = (rows) => parseStatementLines([
-    "        CLIENT STATEMENT   For the Period March 1-31, 2026", ...rows,
-  ].join("\n"), kind).holdings.positions[0];
+  const parse = (rows) =>
+    parseStatementLines(
+      [
+        "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+        ...rows,
+      ].join("\n"),
+      kind,
+    ).holdings.positions[0];
   const withTotal = parse(lines);
-  const withoutTotal = parse(lines.filter((line) => !/\bTotal\s+\d/.test(line)));
-  for (const field of ["quantity", "price", "marketValue", "costBasis", "unrealized"]) {
+  const withoutTotal = parse(
+    lines.filter((line) => !/\bTotal\s+\d/.test(line)),
+  );
+  for (const field of [
+    "quantity",
+    "price",
+    "marketValue",
+    "costBasis",
+    "unrealized",
+  ]) {
     assert.equal(withoutTotal[field], withTotal[field]);
   }
-  const hash = (position) => positionHash({
-    ...position, accountId: "synthetic-account", instrumentId: "synthetic-instrument",
-    sourceLocator: JSON.stringify(position.locators),
-  });
+  const hash = (position) =>
+    positionHash({
+      ...position,
+      accountId: "synthetic-account",
+      instrumentId: "synthetic-instrument",
+      sourceLocator: JSON.stringify(position.locators),
+    });
   assert.equal(hash(withoutTotal), hash(withTotal));
 });
 
 test("missing or unreadable secondary lot fields remain null, never a partial sum", () => {
   for (const totalCost of ["", "—", "1S0.00"]) {
-    const [position] = parseStatementLines(noTotalStatement({ second: { totalCost } }), kind).holdings.positions;
+    const [position] = parseStatementLines(
+      noTotalStatement({ second: { totalCost } }),
+      kind,
+    ).holdings.positions;
     assert.equal(position.marketValue, "240");
     assert.equal(position.costBasis, null);
     assert.equal(position.locators.costBasis, undefined);
@@ -351,10 +418,15 @@ test("missing or unreadable secondary lot fields remain null, never a partial su
 
 test("incomplete or conflicting lots without Total still route to review", () => {
   for (const second of [
-    { quantity: "" }, { quantity: "7S" }, { marketValue: "" },
-    { marketValue: "—" }, { marketValue: "14S.00" },
-    { sharePrice: "" }, { sharePrice: "21.00" },
-    { tradeDate: "" }, { tradeDate: "subtotal" },
+    { quantity: "" },
+    { quantity: "7S" },
+    { marketValue: "" },
+    { marketValue: "—" },
+    { marketValue: "14S.00" },
+    { sharePrice: "" },
+    { sharePrice: "21.00" },
+    { tradeDate: "" },
+    { tradeDate: "subtotal" },
   ]) {
     const parsed = parseStatementLines(noTotalStatement({ second }), kind);
     assert.deepEqual(parsed.holdings.positions, [], JSON.stringify(second));
@@ -379,9 +451,13 @@ test("two cells bound to one lot column are refused instead of choosing the firs
 });
 
 test("section totals and the next security stay outside a lot sum", () => {
-  const parsed = parseStatementLines(noTotalStatement({}, [
-    ...sectionSummaryLines({ named: true }), ...bondBlockLines(),
-  ]), kind);
+  const parsed = parseStatementLines(
+    noTotalStatement({}, [
+      ...sectionSummaryLines({ named: true }),
+      ...bondBlockLines(),
+    ]),
+    kind,
+  );
   assert.equal(parsed.holdings.positions.length, 2);
   assert.equal(parsed.holdings.positions[0].marketValue, "240");
 });
@@ -391,7 +467,10 @@ test("page continuations without Total aggregate only after the block completes"
     page.filter((line) => !/\bTotal\s+\d/.test(line)),
   );
   pages[1].push("        Page 2 of 2");
-  const parsed = parseStatementLines(pages.map((page) => page.join("\n")).join(`\n${PAGE_SEPARATOR}\n`), kind);
+  const parsed = parseStatementLines(
+    pages.map((page) => page.join("\n")).join(`\n${PAGE_SEPARATOR}\n`),
+    kind,
+  );
   assert.equal(parsed.holdings.positions.length, 1);
   const [position] = parsed.holdings.positions;
   assert.equal(position.quantity, "15");
@@ -404,12 +483,18 @@ test("page continuations without Total aggregate only after the block completes"
 
 test("a continuation for another account cannot complete a lot block", () => {
   const text = noTotalStatement({}, [
-    "        Page 1 of 2", PAGE_SEPARATOR, "        987-654321-098",
-    ...lotsWithoutTotalLines(), "        Page 2 of 2",
+    "        Page 1 of 2",
+    PAGE_SEPARATOR,
+    "        987-654321-098",
+    ...lotsWithoutTotalLines(),
+    "        Page 2 of 2",
   ]);
   const parsed = parseStatementLines(text, kind);
   assert.equal(parsed.holdings.positions.length, 1);
-  assert.equal(parsed.holdings.positions[0].accountExternalKey, "987-654321-098");
+  assert.equal(
+    parsed.holdings.positions[0].accountExternalKey,
+    "987-654321-098",
+  );
   assert.match(parsed.parseNote, /1 holdings block\(s\) left unparsed/);
 });
 
@@ -510,7 +595,9 @@ test("every binding on one document shares that document's own text identity", (
 
 test("a position's quantity, price, cost basis and market value each carry their own span", () => {
   const parsed = parseStatementLines(STATEMENT_LAYOUT_TEXT, kind);
-  const equity = parsed.holdings.positions.find((p) => p.instrument?.symbol === "WNDF");
+  const equity = parsed.holdings.positions.find(
+    (p) => p.instrument?.symbol === "WNDF",
+  );
   for (const field of ["quantity", "price", "costBasis", "marketValue"]) {
     const locator = equity.locators[field];
     assert.ok(locator, `locators.${field} is present`);
@@ -607,8 +694,14 @@ test("a consolidated statement's roll-up BALANCE SHEET is recorded against no ac
     assert.notEqual(balance.accountExternalKey, undefined);
   }
   assert.equal(parsed.holdings.liabilities.length, 1);
-  assert.equal(parsed.holdings.liabilities[0].accountExternalKey, CONSOLIDATED_ACCOUNT_TWO);
-  assert.match(parsed.parseNote, /^partially parsed: 1 BALANCE SHEET section\(s\) printed /);
+  assert.equal(
+    parsed.holdings.liabilities[0].accountExternalKey,
+    CONSOLIDATED_ACCOUNT_TWO,
+  );
+  assert.match(
+    parsed.parseNote,
+    /^partially parsed: 1 BALANCE SHEET section\(s\) printed /,
+  );
   assert.match(parsed.parseNote, /Consolidated Summary/);
 });
 
@@ -653,8 +746,15 @@ test("a security the page break cut in half is one position, not two blocks refu
     .map((page) => page.join("\n"))
     .join(`\n${PAGE_SEPARATOR}\n`);
   const parsed = parseStatementLines(text, kind);
-  assert.doesNotMatch(parsed.parseNote ?? "", /holdings block\(s\) left unparsed/);
-  assert.equal(parsed.holdings.positions.length, 1, "the two halves are one security");
+  assert.doesNotMatch(
+    parsed.parseNote ?? "",
+    /holdings block\(s\) left unparsed/,
+  );
+  assert.equal(
+    parsed.holdings.positions.length,
+    1,
+    "the two halves are one security",
+  );
   const [position] = parsed.holdings.positions;
   // The Total row on the second page states the position; the description
   // came from the first page, so the security is still named.
@@ -685,8 +785,16 @@ test("a section's own totals row is not read as a security", () => {
       ...sectionSummaryLines({ named }),
     ].join("\n");
     const parsed = parseStatementLines(text, kind);
-    assert.equal(parsed.parseNote, undefined, `totals row (named: ${named}) left a note`);
-    assert.equal(parsed.holdings.positions.length, 1, "only the security is a position");
+    assert.equal(
+      parsed.parseNote,
+      undefined,
+      `totals row (named: ${named}) left a note`,
+    );
+    assert.equal(
+      parsed.holdings.positions.length,
+      1,
+      "only the security is a position",
+    );
     assert.equal(parsed.holdings.positions[0].marketValue, "3184");
   }
 });
@@ -735,7 +843,11 @@ test("`Value + Distributions` is never read as a holding's value", () => {
     ...privateHoldingsBlockLines(),
   ].join("\n");
   const parsed = parseStatementLines(text, kind);
-  assert.deepEqual(parsed.holdings.positions, [], "a value with distributions in it is not a value");
+  assert.deepEqual(
+    parsed.holdings.positions,
+    [],
+    "a value with distributions in it is not a value",
+  );
   assert.match(parsed.parseNote, /states no Market Value or NAV column/);
 });
 
@@ -771,13 +883,25 @@ test("the cover page's account total is read when there is no BALANCE SHEET bloc
 
 test("an account holding nothing says so, and is not a statement left unparsed", () => {
   const parsed = parseStatementLines(EMPTY_ACCOUNT_LAYOUT_TEXT, kind);
-  assert.equal(parsed.parseNote, undefined, "the statement states its total: none");
+  assert.equal(
+    parsed.parseNote,
+    undefined,
+    "the statement states its total: none",
+  );
   // "none" is not zero and is never recorded as one.
-  assert.deepEqual(parsed.holdings, { positions: [], balances: [], liabilities: [] });
+  assert.deepEqual(parsed.holdings, {
+    positions: [],
+    balances: [],
+    liabilities: [],
+  });
 });
 
 test("a cover page stating none, over holdings, still reports the missing balance sheet", () => {
-  const text = [EMPTY_ACCOUNT_LAYOUT_TEXT, "        HOLDINGS", ...equityBlockLines()].join("\n");
+  const text = [
+    EMPTY_ACCOUNT_LAYOUT_TEXT,
+    "        HOLDINGS",
+    ...equityBlockLines(),
+  ].join("\n");
   const parsed = parseStatementLines(text, kind);
   assert.equal(parsed.holdings.positions.length, 1);
   assert.match(parsed.parseNote, /no readable BALANCE SHEET block/);
@@ -785,8 +909,15 @@ test("a cover page stating none, over holdings, still reports the missing balanc
 
 test("the cash activity summary is named for what it is, not blamed on the period line", () => {
   const parsed = parseStatementLines(ACTIVITY_SUMMARY_TEXT, kind);
-  assert.deepEqual(parsed.holdings, { positions: [], balances: [], liabilities: [] });
-  assert.match(parsed.parseNote, /cash activity summary, not a holdings statement/);
+  assert.deepEqual(parsed.holdings, {
+    positions: [],
+    balances: [],
+    liabilities: [],
+  });
+  assert.match(
+    parsed.parseNote,
+    /cash activity summary, not a holdings statement/,
+  );
   assert.doesNotMatch(parsed.parseNote, /period is unknown/);
 });
 
@@ -795,7 +926,11 @@ test("text in neither grammar routes to review instead of reaching a parser blin
     "TRADE CONFIRMATION\nsomething this adapter has never been shown",
     "trade_confirmation",
   );
-  assert.deepEqual(parsed.holdings, { positions: [], balances: [], liabilities: [] });
+  assert.deepEqual(parsed.holdings, {
+    positions: [],
+    balances: [],
+    liabilities: [],
+  });
   assert.deepEqual(parsed.activity, []);
   assert.match(parsed.parseNote, /matches neither the CLIENT STATEMENT layout/);
 });
@@ -812,8 +947,13 @@ test("parse returns the extracted text so the raw tree retains it, parsed or not
 });
 
 test("a document whose layout no parser reads still returns its text to retain", async () => {
-  const pdf = buildMinimalPdf([["TRADE CONFIRMATION", "an unstudied layout"]], { compress: true });
-  const parsed = await adapter.parse({ kind: "trade_confirmation", bytes: pdf });
+  const pdf = buildMinimalPdf([["TRADE CONFIRMATION", "an unstudied layout"]], {
+    compress: true,
+  });
+  const parsed = await adapter.parse({
+    kind: "trade_confirmation",
+    bytes: pdf,
+  });
   assert.match(parsed.extractedText, /TRADE CONFIRMATION/);
   assert.match(parsed.parseNote, /matches neither/);
 });

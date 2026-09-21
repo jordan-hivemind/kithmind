@@ -55,10 +55,7 @@ export type AdapterSession = {
  * declares a subset of these honestly rather than claiming all four.
  */
 export type CapabilityTier =
-  | "structured_api"
-  | "tabular_export"
-  | "pdf_statement"
-  | "trade_confirmation";
+  "structured_api" | "tabular_export" | "pdf_statement" | "trade_confirmation";
 
 /**
  * F1-19. Per activity-type-string convention the two reconciliation gates
@@ -174,7 +171,10 @@ export function incompleteListing<T>(
 export type DiscoveredDocument = {
   /** Opaque, institution-defined id. Passed back into `acquire`. */
   readonly externalId: string;
-  readonly kind: Extract<CapabilityTier, "pdf_statement" | "trade_confirmation">;
+  readonly kind: Extract<
+    CapabilityTier,
+    "pdf_statement" | "trade_confirmation"
+  >;
   readonly periodStart: string;
   readonly periodEnd: string;
   /** Human-readable, e.g. "Q1 statement". Never an account number or name. */
@@ -255,7 +255,9 @@ export type DiscoverResult = {
    * get a total for. Omitted entirely by an adapter that only ever produces
    * one combined listing (e.g. the synthetic reference adapter).
    */
-  readonly documentListingTotalsByKind?: Readonly<Record<string, number | null>>;
+  readonly documentListingTotalsByKind?: Readonly<
+    Record<string, number | null>
+  >;
 };
 
 // --- acquire --------------------------------------------------------------
@@ -267,13 +269,19 @@ export type DiscoverResult = {
  */
 export type AcquireSelection =
   | {
-      readonly kind: Extract<CapabilityTier, "structured_api" | "tabular_export">;
+      readonly kind: Extract<
+        CapabilityTier,
+        "structured_api" | "tabular_export"
+      >;
       readonly session: AdapterSession;
       readonly periodStart: string;
       readonly periodEnd: string;
     }
   | {
-      readonly kind: Extract<CapabilityTier, "pdf_statement" | "trade_confirmation">;
+      readonly kind: Extract<
+        CapabilityTier,
+        "pdf_statement" | "trade_confirmation"
+      >;
       readonly session: AdapterSession;
       readonly externalId: string;
     };
@@ -410,6 +418,19 @@ export type FieldBinding =
       readonly quote: string;
     };
 
+/**
+ * A value calculated from several independently citable source fields.
+ *
+ * This is deliberately narrower than a general expression language. Each
+ * term must resolve inside the retained bytes, and consumers must verify the
+ * canonical-decimal sum before treating the bindings as evidence for the
+ * calculated value. It does not pretend that the source printed the total.
+ */
+export type FieldCalculation = {
+  readonly format: "decimal_sum_v1";
+  readonly terms: readonly FieldBinding[];
+};
+
 export type FieldLocator = {
   readonly source: CapabilityTier;
   /** 0-based row index within the source page/file, or 1-based page number for a PDF-tier source. */
@@ -418,6 +439,8 @@ export type FieldLocator = {
   readonly field?: string;
   /** Present only when this exact datum resolves inside the retained bytes. */
   readonly binding?: FieldBinding;
+  /** Present when this datum is an exact calculation over bound source fields. */
+  readonly calculation?: FieldCalculation;
 };
 
 /**
@@ -446,82 +469,82 @@ export type ParsedInstrument = {
  * exactly what text produced the ambiguity.
  */
 export type ParsedRow = ParsedAmount & {
-    /**
-     * Which underlying source document (in the archive's `documents` sense)
-     * this row belongs to, among the rows one `parse()` call returns. Rows
-     * from the same document share this value and appear in that document's
-     * own row order; this is what a caller groups rows by to compute the
-     * per-document `occurrence` ordinal `rowHash` requires.
-     *
-     * For a single acquired file (a statement, a confirmation, a tabular
-     * export) this is a constant for the whole call, since one `parse()`
-     * call already covers exactly one document. A paginated structured-API
-     * pull acquires every page as one `RawFile` (one content hash, one
-     * immutable capture) but is logically several documents for dedupe
-     * purposes, one per page: giving each page its own `sourceDocument`
-     * value is what lets the same real transaction on two overlapping pages
-     * land on the same occurrence ordinal in each page's document and
-     * therefore collapse, while two genuinely distinct rows within one page
-     * still get distinct ordinals. See `src/importer.ts` and
-     * `src/adapterImport.ts`.
-     */
-    readonly sourceDocument: string;
-    /**
-     * F1-35. The account this row belongs to, when one `acquire()` pull
-     * spans several accounts (an institution-wide structured-API or
-     * tabular-export pull, e.g. `run.ts`'s `"scope": "institution"` selection).
-     * Matches a `DiscoveredAccount.externalKey` from this institution's own
-     * `discover()`. Omitted for the ordinary case, one pull naming one
-     * account: such a row is attributed to that pull's own account exactly
-     * as before this field existed.
-     */
-    readonly accountExternalKey?: string;
-    /** The provider's own transaction id, when the source has one. */
-    readonly externalId: string | null;
-    readonly tradeDate: string | null;
-    readonly processDate: string;
-    readonly settleDate: string | null;
-    readonly datePrecision: "day" | "month" | "unknown";
-    readonly activityType: string;
-    readonly description: string;
-    readonly instrument: ParsedInstrument | null;
-    /**
-     * Signed, in the instrument's own units: **positive for an acquisition
-     * and negative for a disposal**, whatever the source calls the activity.
-     * A sale of ten shares is `"-10"`, not `"10"` with the sign carried on
-     * `amount` alone.
-     *
-     * This is not a formatting preference. The position reconciliation gate
-     * (`src/positionReconciliation.ts`) replays these quantities to check a
-     * stated position change, so an unsigned disposal reads as an
-     * acquisition and fails every period that contains one. The sign cannot
-     * be recovered downstream from `activityType`: that is free provider
-     * text with no taxonomy behind it, and guessing at it is exactly what
-     * the plan says to surface for review instead.
-     *
-     * `null` when the source's own value is missing or ambiguous, which the
-     * importer routes to `review_items` rather than guessing (ground rule 5).
-     */
-    readonly quantity: string | null;
-    readonly price: string | null;
-    readonly currency: string;
-    /**
-     * F1-8b/F1-38. `amount` converted into the account's base currency, when
-     * the source itself states that converted amount -- decimal text, used
-     * verbatim and never rounded (importer.ts's `resolveAmountBase`).
-     * Omitted or null when the source states no such figure for this row.
-     */
-    readonly amountBase?: string | null;
-    /**
-     * F1-8b/F1-38. The FX rate the source states for this row, decimal
-     * text. Recorded on `fx_rate` whenever it is known, and -- only when
-     * `amountBase` is absent -- multiplied against `amount` to derive
-     * `amount_base`, rounded half_even (importer.ts's `resolveAmountBase`).
-     */
-    readonly fxRate?: string | null;
-    readonly runningBalance: string | null;
-    readonly locators: Readonly<Record<string, FieldLocator>>;
-  };
+  /**
+   * Which underlying source document (in the archive's `documents` sense)
+   * this row belongs to, among the rows one `parse()` call returns. Rows
+   * from the same document share this value and appear in that document's
+   * own row order; this is what a caller groups rows by to compute the
+   * per-document `occurrence` ordinal `rowHash` requires.
+   *
+   * For a single acquired file (a statement, a confirmation, a tabular
+   * export) this is a constant for the whole call, since one `parse()`
+   * call already covers exactly one document. A paginated structured-API
+   * pull acquires every page as one `RawFile` (one content hash, one
+   * immutable capture) but is logically several documents for dedupe
+   * purposes, one per page: giving each page its own `sourceDocument`
+   * value is what lets the same real transaction on two overlapping pages
+   * land on the same occurrence ordinal in each page's document and
+   * therefore collapse, while two genuinely distinct rows within one page
+   * still get distinct ordinals. See `src/importer.ts` and
+   * `src/adapterImport.ts`.
+   */
+  readonly sourceDocument: string;
+  /**
+   * F1-35. The account this row belongs to, when one `acquire()` pull
+   * spans several accounts (an institution-wide structured-API or
+   * tabular-export pull, e.g. `run.ts`'s `"scope": "institution"` selection).
+   * Matches a `DiscoveredAccount.externalKey` from this institution's own
+   * `discover()`. Omitted for the ordinary case, one pull naming one
+   * account: such a row is attributed to that pull's own account exactly
+   * as before this field existed.
+   */
+  readonly accountExternalKey?: string;
+  /** The provider's own transaction id, when the source has one. */
+  readonly externalId: string | null;
+  readonly tradeDate: string | null;
+  readonly processDate: string;
+  readonly settleDate: string | null;
+  readonly datePrecision: "day" | "month" | "unknown";
+  readonly activityType: string;
+  readonly description: string;
+  readonly instrument: ParsedInstrument | null;
+  /**
+   * Signed, in the instrument's own units: **positive for an acquisition
+   * and negative for a disposal**, whatever the source calls the activity.
+   * A sale of ten shares is `"-10"`, not `"10"` with the sign carried on
+   * `amount` alone.
+   *
+   * This is not a formatting preference. The position reconciliation gate
+   * (`src/positionReconciliation.ts`) replays these quantities to check a
+   * stated position change, so an unsigned disposal reads as an
+   * acquisition and fails every period that contains one. The sign cannot
+   * be recovered downstream from `activityType`: that is free provider
+   * text with no taxonomy behind it, and guessing at it is exactly what
+   * the plan says to surface for review instead.
+   *
+   * `null` when the source's own value is missing or ambiguous, which the
+   * importer routes to `review_items` rather than guessing (ground rule 5).
+   */
+  readonly quantity: string | null;
+  readonly price: string | null;
+  readonly currency: string;
+  /**
+   * F1-8b/F1-38. `amount` converted into the account's base currency, when
+   * the source itself states that converted amount -- decimal text, used
+   * verbatim and never rounded (importer.ts's `resolveAmountBase`).
+   * Omitted or null when the source states no such figure for this row.
+   */
+  readonly amountBase?: string | null;
+  /**
+   * F1-8b/F1-38. The FX rate the source states for this row, decimal
+   * text. Recorded on `fx_rate` whenever it is known, and -- only when
+   * `amountBase` is absent -- multiplied against `amount` to derive
+   * `amount_base`, rounded half_even (importer.ts's `resolveAmountBase`).
+   */
+  readonly fxRate?: string | null;
+  readonly runningBalance: string | null;
+  readonly locators: Readonly<Record<string, FieldLocator>>;
+};
 
 // --- holdings ------------------------------------------------------------
 //
@@ -534,7 +557,8 @@ export type ParsedRow = ParsedAmount & {
 // guess at (plan: "capabilities... an adapter declaring a subset honestly
 // is the expected case").
 
-export type ValuationBasis = "market_price" | "last_round" | "cost" | "reported_nav";
+export type ValuationBasis =
+  "market_price" | "last_round" | "cost" | "reported_nav";
 
 /**
  * One point-in-time holding from a statement's positions table. `marketValue`
@@ -661,7 +685,10 @@ export type InstitutionAdapter = {
    */
   discover(
     session: AdapterSession,
-    kinds?: readonly Extract<CapabilityTier, "pdf_statement" | "trade_confirmation">[],
+    kinds?: readonly Extract<
+      CapabilityTier,
+      "pdf_statement" | "trade_confirmation"
+    >[],
   ): Promise<DiscoverResult>;
   acquire(selection: AcquireSelection): Promise<AcquiredDocument>;
   parse(rawFile: RawFile): Promise<ParsedPull>;

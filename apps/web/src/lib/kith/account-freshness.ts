@@ -93,6 +93,12 @@ const NO_HOLDINGS_TYPES = new Set([
 const DAY = 24 * 60 * 60 * 1000;
 /** How many recent balance months the cadence is read from. */
 const CADENCE_WINDOW = 7;
+/**
+ * A longer allowance needs repeated evidence. Three long intervals require
+ * four observed statement months and prevent one missed monthly import from
+ * teaching the account a quarterly cadence.
+ */
+const QUARTERLY_INTERVALS_REQUIRED = 3;
 
 function parts(date: string): { year: number; month: number; day: number } {
   const [year, month, day] = date.split("-").map(Number) as [
@@ -129,9 +135,7 @@ export function dateOf(now: number): string {
 }
 
 function ageDays(asOf: string, now: number): number {
-  return Math.floor(
-    Math.max(now - Date.parse(`${asOf}T00:00:00Z`), 0) / DAY,
-  );
+  return Math.floor(Math.max(now - Date.parse(`${asOf}T00:00:00Z`), 0) / DAY);
 }
 
 /**
@@ -160,18 +164,17 @@ export function nextPeriodEnd(date: string, cadence: StatementCadence): string {
  * The cadence the archive's own balance dates show.
  *
  * `monthly` when each of the recent balances is one month after the one
- * before. `quarterly` when gaps are at most three months and every gap longer
- * than one ends on a quarter end, the pattern of a statement monthly while
- * active and quarterly while quiet. Anything else, including fewer than two
- * months of balances, is `unknown`, which is judged as monthly: an unknown
- * cadence never earns a longer allowance than the strictest regular one.
- *
- * ponytail: a monthly account that misses the one statement just before a
- * quarter end reads as quarterly until its next statement. Upgrade path:
- * count months with transactions and no balance (a statement a month with
- * activity should have produced) and treat any as a gap.
+ * before. `quarterly` requires at least three repeated long intervals; gaps
+ * must be at most three months and every long gap must end on a quarter end.
+ * That admits a statement monthly while active and quarterly while quiet,
+ * but neither two isolated dates nor one missed monthly import earns the
+ * longer allowance. Anything else, including sparse or interrupted history,
+ * is `unknown`, which is judged as monthly: an unknown cadence never earns a
+ * longer allowance than the strictest regular one.
  */
-export function inferCadence(balanceDates: readonly string[]): StatementCadence {
+export function inferCadence(
+  balanceDates: readonly string[],
+): StatementCadence {
   const months: number[] = [];
   for (const date of balanceDates) {
     const index = monthIndex(date);
@@ -180,6 +183,7 @@ export function inferCadence(balanceDates: readonly string[]): StatementCadence 
   }
   if (months.length < 2) return "unknown";
   let monthly = true;
+  let quarterlyIntervals = 0;
   for (let i = 1; i < months.length; i += 1) {
     const gap = months[i - 1]! - months[i]!;
     if (gap < 1 || gap > 3) return "unknown";
@@ -187,8 +191,12 @@ export function inferCadence(balanceDates: readonly string[]): StatementCadence 
     monthly = false;
     // The later date of a long gap must be a quarter end month.
     if ((months[i - 1]! % 12) % 3 !== 2) return "unknown";
+    quarterlyIntervals += 1;
   }
-  return monthly ? "monthly" : "quarterly";
+  if (monthly) return "monthly";
+  return quarterlyIntervals >= QUARTERLY_INTERVALS_REQUIRED
+    ? "quarterly"
+    : "unknown";
 }
 
 function cadenceLabel(cadence: StatementCadence): string {

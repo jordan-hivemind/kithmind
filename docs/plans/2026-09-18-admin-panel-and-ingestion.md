@@ -6,40 +6,40 @@ else is the orchestrator's recommendation and may change as screens are built.
 
 ## 1. Owner decisions
 
-| Topic | Decision |
-| --- | --- |
-| Quality bar | A personal project, built well. Not enterprise software. The source files are the ultimate backup. No new hardening unless it blocks use. |
-| Priority | Ingest real life data across many types, to test flexibility and precision. Outside investments first, then bank and card statements, other brokerages, medical records, vehicle service records, project receipts. |
-| Operation | Long term the product is operated from its own UI, not from a coding agent. Adding a major new provider through a coding agent is fine, but the UI must show a complete inventory so gaps are visible. |
-| Configuration | Out of JSON files and into the database: document types and fields, watched sources, mappings. |
-| Watcher host | The always-on home machine is the long-term home of the filesystem watcher. The laptop is the interim host. |
-| Moves and renames | Watched folders and files must self-repair when renamed or moved. No breakage, no duplicates. |
-| Investments | Tracked in the app, not in a spreadsheet. The existing spreadsheet is imported once. Entry forms for capital calls, distributions and the like are the frequent path. |
-| UI behaviour | Reactive. Edits apply optimistically with no refresh. Server-side changes appear live with no refresh. |
-| UI style | White, gray and blue. Inter. Compact tables. Kebab menus for row actions. Everything sortable and filterable with search as you type. Tooltips for detail. Square tags. No explanatory prose in the UI. |
-| Reviews | Second-model review only for sign-in, access control, MCP exposure and anything that changes financial numbers. |
-| Runtime pins | Keep a recorded parser version so reprocessing is reproducible. Drop per-file hash manifests and config fingerprint ceremony. Updates are pull, build, restart. |
+| Topic             | Decision                                                                                                                                                                                                            |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Quality bar       | A personal project, built well. Not enterprise software. The source files are the ultimate backup. No new hardening unless it blocks use.                                                                           |
+| Priority          | Ingest real life data across many types, to test flexibility and precision. Outside investments first, then bank and card statements, other brokerages, medical records, vehicle service records, project receipts. |
+| Operation         | Long term the product is operated from its own UI, not from a coding agent. Adding a major new provider through a coding agent is fine, but the UI must show a complete inventory so gaps are visible.              |
+| Configuration     | Out of JSON files and into the database: document types and fields, watched sources, mappings.                                                                                                                      |
+| Watcher host      | The always-on home machine is the long-term home of the filesystem watcher. The laptop is the interim host.                                                                                                         |
+| Moves and renames | Watched folders and files must self-repair when renamed or moved. No breakage, no duplicates.                                                                                                                       |
+| Investments       | Tracked in the app, not in a spreadsheet. The existing spreadsheet is imported once. Entry forms for capital calls, distributions and the like are the frequent path.                                               |
+| UI behaviour      | Reactive. Edits apply optimistically with no refresh. Server-side changes appear live with no refresh.                                                                                                              |
+| UI style          | White, gray and blue. Inter. Compact tables. Kebab menus for row actions. Everything sortable and filterable with search as you type. Tooltips for detail. Square tags. No explanatory prose in the UI.             |
+| Reviews           | Second-model review only for sign-in, access control, MCP exposure and anything that changes financial numbers.                                                                                                     |
+| Runtime pins      | Keep a recorded parser version so reprocessing is reproducible. Drop per-file hash manifests and config fingerprint ceremony. Updates are pull, build, restart.                                                     |
 
 ## 2. What exists and what does not
 
-| Area | Today |
-| --- | --- |
-| Documents | Parsed to pages, chunks and cited evidence spans, embedded, searchable through MCP. PDF and xlsx only. |
+| Area             | Today                                                                                                                         |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Documents        | Parsed to pages, chunks and cited evidence spans, embedded, searchable through MCP. PDF and xlsx only.                        |
 | Typed extraction | Not running. The read side (events, observations, `query_records`) exists. Nothing writes to it since the move to PostgreSQL. |
-| Watched sources | One private JSON config per source on the watcher host. The web app can only name and enable a source. |
-| Document types | TypeScript constants. Not visible or editable. |
-| Finance archive | One institution, strict typed records, its own read contract. Unchanged by this plan. |
-| Web app | Next.js 15, React 19. Pages: browse, settings, spaces, getting started. No admin panel. No live updates. |
+| Watched sources  | One private JSON config per source on the watcher host. The web app can only name and enable a source.                        |
+| Document types   | TypeScript constants. Not visible or editable.                                                                                |
+| Finance archive  | One institution, strict typed records, its own read contract. Unchanged by this plan.                                         |
+| Web app          | Next.js 15, React 19. Pages: browse, settings, spaces, getting started. No admin panel. No live updates.                      |
 
 ## 3. Stack
 
-| Piece | Choice | Why |
-| --- | --- | --- |
-| App | The existing Next.js app | Sign-in, spaces and the store are already wired. |
-| Styling | Tailwind plus a small set of accessible primitives (menu, tooltip, dialog, drawer) | Matches the style decision with little code. |
-| Tables | TanStack Table | Sorting, filtering, search, grouping and expandable rows from one headless component. |
-| Client state | TanStack Query | Optimistic mutations with rollback, and targeted refetch. |
-| Live updates | A change feed (section 4) | PostgreSQL and serverless hosting give no subscriptions on their own. |
+| Piece        | Choice                                                                             | Why                                                                                   |
+| ------------ | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| App          | The existing Next.js app                                                           | Sign-in, spaces and the store are already wired.                                      |
+| Styling      | Tailwind plus a small set of accessible primitives (menu, tooltip, dialog, drawer) | Matches the style decision with little code.                                          |
+| Tables       | TanStack Table                                                                     | Sorting, filtering, search, grouping and expandable rows from one headless component. |
+| Client state | TanStack Query                                                                     | Optimistic mutations with rollback, and targeted refetch.                             |
+| Live updates | A change feed (section 4)                                                          | PostgreSQL and serverless hosting give no subscriptions on their own.                 |
 
 ## 4. Change feed
 
@@ -52,39 +52,39 @@ Access control: the route uses the same session and space authorization as every
 
 ## 5. Data model additions
 
-| Table | Holds | Notes |
-| --- | --- | --- |
-| `document_types` | kind, description, area, extraction guidance, examples, version, active | Editing creates a new version. Extracted documents record the version they used. |
-| `document_type_fields` | type id, field name, value type, required, check (on page, exact, sums to total), example | Value types: text, organization, person, date, money, number, identifier, line item list. |
-| `source_roots` | source account id, kind (folder, institution, manual), provider folder id, last known path, expected types, area, state | The desired list. The watcher pulls it each pass. |
-| `source_root_reports` | what the watcher host sees: available top-level folders, counts, skipped files with reasons, last pass, problems | Written by the watcher, read by the UI. |
-| `investments` | entity id, category, signed date, status, notes | One row per investment. |
-| `investment_entries` | investment id, entry type, date, amount, currency, exchange rate, note, document id, evidence span | Capital call paid, distribution, commitment, commitment change, fee, write-off. Totals are computed, never stored. |
-| `corrections` | target (document, field or record), original value, corrected value, actor, reason, time | The original reading is kept. Reads prefer the correction. |
-| `changes` | section 4 | |
+| Table                  | Holds                                                                                                                   | Notes                                                                                                              |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `document_types`       | kind, description, area, extraction guidance, examples, version, active                                                 | Editing creates a new version. Extracted documents record the version they used.                                   |
+| `document_type_fields` | type id, field name, value type, required, check (on page, exact, sums to total), example                               | Value types: text, organization, person, date, money, number, identifier, line item list.                          |
+| `source_roots`         | source account id, kind (folder, institution, manual), provider folder id, last known path, expected types, area, state | The desired list. The watcher pulls it each pass.                                                                  |
+| `source_root_reports`  | what the watcher host sees: available top-level folders, counts, skipped files with reasons, last pass, problems        | Written by the watcher, read by the UI.                                                                            |
+| `investments`          | entity id, category, signed date, status, notes                                                                         | One row per investment.                                                                                            |
+| `investment_entries`   | investment id, entry type, date, amount, currency, exchange rate, note, document id, evidence span                      | Capital call paid, distribution, commitment, commitment change, fee, write-off. Totals are computed, never stored. |
+| `corrections`          | target (document, field or record), original value, corrected value, actor, reason, time                                | The original reading is kept. Reads prefer the correction.                                                         |
+| `changes`              | section 4                                                                                                               |                                                                                                                    |
 
 Statements produced by extraction are ordinary observations with evidence spans, so `query_records`, coverage and citations keep working.
 
 ## 6. Sources that repair themselves
 
-| Case | Behaviour |
-| --- | --- |
-| Watched folder renamed or moved | The source is keyed by the provider's folder id. The watcher resolves the id to the current path each pass and updates `last known path`. Nothing is re-ingested. |
-| File renamed or moved inside a source | Keyed by provider file id. Same document, new location recorded. |
-| File copied to a second place | Same content hash, different file id: recorded as a duplicate of the first, not a second document. |
-| File moved out of every source | Marked unavailable, then retired after a grace period. The archived original is kept. |
-| Provider id unavailable (non-provider folder) | Fall back to content hash plus size. A rename looks like a removal and an addition with the same hash, and is joined. |
-| Folder deleted | The source shows a problem in the UI. Nothing is deleted. |
+| Case                                          | Behaviour                                                                                                                                                         |
+| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Watched folder renamed or moved               | The source is keyed by the provider's folder id. The watcher resolves the id to the current path each pass and updates `last known path`. Nothing is re-ingested. |
+| File renamed or moved inside a source         | Keyed by provider file id. Same document, new location recorded.                                                                                                  |
+| File copied to a second place                 | Same content hash, different file id: recorded as a duplicate of the first, not a second document.                                                                |
+| File moved out of every source                | Marked unavailable, then retired after a grace period. The archived original is kept.                                                                             |
+| Provider id unavailable (non-provider folder) | Fall back to content hash plus size. A rename looks like a removal and an addition with the same hash, and is joined.                                             |
+| Folder deleted                                | The source shows a problem in the UI. Nothing is deleted.                                                                                                         |
 
 The watcher host keeps one local setting: the top-level directories it may read (for example the synced provider folder). A database row can never point it outside them.
 
 ## 7. Watcher host
 
-| Step | Detail |
-| --- | --- |
-| Interim | The laptop keeps running the watcher. |
-| Move | Install the provider's sync client and the worker checkout on the always-on machine, create a worker credential for it, copy the journal and archive catalog once, start the LaunchAgent there, stop the laptop's. |
-| After | The laptop is a client only. The health page shows which host is watching and when it last passed. |
+| Step    | Detail                                                                                                                                                                                                             |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Interim | The laptop keeps running the watcher.                                                                                                                                                                              |
+| Move    | Install the provider's sync client and the worker checkout on the always-on machine, create a worker credential for it, copy the journal and archive catalog once, start the LaunchAgent there, stop the laptop's. |
+| After   | The laptop is a client only. The health page shows which host is watching and when it last passed.                                                                                                                 |
 
 ## 8. Extraction
 
@@ -102,26 +102,26 @@ Dropped from the earlier card design: closed kind enums, the model tier ladder, 
 
 ## 9. Screens
 
-| Order | Screen | Shows |
-| --- | --- | --- |
-| 1 | Health | Checks with plain status. Same content as the daily report. |
-| 2 | Sources | Every folder, institution and manual source: location, area, items, skipped, last read, status. Add folder. |
-| 3 | Institutions | Institutions as expandable groups over their accounts: statements, activity range, latest snapshot, open reviews, status. |
-| 4 | Coverage | Life areas against sources, documents, records, date range and gaps. |
-| 5 | Investments | Investments with computed committed, sent, outstanding and received, expandable into entries. Add entry is the primary action. Import from a spreadsheet is a secondary action. |
-| 6 | Types and fields | Kinds, their fields, checks, guidance, versions. Edit and re-extract. |
-| 7 | Corrections | Open and resolved items with the original reading and the fix. |
+| Order | Screen           | Shows                                                                                                                                                                           |
+| ----- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | Health           | Checks with plain status. Same content as the daily report.                                                                                                                     |
+| 2     | Sources          | Every folder, institution and manual source: location, area, items, skipped, last read, status. Add folder.                                                                     |
+| 3     | Institutions     | Institutions as expandable groups over their accounts: statements, activity range, latest snapshot, open reviews, status.                                                       |
+| 4     | Coverage         | Life areas against sources, documents, records, date range and gaps.                                                                                                            |
+| 5     | Investments      | Investments with computed committed, sent, outstanding and received, expandable into entries. Add entry is the primary action. Import from a spreadsheet is a secondary action. |
+| 6     | Types and fields | Kinds, their fields, checks, guidance, versions. Edit and re-extract.                                                                                                           |
+| 7     | Corrections      | Open and resolved items with the original reading and the fix.                                                                                                                  |
 
 ## 10. Build order
 
-| Step | Delivers | Usable result |
-| --- | --- | --- |
-| 1 | Schema for section 5, change feed, UI foundation (Tailwind, table, query cache, live hook) | Nothing visible yet. |
-| 2 | Health, Sources, Institutions, Coverage, read-only and live | An inventory of everything the system reads, with gaps. |
-| 3 | Investments: tables, entry forms with optimistic saves, one-time spreadsheet import, MCP read tools | Exact answers about commitments, calls and distributions. |
-| 4 | Sources write path: add folder, provider ids, self-repair, watcher pulls `source_roots` | New folders added from the UI. |
-| 5 | Extraction writer, types and fields screen, corrections | Typed, cited answers from documents and receipts. |
-| 6 | Watcher moves to the always-on host | Ingestion independent of the laptop. |
+| Step | Delivers                                                                                            | Usable result                                             |
+| ---- | --------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| 1    | Schema for section 5, change feed, UI foundation (Tailwind, table, query cache, live hook)          | Nothing visible yet.                                      |
+| 2    | Health, Sources, Institutions, Coverage, read-only and live                                         | An inventory of everything the system reads, with gaps.   |
+| 3    | Investments: tables, entry forms with optimistic saves, one-time spreadsheet import, MCP read tools | Exact answers about commitments, calls and distributions. |
+| 4    | Sources write path: add folder, provider ids, self-repair, watcher pulls `source_roots`             | New folders added from the UI.                            |
+| 5    | Extraction writer, types and fields screen, corrections                                             | Typed, cited answers from documents and receipts.         |
+| 6    | Watcher moves to the always-on host                                                                 | Ingestion independent of the laptop.                      |
 
 ## 11. Acceptance for the first use case
 
@@ -137,12 +137,12 @@ have to re-decide it.
 
 ### What exists now
 
-| Piece | Behaviour |
-| --- | --- |
-| `investment_entries.document_id` | Optional. One entry cites at most one document. |
-| `suggestDocumentsForEntry` | Computed on read, never stored. Ranks the space's published, unlinked documents by three signals: the investment's name in the document title (3), an exact string form of the entry amount in its text chunks, tried as `25000.00`, `25,000.00`, `25000` and `25,000` (2), and a capture date within 45 days of the entry date (1). A document scoring zero is not offered. |
-| Unlinked count | Per investment: published documents whose title contains the investment's name and that no entry links to. The screen shows it as a gap, not a total. |
-| Upload | Present and disabled, with the tooltip "Drop files in the watched Investing folder". |
+| Piece                            | Behaviour                                                                                                                                                                                                                                                                                                                                                                    |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `investment_entries.document_id` | Optional. One entry cites at most one document.                                                                                                                                                                                                                                                                                                                              |
+| `suggestDocumentsForEntry`       | Computed on read, never stored. Ranks the space's published, unlinked documents by three signals: the investment's name in the document title (3), an exact string form of the entry amount in its text chunks, tried as `25000.00`, `25,000.00`, `25000` and `25,000` (2), and a capture date within 45 days of the entry date (1). A document scoring zero is not offered. |
+| Unlinked count                   | Per investment: published documents whose title contains the investment's name and that no entry links to. The screen shows it as a gap, not a total.                                                                                                                                                                                                                        |
+| Upload                           | Present and disabled, with the tooltip "Drop files in the watched Investing folder".                                                                                                                                                                                                                                                                                         |
 
 ### The automatic rule, for when extraction lands
 
@@ -170,14 +170,14 @@ deduplicated exactly like one dropped in by hand.
 
 ### Totals
 
-| Total | Rule |
-| --- | --- |
-| committed | `commitment` plus `commitment_change` |
-| sent | `capital_call_paid`, and only that |
-| fees | `fee`, its own total, never folded into sent |
-| received | `distribution` |
-| outstanding | committed minus sent, **signed** |
-| overCalled | sent minus committed when that is positive, else zero |
+| Total       | Rule                                                  |
+| ----------- | ----------------------------------------------------- |
+| committed   | `commitment` plus `commitment_change`                 |
+| sent        | `capital_call_paid`, and only that                    |
+| fees        | `fee`, its own total, never folded into sent          |
+| received    | `distribution`                                        |
+| outstanding | committed minus sent, **signed**                      |
+| overCalled  | sent minus committed when that is positive, else zero |
 
 `outstanding` is signed rather than floored at zero: flooring made an
 over-called fund read exactly like a fully called one, and an over-call is the
@@ -235,11 +235,11 @@ and chunks the parser produced. Typed extraction is a derived layer written on
 top of an already-activated generation, and its rows must not count against
 that seal.
 
-| Row | How the seal knows it is extraction's |
-| --- | --- |
-| Event version, observation | `event_type = 'document_statement'` |
-| Evidence span, written from ADM-5i on | `locator->>'kind' = 'extraction_v1'` |
-| Evidence span, written before that | Referenced only by a `document_statement` observation's `value_evidence` or that event version's `field_evidence` |
+| Row                                   | How the seal knows it is extraction's                                                                             |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| Event version, observation            | `event_type = 'document_statement'`                                                                               |
+| Evidence span, written from ADM-5i on | `locator->>'kind' = 'extraction_v1'`                                                                              |
+| Evidence span, written before that    | Referenced only by a `document_statement` observation's `value_evidence` or that event version's `field_evidence` |
 
 A span the manifest lists is never excluded, whatever points at it: extraction
 reuses a parser span when one already covers the range, and excluding it would
@@ -265,16 +265,16 @@ a sealed text version whose locator has no kind or the `extraction_v1` kind.
 Both halves use one reference whitelist, read off the schema rather than
 inferred. A span named by any of these is never removed:
 
-| Table | Column |
-| --- | --- |
-| `processing_generation_payload_manifests` | `evidence_span_ids` |
-| `observations` | `value_evidence` |
-| `event_versions` | `field_evidence` |
-| `documents` | `evidence_span_ids` |
-| `chunks` | `evidence_span_ids` |
-| `worker_parsed_stages` | `evidence_span_ids` |
-| `investment_entries` | `evidence_span_id` |
-| `document_extractions` | `statements[].evidenceSpanId` |
+| Table                                     | Column                        |
+| ----------------------------------------- | ----------------------------- |
+| `processing_generation_payload_manifests` | `evidence_span_ids`           |
+| `observations`                            | `value_evidence`              |
+| `event_versions`                          | `field_evidence`              |
+| `documents`                               | `evidence_span_ids`           |
+| `chunks`                                  | `evidence_span_ids`           |
+| `worker_parsed_stages`                    | `evidence_span_ids`           |
+| `investment_entries`                      | `evidence_span_id`            |
+| `document_extractions`                    | `statements[].evidenceSpanId` |
 
 A span carrying `card_extraction_fingerprints` is the card runner's and is out
 of scope. `corrections` names a document, a field or an observation key and
@@ -319,19 +319,19 @@ on none of the cited lines may be stored from a line **next to** one of them.
 This is the only rule in the round that relaxes a check, so it is fenced on
 every side. All eleven of these have to hold:
 
-| Condition | Why |
-| --- | --- |
-| The statement cited line ids | The older quote shape has none, so "one line off" means nothing there |
-| The field is money or number | Dates and text are never repaired |
-| A money value carries a decimal point or a currency mark | A bare run of digits is a suite number, a tax year or a page number, and each of those stored a wrong total end to end |
-| No cited line states a value of that type | Then the model contradicted its own citation rather than missing by a line: `Fee 100.00` cited as a total of 250.00 |
-| The target is within one line id of **every** cited line, on the cited page | One off is the miss this exists for; further is a search of the page |
-| The target is the line **after** a cited line, never the one before it (ADM-5k) | A label stands above its amount. Reaching backwards as well, the repair could not tell which side of a label it was reading: `Subtotal`/`20.00`/`Total`/`21.60` with a total of 20.00 cited to `Total` stored the subtotal's amount as the total, because 20.00 is one line from `Total` exactly as 21.60 is. The backwards miss -- a citation naming the line *after* its value -- is refused with it: it is the rarer half of a rule that could not tell them apart |
-| Exactly one line of that window states the value | Choosing between two is a guess |
-| No other line of the **whole document** states it | A value printed twice says nothing about which line states it |
-| The target line prints that one value and nothing else | A line with a word on it belongs to that word: `Tax 1.60` beside `Subtotal`, `Invoice 48210` beside `Odometer`, `Page 2023` beside `Tax year` and a K-1's `12 Section 179 deduction` beside `Profit share` each stored the neighbour's number |
-| The target's neighbour on the side away from the citation is not itself a bare value | A page that prints its labels together and its amounts together says which amount is which by counting, and counting is the guess this rule refuses: `Subtotal`/`Tax`/`Total` over `20.00`/`1.60`/`21.60` stored a total of 20.00 |
-| No other statement of the run was read from that line, and no second statement would repair onto it | One printed number is one field's. A `line_item_list` occupies the lines its entries were read from, like every other accepted reading, and repairs are resolved only after every statement of the reply has been read, so the order the model printed them in cannot change what is stored |
+| Condition                                                                                           | Why                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The statement cited line ids                                                                        | The older quote shape has none, so "one line off" means nothing there                                                                                                                                                                                                                                                                                                                                                                                                 |
+| The field is money or number                                                                        | Dates and text are never repaired                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| A money value carries a decimal point or a currency mark                                            | A bare run of digits is a suite number, a tax year or a page number, and each of those stored a wrong total end to end                                                                                                                                                                                                                                                                                                                                                |
+| No cited line states a value of that type                                                           | Then the model contradicted its own citation rather than missing by a line: `Fee 100.00` cited as a total of 250.00                                                                                                                                                                                                                                                                                                                                                   |
+| The target is within one line id of **every** cited line, on the cited page                         | One off is the miss this exists for; further is a search of the page                                                                                                                                                                                                                                                                                                                                                                                                  |
+| The target is the line **after** a cited line, never the one before it (ADM-5k)                     | A label stands above its amount. Reaching backwards as well, the repair could not tell which side of a label it was reading: `Subtotal`/`20.00`/`Total`/`21.60` with a total of 20.00 cited to `Total` stored the subtotal's amount as the total, because 20.00 is one line from `Total` exactly as 21.60 is. The backwards miss -- a citation naming the line _after_ its value -- is refused with it: it is the rarer half of a rule that could not tell them apart |
+| Exactly one line of that window states the value                                                    | Choosing between two is a guess                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| No other line of the **whole document** states it                                                   | A value printed twice says nothing about which line states it                                                                                                                                                                                                                                                                                                                                                                                                         |
+| The target line prints that one value and nothing else                                              | A line with a word on it belongs to that word: `Tax 1.60` beside `Subtotal`, `Invoice 48210` beside `Odometer`, `Page 2023` beside `Tax year` and a K-1's `12 Section 179 deduction` beside `Profit share` each stored the neighbour's number                                                                                                                                                                                                                         |
+| The target's neighbour on the side away from the citation is not itself a bare value                | A page that prints its labels together and its amounts together says which amount is which by counting, and counting is the guess this rule refuses: `Subtotal`/`Tax`/`Total` over `20.00`/`1.60`/`21.60` stored a total of 20.00                                                                                                                                                                                                                                     |
+| No other statement of the run was read from that line, and no second statement would repair onto it | One printed number is one field's. A `line_item_list` occupies the lines its entries were read from, like every other accepted reading, and repairs are resolved only after every statement of the reply has been read, so the order the model printed them in cannot change what is stored                                                                                                                                                                           |
 
 "Prints that one value and nothing else" means exactly one amount is offered
 for the line and what is left after removing it -- its sign, its parentheses,
@@ -395,13 +395,13 @@ this, any word the grammar did not recognise was neutral, so `$2.5 trillion`,
 `45 cents` and `45.00 percent` each offered forty-five. Every word a document
 prints beside an amount now falls in one of three tables.
 
-| Table | Words | What happens |
-| --- | --- | --- |
-| Scale, read | `thousand(s)`, `million(s)`, `billion(s)`, `trillion(s)`, `lakh(s)`, `crore(s)`, and the abbreviations `k`, `m`, `b`, `mm`, `mn`, `bn` glued to the digits beside a currency marker | The point moves. Each of these spells one number and no other |
-| Scale, refused outright | `mil`, `mio`, `mln`, `thous`, `trn`, `tril(l)`, `lac(s)`, and a magnitude abbreviation a space away from its digits | The word joins the token and the whole token is refused. None of these is an English word or a name |
-| Scale, refused after the amount | `mill(s)`, `thou`, `grand`, `bil`, `bill(s)`, `tn` | The same, but only directly after the amount and only where the word does not open a name. `mill` is a million and a property-tax mill; `bill` is a billion and an invoice; `grand` is a thousand and an adjective; `tn` is a trillion and Tennessee |
-| Unit | `cent(s)`, `percent`, `percentage`, `pct`, `bp`, `bps`, `basis` | Refused for a money field. A unit is not a scale: `45 cents` is not forty-five dollars and `45.00 percent` is not forty-five of anything a money field stores |
-| Counted unit | `share(s)`, `unit(s)` | Refused for a money field **only where the amount prints no currency mark**. `100 shares` is a holding; `$50,000.00 Shares issued` is fifty thousand dollars, and the mark says so |
+| Table                           | Words                                                                                                                                                                               | What happens                                                                                                                                                                                                                                         |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Scale, read                     | `thousand(s)`, `million(s)`, `billion(s)`, `trillion(s)`, `lakh(s)`, `crore(s)`, and the abbreviations `k`, `m`, `b`, `mm`, `mn`, `bn` glued to the digits beside a currency marker | The point moves. Each of these spells one number and no other                                                                                                                                                                                        |
+| Scale, refused outright         | `mil`, `mio`, `mln`, `thous`, `trn`, `tril(l)`, `lac(s)`, and a magnitude abbreviation a space away from its digits                                                                 | The word joins the token and the whole token is refused. None of these is an English word or a name                                                                                                                                                  |
+| Scale, refused after the amount | `mill(s)`, `thou`, `grand`, `bil`, `bill(s)`, `tn`                                                                                                                                  | The same, but only directly after the amount and only where the word does not open a name. `mill` is a million and a property-tax mill; `bill` is a billion and an invoice; `grand` is a thousand and an adjective; `tn` is a trillion and Tennessee |
+| Unit                            | `cent(s)`, `percent`, `percentage`, `pct`, `bp`, `bps`, `basis`                                                                                                                     | Refused for a money field. A unit is not a scale: `45 cents` is not forty-five dollars and `45.00 percent` is not forty-five of anything a money field stores                                                                                        |
+| Counted unit                    | `share(s)`, `unit(s)`                                                                                                                                                               | Refused for a money field **only where the amount prints no currency mark**. `100 shares` is a holding; `$50,000.00 Shares issued` is fifty thousand dollars, and the mark says so                                                                   |
 
 A **unit** word counts only where a unit can stand, which is directly after
 the amount: `Cost basis 1,234.56` is a money line with a label on it, and
@@ -417,7 +417,7 @@ beside an amount, is what lets `$1,250.00 Mill Creek Partners LP`,
 `500.00 Grand Rapids` and `12 Mill Lane` read while `$2.5 mill` and
 `$2.5 Mill` refuse -- and it closes the mirror hole in the same move:
 `45.00 Thousand Oaks` offered forty-five thousand and `45.00 Lakh Street` four
-and a half million, because a *read* magnitude was scaling a place name. The
+and a half million, because a _read_ magnitude was scaling a place name. The
 finder has no gazetteer, and every other way of telling a town from a
 multiplier is a guess.
 
@@ -484,11 +484,11 @@ label's closing parenthesis looked exactly like a marker. A cell says nothing
 about the amount on the other side of the rule when it is any of three
 things, each decided mechanically:
 
-| Harmless cell | Example |
-| --- | --- |
-| One printed amount and nothing else, sign and marker included | `$150.00`, `(6.00)`, `-1,204.17`, `3,200`, `£9,898.64 CR` |
-| A lone currency code, or a blank marker | `USD`, `N/A`, `none` |
-| A label: no digit, balanced parentheses, nothing that signs or scales, every word neutral on its own account | `Net income (loss)`, `Check`, `Dividends` |
+| Harmless cell                                                                                                | Example                                                   |
+| ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------- |
+| One printed amount and nothing else, sign and marker included                                                | `$150.00`, `(6.00)`, `-1,204.17`, `3,200`, `£9,898.64 CR` |
+| A lone currency code, or a blank marker                                                                      | `USD`, `N/A`, `none`                                      |
+| A label: no digit, balanced parentheses, nothing that signs or scales, every word neutral on its own account | `Net income (loss)`, `Check`, `Dividends`                 |
 
 Everything else falls through to the ordinary neighbour rule, so a `CR`, `DR`,
 `%`, magnitude or unit cell refuses exactly as it did.
@@ -503,7 +503,7 @@ Unicode property rather than a list of blocks: anything Unicode files as
 "other number" -- `①`, `⒈`, `❶`, `½` -- because a list is what the
 last four reviews kept finding a gap in.
 
-**Two runs join when *any* reading joins them (ADM-5k).** "Do these two runs
+**Two runs join when _any_ reading joins them (ADM-5k).** "Do these two runs
 join" is a question about digits and separators, and a reading refused for
 some other reason is no evidence they are separate. `1, 234K` offered the
 leading 1 because `1,234K` is refused for want of a currency marker -- a rule
@@ -526,7 +526,7 @@ column boundary in `$123 456   789`; only the last character of the head was
 checked, so `$12.99 100 200` offered 12.991002 -- a number with the cents of
 one cell and the digits of two more. The head has to be a bare run of digits.
 
-**A line break is not a full stop (ADM-5k).** A real line edge was a *known*
+**A line break is not a full stop (ADM-5k).** A real line edge was a _known_
 edge, so nothing asked what stood past it: a letter printing `raised $2.5`
 with `million` wrapped onto the next line offered two and a half, and a ledger
 printing `CR` above its amount offered a charge. Each line now carries the
@@ -548,11 +548,11 @@ review, which measured the first round refusing an eighth of the correct
 offers on amount columns:
 
 - **An amount the neighbouring line prints for itself is a value, not a
-  marker.** The question is asked of the *edge*: that line's own reading has
+  marker.** The question is asked of the _edge_: that line's own reading has
   to run up to the break. `$20.00` over `$1.60` over `$21.60` is a column and
   every line of it reads; `($ 9,696,944)` over `197,577.62` is two amounts;
   `45.00 CR` over the next row is a credit of its own, because the `CR` has a
-  number in front of it on its own line. An amount in the *middle* of the
+  number in front of it on its own line. An amount in the _middle_ of the
   neighbouring line settles nothing, which is what keeps `raised $2.5` over
   `million from` refusing.
 - **A single closing letter is a row label when a word follows it.** A K-1
@@ -616,15 +616,15 @@ which line ids, whether it occurs on another page, and the character-class
 signature of the value. Its output is integers, booleans, enum reasons and
 field names only: operators debug extraction without reading the documents.
 
-| Knob | Where | Effect |
-| --- | --- | --- |
-| `KITH_EXTRACT_MODEL` | daemon environment | The default model. Unchanged. |
-| `KITH_EXTRACT_ENDPOINT` | daemon environment | OpenAI-compatible chat completions. A 4xx on the JSON-schema request falls back to plain JSON for the rest of the run. |
-| `KITH_EXTRACT_API_KEY` | daemon environment | Falls back to `OPENAI_API_KEY` on the default endpoint. |
-| per-kind model | `document_types.examples`, an element `{"setting": "extraction_model", "value": "<model>"}` | That kind is read with that model. A kind without one uses the default. A model the provider refuses falls back to the default for that run and opens one `extraction_model_refused` item. |
-| per-kind date order | `document_types.examples`, an element `{"setting": "date_order", "value": "MDY"}` or `"DMY"` | How that kind writes an all-numeric date. |
-| per-kind page bound | `document_types.examples`, an element `{"setting": "max_pages", "value": "25"}` or `{"setting": "max_pages", "value": 25}` | How many pages of a document of that kind the model is shown, in place of the default 12. Capped at 60; a value past the cap, or one that is not a whole number, reads as unset rather than being clamped. |
-| per-kind character bound | `document_types.examples`, an element `{"setting": "max_chars", "value": "120000"}` | The same for characters, in place of the default 60,000. Capped at 400,000. |
+| Knob                     | Where                                                                                                                      | Effect                                                                                                                                                                                                     |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KITH_EXTRACT_MODEL`     | daemon environment                                                                                                         | The default model. Unchanged.                                                                                                                                                                              |
+| `KITH_EXTRACT_ENDPOINT`  | daemon environment                                                                                                         | OpenAI-compatible chat completions. A 4xx on the JSON-schema request falls back to plain JSON for the rest of the run.                                                                                     |
+| `KITH_EXTRACT_API_KEY`   | daemon environment                                                                                                         | Falls back to `OPENAI_API_KEY` on the default endpoint.                                                                                                                                                    |
+| per-kind model           | `document_types.examples`, an element `{"setting": "extraction_model", "value": "<model>"}`                                | That kind is read with that model. A kind without one uses the default. A model the provider refuses falls back to the default for that run and opens one `extraction_model_refused` item.                 |
+| per-kind date order      | `document_types.examples`, an element `{"setting": "date_order", "value": "MDY"}` or `"DMY"`                               | How that kind writes an all-numeric date.                                                                                                                                                                  |
+| per-kind page bound      | `document_types.examples`, an element `{"setting": "max_pages", "value": "25"}` or `{"setting": "max_pages", "value": 25}` | How many pages of a document of that kind the model is shown, in place of the default 12. Capped at 60; a value past the cap, or one that is not a whole number, reads as unset rather than being clamped. |
+| per-kind character bound | `document_types.examples`, an element `{"setting": "max_chars", "value": "120000"}`                                        | The same for characters, in place of the default 60,000. Capped at 400,000.                                                                                                                                |
 
 A per-kind bound costs the same extra call a per-kind model does, and for the
 same reason: the kind is not known until the reply names it, so a first pass
@@ -714,27 +714,29 @@ expected date is never stored or returned as data. `latestSnapshotAsOf` and
 date.
 
 **Cadence** comes from the balance dates. Consecutive months are `monthly`.
-Gaps of at most three months, each long gap ending on a quarter end, are
-`quarterly` (monthly while active, quarterly while quiet). Anything else, or
-fewer than two months, is `unknown`, which is held to the monthly allowance and
-says so in the tooltip.
+`quarterly` requires at least four observed statement months that establish
+three repeated long intervals. Gaps are at most three months and every long
+gap ends on a quarter end (monthly while active, quarterly while quiet). Two
+isolated quarter ends or one missed monthly import do not earn the longer
+allowance. Anything else is `unknown`, which is held to the monthly allowance
+and says so in the tooltip.
 
 A statement is **due** by the first period end after the latest balance plus
 20 days of grace. An account is **dormant** after 100 days without activity
 (204 for quarterly). Only the owner's Closed flag closes an account. A balance's
 size never does.
 
-| Synthetic account on 2026-09-18 | Status | Reason |
-| --- | --- | --- |
-| Balances monthly to 2026-08-31, holdings 2026-08-31 | fresh | current |
-| Balances quarterly to 2026-06-30, holdings 2026-06-30 | fresh | current, next expected by 2026-10-20 |
-| Balances monthly to 2026-06-30, last activity 2026-06-30 | stale | statement overdue |
-| Balances monthly to 2026-08-31, holdings 2025-09-30 | stale | holdings behind |
-| Latest balance holds securities, no holdings ever | stale | holdings missing |
-| Latest balance all cash, last holdings 2025-04-30 | fresh | balance only |
-| Bank or credit line type | fresh | balance only |
-| Transactions only, no balance or holdings | fresh | no balance |
-| No activity since 2022-12-31 | inactive | dormant |
+| Synthetic account on 2026-09-18                          | Status   | Reason                               |
+| -------------------------------------------------------- | -------- | ------------------------------------ |
+| Balances monthly to 2026-08-31, holdings 2026-08-31      | fresh    | current                              |
+| Balances quarterly to 2026-06-30, holdings 2026-06-30    | fresh    | current, next expected by 2026-10-20 |
+| Balances monthly to 2026-06-30, last activity 2026-06-30 | stale    | statement overdue                    |
+| Balances monthly to 2026-08-31, holdings 2025-09-30      | stale    | holdings behind                      |
+| Latest balance holds securities, no holdings ever        | stale    | holdings missing                     |
+| Latest balance all cash, last holdings 2025-04-30        | fresh    | balance only                         |
+| Bank or credit line type                                 | fresh    | balance only                         |
+| Transactions only, no balance or holdings                | fresh    | no balance                           |
+| No activity since 2022-12-31                             | inactive | dormant                              |
 
 **Parents** are honest aggregates. A group is stale when any live account is,
 and its tooltip counts stale accounts by reason, because an overdue statement
@@ -746,9 +748,10 @@ The inventory's current value also treats two balance rows on the latest date
 that state the same total and currency as one answer, not an ambiguity. Rows
 that differ still report nothing.
 
-Known limits, left for later work: a monthly account that misses the one
-statement just before a quarter end reads as quarterly until its next
-statement arrives. Holdings that the statement parser refuses (a security
-printed as several lots with no Total row) show as `holdings behind`. They
-are not suppressed, and the fix belongs in the parser, followed by an
-auditable reimport.
+Known limits, left for later work: balance dates cannot distinguish a source
+that failed to ingest several statements from an account whose real reporting
+schedule changed. Insufficient or conflicting evidence remains `unknown` and
+uses the stricter monthly allowance. Holdings that the statement parser
+refuses (a security printed as several lots with no Total row) show as
+`holdings behind`. They are not suppressed, and the fix belongs in the parser,
+followed by an auditable reimport.

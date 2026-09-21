@@ -17,7 +17,9 @@ import { groupInstitutions } from "@/lib/kith/institutions";
 const at = (date: string, time = "12:00:00") => Date.parse(`${date}T${time}Z`);
 const NOW = at("2026-09-18");
 
-function input(overrides: Partial<AccountFreshnessInput> = {}): AccountFreshnessInput {
+function input(
+  overrides: Partial<AccountFreshnessInput> = {},
+): AccountFreshnessInput {
   return {
     hasContent: true,
     closed: false,
@@ -64,13 +66,22 @@ describe("period ends", () => {
 
 describe("cadence from the archive's own balance dates", () => {
   test("consecutive month ends are monthly, across a year end", () => {
-    expect(inferCadence(["2026-01-31", "2025-12-31", "2025-11-30"])).toBe("monthly");
+    expect(inferCadence(["2026-01-31", "2025-12-31", "2025-11-30"])).toBe(
+      "monthly",
+    );
   });
 
   test("quarter ends only are quarterly", () => {
     expect(
       inferCadence(["2026-06-30", "2026-03-31", "2025-12-31", "2025-09-30"]),
     ).toBe("quarterly");
+  });
+
+  test("two quarter ends are not enough to infer a permissive cadence", () => {
+    expect(inferCadence(["2026-06-30", "2026-03-31"])).toBe("unknown");
+    expect(inferCadence(["2026-06-30", "2026-03-31", "2025-12-31"])).toBe(
+      "unknown",
+    );
   });
 
   test("monthly while active and quarterly while quiet is quarterly", () => {
@@ -88,7 +99,21 @@ describe("cadence from the archive's own balance dates", () => {
   });
 
   test("two dates in one month count once", () => {
-    expect(inferCadence(["2026-08-31", "2026-08-15", "2026-07-31"])).toBe("monthly");
+    expect(inferCadence(["2026-08-31", "2026-08-15", "2026-07-31"])).toBe(
+      "monthly",
+    );
+  });
+
+  test("one missed monthly statement does not teach a quarterly cadence", () => {
+    expect(
+      inferCadence([
+        "2026-06-30",
+        "2026-05-31",
+        "2026-03-31",
+        "2026-02-28",
+        "2026-01-31",
+      ]),
+    ).toBe("unknown");
   });
 
   test("fewer than two months, a long gap, or a gap ending off a quarter is unknown", () => {
@@ -129,7 +154,9 @@ describe("statements: monthly", () => {
     const late = accountFreshness(monthly, at("2026-09-21", "00:00:00"));
     expect(late.status).toBe("stale");
     expect(late.reason).toBe("statement_overdue");
-    expect(late.statusDetail).toMatch(/next was expected by 2026-09-20 \(monthly\)/);
+    expect(late.statusDetail).toMatch(
+      /next was expected by 2026-09-20 \(monthly\)/,
+    );
   });
 
   test("a year-end statement is due in January", () => {
@@ -139,8 +166,12 @@ describe("statements: monthly", () => {
       balanceDates: ["2025-12-31", "2025-11-30"],
     });
     expect(accountFreshness(yearEnd, at("2026-02-19")).status).toBe("fresh");
-    expect(accountFreshness(yearEnd, at("2026-02-20")).expectedBy).toBe("2026-02-20");
-    expect(accountFreshness(yearEnd, at("2026-02-21")).reason).toBe("statement_overdue");
+    expect(accountFreshness(yearEnd, at("2026-02-20")).expectedBy).toBe(
+      "2026-02-20",
+    );
+    expect(accountFreshness(yearEnd, at("2026-02-21")).reason).toBe(
+      "statement_overdue",
+    );
   });
 
   test("a January statement in a leap year is due after February 29", () => {
@@ -149,7 +180,9 @@ describe("statements: monthly", () => {
       latestSnapshotAsOf: "2024-01-31",
       balanceDates: ["2024-01-31", "2023-12-31"],
     });
-    expect(accountFreshness(leap, at("2024-03-20")).expectedBy).toBe("2024-03-20");
+    expect(accountFreshness(leap, at("2024-03-20")).expectedBy).toBe(
+      "2024-03-20",
+    );
     expect(accountFreshness(leap, at("2024-03-20")).status).toBe("fresh");
     expect(accountFreshness(leap, at("2024-03-21")).status).toBe("stale");
   });
@@ -193,6 +226,27 @@ describe("unknown cadence", () => {
     expect(judged.status).toBe("stale");
     expect(judged.statusDetail).toMatch(/cadence unknown/);
   });
+
+  test("recent activity cannot turn a missed monthly import into quarterly", () => {
+    const interrupted = input({
+      activityTo: "2026-09-10",
+      latestSnapshotAsOf: "2026-06-30",
+      balanceDates: [
+        "2026-06-30",
+        "2026-05-31",
+        "2026-03-31",
+        "2026-02-28",
+        "2026-01-31",
+      ],
+    });
+    const judged = accountFreshness(interrupted, at("2026-09-21"));
+    expect(judged).toMatchObject({
+      cadence: "unknown",
+      status: "stale",
+      reason: "statement_overdue",
+      expectedBy: "2026-08-20",
+    });
+  });
 });
 
 describe("dormant and closed", () => {
@@ -222,7 +276,13 @@ describe("dormant and closed", () => {
       input({
         activityTo: "2026-06-30",
         latestSnapshotAsOf: "2025-04-30",
-        balanceDates: ["2026-06-30", "2026-04-30", "2026-03-31", "2025-12-31"],
+        balanceDates: [
+          "2026-06-30",
+          "2026-04-30",
+          "2026-03-31",
+          "2025-12-31",
+          "2025-09-30",
+        ],
         latestBalanceHoldsSecurities: false,
       }),
       NOW,
@@ -235,7 +295,9 @@ describe("dormant and closed", () => {
   });
 
   test("nothing held is empty", () => {
-    expect(accountFreshness(input({ hasContent: false }), NOW).status).toBe("empty");
+    expect(accountFreshness(input({ hasContent: false }), NOW).status).toBe(
+      "empty",
+    );
   });
 });
 
@@ -262,16 +324,19 @@ describe("balances against holdings", () => {
   });
 
   test("recent activity and a securities balance with no holdings ever recorded is stale", () => {
-    const judged = accountFreshness(
-      input({ latestSnapshotAsOf: null }),
-      NOW,
-    );
-    expect(judged).toMatchObject({ status: "stale", reason: "holdings_missing" });
+    const judged = accountFreshness(input({ latestSnapshotAsOf: null }), NOW);
+    expect(judged).toMatchObject({
+      status: "stale",
+      reason: "holdings_missing",
+    });
   });
 
   test("an all-cash latest balance expects no holdings, however old the last snapshot", () => {
     const judged = accountFreshness(
-      input({ latestSnapshotAsOf: "2024-01-31", latestBalanceHoldsSecurities: false }),
+      input({
+        latestSnapshotAsOf: "2024-01-31",
+        latestBalanceHoldsSecurities: false,
+      }),
       NOW,
     );
     expect(judged).toMatchObject({ status: "fresh", reason: "balance_only" });
@@ -293,7 +358,10 @@ describe("balances against holdings", () => {
 
   test("an unstated holds-securities flag with an old snapshot still flags holdings", () => {
     const judged = accountFreshness(
-      input({ latestSnapshotAsOf: "2025-09-30", latestBalanceHoldsSecurities: null }),
+      input({
+        latestSnapshotAsOf: "2025-09-30",
+        latestBalanceHoldsSecurities: null,
+      }),
       NOW,
     );
     expect(judged.reason).toBe("holdings_behind");
@@ -301,7 +369,11 @@ describe("balances against holdings", () => {
 
   test("transactions only, no balance or snapshot, is fresh with nothing to hold it to", () => {
     const judged = accountFreshness(
-      input({ balanceDates: [], latestSnapshotAsOf: null, latestBalanceHoldsSecurities: null }),
+      input({
+        balanceDates: [],
+        latestSnapshotAsOf: null,
+        latestBalanceHoldsSecurities: null,
+      }),
       NOW,
     );
     expect(judged).toMatchObject({
@@ -316,7 +388,11 @@ describe("balances against holdings", () => {
 
   test("no balance but an old snapshot is holdings behind", () => {
     const judged = accountFreshness(
-      input({ balanceDates: [], latestSnapshotAsOf: "2026-06-30", latestBalanceHoldsSecurities: null }),
+      input({
+        balanceDates: [],
+        latestSnapshotAsOf: "2026-06-30",
+        latestBalanceHoldsSecurities: null,
+      }),
       NOW,
     );
     expect(judged.reason).toBe("holdings_behind");
@@ -327,9 +403,15 @@ describe("value staleness follows the cadence", () => {
   test("monthly and unknown allow 100 days, quarterly 204", () => {
     expect(valueIsStale(addDays("2026-09-18", -100), NOW)).toBe(false);
     expect(valueIsStale(addDays("2026-09-18", -101), NOW)).toBe(true);
-    expect(valueIsStale(addDays("2026-09-18", -101), NOW, "unknown")).toBe(true);
-    expect(valueIsStale(addDays("2026-09-18", -204), NOW, "quarterly")).toBe(false);
-    expect(valueIsStale(addDays("2026-09-18", -205), NOW, "quarterly")).toBe(true);
+    expect(valueIsStale(addDays("2026-09-18", -101), NOW, "unknown")).toBe(
+      true,
+    );
+    expect(valueIsStale(addDays("2026-09-18", -204), NOW, "quarterly")).toBe(
+      false,
+    );
+    expect(valueIsStale(addDays("2026-09-18", -205), NOW, "quarterly")).toBe(
+      true,
+    );
   });
 });
 
@@ -348,7 +430,12 @@ describe("identity and display never change freshness", () => {
       activityFrom: "2025-01-02",
       activityTo: "2026-06-30",
       latestSnapshotAsOf: "2026-06-30",
-      balanceDates: ["2026-06-30", "2026-03-31", "2025-12-31"],
+      balanceDates: [
+        "2026-06-30",
+        "2026-03-31",
+        "2025-12-31",
+        "2025-09-30",
+      ],
       latestBalanceHoldsSecurities: true,
       openReviewCount: 0,
     }) as never;
@@ -399,7 +486,12 @@ describe("identity and display never change freshness", () => {
       new Map([
         [
           "account-1",
-          { displayName: null, accountLast4: null, accountType: "bank", closed: false },
+          {
+            displayName: null,
+            accountLast4: null,
+            accountType: "bank",
+            closed: false,
+          },
         ],
       ]),
     )[0]!.children![0]!;
