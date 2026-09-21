@@ -621,6 +621,8 @@ function reconcileProviderTargets(
         (target.ack.detachId !== providerDetachId(target) ||
           target.ack.referenceId !== target.referenceId ||
           target.ack.forgetEpoch !== target.forgetEpoch ||
+          (target.ack.referenceOutcome !== "detached" &&
+            target.ack.referenceOutcome !== "already_detached") ||
           target.ack.providerSourceOutcome !== "retained_unchanged")
       )
         throw { code: "provider_ack_identity_mismatch" };
@@ -1222,6 +1224,8 @@ export async function runArchiveForget(input: {
             target.ack.detachId !== detachId ||
             target.ack.referenceId !== target.referenceId ||
             target.ack.forgetEpoch !== input.forgetEpoch ||
+            (target.ack.referenceOutcome !== "detached" &&
+              target.ack.referenceOutcome !== "already_detached") ||
             target.ack.providerSourceOutcome !== "retained_unchanged"
           )
             throw { code: "provider_ack_identity_mismatch" };
@@ -1252,7 +1256,8 @@ export async function runArchiveForget(input: {
           ack.detachId !== detachId ||
           ack.referenceId !== target.referenceId ||
           ack.forgetEpoch !== input.forgetEpoch ||
-          ack.referenceOutcome !== "detached" ||
+          (ack.referenceOutcome !== "detached" &&
+            ack.referenceOutcome !== "already_detached") ||
           ack.providerSourceOutcome !== "retained_unchanged"
         )
           throw { code: "provider_ack_identity_mismatch" };

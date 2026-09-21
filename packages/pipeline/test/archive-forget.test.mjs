@@ -1321,7 +1321,7 @@ test("provider v2 forget detaches the reference without locator or backup work",
           detachId: request.detachId,
           referenceId,
           forgetEpoch: 7,
-          referenceOutcome: "detached",
+          referenceOutcome: "already_detached",
           providerSourceOutcome: "retained_unchanged",
           completedAt: 10,
         };
