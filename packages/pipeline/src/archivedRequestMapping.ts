@@ -16,6 +16,21 @@ import type {
 
 const ARCHIVE_INTENT_DOMAIN = "kith-archive-intent:v1";
 
+/** Legacy catalogs used source mtimes as provenance creation times. A durable
+ * verification proves the object existed by that time, without rewriting its
+ * catalog identity or changing the exact body of an already pending request.
+ */
+export function provenanceCreatedAt(
+  createdAt: number,
+  ...verifiedAt: number[]
+): number {
+  const times = [createdAt, ...verifiedAt];
+  if (times.some((time) => !Number.isSafeInteger(time) || time < 0)) {
+    throw new Error("Invalid provenance timestamp");
+  }
+  return Math.min(...times);
+}
+
 function copyIntent(copy: ArchiveCopyIntent): readonly string[] {
   return [
     copy.role,
@@ -123,11 +138,15 @@ export function providerOriginalReferenceFingerprint(
 export function createParserArtifactSelection(
   processing: Pick<
     ProcessingCatalogRow,
-    "createdAt" | "parserIntent" | "parserOutput"
+    "createdAt" | "parserIntent" | "parserOutput" | "copies"
   >,
 ): ParserArtifactSelection {
   const output = processing.parserOutput;
   if (!output) throw new Error("Parser output is not durable");
+  const primary = processing.copies.primary.readbackVerifiedAt;
+  const backup = processing.copies.independent_backup.readbackVerifiedAt;
+  if (primary === undefined || backup === undefined)
+    throw new Error("Parser archive readback times are not durable");
   return {
     kind: "create",
     clientArtifactId: processing.parserIntent.parserArtifactClientId,
@@ -136,7 +155,7 @@ export function createParserArtifactSelection(
     // P2-70i3: the class that produced the artifact names its media type, and
     // the server checks it against the discovery work's own class.
     outputMediaType: output.rawArtifact.mediaType,
-    createdAt: processing.createdAt,
+    createdAt: provenanceCreatedAt(processing.createdAt, primary, backup),
   };
 }
 
@@ -178,7 +197,7 @@ export function createArchiveReceiptSelection(
     ciphertextHash: copy.published.ciphertext.sha256,
     ciphertextByteLength: copy.published.ciphertext.byteLength,
     readbackVerifiedAt: copy.readbackVerifiedAt,
-    createdAt: row.createdAt,
+    createdAt: provenanceCreatedAt(row.createdAt, copy.readbackVerifiedAt),
   };
 }
 
