@@ -1335,6 +1335,55 @@ test(
 );
 
 test(
+  "a new provider identity cannot borrow another document's globally unique activity hash",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const shared = row({ sourceLocator: "document-a" });
+    const first = document("b0".padEnd(64, "0"), [shared]);
+    const second = document("b1".padEnd(64, "0"), [], {
+      positions: [position()],
+    });
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [first, second] },
+      NOW,
+    );
+
+    await authoritativeReparse(client, {
+      ...second,
+      rows: [
+        {
+          ...shared,
+          sourceLocator: "document-b",
+          providerTxnId: "new-provider-identity",
+        },
+      ],
+      providerReportedCount: 1,
+    });
+
+    assert.equal(await count(client, "transactions"), 1);
+    assert.equal(
+      (
+        await one(client, "SELECT parsed_ok FROM documents WHERE sha256 = $1", [
+          second.sha256,
+        ])
+      ).parsed_ok,
+      false,
+    );
+    assert.equal(
+      await count(
+        client,
+        "review_items",
+        "WHERE kind = 'reparse_activity_projection_mismatch' AND status = 'open'",
+      ),
+      1,
+    );
+  },
+);
+
+test(
   "authoritative activity is not replayed after a holdings mismatch makes parsed_ok false",
   { skip },
   async (t) => {

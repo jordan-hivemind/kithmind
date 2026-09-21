@@ -1642,9 +1642,13 @@ export async function importBatch(
     );
     const candidates = new Map<string, number>();
     const semanticByIdentity = new Map<string, string>();
+    const semanticByHash = new Map<string, string>();
     for (const candidate of prepared) {
       const key = keyFromValues(candidate.values);
       candidates.set(key, (candidates.get(key) ?? 0) + 1);
+      const priorHash = semanticByHash.get(candidate.hash);
+      if (priorHash !== undefined && priorHash !== key) return false;
+      semanticByHash.set(candidate.hash, key);
       const identity = candidate.row.providerTxnId
         ? `provider:${providerKey(candidate.row.accountId, candidate.row.providerTxnId)}`
         : `hash:${candidate.hash}`;
@@ -1662,18 +1666,13 @@ export async function importBatch(
     const byHash = await client.query<Record<string, unknown>>(
       `SELECT ${semanticColumns.join(", ")}, source_document_id FROM transactions
         WHERE row_hash = ANY($1::text[])`,
-      [
-        prepared
-          .filter((item) => !item.row.providerTxnId)
-          .map(({ hash }) => hash),
-      ],
+      [prepared.map(({ hash }) => hash)],
     );
     if (
       byHash.rows.some(
         (row) =>
           row.source_document_id !== documentId ||
-          semanticByIdentity.get(`hash:${String(row.row_hash)}`) !==
-            keyFromRow(row),
+          semanticByHash.get(String(row.row_hash)) !== keyFromRow(row),
       )
     ) {
       return false;
