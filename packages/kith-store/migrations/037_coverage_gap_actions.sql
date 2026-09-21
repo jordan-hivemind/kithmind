@@ -56,7 +56,7 @@ CREATE UNIQUE INDEX coverage_gaps_open_condition_idx
 -- Legacy CSV imports predate condition_key and COPY only their mapped
 -- columns. Derive the same identity for those rows before NOT NULL is
 -- enforced; current writers supply the value explicitly.
-CREATE FUNCTION kith.fill_coverage_gap_condition_key()
+CREATE OR REPLACE FUNCTION kith.fill_coverage_gap_condition_key()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
@@ -71,6 +71,8 @@ BEGIN
   RETURN NEW;
 END;
 $$;
+
+DROP TRIGGER IF EXISTS coverage_gaps_condition_key_trg ON kith.coverage_gaps;
 
 CREATE TRIGGER coverage_gaps_condition_key_trg
   BEFORE INSERT OR UPDATE OF condition_key ON kith.coverage_gaps
