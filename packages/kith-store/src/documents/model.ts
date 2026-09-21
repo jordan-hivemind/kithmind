@@ -330,40 +330,93 @@ type OriginalRecoveryStatus =
       verifiedAt: number;
       continuousAvailability: false;
       desktopRecoveryRequired: true;
+    }
+  | {
+      kind: "provider_original_v2";
+      localPrimaryArchived: false;
+      parserArtifactArchived: true;
+      providerVerification: "verified_at_admission" | "audit_unavailable";
+      verifiedAt: number;
+      continuousAvailability: false;
+      desktopRecoveryRequired: true;
     };
 
 async function originalRecoveryStatus(
   client: ClientBase,
   generation: ProcessingGenerationRow,
 ): Promise<OriginalRecoveryStatus | undefined> {
-  async function receiptMatches(id: string | null, copyRole: "primary" | "independent_backup"): Promise<boolean> {
+  async function receiptMatches(
+    id: string | null,
+    copyRole: "primary" | "independent_backup",
+  ): Promise<boolean> {
     const receipt = id
-      ? await getRow(client, "source_artifact_archive_receipts", id, camelizeSourceArtifactArchiveReceipt)
+      ? await getRow(
+          client,
+          "source_artifact_archive_receipts",
+          id,
+          camelizeSourceArtifactArchiveReceipt,
+        )
       : undefined;
     return Boolean(
       receipt &&
-        receipt.spaceId === generation.spaceId &&
-        receipt.sourceAccountId === generation.sourceAccountId &&
-        receipt.sourceItemId === generation.sourceItemId &&
-        receipt.sourceRevisionId === generation.sourceRevisionId &&
-        receipt.subjectKind === "original_bytes" &&
-        receipt.copyRole === copyRole &&
-        receipt.parserArtifactId === null,
+      receipt.spaceId === generation.spaceId &&
+      receipt.sourceAccountId === generation.sourceAccountId &&
+      receipt.sourceItemId === generation.sourceItemId &&
+      receipt.sourceRevisionId === generation.sourceRevisionId &&
+      receipt.subjectKind === "original_bytes" &&
+      receipt.copyRole === copyRole &&
+      receipt.parserArtifactId === null,
     );
   }
-  if (generation.originalPrimaryReceiptId === null || generation.archiveSetDigest === null) return undefined;
+  async function parserPrimaryMatches(id: string | null): Promise<boolean> {
+    const receipt = id
+      ? await getRow(
+          client,
+          "source_artifact_archive_receipts",
+          id,
+          camelizeSourceArtifactArchiveReceipt,
+        )
+      : undefined;
+    return Boolean(
+      receipt &&
+      receipt.spaceId === generation.spaceId &&
+      receipt.sourceAccountId === generation.sourceAccountId &&
+      receipt.sourceItemId === generation.sourceItemId &&
+      receipt.sourceRevisionId === generation.sourceRevisionId &&
+      receipt.subjectKind === "parser_output" &&
+      receipt.copyRole === "primary" &&
+      receipt.parserArtifactId === generation.parserArtifactId,
+    );
+  }
+  if (generation.archiveSetDigest === null) return undefined;
   if (generation.originalBackupReceiptId !== null) {
-    if (generation.originalProviderReferenceId !== null || generation.originalProviderBindingEpoch !== null) {
+    if (
+      generation.originalPrimaryReceiptId === null ||
+      generation.originalProviderReferenceId !== null ||
+      generation.originalProviderBindingEpoch !== null
+    ) {
       return undefined;
     }
-    const primary = await receiptMatches(generation.originalPrimaryReceiptId, "primary");
-    const independentBackup = await receiptMatches(generation.originalBackupReceiptId, "independent_backup");
+    const primary = await receiptMatches(
+      generation.originalPrimaryReceiptId,
+      "primary",
+    );
+    const independentBackup = await receiptMatches(
+      generation.originalBackupReceiptId,
+      "independent_backup",
+    );
     return { kind: "archive_pair_v1", primary, independentBackup };
   }
-  if (generation.originalProviderReferenceId === null || generation.originalProviderBindingEpoch === null) {
+  if (
+    generation.originalProviderReferenceId === null ||
+    generation.originalProviderBindingEpoch === null
+  ) {
     return undefined;
   }
-  const primaryOk = await receiptMatches(generation.originalPrimaryReceiptId, "primary");
+  const primaryOk = await receiptMatches(
+    generation.originalPrimaryReceiptId,
+    "primary",
+  );
   const reference = await getRow(
     client,
     "source_provider_original_references",
@@ -374,11 +427,21 @@ async function originalRecoveryStatus(
       sourceAccountId: row.source_account_id as string,
       sourceItemId: row.source_item_id as string,
       sourceRevisionId: row.source_revision_id as string,
+      referenceVersion: row.reference_version as
+        "provider_original_v1" | "provider_original_v2",
       verifiedAt: (row.verified_at as Date).getTime(),
     }),
   );
+  const expectedV1Shape =
+    reference?.referenceVersion === "provider_original_v1" && primaryOk;
+  const expectedV2Shape =
+    reference?.referenceVersion === "provider_original_v2" &&
+    generation.originalPrimaryReceiptId === null &&
+    generation.originalBackupReceiptId === null &&
+    generation.parserBackupReceiptId === null &&
+    (await parserPrimaryMatches(generation.parserPrimaryReceiptId));
   if (
-    !primaryOk ||
+    (!expectedV1Shape && !expectedV2Shape) ||
     !reference ||
     reference.spaceId !== generation.spaceId ||
     reference.sourceAccountId !== generation.sourceAccountId ||
@@ -399,14 +462,28 @@ async function originalRecoveryStatus(
   } catch {
     // A corrupt immutable reference is reported without exposing provider data.
   }
-  return {
-    kind: "provider_original_v1",
-    localPrimaryArchived: true,
-    providerVerification: hasAdmissionAudit ? "verified_at_admission" : "audit_unavailable",
-    verifiedAt: reference.verifiedAt,
-    continuousAvailability: false,
-    desktopRecoveryRequired: true,
-  };
+  return reference.referenceVersion === "provider_original_v2"
+    ? {
+        kind: "provider_original_v2",
+        localPrimaryArchived: false,
+        parserArtifactArchived: true,
+        providerVerification: hasAdmissionAudit
+          ? "verified_at_admission"
+          : "audit_unavailable",
+        verifiedAt: reference.verifiedAt,
+        continuousAvailability: false,
+        desktopRecoveryRequired: true,
+      }
+    : {
+        kind: "provider_original_v1",
+        localPrimaryArchived: true,
+        providerVerification: hasAdmissionAudit
+          ? "verified_at_admission"
+          : "audit_unavailable",
+        verifiedAt: reference.verifiedAt,
+        continuousAvailability: false,
+        desktopRecoveryRequired: true,
+      };
 }
 
 async function hydrateCitations(
