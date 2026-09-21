@@ -124,6 +124,7 @@ test("candidate manifest binds exact old state and reports add/change/remove wit
     changed: 1,
     added: 1,
     removed: 1,
+    ambiguousLocators: 0,
   });
   assert.equal(manifest.completeness.state, "unproven");
   assert.equal(manifest.completeness.removalsAuthorized, false);
@@ -207,6 +208,7 @@ test("a second distinct balance for one account and date is not publishable cand
     changed: 0,
     added: 1,
     removed: 0,
+    ambiguousLocators: 0,
   });
   assert.equal(manifest.completeness.state, "partial");
   assert.equal(manifest.completeness.issueCount, 1);
@@ -239,9 +241,7 @@ test("unknown three-letter money currencies mirror importer review semantics wit
           sourceLocator: "page:1:position:1",
         },
       ],
-      balances: [
-        balance("100", null, "page:1:balance:1", unknownCurrency),
-      ],
+      balances: [balance("100", null, "page:1:balance:1", unknownCurrency)],
       liabilities: [
         {
           accountId: "acct-1",
@@ -290,25 +290,52 @@ test("unknown three-letter money currencies mirror importer review semantics wit
   );
 });
 
-test("ambiguous remaining locators and retained-byte mismatches fail closed", () => {
-  const duplicatedLocator = {
+test("ambiguous locators preserve exact previews without pairing changes or authorizing removal", () => {
+  const stored = {
     ...emptyTables,
     positions: [
       storedPosition("old-a", "inst-a", "same"),
       storedPosition("old-b", "inst-b", "same"),
+      storedPosition("old-c", "inst-c", "unique"),
     ],
   };
-  assert.throws(
-    () =>
-      buildHoldingCorrectionCandidateManifest({
-        documentId: "doc-3",
-        retainedSha256: SHA,
-        stored: duplicatedLocator,
-        candidate: candidate({
-          positions: [position({ instrumentId: "inst-z", locator: "same" })],
-        }),
+  const parsed = candidate({
+    positions: [
+      position({ instrumentId: "inst-z", locator: "same" }),
+      position({
+        instrumentId: "inst-c",
+        locator: "unique",
+        marketValue: "120",
       }),
-    /ambiguous source locator/,
+      position({ instrumentId: "inst-x", locator: "new-same" }),
+      position({ instrumentId: "inst-y", locator: "new-same" }),
+    ],
+  });
+  const input = {
+    documentId: "doc-3",
+    retainedSha256: SHA,
+    stored,
+    candidate: parsed,
+  };
+  const manifest = buildHoldingCorrectionCandidateManifest(input);
+  assert.deepEqual(manifest.tables.positions, {
+    oldRows: 3,
+    candidateRows: 4,
+    unchanged: 0,
+    changed: 1,
+    added: 3,
+    removed: 2,
+    ambiguousLocators: 2,
+  });
+  assert.equal(manifest.completeness.state, "unproven");
+  assert.equal(manifest.completeness.removalsAuthorized, false);
+  assert.deepEqual(
+    buildHoldingCorrectionCandidateManifest({
+      ...input,
+      stored: { ...stored, positions: [...stored.positions].reverse() },
+      candidate: { ...parsed, positions: [...parsed.positions].reverse() },
+    }),
+    manifest,
   );
   assert.throws(
     () =>
@@ -320,4 +347,71 @@ test("ambiguous remaining locators and retained-byte mismatches fail closed", ()
       }),
     /not bound to the selected retained bytes/,
   );
+});
+
+test("semantic duplicate matching preserves exact locators before deterministic fallback", () => {
+  const stored = {
+    ...emptyTables,
+    positions: [
+      storedPosition("old-a", "inst-a", "a"),
+      storedPosition("old-b", "inst-a", "b"),
+      storedPosition("old-c", "inst-c", "a"),
+    ],
+  };
+  const parsed = candidate({
+    positions: [
+      position({ instrumentId: "inst-a", locator: "b" }),
+      position({ instrumentId: "inst-z", locator: "a" }),
+    ],
+  });
+  const input = {
+    documentId: "doc-4",
+    retainedSha256: SHA,
+    stored,
+    candidate: parsed,
+  };
+  const manifest = buildHoldingCorrectionCandidateManifest(input);
+  assert.equal(manifest.tables.positions.unchanged, 1);
+  assert.equal(manifest.tables.positions.ambiguousLocators, 1);
+  assert.equal(manifest.tables.positions.changed, 0);
+  assert.equal(manifest.tables.positions.removed, 2);
+  assert.equal(manifest.tables.positions.added, 1);
+  for (const oldRows of [stored.positions, [...stored.positions].reverse()]) {
+    for (const newRows of [parsed.positions, [...parsed.positions].reverse()]) {
+      assert.deepEqual(
+        buildHoldingCorrectionCandidateManifest({
+          ...input,
+          stored: { ...stored, positions: oldRows },
+          candidate: { ...parsed, positions: newRows },
+        }),
+        manifest,
+      );
+    }
+  }
+});
+
+test("accepted instrument-match audit items do not invent a mapping gap", () => {
+  const review = {
+    kind: "institution_symbol_match", accountId: null,
+    institutionId: "inst-1", matchedInstrumentId: "inst-a",
+    reasonCode: "same_institution_symbol_v1", rawValue: "synthetic",
+    reason: "accepted by the institution symbol rule",
+  };
+  const input = {
+    documentId: "doc-5", retainedSha256: SHA, stored: emptyTables,
+    candidate: candidate({reviewItems: [review]}),
+  };
+  const accepted = buildHoldingCorrectionCandidateManifest(input);
+  assert.equal(accepted.completeness.state, "unproven");
+  assert.equal(accepted.completeness.issueCount, 0);
+  assert.equal(accepted.completeness.removalsAuthorized, false);
+  assert.deepEqual(accepted.completeness.reasons, ["adapter_has_no_holding_completeness_attestation"]);
+  for (const kind of ["weak_instrument_match", "future_unknown_review"]) {
+    const blocked = buildHoldingCorrectionCandidateManifest({
+      ...input, candidate: candidate({reviewItems: [review, {...review, kind}]}),
+    });
+    assert.equal(blocked.completeness.state, "partial");
+    assert.equal(blocked.completeness.issueCount, 1);
+    assert.ok(blocked.completeness.reasons.includes("adapter_mapping_review_required"));
+  }
 });

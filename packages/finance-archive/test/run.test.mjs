@@ -2270,6 +2270,7 @@ test(
       changed: 0,
       added: 0,
       removed: 0,
+      ambiguousLocators: 0,
     });
     assert.deepEqual(manifest.tables.balances, {
       oldRows: 1,
@@ -2278,6 +2279,7 @@ test(
       changed: 0,
       added: 0,
       removed: 0,
+      ambiguousLocators: 0,
     });
     assert.deepEqual(manifest.tables.liabilities, {
       oldRows: 1,
@@ -2286,6 +2288,7 @@ test(
       changed: 0,
       added: 0,
       removed: 0,
+      ambiguousLocators: 0,
     });
     assert.doesNotMatch(output, /Synthetic Neutral Fund|holdings:/i);
     for (const table of tables) {
@@ -2311,6 +2314,7 @@ test(
       changed: 1,
       added: 0,
       removed: 0,
+      ambiguousLocators: 0,
     });
     assert.notEqual(
       changedManifest.oldProjectionDigest,
