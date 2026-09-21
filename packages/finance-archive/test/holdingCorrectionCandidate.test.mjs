@@ -74,6 +74,19 @@ function storedPosition(id, instrumentId, locator, overrides = {}) {
   };
 }
 
+function balance(totalValue, cash, locator) {
+  return {
+    asOf: "2025-03-31",
+    totalValueText: totalValue,
+    totalValueNote: null,
+    cash,
+    currency: "USD",
+    periodStartValue: null,
+    periodEndValue: null,
+    sourceLocator: locator,
+  };
+}
+
 const emptyTables = { positions: [], balances: [], liabilities: [] };
 
 test("candidate manifest binds exact old state and reports add/change/remove without authorizing removal", () => {
@@ -172,6 +185,35 @@ test("parse gaps and rejected rows stay partial even when the candidate appears 
   ]);
   assert.equal(manifest.tables.positions.removed, 1);
   assert.equal(manifest.tables.positions.candidateRows, 0);
+});
+
+test("a second distinct balance for one account and date is not publishable candidate state", () => {
+  const manifest = buildHoldingCorrectionCandidateManifest({
+    documentId: "doc-balance-duplicate",
+    retainedSha256: SHA,
+    stored: emptyTables,
+    candidate: candidate({
+      balances: [
+        balance("100", "10", "page:1:balance:1"),
+        balance("200", "20", "page:1:balance:2"),
+      ],
+    }),
+  });
+
+  assert.deepEqual(manifest.tables.balances, {
+    oldRows: 0,
+    candidateRows: 1,
+    unchanged: 0,
+    changed: 0,
+    added: 1,
+    removed: 0,
+  });
+  assert.equal(manifest.completeness.state, "partial");
+  assert.equal(manifest.completeness.issueCount, 1);
+  assert.deepEqual(manifest.completeness.reasons, [
+    "adapter_has_no_holding_completeness_attestation",
+    "candidate_row_rejected",
+  ]);
 });
 
 test("ambiguous remaining locators and retained-byte mismatches fail closed", () => {

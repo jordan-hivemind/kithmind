@@ -2188,6 +2188,39 @@ test(
       changedHoldingsAdapterModulePath,
       sessionModulePath,
     } = writeReparseAdapterFixtures(t);
+    const parseFailureSentinel = "PRIVATE_PARSE_VALUE_MUST_NOT_ESCAPE";
+    const parseFailureAdapterModulePath = join(
+      fixturesDir,
+      "adapter-private-parse-failure.mjs",
+    );
+    writeFileSync(
+      parseFailureAdapterModulePath,
+      `import { syntheticAdapter } from ${JSON.stringify(distIndexUrl)};\n` +
+        `export default { ...syntheticAdapter, async parse() {\n` +
+        `  throw new Error(${JSON.stringify(parseFailureSentinel)});\n` +
+        `} };\n`,
+    );
+    const mappingFailureSentinel = "PRIVATE_MAPPING_VALUE_MUST_NOT_ESCAPE";
+    const mappingFailureAdapterModulePath = join(
+      fixturesDir,
+      "adapter-private-mapping-failure.mjs",
+    );
+    writeFileSync(
+      mappingFailureAdapterModulePath,
+      `import { syntheticAdapter } from ${JSON.stringify(distIndexUrl)};\n` +
+        `export default { ...syntheticAdapter, async parse(rawFile) {\n` +
+        `  const parsed = await syntheticAdapter.parse(rawFile);\n` +
+        `  const first = { ...parsed.holdings.positions[0] };\n` +
+        `  Object.defineProperty(first, "accountExternalKey", {\n` +
+        `    enumerable: true,\n` +
+        `    get() { throw new Error(${JSON.stringify(mappingFailureSentinel)}); },\n` +
+        `  });\n` +
+        `  return {\n` +
+        `    ...parsed,\n` +
+        `    holdings: { ...parsed.holdings, positions: [first, ...parsed.holdings.positions.slice(1)] },\n` +
+        `  };\n` +
+        `} };\n`,
+    );
     const selectionPath = reparseSelection(fixturesDir);
     makeRunner({
       adapterModulePath,
@@ -2290,6 +2323,57 @@ test(
         `${table} is unchanged by a correction candidate`,
       );
     }
+
+    for (const [privateAdapterModulePath, sentinel, stage] of [
+      [parseFailureAdapterModulePath, parseFailureSentinel, "adapter_parse"],
+      [
+        mappingFailureAdapterModulePath,
+        mappingFailureSentinel,
+        "adapter_mapping",
+      ],
+    ]) {
+      assert.throws(
+        () =>
+          makeHoldingCorrectionCandidateRunner({
+            adapterModulePath: privateAdapterModulePath,
+            schema,
+            rawDir,
+            documentId: document.id,
+            retainedSha256: document.retained_sha256,
+          })(),
+        (error) => {
+          assert.match(
+            error.stderr,
+            new RegExp(`holding correction candidate failed: ${stage}`),
+          );
+          assert.doesNotMatch(error.stderr, new RegExp(sentinel));
+          return true;
+        },
+      );
+    }
+
+    const missingPrivateRawTree = join(
+      tmpdir(),
+      "PRIVATE_RAW_TREE_PATH_MUST_NOT_ESCAPE",
+    );
+    assert.throws(
+      () =>
+        makeHoldingCorrectionCandidateRunner({
+          adapterModulePath,
+          schema,
+          rawDir: missingPrivateRawTree,
+          documentId: document.id,
+          retainedSha256: document.retained_sha256,
+        })(),
+      (error) => {
+        assert.match(
+          error.stderr,
+          /holding correction candidate failed: retained_document_open/,
+        );
+        assert.doesNotMatch(error.stderr, /PRIVATE_RAW_TREE_PATH_MUST_NOT_ESCAPE/);
+        return true;
+      },
+    );
 
     assert.throws(
       () =>

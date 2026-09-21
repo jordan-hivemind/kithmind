@@ -1072,6 +1072,20 @@ class HoldingCorrectionCandidateRollback extends Error {
   }
 }
 
+async function runBoundedHoldingCandidateStage<T>(
+  stage: "retained_document_open" | "adapter_parse" | "adapter_mapping",
+  action: () => T | Promise<T>,
+): Promise<T> {
+  try {
+    return await action();
+  } catch {
+    // This CLI's stdout is deliberately value-free. Keep its failure channel
+    // equally bounded: adapter exceptions may quote source fields, while raw
+    // read errors normally quote absolute archive paths.
+    throw new Error(`holding correction candidate failed: ${stage}`);
+  }
+}
+
 /**
  * Read and parse exactly one retained document, then emit only a digest/count
  * manifest for an operator to review. Instrument resolution uses the ordinary
@@ -1129,7 +1143,10 @@ async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<v
           "holding correction candidates require a single-file document revision",
         );
       }
-      const opened = openRetainedDocument(rawTreeRoot, doc);
+      const opened = await runBoundedHoldingCandidateStage(
+        "retained_document_open",
+        () => openRetainedDocument(rawTreeRoot, doc),
+      );
       if (opened === null) {
         throw new Error(
           "holding correction candidates require a document-tier capture",
@@ -1144,10 +1161,14 @@ async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<v
           "capture manifest does not match the selected document revision",
         );
       }
-      const parsed = await adapter.parse({
-        kind: opened.manifest.capabilityTier,
-        bytes: opened.bytes,
-      });
+      const parsed = await runBoundedHoldingCandidateStage(
+        "adapter_parse",
+        () =>
+          adapter.parse({
+            kind: opened.manifest.capabilityTier,
+            bytes: opened.bytes,
+          }),
+      );
       const accountsByExternalKey = await loadAccountsByExternalKey(
         doc.institution_id,
       );
@@ -1195,7 +1216,10 @@ async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<v
       };
 
       await tx.query("SAVEPOINT holding_correction_candidate_mapping");
-      const candidates = await adapterPullToImportDocuments(tx, pull);
+      const candidates = await runBoundedHoldingCandidateStage(
+        "adapter_mapping",
+        () => adapterPullToImportDocuments(tx, pull),
+      );
       if (candidates.length !== 1) {
         throw new Error(
           `exact retained document produced ${candidates.length} candidate documents`,

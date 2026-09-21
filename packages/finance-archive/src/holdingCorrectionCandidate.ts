@@ -369,6 +369,30 @@ function dedupeCandidateRows(
   return [...byHash.values()];
 }
 
+function keepFirstBalancePerAccountDate(
+  rows: readonly CandidateHoldingRow[],
+  reject: () => void,
+): CandidateHoldingRow[] {
+  // Importer parity: exact row-hash duplicates collapse first. Among the
+  // remaining distinct assertions, balances permit one row for an account
+  // and date. A second different balance is a contradiction under review,
+  // not a second publishable fact. The candidate describes the replacement
+  // projection, so this key is scoped to its own rows rather than seeded
+  // from the current projection it may eventually replace.
+  const seen = new Set<string>();
+  const accepted: CandidateHoldingRow[] = [];
+  for (const row of rows) {
+    const key = canonical([row.semantic[0], row.semantic[1]]);
+    if (seen.has(key)) {
+      reject();
+      continue;
+    }
+    seen.add(key);
+    accepted.push(row);
+  }
+  return accepted;
+}
+
 function prepareCandidate(document: ImportDocument): CandidateBuild {
   let issueCount = document.reviewItems?.length ?? 0;
   let rejectedRows = 0;
@@ -390,14 +414,20 @@ function prepareCandidate(document: ImportDocument): CandidateBuild {
     }
     return prepared;
   };
+  const preparedBalances = dedupeCandidateRows(
+    "balances",
+    collect(document.balances, (row) => prepareBalance(row, document, issue)),
+  );
   const projection = {
     positions: dedupeCandidateRows(
       "positions",
       collect(document.positions, (row) => preparePosition(row, document, issue)),
     ),
-    balances: dedupeCandidateRows(
-      "balances",
-      collect(document.balances, (row) => prepareBalance(row, document, issue)),
+    balances: keepFirstBalancePerAccountDate(
+      preparedBalances,
+      () => {
+        rejectedRows += 1;
+      },
     ),
     liabilities: dedupeCandidateRows(
       "liabilities",
