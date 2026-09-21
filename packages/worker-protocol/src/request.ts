@@ -345,6 +345,8 @@ export type WorkerRequest =
        * above is already fixed by `legacyWatcherId`.
        */
       heartbeatNonce?: string;
+      /** Sorted unique aliases from this host's allow-listed root config. */
+      allowedRootAliases?: string[];
       connectorVersion: string;
     })
   | (WorkerSourceRequest & {
@@ -2017,7 +2019,7 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
       exactKeys(
         input,
         [...baseKeys, "watcherId", "connectorVersion"],
-        ["legacyWatcherId", "heartbeatNonce"],
+        ["legacyWatcherId", "heartbeatNonce", "allowedRootAliases"],
       );
       return {
         ...base,
@@ -2038,6 +2040,29 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
                 maxUtf16: 32,
                 pattern: HEARTBEAT_NONCE,
               }),
+            }),
+        ...(input.allowedRootAliases === undefined
+          ? {}
+          : {
+              allowedRootAliases: (() => {
+                if (
+                  !Array.isArray(input.allowedRootAliases) ||
+                  input.allowedRootAliases.length >
+                    MAX_WORKER_SOURCE_ITEM_COUNT_ROOTS
+                )
+                  return invalid();
+                const aliases = input.allowedRootAliases.map((alias) =>
+                  string(alias, { maxUtf16: 64, pattern: FS_ROOT_ALIAS }),
+                );
+                if (
+                  new Set(aliases).size !== aliases.length ||
+                  aliases.some(
+                    (alias, index) => index > 0 && alias <= aliases[index - 1]!,
+                  )
+                )
+                  return invalid();
+                return aliases;
+              })(),
             }),
         connectorVersion: string(input.connectorVersion, { maxUtf8: 100 }),
       };

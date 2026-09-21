@@ -258,6 +258,13 @@ export class WatchHeartbeat {
         ? {}
         : { legacyWatcherId: this.legacyWatcherId }),
       ...(this.extended ? { heartbeatNonce: this.heartbeatNonce } : {}),
+      ...(this.extended
+        ? {
+            allowedRootAliases: this.config.roots
+              .map((root) => root.alias)
+              .sort(),
+          }
+        : {}),
       connectorVersion: "kithmind-filesystem-worker-v1",
     };
   }
@@ -288,10 +295,7 @@ export class WatchHeartbeat {
       HEARTBEAT_REQUEST_TIMEOUT_MS,
     );
     try {
-      let result = await this.transport.call(
-        this.request(),
-        controller.signal,
-      );
+      let result = await this.transport.call(this.request(), controller.signal);
       // ADM-9 follow-up. The refusal code, before the parser turns every
       // failure into one indistinguishable throw: it is the only thing that
       // tells a stopped heartbeat apart from a broken one.
