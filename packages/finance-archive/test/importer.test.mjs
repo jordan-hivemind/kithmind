@@ -938,6 +938,289 @@ test(
   },
 );
 
+async function authoritativeReparse(client, doc) {
+  return importBatch(
+    client,
+    { source: "synthetic-reparse", documents: [doc] },
+    NOW,
+    { authoritativeReparse: true },
+  );
+}
+
+test(
+  "authoritative reparse preserves an old position when its value changes or it disappears",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const original = document("a5".padEnd(64, "0"), [], {
+      positions: [position({ marketValueText: "100" })],
+    });
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [original] },
+      NOW,
+    );
+
+    for (const positions of [[position({ marketValueText: "120" })], []]) {
+      await authoritativeReparse(client, { ...original, positions });
+      const rows = await all(client, "SELECT market_value FROM positions");
+      assert.deepEqual(
+        rows,
+        [{ market_value: "100" }],
+        "never publishes 100 + 120",
+      );
+      assert.equal(
+        (
+          await one(
+            client,
+            "SELECT parsed_ok FROM documents WHERE sha256 = $1",
+            [original.sha256],
+          )
+        ).parsed_ok,
+        false,
+      );
+      assert.equal(
+        await count(
+          client,
+          "review_items",
+          "WHERE kind = 'reparse_projection_mismatch'",
+        ),
+        1,
+      );
+    }
+  },
+);
+
+test(
+  "authoritative reparse rejects non-hash corrections without moving old evidence",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    await client.query(
+      "INSERT INTO instruments (id, symbol) VALUES ('inst_guard', 'GRD')",
+    );
+    const original = document("a6".padEnd(64, "0"), [], {
+      positions: [
+        position({
+          instrumentId: "inst_guard",
+          sourceLocator: "old",
+          price: "10",
+        }),
+      ],
+    });
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [original] },
+      NOW,
+    );
+    await authoritativeReparse(client, {
+      ...original,
+      positions: [
+        position({
+          instrumentId: "inst_guard",
+          sourceLocator: "new",
+          price: "11",
+          unrealized: "101",
+          valuationNote: "Corrected synthetic note.",
+        }),
+      ],
+    });
+    assert.deepEqual(
+      await all(
+        client,
+        "SELECT price, unrealized, valuation_note, source_locator FROM positions",
+      ),
+      [
+        {
+          price: "10",
+          unrealized: "100",
+          valuation_note: "Synthetic delayed market feed.",
+          source_locator: "old",
+        },
+      ],
+    );
+  },
+);
+
+test(
+  "an already-parsed document becomes partial from persisted outcome despite closed triage",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const original = document("aa".padEnd(64, "0"), [], {
+      positions: [position()],
+    });
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [original] },
+      NOW,
+    );
+    const { id } = await one(
+      client,
+      "SELECT id FROM documents WHERE sha256 = $1",
+      [original.sha256],
+    );
+    await client.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, reason, status)
+       VALUES ('review_closed', 'document_unparsed', $1, $2, 'old parser note', 'dismissed')`,
+      [ACCOUNT.id, id],
+    );
+
+    await authoritativeReparse(client, {
+      ...original,
+      positions: [],
+      parseNote: "synthetic parser now reports an incomplete holdings table",
+      reviewItems: [
+        {
+          kind: "synthetic_parser_gap",
+          accountId: ACCOUNT.id,
+          rawValue: null,
+          reason: "synthetic general review from the new parse",
+        },
+      ],
+    });
+
+    assert.equal(
+      (await one(client, "SELECT parsed_ok FROM documents WHERE id = $1", [id]))
+        .parsed_ok,
+      false,
+    );
+    assert.equal(await count(client, "positions"), 1);
+    assert.equal(
+      await count(
+        client,
+        "review_items",
+        "WHERE source_document_id = $1 AND kind = 'synthetic_parser_gap'",
+        [id],
+      ),
+      1,
+    );
+    assert.equal(
+      await count(
+        client,
+        "review_items",
+        "WHERE source_document_id = $1 AND kind = 'reparse_projection_mismatch' AND status = 'open'",
+        [id],
+      ),
+      1,
+    );
+  },
+);
+
+test(
+  "authoritative exact replay refreshes same-source evidence and permits grounded additions",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    await client.query(
+      "INSERT INTO instruments (id, symbol) VALUES ('inst_repeat', 'RPT'), ('inst_new', 'NEW')",
+    );
+    const original = document("a7".padEnd(64, "0"), [], {
+      positions: [
+        position({ instrumentId: "inst_repeat", sourceLocator: "old" }),
+      ],
+    });
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [original] },
+      NOW,
+    );
+    const summary = await authoritativeReparse(client, {
+      ...original,
+      positions: [
+        position({ instrumentId: "inst_repeat", sourceLocator: "fresh" }),
+        position({
+          instrumentId: "inst_new",
+          sourceLocator: "added",
+          quantity: "2",
+          marketValueText: "40",
+          costBasis: "30",
+          unrealized: "10",
+        }),
+      ],
+    });
+    assert.equal(summary.rowsInserted, 1);
+    assert.deepEqual(
+      await all(
+        client,
+        "SELECT instrument_id, source_locator FROM positions ORDER BY instrument_id",
+      ),
+      [
+        { instrument_id: "inst_new", source_locator: "added" },
+        { instrument_id: "inst_repeat", source_locator: "fresh" },
+      ],
+    );
+    assert.equal(
+      (
+        await one(client, "SELECT parsed_ok FROM documents WHERE sha256 = $1", [
+          original.sha256,
+        ])
+      ).parsed_ok,
+      true,
+    );
+  },
+);
+
+test(
+  "authoritative reparse never borrows another document's hash provenance",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    await client.query(
+      "INSERT INTO instruments (id, symbol) VALUES ('inst_shared', 'SHR')",
+    );
+    const shared = position({
+      instrumentId: "inst_shared",
+      sourceLocator: "first",
+    });
+    const first = document("a8".padEnd(64, "0"), [], { positions: [shared] });
+    const second = document("a9".padEnd(64, "0"), [], {
+      positions: [{ ...shared, sourceLocator: "second" }],
+    });
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [first] },
+      NOW,
+    );
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [second] },
+      NOW,
+    );
+    await authoritativeReparse(client, second);
+
+    const stored = await one(
+      client,
+      `SELECT p.source_locator, d.sha256 AS owner_sha
+         FROM positions p JOIN documents d ON d.id = p.source_document_id`,
+    );
+    assert.equal(stored.source_locator, "first");
+    assert.equal(stored.owner_sha, first.sha256);
+    assert.equal(
+      (
+        await one(client, "SELECT parsed_ok FROM documents WHERE sha256 = $1", [
+          second.sha256,
+        ])
+      ).parsed_ok,
+      false,
+    );
+    assert.equal(
+      await count(
+        client,
+        "review_items",
+        "WHERE kind = 'reparse_projection_mismatch'",
+      ),
+      1,
+    );
+  },
+);
+
 // F1-8a. The hosted archive holds 49 (account, as_of) dates with two
 // `balances` rows stating different cash: a per-period statement and,
 // separately, a document that bundles many periods (an incidental second
@@ -1064,7 +1347,11 @@ test(
     assert.equal(summary.reviewItemsOpened, 0);
     assert.equal(await count(client, "balances"), 2);
     assert.equal(
-      await count(client, "review_items", "WHERE kind = 'balance_cash_conflict'"),
+      await count(
+        client,
+        "review_items",
+        "WHERE kind = 'balance_cash_conflict'",
+      ),
       0,
     );
   },
@@ -1134,52 +1421,98 @@ test(
   },
 );
 
-test("a reparse refuses a second same-document balance even when another document owns the conflict-map entry", { skip }, async (t) => {
-  const client = await archive(t);
-  await seed(client);
-  const balance = (cash) => ({
-    asOf: "2026-03-31", totalValueText: "10000", totalValueNote: null,
-    cash, currency: "USD", periodStartValue: null, periodEndValue: "10000",
-    sourceLocator: "holdings:balance",
-  });
-  const original = document("1b".padEnd(64, "0"), [], {
-    parseNote: "Synthetic incomplete extraction permits a later reparse.",
-    balances: [balance("500")],
-  });
-  const other = document("1c".padEnd(64, "0"), [], { balances: [balance("600")] });
-  await importBatch(client, { source: "synthetic-pull", documents: [original, other] }, NOW);
-  const own = await one(client, "SELECT id FROM documents WHERE sha256 = $1", [original.sha256]);
+test(
+  "a reparse refuses a second same-document balance even when another document owns the conflict-map entry",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const balance = (cash) => ({
+      asOf: "2026-03-31",
+      totalValueText: "10000",
+      totalValueNote: null,
+      cash,
+      currency: "USD",
+      periodStartValue: null,
+      periodEndValue: "10000",
+      sourceLocator: "holdings:balance",
+    });
+    const original = document("1b".padEnd(64, "0"), [], {
+      parseNote: "Synthetic incomplete extraction permits a later reparse.",
+      balances: [balance("500")],
+    });
+    const other = document("1c".padEnd(64, "0"), [], {
+      balances: [balance("600")],
+    });
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [original, other] },
+      NOW,
+    );
+    const own = await one(
+      client,
+      "SELECT id FROM documents WHERE sha256 = $1",
+      [original.sha256],
+    );
 
-  // Make the formerly lossy map select the other document deterministically,
-  // without relying on PostgreSQL's unspecified row order.
-  const query = client.query.bind(client);
-  let reordered = false;
-  client.query = async (...args) => {
-    const result = await query(...args);
-    if (typeof args[0] === "string" && args[0].includes("FROM balances b")) {
-      result.rows.sort((a, b) => Number(a.source_document_id !== own.id) - Number(b.source_document_id !== own.id));
-      assert.equal(result.rows.length, 2);
-      assert.equal(result.rows[0].source_document_id, own.id);
-      assert.notEqual(result.rows[1].source_document_id, own.id);
-      reordered = true;
+    // Make the formerly lossy map select the other document deterministically,
+    // without relying on PostgreSQL's unspecified row order.
+    const query = client.query.bind(client);
+    let reordered = false;
+    client.query = async (...args) => {
+      const result = await query(...args);
+      if (typeof args[0] === "string" && args[0].includes("FROM balances b")) {
+        result.rows.sort(
+          (a, b) =>
+            Number(a.source_document_id !== own.id) -
+            Number(b.source_document_id !== own.id),
+        );
+        assert.equal(result.rows.length, 2);
+        assert.equal(result.rows[0].source_document_id, own.id);
+        assert.notEqual(result.rows[1].source_document_id, own.id);
+        reordered = true;
+      }
+      return result;
+    };
+    let result;
+    try {
+      result = await importBatch(
+        client,
+        {
+          source: "synthetic-pull",
+          documents: [{ ...original, balances: [balance("700")] }],
+        },
+        NOW,
+      );
+    } finally {
+      client.query = query;
     }
-    return result;
-  };
-  let result;
-  try {
-    result = await importBatch(client, {
-      source: "synthetic-pull", documents: [{ ...original, balances: [balance("700")] }],
-    }, NOW);
-  } finally {
-    client.query = query;
-  }
-  assert.equal(reordered, true);
-  assert.equal(result.rowsInserted, 0);
-  assert.equal(result.rowsRefused, 1);
-  assert.equal(await count(client, "balances"), 2);
-  assert.equal((await one(client, "SELECT cash FROM balances WHERE source_document_id = $1", [own.id])).cash, "500");
-  assert.equal((await one(client, "SELECT count(*)::int AS n FROM review_items WHERE source_document_id = $1 AND kind = 'balance_duplicate_in_document'", [own.id])).n, 1);
-});
+    assert.equal(reordered, true);
+    assert.equal(result.rowsInserted, 0);
+    assert.equal(result.rowsRefused, 1);
+    assert.equal(await count(client, "balances"), 2);
+    assert.equal(
+      (
+        await one(
+          client,
+          "SELECT cash FROM balances WHERE source_document_id = $1",
+          [own.id],
+        )
+      ).cash,
+      "500",
+    );
+    assert.equal(
+      (
+        await one(
+          client,
+          "SELECT count(*)::int AS n FROM review_items WHERE source_document_id = $1 AND kind = 'balance_duplicate_in_document'",
+          [own.id],
+        )
+      ).n,
+      1,
+    );
+  },
+);
 
 // F1-49. A parse-noted document is never eligible for the whole-document
 // skip (see the parsed_ok test above and importBatch's parseNote branch), so
@@ -1218,7 +1551,8 @@ test(
       "17".padEnd(64, "0"),
       [row({ sourceLocator: "row:1", providerTxnId: "ptx-parsenote" })],
       {
-        parseNote: "extractor found no text for the remainder of this statement",
+        parseNote:
+          "extractor found no text for the remainder of this statement",
         positions: [position()],
         balances: [balance],
         liabilities: [liability],
@@ -1656,14 +1990,20 @@ test(
     const small = await countQueries(client, () =>
       importBatch(
         client,
-        { source: "synthetic-pull", documents: [statement("c".repeat(64), 10, "2026-03-31")] },
+        {
+          source: "synthetic-pull",
+          documents: [statement("c".repeat(64), 10, "2026-03-31")],
+        },
         NOW,
       ),
     );
     const large = await countQueries(client, () =>
       importBatch(
         client,
-        { source: "synthetic-pull", documents: [statement("d".repeat(64), 200, "2025-12-31")] },
+        {
+          source: "synthetic-pull",
+          documents: [statement("d".repeat(64), 200, "2025-12-31")],
+        },
         NOW,
       ),
     );
@@ -1790,7 +2130,11 @@ test(
         source: "synthetic-pull",
         documents: [
           document("c".repeat(64), [
-            row({ providerTxnId: "ptx-1", currency: "EUR", amountText: "-100.00" }),
+            row({
+              providerTxnId: "ptx-1",
+              currency: "EUR",
+              amountText: "-100.00",
+            }),
           ]),
         ],
       },

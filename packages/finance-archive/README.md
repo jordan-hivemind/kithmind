@@ -781,6 +781,19 @@ change onto existing rows, and none of them does:
 | a fresh pull and import             | An activity row carries `provider_txn_id`, and `importRows` treats a provider-id match as an authoritative identity match: `rowsDeduplicated += 1; continue`. A skip, not a rewrite. Nothing in `src/` issues an `UPDATE transactions` at all.                                                                                      |
 | falling back to `row_hash`          | `amount` is in `rowHash`'s preimage, so a row whose amount the new declaration nulls hashes differently and would insert a _second_ row rather than deduplicate. Worse than the skip, and avoided here only because every row in scope carries a provider id.                                                                       |
 
+Statement reparses are authoritative for parser status and holdings, but do
+not replay activity occurrence ordinals. Before publishing any positions,
+balances or liabilities, the importer compares all three candidate projections
+with the full stored projection owned by that source document. Every stored row
+must be restated exactly across all semantic columns. A changed or omitted row,
+or a candidate hash currently owned by another document, leaves every old row
+and its evidence untouched, marks the document partial, and opens a
+`reparse_projection_mismatch` review item. Exact same-source replay may refresh
+its locator, and newly grounded rows may be added only after the complete
+three-table comparison passes. This is conservative because the current schema
+has no membership table that could prove a globally deduplicated holding also
+belongs to a second source document.
+
 `scripts/nullNonCashAmounts.mjs` is what applies it. It reads the taxonomy off
 the adapter rather than naming activity types, so it cannot drift from the
 declaration it is applying and it serves the next declaration too. For every

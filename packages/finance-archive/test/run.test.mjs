@@ -122,11 +122,31 @@ function writeReparseAdapterFixtures(t) {
       `};\n` +
       `export default rebrokenAdapter;\n`,
   );
+  const changedHoldingsAdapterModulePath = join(
+    fixturesDir,
+    "adapter-changed-holdings.mjs",
+  );
+  writeFileSync(
+    changedHoldingsAdapterModulePath,
+    `import { syntheticAdapter } from ${JSON.stringify(distIndexUrl)};\n` +
+      `const changedAdapter = {\n` +
+      `  ...syntheticAdapter,\n` +
+      `  async parse(rawFile) {\n` +
+      `    const parsed = await syntheticAdapter.parse(rawFile);\n` +
+      `    const positions = parsed.holdings.positions.map((position, index) =>\n` +
+      `      index === 0 ? { ...position, marketValue: "999999.99" } : position,\n` +
+      `    );\n` +
+      `    return { ...parsed, holdings: { ...parsed.holdings, positions } };\n` +
+      `  },\n` +
+      `};\n` +
+      `export default changedAdapter;\n`,
+  );
   return {
     fixturesDir,
     adapterModulePath,
     brokenAdapterModulePath,
     rebrokenAdapterModulePath,
+    changedHoldingsAdapterModulePath,
     sessionModulePath,
   };
 }
@@ -2115,6 +2135,55 @@ test(
     assert.equal(await count(client, "transactions"), transactionsBefore);
     assert.equal(await count(client, "positions"), positionsBefore);
     assert.equal(await count(client, "review_items", "WHERE kind = 'document_unparsed'"), 0);
+  },
+);
+
+test(
+  "reparse summary reports the persisted partial outcome of a holdings mismatch",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-reparse-mismatch-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const {
+      fixturesDir,
+      adapterModulePath,
+      changedHoldingsAdapterModulePath,
+      sessionModulePath,
+    } = writeReparseAdapterFixtures(t);
+    const selectionPath = reparseSelection(fixturesDir);
+    makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    })();
+
+    const before = await all(
+      client,
+      "SELECT market_value, source_locator FROM positions ORDER BY id",
+    );
+    const output = makeReparseRunner({
+      adapterModulePath: changedHoldingsAdapterModulePath,
+      schema,
+      rawDir,
+    })();
+
+    assert.match(output, /documents reparsed: 1/);
+    assert.match(output, /documents now parsed: 0/);
+    assert.match(output, /documents still unparsed: 1/);
+    assert.deepEqual(
+      await all(client, "SELECT market_value, source_locator FROM positions ORDER BY id"),
+      before,
+      "the mismatch leaves every old holding and locator intact",
+    );
+    assert.equal(await count(client, "documents", "WHERE parsed_ok = FALSE"), 1);
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = 'reparse_projection_mismatch'"),
+      1,
+    );
   },
 );
 
