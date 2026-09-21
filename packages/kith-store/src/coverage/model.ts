@@ -1,17 +1,29 @@
+import { createHash } from "node:crypto";
+
 import type { ClientBase, QueryResultRow } from "pg";
 
-import { newKithId } from "../ids.js";
+import { getAdminSpaceIds } from "../admin/model.js";
+import {
+  type Principal,
+  requireSpaceAccess,
+} from "../identity/authorization.js";
+import type { IdentityCtx } from "../identity/db.js";
+import { IdentityError } from "../identity/errors.js";
+import { assertKithId, newKithId } from "../ids.js";
+import { spacePredicate } from "../spaces.js";
 
 const MAX_ACCOUNTS = 32;
 const MAX_ROWS = 128;
 const MAX_RECORD_TYPE_LENGTH = 100;
 const MAX_GAP_REASON_LENGTH = 500;
+const MAX_GAP_NOTE_LENGTH = 1_000;
+const MAX_LISTED_GAPS = 200;
 /**
  * The caller has already authenticated the actor and derived this transaction's
  * authorized space. Coverage does not open pools or authorize arbitrary IDs;
  * callers run every read and write in their own SERIALIZABLE transaction.
  */
-type Ctx = { readonly client: ClientBase; readonly now: number };
+type Ctx = IdentityCtx;
 export type CoverageRange = { from: number; to: number };
 export type QueryCoverage = {
   state: "complete" | "partial" | "unknown" | "stale";
@@ -46,6 +58,31 @@ export type CoverageGapInput = {
   reason: string;
   detectedAt: number;
 };
+export type CoverageGapAcknowledgement =
+  | "mark_unavailable"
+  | "mark_not_expected";
+export type CoverageGapListItem = {
+  id: string;
+  spaceId: string;
+  sourceAccountId: string;
+  sourceName: string;
+  connector: string;
+  accountId: string;
+  recordType: string;
+  entityId: string | null;
+  entityName: string | null;
+  expectedFrom: number | null;
+  expectedTo: number | null;
+  observedFrom: number | null;
+  observedTo: number | null;
+  lastEnumeratedAt: number | null;
+  reason: string;
+  detectedAt: number;
+};
+export type CoverageGapList = {
+  items: CoverageGapListItem[];
+  overflow: boolean;
+};
 const finite = (n: number, name: string) => {
   if (!Number.isFinite(n)) throw new Error(`${name} must be finite`);
 };
@@ -70,6 +107,8 @@ const ms = (v: unknown, name: string) => {
     throw new Error(`${name} is corrupt`);
   return v.getTime();
 };
+const optionalMs = (v: unknown, name: string): number | null =>
+  v === null ? null : ms(v, name);
 const numeric = (v: unknown, name: string) => {
   const n =
     typeof v === "number"
@@ -115,6 +154,24 @@ async function parent(
     );
     if (e.rows.length !== 1) throw new Error("Entity not found");
   }
+}
+function gapIdentity(
+  f: CoverageGapInput,
+  normalizedRecordType: string,
+  normalizedReason: string,
+): string {
+  return [
+    f.sourceAccountId,
+    normalizedRecordType,
+    f.entityId ?? "",
+    f.from === undefined ? "" : String(f.from),
+    f.to === undefined ? "" : String(f.to),
+    normalizedReason,
+  ].join("\u001f");
+}
+
+function conditionKey(identity: string): string {
+  return `v1:${createHash("sha256").update(identity).digest("hex")}`;
 }
 export async function upsertCoverageWindow(
   ctx: Ctx,
@@ -201,9 +258,42 @@ export async function openCoverageGap(
   const reason = f.reason.trim();
   if (!reason || reason.length > MAX_GAP_REASON_LENGTH)
     throw new Error("Coverage gap reason is invalid");
+  const identity = gapIdentity(f, rt, reason);
+  await ctx.client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+    `kith.coverage_gaps\u001f${identity}`,
+  ]);
+  const existing = await ctx.client.query<QueryResultRow>(
+    `SELECT id FROM kith.coverage_gaps
+      WHERE space_id = $1 AND source_account_id = $2 AND record_type = $3
+        AND entity_id IS NOT DISTINCT FROM $4
+        AND "from" IS NOT DISTINCT FROM $5
+        AND "to" IS NOT DISTINCT FROM $6
+        AND reason = $7 AND status = 'open'
+      ORDER BY detected_at DESC, id DESC LIMIT 2`,
+    [
+      f.spaceId,
+      f.sourceAccountId,
+      rt,
+      f.entityId ?? null,
+      f.from === undefined ? null : date(f.from),
+      f.to === undefined ? null : date(f.to),
+      reason,
+    ],
+  );
+  if (existing.rows.length > 1)
+    throw new Error("Duplicate open coverage gap condition");
+  if (existing.rows[0]) {
+    await ctx.client.query(
+      `UPDATE kith.coverage_gaps
+          SET detected_at = GREATEST(detected_at, $3)
+        WHERE id = $1 AND space_id = $2`,
+      [existing.rows[0].id, f.spaceId, date(f.detectedAt)],
+    );
+    return String(existing.rows[0].id);
+  }
   const id = newKithId();
   await ctx.client.query(
-    'INSERT INTO kith.coverage_gaps(id,space_id,created_at,source_account_id,record_type,entity_id,"from","to",reason,detected_at,status) VALUES($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,\'open\')',
+    'INSERT INTO kith.coverage_gaps(id,space_id,created_at,source_account_id,record_type,entity_id,"from","to",reason,detected_at,status,condition_key) VALUES($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,\'open\',$10)',
     [
       id,
       f.spaceId,
@@ -214,17 +304,24 @@ export async function openCoverageGap(
       f.to === undefined ? null : date(f.to),
       reason,
       date(f.detectedAt),
+      conditionKey(identity),
     ],
   );
   return id;
 }
 export async function resolveCoverageGap(
   ctx: Ctx,
-  args: { spaceId: string; gapId: string; resolvedAt: number },
+  args: {
+    spaceId: string;
+    gapId: string;
+    resolvedAt: number;
+    note?: string;
+  },
 ): Promise<void> {
   finite(args.resolvedAt, "resolvedAt");
+  const note = validatedNote(args.note);
   const r = await ctx.client.query<QueryResultRow>(
-    "SELECT detected_at,status,source_account_id,entity_id FROM kith.coverage_gaps WHERE id=$1 AND space_id=$2 LIMIT 2",
+    "SELECT detected_at,status,source_account_id,entity_id FROM kith.coverage_gaps WHERE id=$1 AND space_id=$2 LIMIT 2 FOR UPDATE",
     [args.gapId, args.spaceId],
   );
   if (r.rows.length !== 1) throw new Error("Coverage gap not found");
@@ -238,9 +335,163 @@ export async function resolveCoverageGap(
   if (args.resolvedAt < ms(r.rows[0]!.detected_at, "detectedAt"))
     throw new Error("resolvedAt precedes detectedAt");
   await ctx.client.query(
+    `INSERT INTO kith.coverage_gap_actions
+       (id,space_id,coverage_gap_id,created_at,actor_user_id,actor_kind,action,note)
+     VALUES($1,$2,$3,$4,NULL,'system','condition_cleared',$5)`,
+    [newKithId(), args.spaceId, args.gapId, date(args.resolvedAt), note],
+  );
+  await ctx.client.query(
     "UPDATE kith.coverage_gaps SET status='resolved',resolved_at=$3 WHERE id=$1 AND space_id=$2",
     [args.gapId, args.spaceId, date(args.resolvedAt)],
   );
+}
+
+function validatedNote(value: string | undefined): string | null {
+  if (value === undefined) return null;
+  const note = value.trim();
+  if (!note || note.length > MAX_GAP_NOTE_LENGTH)
+    throw new Error("Coverage gap note is invalid");
+  return note;
+}
+
+function gapNotFound(): never {
+  throw new IdentityError("Coverage gap not found");
+}
+
+/**
+ * Every unresolved gap across spaces this principal may administer.
+ *
+ * UI filters are deliberately absent from this read. Search and chips narrow
+ * the already-authorized result in the browser; changing them cannot mutate a
+ * gap or remove it from the query contract.
+ */
+export async function listCoverageGaps(
+  ctx: IdentityCtx,
+  args: { principal: Principal },
+): Promise<CoverageGapList> {
+  const spaceIds = await getAdminSpaceIds(ctx, args.principal);
+  if (spaceIds.length === 0) return { items: [], overflow: false };
+  const predicate = spacePredicate(spaceIds, 1, "g.space_id");
+  const result = await ctx.client.query<QueryResultRow>(
+    `SELECT g.id,g.space_id,g.source_account_id,g.record_type,g.entity_id,
+            g."from",g."to",g.reason,g.detected_at,
+            a.name AS source_name,a.connector,a.account_id,
+            e.canonical_name AS entity_name,
+            observed.observed_from,observed.observed_to,
+            observed.last_enumerated_at
+       FROM kith.coverage_gaps g
+       JOIN kith.source_accounts a
+         ON a.id = g.source_account_id AND a.space_id = g.space_id
+       LEFT JOIN kith.entities e
+         ON e.id = g.entity_id AND e.space_id = g.space_id
+       LEFT JOIN LATERAL (
+         SELECT min(w."from") AS observed_from,
+                max(w."to") AS observed_to,
+                max(w.last_enumerated_at) AS last_enumerated_at
+           FROM kith.coverage_windows w
+          WHERE w.space_id = g.space_id
+            AND w.source_account_id = g.source_account_id
+            AND w.record_type = g.record_type
+            AND w.entity_id IS NOT DISTINCT FROM g.entity_id
+       ) observed ON true
+      WHERE ${predicate.sql} AND g.status = 'open'
+      ORDER BY g.detected_at DESC,g.id DESC LIMIT $2`,
+    [predicate.value, MAX_LISTED_GAPS + 1],
+  );
+  const overflow = result.rows.length > MAX_LISTED_GAPS;
+  return {
+    items: result.rows.slice(0, MAX_LISTED_GAPS).map((record) => ({
+      id: String(record.id),
+      spaceId: String(record.space_id),
+      sourceAccountId: String(record.source_account_id),
+      sourceName:
+        typeof record.source_name === "string" ? record.source_name : "",
+      connector: typeof record.connector === "string" ? record.connector : "",
+      accountId: typeof record.account_id === "string" ? record.account_id : "",
+      recordType: String(record.record_type),
+      entityId: record.entity_id === null ? null : String(record.entity_id),
+      entityName:
+        typeof record.entity_name === "string" ? record.entity_name : null,
+      expectedFrom: optionalMs(record.from, "from"),
+      expectedTo: optionalMs(record.to, "to"),
+      observedFrom: optionalMs(record.observed_from, "observedFrom"),
+      observedTo: optionalMs(record.observed_to, "observedTo"),
+      lastEnumeratedAt: optionalMs(
+        record.last_enumerated_at,
+        "lastEnumeratedAt",
+      ),
+      reason: String(record.reason),
+      detectedAt: ms(record.detected_at, "detectedAt"),
+    })),
+    overflow,
+  };
+}
+
+/** Resolve one current occurrence with an immutable user acknowledgement. */
+export async function acknowledgeCoverageGap(
+  ctx: IdentityCtx,
+  args: {
+    principal: Principal;
+    gapId: string;
+    action: CoverageGapAcknowledgement;
+    note?: string;
+  },
+): Promise<{ changed: boolean; actionId: string | null }> {
+  const gapId = assertKithId(args.gapId, "invalid_coverage_gap_id");
+  if (
+    args.action !== "mark_unavailable" &&
+    args.action !== "mark_not_expected"
+  ) {
+    throw new IdentityError("Coverage gap action is invalid", {
+      code: "invalid_input",
+      message: "Coverage gap action is invalid",
+    });
+  }
+  const note = validatedNote(args.note);
+  const result = await ctx.client.query<QueryResultRow>(
+    `SELECT id,space_id,status FROM kith.coverage_gaps
+      WHERE id = $1 LIMIT 2 FOR UPDATE`,
+    [gapId],
+  );
+  if (result.rows.length !== 1) gapNotFound();
+  const gap = result.rows[0]!;
+  let actorUserId: string;
+  try {
+    actorUserId = (
+      await requireSpaceAccess(
+        ctx,
+        args.principal,
+        String(gap.space_id),
+        "write",
+      )
+    ).userId;
+  } catch (error) {
+    if (error instanceof IdentityError) gapNotFound();
+    throw error;
+  }
+  if (gap.status === "resolved") return { changed: false, actionId: null };
+  if (gap.status !== "open") gapNotFound();
+  const actionId = newKithId();
+  await ctx.client.query(
+    `INSERT INTO kith.coverage_gap_actions
+       (id,space_id,coverage_gap_id,created_at,actor_user_id,actor_kind,action,note)
+     VALUES($1,$2,$3,$4,$5,'user',$6,$7)`,
+    [
+      actionId,
+      String(gap.space_id),
+      gapId,
+      date(ctx.now),
+      actorUserId,
+      args.action,
+      note,
+    ],
+  );
+  await ctx.client.query(
+    `UPDATE kith.coverage_gaps SET status = 'resolved',resolved_at = $3
+      WHERE id = $1 AND space_id = $2`,
+    [gapId, String(gap.space_id), date(ctx.now)],
+  );
+  return { changed: true, actionId };
 }
 export async function calculateCoverage(
   ctx: Ctx,

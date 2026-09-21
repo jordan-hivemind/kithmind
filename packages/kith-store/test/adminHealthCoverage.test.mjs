@@ -382,9 +382,12 @@ test("coverage lists every starter area, with the empty ones empty", { skip }, a
   );
   await ctx.client.query(
     `INSERT INTO kith.coverage_gaps
-       (id, space_id, created_at, source_account_id, record_type, reason, status)
-     VALUES ($1,$2,to_timestamp($3/1000.0),$4,'statement','missing quarter','open'),
-            ($5,$2,to_timestamp($3/1000.0),$4,'statement','fixed','resolved')`,
+       (id, space_id, created_at, source_account_id, record_type, reason, status,
+        condition_key)
+     VALUES ($1,$2,to_timestamp($3/1000.0),$4,'statement','missing quarter','open',
+             'synthetic-missing-quarter'),
+            ($5,$2,to_timestamp($3/1000.0),$4,'statement','fixed','resolved',
+             'synthetic-fixed')`,
     [newKithId(), f.spaceId, NOW, f.sourceAccountId, newKithId()],
   );
   // Another space's source, root, items and gaps: never in this caller's rows.
@@ -510,8 +513,10 @@ test("migration 024's triggers put every health and coverage table on the feed",
   );
   await ctx.client.query(
     `INSERT INTO kith.coverage_gaps
-       (id, space_id, created_at, source_account_id, reason, status)
-     VALUES ($1,$2,to_timestamp($3/1000.0),$4,'missing','open')`,
+       (id, space_id, created_at, source_account_id, reason, status,
+        condition_key)
+     VALUES ($1,$2,to_timestamp($3/1000.0),$4,'missing','open',
+             'synthetic-change-feed-gap')`,
     [newKithId(), f.spaceId, NOW, f.sourceAccountId],
   );
   await ctx.client.query(
