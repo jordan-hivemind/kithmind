@@ -768,6 +768,43 @@ function printedPageSequenceIsAnchored(page, printedByPage, populatedPages) {
   }
   return declaration.number === 1;
 }
+
+/** The declared run beginning on `startPage` reaches its own stated final
+ * page at `endPage`, with every intervening physical page present. */
+function printedPageRunEndsAt(
+  startPage,
+  endPage,
+  printedByPage,
+  populatedPages,
+) {
+  if (endPage < startPage) return false;
+  const first = printedByPage.get(startPage);
+  const last = printedByPage.get(endPage);
+  if (
+    first === null ||
+    first === undefined ||
+    last === null ||
+    last === undefined ||
+    first.total !== last.total ||
+    last.number !== last.total ||
+    last.number - first.number !== endPage - startPage ||
+    !printedPageSequenceIsAnchored(endPage, printedByPage, populatedPages)
+  ) {
+    return false;
+  }
+  for (let page = startPage; page <= endPage; page += 1) {
+    const declaration = printedByPage.get(page);
+    if (
+      declaration === null ||
+      declaration === undefined ||
+      declaration.total !== first.total ||
+      declaration.number !== first.number + page - startPage
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
 /**
  * F1-61. The sub-header a table reprints above a section's own totals rows
  * ("Percentage of Holdings", then the value columns again). Everything from
@@ -1587,10 +1624,20 @@ function parseHoldings(
           printedByPage,
           populatedPages,
         );
+      const priorAccountRunEnded = printedPageRunEndsAt(
+        carried.page,
+        lines[nextMarker].page - 1,
+        printedByPage,
+        populatedPages,
+      );
       // A new account's own Page 1 can start a valid local run, but it cannot
       // prove that the prior account's declared successor page was retained.
       // A final declaration or a contiguous global run can.
-      if (!carried.finalPageFooter && !contiguousGlobalRun) {
+      if (
+        !carried.finalPageFooter &&
+        !contiguousGlobalRun &&
+        !priorAccountRunEnded
+      ) {
         carried.table.gapCodes.add("page_sequence_gap");
       }
     } else if (nextHeaderIndex !== null) {

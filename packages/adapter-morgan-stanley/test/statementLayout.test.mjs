@@ -1134,6 +1134,55 @@ test("a new account page-one reset cannot hide the prior account's missing page"
   );
 });
 
+test("a complete non-holdings tail can finish an account before the next page-one reset", () => {
+  const [firstPage, secondPage] = CONSOLIDATED_LAYOUT_TEXT.split(
+    `\n${PAGE_SEPARATOR}\n`,
+  );
+  const pages = [
+    firstPage.replace("Page 1 of 2", "Page 1 of 4"),
+    [
+      "        Page 2 of 4",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      "        ACTIVITY",
+      "        Synthetic activity section retained in full",
+    ].join("\n"),
+    [
+      "        Page 3 of 4",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      "        DISCLOSURES",
+      "        Synthetic disclosure section retained in full",
+    ].join("\n"),
+    [
+      "        Page 4 of 4",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      "        DISCLOSURES",
+      "        End of synthetic account section",
+    ].join("\n"),
+    secondPage.replace("Page 2 of 2", "Page 1 of 1"),
+  ];
+  const parsed = parseStatementLines(pages.join(`\n${PAGE_SEPARATOR}\n`), kind);
+  assert.equal(parsed.holdings.positions.length, 2);
+  assert.deepEqual(
+    parsed.holdings.positionScopes.map((scope) => ({
+      accountExternalKey: scope.accountExternalKey,
+      status: scope.status,
+      gapCodes: scope.gapCodes,
+    })),
+    [
+      {
+        accountExternalKey: CONSOLIDATED_ACCOUNT_ONE,
+        status: "complete",
+        gapCodes: [],
+      },
+      {
+        accountExternalKey: CONSOLIDATED_ACCOUNT_TWO,
+        status: "complete",
+        gapCodes: [],
+      },
+    ],
+  );
+});
+
 test("one consolidated account can be complete while another has a zero-emitted typed gap", () => {
   const [firstPage, originalSecondPage] = CONSOLIDATED_LAYOUT_TEXT.split(
     `\n${PAGE_SEPARATOR}\n`,
