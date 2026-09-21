@@ -32,6 +32,30 @@ const OBJECT_NAME = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,128}$/;
 function ackSummary(
   ack: SourceProviderOriginalDetachAckRow,
 ): WorkerProviderOriginalDetachAckSummary {
+  if (ack.ackVersion === "provider_original_detach_ack_v2") {
+    if (
+      (ack.referenceOutcome !== "detached" &&
+        ack.referenceOutcome !== "already_detached") ||
+      ack.providerSourceOutcome !== "retained_unchanged" ||
+      ack.locatorBindingId !== null ||
+      ack.locatorRepositoryId !== null ||
+      ack.locatorSnapshotId !== null ||
+      ack.locatorObjectName !== null ||
+      ack.locatorBundleOutcome !== null ||
+      ack.locatorAbsenceAuthority !== null ||
+      ack.retentionDisclosure !== null
+    )
+      workerProtocolError("scan_conflict");
+    return {
+      referenceVersion: "provider_original_v2",
+      detachId: ack.detachId,
+      referenceId: ack.referenceId,
+      forgetEpoch: ack.forgetEpoch,
+      referenceOutcome: ack.referenceOutcome,
+      providerSourceOutcome: ack.providerSourceOutcome,
+      completedAt: ack.completedAt.getTime(),
+    };
+  }
   if (
     ack.ackVersion !== "provider_original_detach_ack_v1" ||
     ack.locatorAbsenceAuthority !== "worker_asserted_live_repository_absence" ||
@@ -77,17 +101,26 @@ export async function requireProviderOriginalReferenceChain(
     revision.sourceItemId !== item.id ||
     revision.contentHash !== reference.sourceContentHash ||
     revision.byteLength !== reference.sourceByteLength ||
-    reference.referenceVersion !== "provider_original_v1" ||
     reference.providerKind !== "dropbox_v1" ||
     reference.verificationAuthority !== "worker_asserted" ||
-    !UUID.test(reference.locatorBindingId) ||
     !SHA256.test(reference.referenceFingerprint) ||
-    !SHA256.test(reference.locatorRepositoryId) ||
-    !SHA256.test(reference.locatorSnapshotId) ||
-    !SHA256.test(reference.locatorCiphertextHash) ||
-    !OBJECT_NAME.test(reference.locatorObjectName) ||
-    !Number.isSafeInteger(reference.locatorCiphertextByteLength) ||
-    reference.locatorCiphertextByteLength < 1
+    (reference.referenceVersion === "provider_original_v2"
+      ? reference.locatorBindingId !== null ||
+        reference.locatorRepositoryKeyDomainFingerprint !== null ||
+        reference.locatorRepositoryId !== null ||
+        reference.locatorSnapshotId !== null ||
+        reference.locatorObjectName !== null ||
+        reference.locatorCiphertextHash !== null ||
+        reference.locatorCiphertextByteLength !== null ||
+        reference.locatorReadbackVerifiedAt !== null
+      : reference.referenceVersion !== "provider_original_v1" ||
+        !UUID.test(reference.locatorBindingId ?? "") ||
+        !SHA256.test(reference.locatorRepositoryId ?? "") ||
+        !SHA256.test(reference.locatorSnapshotId ?? "") ||
+        !SHA256.test(reference.locatorCiphertextHash ?? "") ||
+        !OBJECT_NAME.test(reference.locatorObjectName ?? "") ||
+        !Number.isSafeInteger(reference.locatorCiphertextByteLength) ||
+        (reference.locatorCiphertextByteLength ?? 0) < 1)
   )
     workerProtocolError("scan_conflict");
   try {
@@ -111,6 +144,38 @@ function target(
   forgetEpoch: number,
   ack: SourceProviderOriginalDetachAckRow | null,
 ): WorkerProviderOriginalForgetTarget {
+  const summary = ack ? ackSummary(ack) : undefined;
+  const referenceV2 = reference.referenceVersion === "provider_original_v2";
+  const summaryV2 = summary
+    ? "referenceVersion" in summary &&
+      summary.referenceVersion === "provider_original_v2"
+    : referenceV2;
+  if (referenceV2 !== summaryV2) workerProtocolError("scan_conflict");
+  if (reference.referenceVersion === "provider_original_v2") {
+    return {
+      referenceVersion: "provider_original_v2",
+      referenceId: reference.id,
+      referenceFingerprint: reference.referenceFingerprint,
+      forgetEpoch,
+      ...(summary
+        ? {
+            ack: summary as Extract<
+              WorkerProviderOriginalDetachAckSummary,
+              { referenceVersion: "provider_original_v2" }
+            >,
+          }
+        : {}),
+    };
+  }
+  if (
+    reference.locatorBindingId === null ||
+    reference.locatorRepositoryId === null ||
+    reference.locatorSnapshotId === null ||
+    reference.locatorObjectName === null ||
+    reference.locatorCiphertextHash === null ||
+    reference.locatorCiphertextByteLength === null
+  )
+    workerProtocolError("scan_conflict");
   return {
     referenceId: reference.id,
     referenceFingerprint: reference.referenceFingerprint,
@@ -121,7 +186,14 @@ function target(
     locatorCiphertextHash: reference.locatorCiphertextHash,
     locatorCiphertextByteLength: reference.locatorCiphertextByteLength,
     forgetEpoch,
-    ...(ack ? { ack: ackSummary(ack) } : {}),
+    ...(summary
+      ? {
+          ack: summary as Exclude<
+            WorkerProviderOriginalDetachAckSummary,
+            { referenceVersion: "provider_original_v2" }
+          >,
+        }
+      : {}),
   };
 }
 
@@ -182,6 +254,21 @@ export async function getProviderOriginalForgetTargets(
 async function requestDigest(
   request: Extract<WorkerRequest, { operation: "providerOriginal.ackDetach" }>,
 ): Promise<string> {
+  if (request.referenceVersion === "provider_original_v2") {
+    return sha256Hex(
+      `provider-original-detach-ack:v2\0${JSON.stringify([
+        request.spaceId,
+        request.sourceAccountId,
+        request.requestId,
+        request.sourceItemId,
+        request.expectedForgetEpoch,
+        request.detachId,
+        request.referenceId,
+        request.referenceOutcome,
+        request.providerSourceOutcome,
+      ])}`,
+    );
+  }
   return sha256Hex(
     `provider-original-detach-ack:v1\0${JSON.stringify([
       request.spaceId,
@@ -211,7 +298,7 @@ function sameAck(
   item: SourceItemRow,
   digest: string,
 ): boolean {
-  return (
+  const common =
     ack.spaceId === source.spaceId &&
     ack.sourceAccountId === source.account.id &&
     ack.sourceItemId === item.id &&
@@ -220,17 +307,31 @@ function sameAck(
     ack.detachId === request.detachId &&
     ack.requestId === request.requestId &&
     ack.requestDigest === digest &&
+    ack.referenceOutcome === request.referenceOutcome &&
+    ack.providerSourceOutcome === request.providerSourceOutcome &&
+    ack.actorUserId === source.principal.userId &&
+    ack.actorCredentialId === source.principal.credentialId;
+  if (!common) return false;
+  if (request.referenceVersion === "provider_original_v2")
+    return (
+      ack.ackVersion === "provider_original_detach_ack_v2" &&
+      ack.locatorBindingId === null &&
+      ack.locatorRepositoryId === null &&
+      ack.locatorSnapshotId === null &&
+      ack.locatorObjectName === null &&
+      ack.locatorBundleOutcome === null &&
+      ack.locatorAbsenceAuthority === null &&
+      ack.retentionDisclosure === null
+    );
+  return (
+    ack.ackVersion === "provider_original_detach_ack_v1" &&
     ack.locatorBindingId === request.locatorBindingId &&
     ack.locatorRepositoryId === request.locatorRepositoryId &&
     ack.locatorSnapshotId === request.locatorSnapshotId &&
     ack.locatorObjectName === request.locatorObjectName &&
-    ack.referenceOutcome === request.referenceOutcome &&
     ack.locatorBundleOutcome === request.locatorBundleOutcome &&
     ack.locatorAbsenceAuthority === request.locatorAbsenceAuthority &&
-    ack.retentionDisclosure === request.retentionDisclosure &&
-    ack.providerSourceOutcome === request.providerSourceOutcome &&
-    ack.actorUserId === source.principal.userId &&
-    ack.actorCredentialId === source.principal.credentialId
+    ack.retentionDisclosure === request.retentionDisclosure
   );
 }
 
@@ -289,10 +390,17 @@ export async function acknowledgeProviderOriginalDetach(
     reference.spaceId !== source.spaceId ||
     reference.sourceAccountId !== source.account.id ||
     reference.sourceItemId !== item.id ||
-    reference.locatorBindingId !== request.locatorBindingId ||
-    reference.locatorRepositoryId !== request.locatorRepositoryId ||
-    reference.locatorSnapshotId !== request.locatorSnapshotId ||
-    reference.locatorObjectName !== request.locatorObjectName
+    reference.referenceVersion !==
+      (request.referenceVersion ?? "provider_original_v1") ||
+    (request.referenceVersion === "provider_original_v2"
+      ? reference.locatorBindingId !== null ||
+        reference.locatorRepositoryId !== null ||
+        reference.locatorSnapshotId !== null ||
+        reference.locatorObjectName !== null
+      : reference.locatorBindingId !== request.locatorBindingId ||
+        reference.locatorRepositoryId !== request.locatorRepositoryId ||
+        reference.locatorSnapshotId !== request.locatorSnapshotId ||
+        reference.locatorObjectName !== request.locatorObjectName)
   )
     workerProtocolError("stale_observation");
   await requireProviderOriginalReferenceChain(ctx, source, item, reference);
@@ -312,12 +420,15 @@ export async function acknowledgeProviderOriginalDetach(
       reference_outcome, locator_bundle_outcome, locator_absence_authority,
       retention_disclosure, provider_source_outcome, actor_user_id,
       actor_credential_id, completed_at)
-     VALUES ($1,$2,transaction_timestamp(),'provider_original_detach_ack_v1',
-      $3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-      $21,$22,$23)`,
+     VALUES ($1,$2,transaction_timestamp(),$3,
+      $4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,
+      $22,$23,$24)`,
     [
       id,
       source.spaceId,
+      request.referenceVersion === "provider_original_v2"
+        ? "provider_original_detach_ack_v2"
+        : "provider_original_detach_ack_v1",
       source.account.id,
       item.id,
       reference.sourceRevisionId,
@@ -327,14 +438,28 @@ export async function acknowledgeProviderOriginalDetach(
       request.requestId,
       digest,
       reference.referenceFingerprint,
-      reference.locatorBindingId,
-      reference.locatorRepositoryId,
-      reference.locatorSnapshotId,
-      reference.locatorObjectName,
+      request.referenceVersion === "provider_original_v2"
+        ? null
+        : reference.locatorBindingId,
+      request.referenceVersion === "provider_original_v2"
+        ? null
+        : reference.locatorRepositoryId,
+      request.referenceVersion === "provider_original_v2"
+        ? null
+        : reference.locatorSnapshotId,
+      request.referenceVersion === "provider_original_v2"
+        ? null
+        : reference.locatorObjectName,
       request.referenceOutcome,
-      request.locatorBundleOutcome,
-      request.locatorAbsenceAuthority,
-      request.retentionDisclosure,
+      request.referenceVersion === "provider_original_v2"
+        ? null
+        : request.locatorBundleOutcome,
+      request.referenceVersion === "provider_original_v2"
+        ? null
+        : request.locatorAbsenceAuthority,
+      request.referenceVersion === "provider_original_v2"
+        ? null
+        : request.retentionDisclosure,
       request.providerSourceOutcome,
       source.principal.userId,
       source.principal.credentialId,

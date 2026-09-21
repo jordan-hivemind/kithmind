@@ -539,7 +539,7 @@ export type ArchiveReceiptSelection =
       bindingEpoch: number;
     };
 
-export type ProviderOriginalDeclaration = {
+export type ProviderOriginalDeclarationV1 = {
   referenceVersion: "provider_original_v1";
   providerKind: "dropbox_v1";
   clientReferenceId: string;
@@ -565,6 +565,30 @@ export type ProviderOriginalDeclaration = {
   };
   createdAt: number;
 };
+
+/**
+ * An exact Dropbox object is the original. The provider identity and revision
+ * are sufficient to re-fetch it, while `sourceContentHash` verifies the bytes
+ * after that fetch. This version deliberately carries no locator archive:
+ * Dropbox is the retained source, not one leg of a separately backed-up copy.
+ */
+export type ProviderOriginalDeclarationV2 = {
+  referenceVersion: "provider_original_v2";
+  providerKind: "dropbox_v1";
+  clientReferenceId: string;
+  sourceContentHash: string;
+  sourceByteLength: number;
+  providerAccountIdHash: string;
+  providerRootDirectoryIdHash: string;
+  providerFileIdHash: string;
+  providerRevision: string;
+  providerContentHash: string;
+  verifiedAt: number;
+  createdAt: number;
+};
+
+export type ProviderOriginalDeclaration =
+  ProviderOriginalDeclarationV1 | ProviderOriginalDeclarationV2;
 
 export type ParsedTextDeclaration = {
   extractionFingerprint: string;

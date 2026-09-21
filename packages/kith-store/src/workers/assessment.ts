@@ -883,9 +883,7 @@ async function terminalReady(
       !generation.archiveSetDigest ||
       !generation.normalizedBundleDigest ||
       !generation.payloadManifestId ||
-      !generation.originalPrimaryReceiptId ||
-      !generation.parserPrimaryReceiptId ||
-      !generation.parserBackupReceiptId
+      !generation.parserPrimaryReceiptId
     )
       return no("generation_shape");
     if (item.workerProfileId !== entry.binaryParserProfileId)
@@ -1033,34 +1031,37 @@ async function terminalReady(
             copyRole: "independent_backup",
           }),
       );
-      if (!originalPrimary) return no("binding_missing:original/primary");
       if (!parserPrimary) return no("binding_missing:parser/primary");
-      if (!parserBackup) return no("binding_missing:parser/backup");
-      if (Boolean(originalBackup) === Boolean(provider))
+      const providerV2 = provider?.reference.referenceVersion === "provider_original_v2";
+      if (
+        providerV2
+          ? Boolean(originalPrimary || originalBackup || parserBackup)
+          : !originalPrimary ||
+            !parserBackup ||
+            Boolean(originalBackup) === Boolean(provider)
+      )
         return no(
-          originalBackup
-            ? "binding_missing:original/backup"
-            : "binding_missing:provider",
+          providerV2
+            ? "archive_selection"
+            : !originalPrimary
+              ? "binding_missing:original/primary"
+              : !parserBackup
+                ? "binding_missing:parser/backup"
+                : originalBackup
+                  ? "binding_missing:original/backup"
+                  : "binding_missing:provider",
         );
       await staged(note, "receipt_chain", async () => {
-        await requireArchiveReceiptChain(
-          ctx,
-          source,
-          item,
-          originalPrimary.receipt,
-        );
+        if (originalPrimary)
+          await requireArchiveReceiptChain(ctx, source, item, originalPrimary.receipt);
         await requireArchiveReceiptChain(
           ctx,
           source,
           item,
           parserPrimary.receipt,
         );
-        await requireArchiveReceiptChain(
-          ctx,
-          source,
-          item,
-          parserBackup.receipt,
-        );
+        if (parserBackup)
+          await requireArchiveReceiptChain(ctx, source, item, parserBackup.receipt);
         if (originalBackup)
           await requireArchiveReceiptChain(
             ctx,
@@ -1079,11 +1080,9 @@ async function terminalReady(
           ),
         );
       await staged(note, "archive_independence", async () => {
-        requireIndependentArchivePair(
-          parserPrimary.receipt,
-          parserBackup.receipt,
-        );
-        if (originalBackup)
+        if (parserBackup)
+          requireIndependentArchivePair(parserPrimary.receipt, parserBackup.receipt);
+        if (originalPrimary && originalBackup)
           requireIndependentArchivePair(
             originalPrimary.receipt,
             originalBackup.receipt,
@@ -1108,7 +1107,7 @@ async function terminalReady(
       );
       if (
         generation.archiveSetDigest !== archiveSet ||
-        generation.originalPrimaryReceiptId !== originalPrimary.receipt.id ||
+        generation.originalPrimaryReceiptId !== (originalPrimary?.receipt.id ?? null) ||
         generation.originalBackupReceiptId !==
           (originalBackup?.receipt.id ?? null) ||
         generation.originalProviderReferenceId !==
@@ -1116,7 +1115,7 @@ async function terminalReady(
         generation.originalProviderBindingEpoch !==
           (provider?.binding.bindingEpoch ?? null) ||
         generation.parserPrimaryReceiptId !== parserPrimary.receipt.id ||
-        generation.parserBackupReceiptId !== parserBackup.receipt.id
+        generation.parserBackupReceiptId !== (parserBackup?.receipt.id ?? null)
       )
         return no(
           generation.archiveSetDigest !== archiveSet

@@ -13,6 +13,7 @@ import type {
   WorkerArchivedPreflightResult,
   WorkerArchivedReserveResult,
   WorkerExistingParserArtifact,
+  WorkerParserRecoverySelection,
   WorkerRequest,
 } from "@repo/worker-protocol/request";
 import type { PrincipalRef } from "../identity/authorization.js";
@@ -96,6 +97,14 @@ type ArchiveRecovery =
       originalPrimaryBindingEpoch: number;
       originalProviderReferenceId: string;
       originalProviderBindingEpoch: number;
+      originalBackupReceiptId?: never;
+      originalBackupBindingEpoch?: never;
+    }
+  | {
+      originalProviderReferenceId: string;
+      originalProviderBindingEpoch: number;
+      originalPrimaryReceiptId?: never;
+      originalPrimaryBindingEpoch?: never;
       originalBackupReceiptId?: never;
       originalBackupBindingEpoch?: never;
     };
@@ -259,13 +268,21 @@ async function loadJob(
 }
 
 export async function archiveSetDigest(
-  originalPrimary: BoundArchive,
+  originalPrimary: BoundArchive | undefined,
   originalBackup: BoundArchive | undefined,
-  provider: { reference: { id: string }; bindingEpoch: number } | null,
+  provider: {
+    reference: {
+      id: string;
+      referenceVersion: "provider_original_v1" | "provider_original_v2";
+    };
+    bindingEpoch: number;
+  } | null,
   parserPrimary: BoundArchive,
-  parserBackup: BoundArchive,
+  parserBackup: BoundArchive | undefined,
 ): Promise<string> {
   if (originalBackup) {
+    if (!originalPrimary || !parserBackup || provider)
+      workerProtocolError("scan_conflict");
     return digest(
       "archive-set:v1",
       [originalPrimary, originalBackup, parserPrimary, parserBackup].map(
@@ -279,6 +296,19 @@ export async function archiveSetDigest(
     );
   }
   if (!provider) workerProtocolError("scan_conflict");
+  if (provider.reference.referenceVersion === "provider_original_v2") {
+    if (originalPrimary || parserBackup) workerProtocolError("scan_conflict");
+    return digest("recovery-set:provider-original:v2", [
+      ["provider_original", provider.reference.id, provider.bindingEpoch],
+      [
+        parserPrimary.receipt.subjectKind,
+        parserPrimary.receipt.copyRole,
+        parserPrimary.receipt.id,
+        parserPrimary.binding.bindingEpoch,
+      ],
+    ]);
+  }
+  if (!originalPrimary || !parserBackup) workerProtocolError("scan_conflict");
   return digest("recovery-set:provider-original:v1", [
     [
       originalPrimary.receipt.subjectKind,
@@ -304,9 +334,15 @@ async function loadArchiveRecovery(
 ): Promise<
   | {
       recovery: ArchiveRecovery;
-      originalPrimary: BoundArchive;
+      originalPrimary?: BoundArchive;
       originalBackup?: BoundArchive;
-      provider: { reference: { id: string }; bindingEpoch: number } | null;
+      provider: {
+        reference: {
+          id: string;
+          referenceVersion: "provider_original_v1" | "provider_original_v2";
+        };
+        bindingEpoch: number;
+      } | null;
     }
   | undefined
 > {
@@ -330,11 +366,24 @@ async function loadArchiveRecovery(
     ctx.client,
     revision.id,
   );
-  if (
-    !originalPrimary ||
-    (!originalBackup && !providerBinding) ||
-    (originalBackup && providerBinding)
-  )
+  if (providerBinding?.reference.referenceVersion === "provider_original_v2") {
+    if (originalPrimary || originalBackup) return undefined;
+    const provider = {
+      reference: {
+        id: providerBinding.reference.id,
+        referenceVersion: providerBinding.reference.referenceVersion,
+      },
+      bindingEpoch: providerBinding.binding.bindingEpoch,
+    };
+    return {
+      provider,
+      recovery: {
+        originalProviderReferenceId: provider.reference.id,
+        originalProviderBindingEpoch: provider.bindingEpoch,
+      },
+    };
+  }
+  if (!originalPrimary || Boolean(originalBackup) === Boolean(providerBinding))
     return undefined;
   if (originalBackup) {
     requireIndependentArchivePair(
@@ -354,7 +403,10 @@ async function loadArchiveRecovery(
     };
   }
   const provider = {
-    reference: { id: providerBinding!.reference.id },
+    reference: {
+      id: providerBinding!.reference.id,
+      referenceVersion: providerBinding!.reference.referenceVersion,
+    },
     bindingEpoch: providerBinding!.binding.bindingEpoch,
   };
   return {
@@ -383,14 +435,7 @@ export async function validateAdmittedArchiveChain(
     archiveSetDigest: string;
     parsedText?: ParsedTextDeclaration;
   },
-): Promise<
-  ArchiveRecovery & {
-    parserPrimaryReceiptId: string;
-    parserPrimaryBindingEpoch: number;
-    parserBackupReceiptId: string;
-    parserBackupBindingEpoch: number;
-  }
-> {
+): Promise<ArchiveRecovery & WorkerParserRecoverySelection> {
   requireStoredBinaryWork(current);
   const revision = await loadRevision(ctx, ids.sourceRevisionId);
   const artifact = await loadArtifact(ctx, ids.parserArtifactId);
@@ -533,8 +578,12 @@ export async function validateAdmittedArchiveChain(
     subjectKind: "parser_output",
     copyRole: "independent_backup",
   });
-  if (!parserPrimary || !parserBackup) workerProtocolError("scan_conflict");
-  requireIndependentArchivePair(parserPrimary.receipt, parserBackup.receipt);
+  const providerV2 =
+    recovery.provider?.reference.referenceVersion === "provider_original_v2";
+  if (!parserPrimary || (providerV2 ? Boolean(parserBackup) : !parserBackup))
+    workerProtocolError("scan_conflict");
+  if (parserBackup)
+    requireIndependentArchivePair(parserPrimary.receipt, parserBackup.receipt);
   const expectedArchiveSet = await archiveSetDigest(
     recovery.originalPrimary,
     recovery.originalBackup,
@@ -545,7 +594,9 @@ export async function validateAdmittedArchiveChain(
   if (
     expectedArchiveSet !== ids.archiveSetDigest ||
     generation.originalPrimaryReceiptId !==
-      recovery.recovery.originalPrimaryReceiptId ||
+      ("originalPrimaryReceiptId" in recovery.recovery
+        ? recovery.recovery.originalPrimaryReceiptId!
+        : null) ||
     generation.originalBackupReceiptId !==
       ("originalBackupReceiptId" in recovery.recovery
         ? recovery.recovery.originalBackupReceiptId!
@@ -559,16 +610,21 @@ export async function validateAdmittedArchiveChain(
         ? recovery.recovery.originalProviderBindingEpoch!
         : null) ||
     generation.parserPrimaryReceiptId !== parserPrimary.receipt.id ||
-    generation.parserBackupReceiptId !== parserBackup.receipt.id
+    generation.parserBackupReceiptId !== (parserBackup?.receipt.id ?? null)
   )
     workerProtocolError("scan_conflict");
-  return {
-    ...recovery.recovery,
-    parserPrimaryReceiptId: parserPrimary.receipt.id,
-    parserPrimaryBindingEpoch: parserPrimary.binding.bindingEpoch,
-    parserBackupReceiptId: parserBackup.receipt.id,
-    parserBackupBindingEpoch: parserBackup.binding.bindingEpoch,
-  };
+  const parserRecovery: WorkerParserRecoverySelection = parserBackup
+    ? {
+        parserPrimaryReceiptId: parserPrimary.receipt.id,
+        parserPrimaryBindingEpoch: parserPrimary.binding.bindingEpoch,
+        parserBackupReceiptId: parserBackup.receipt.id,
+        parserBackupBindingEpoch: parserBackup.binding.bindingEpoch,
+      }
+    : {
+        parserPrimaryReceiptId: parserPrimary.receipt.id,
+        parserPrimaryBindingEpoch: parserPrimary.binding.bindingEpoch,
+      };
+  return { ...recovery.recovery, ...parserRecovery };
 }
 
 function requireIdentity(
@@ -981,6 +1037,7 @@ async function existingParserArtifact(
     parserOutputByteLength: number;
     parserOutputMediaType: string;
   },
+  providerV2: boolean,
 ): Promise<WorkerExistingParserArtifact | undefined> {
   if (current.work.parserFingerprint === null) return undefined;
   const found = (
@@ -1020,17 +1077,21 @@ async function existingParserArtifact(
     ...subject,
     copyRole: "independent_backup",
   });
-  // Both copies or nothing. A half-archived artifact is not reusable: the
-  // client would skip the archive step for a copy that was never durable.
-  if (!primary || !backup) return undefined;
-  requireIndependentArchivePair(primary.receipt, backup.receipt);
-  return {
-    parserArtifactId: artifact.id,
-    primaryReceiptId: primary.receipt.id,
-    primaryBindingEpoch: primary.binding.bindingEpoch,
-    backupReceiptId: backup.receipt.id,
-    backupBindingEpoch: backup.binding.bindingEpoch,
-  };
+  if (!primary || (providerV2 ? Boolean(backup) : !backup)) return undefined;
+  if (backup) requireIndependentArchivePair(primary.receipt, backup.receipt);
+  return backup
+    ? {
+        parserArtifactId: artifact.id,
+        primaryReceiptId: primary.receipt.id,
+        primaryBindingEpoch: primary.binding.bindingEpoch,
+        backupReceiptId: backup.receipt.id,
+        backupBindingEpoch: backup.binding.bindingEpoch,
+      }
+    : {
+        parserArtifactId: artifact.id,
+        primaryReceiptId: primary.receipt.id,
+        primaryBindingEpoch: primary.binding.bindingEpoch,
+      };
 }
 
 export async function lookupArchivedAdmission(
@@ -1105,7 +1166,15 @@ export async function lookupArchivedAdmission(
   // when the client needs it: it is about to archive and admit, and this is
   // what tells it there is nothing to archive.
   const reusable = lookup.reuseParserArtifact
-    ? await existingParserArtifact(ctx, source, current, revision, lookup)
+    ? await existingParserArtifact(
+        ctx,
+        source,
+        current,
+        revision,
+        lookup,
+        recovery.provider?.reference.referenceVersion ===
+          "provider_original_v2",
+      )
     : undefined;
   const processingNotFound = (): WorkerArchivedLookupResult => ({
     operation: "discovery.lookupArchivedAdmission",
@@ -1168,9 +1237,16 @@ export async function lookupArchivedAdmission(
      ORDER BY created_at, id LIMIT 2`,
     [revision.id, lookup.parsedText.extractionFingerprint],
   );
-  if (!parserPrimary || !parserBackup || textRows.length !== 1)
+  const providerV2 =
+    recovery.provider?.reference.referenceVersion === "provider_original_v2";
+  if (
+    !parserPrimary ||
+    (providerV2 ? Boolean(parserBackup) : !parserBackup) ||
+    textRows.length !== 1
+  )
     return processingNotFound();
-  requireIndependentArchivePair(parserPrimary.receipt, parserBackup.receipt);
+  if (parserBackup)
+    requireIndependentArchivePair(parserPrimary.receipt, parserBackup.receipt);
   const text = camelizeSourceTextVersion(textRows[0]!);
   let textRepresentation;
   try {
@@ -1244,16 +1320,21 @@ export async function lookupArchivedAdmission(
     generation.desiredProcessingEpoch === null
   )
     workerProtocolError("scan_conflict");
-  await validateAdmittedArchiveChain(ctx, source, current, {
-    sourceRevisionId: revision.id,
-    parserArtifactId: artifact.id,
-    sourceTextVersionId: text.id,
-    processingGenerationId: generation.id,
-    ingestJobId: job.id,
-    desiredProcessingEpoch: generation.desiredProcessingEpoch,
-    archiveSetDigest: expectedArchiveSet,
-    parsedText: lookup.parsedText,
-  });
+  const archiveReceipts = await validateAdmittedArchiveChain(
+    ctx,
+    source,
+    current,
+    {
+      sourceRevisionId: revision.id,
+      parserArtifactId: artifact.id,
+      sourceTextVersionId: text.id,
+      processingGenerationId: generation.id,
+      ingestJobId: job.id,
+      desiredProcessingEpoch: generation.desiredProcessingEpoch,
+      archiveSetDigest: expectedArchiveSet,
+      parsedText: lookup.parsedText,
+    },
+  );
   return {
     operation: "discovery.lookupArchivedAdmission",
     mode: "processing",
@@ -1265,11 +1346,7 @@ export async function lookupArchivedAdmission(
     ingestJobId: job.id,
     desiredProcessingEpoch: generation.desiredProcessingEpoch,
     archiveSetDigest: expectedArchiveSet,
-    ...recovery.recovery,
-    parserPrimaryReceiptId: parserPrimary.receipt.id,
-    parserPrimaryBindingEpoch: parserPrimary.binding.bindingEpoch,
-    parserBackupReceiptId: parserBackup.receipt.id,
-    parserBackupBindingEpoch: parserBackup.binding.bindingEpoch,
+    ...archiveReceipts,
   };
 }
 
@@ -1414,7 +1491,7 @@ async function createArchivedIngestWork(
     parsedText: ParsedTextDeclaration;
     recovery: ArchiveRecovery;
     parserPrimaryReceiptId: string;
-    parserBackupReceiptId: string;
+    parserBackupReceiptId?: string;
   },
 ): Promise<{
   generation: ProcessingGenerationRow;
@@ -1471,6 +1548,10 @@ async function createArchivedIngestWork(
     "originalBackupReceiptId" in input.recovery
       ? input.recovery.originalBackupReceiptId!
       : null;
+  const originalPrimaryReceiptId =
+    "originalPrimaryReceiptId" in input.recovery
+      ? input.recovery.originalPrimaryReceiptId!
+      : null;
   const originalProviderReferenceId =
     "originalProviderReferenceId" in input.recovery
       ? input.recovery.originalProviderReferenceId!
@@ -1514,12 +1595,12 @@ async function createArchivedIngestWork(
       input.artifact.id,
       input.archiveSetDigest,
       input.parsedText.normalizedBundleDigest,
-      input.recovery.originalPrimaryReceiptId,
+      originalPrimaryReceiptId,
       originalBackupReceiptId,
       originalProviderReferenceId,
       originalProviderBindingEpoch,
       input.parserPrimaryReceiptId,
-      input.parserBackupReceiptId,
+      input.parserBackupReceiptId ?? null,
       desiredProcessingEpoch,
       input.parsedText.pageCount,
       input.parsedText.expectedEvidenceSpanCount,
@@ -1709,6 +1790,30 @@ export async function admitArchivedDiscovery(
       userId: current.work.actorUserId,
     });
     await linkTriagePreviewsToRevision(ctx, revision);
+    // Existing-provider requests identify the immutable reference version on
+    // the wire. Verify it before resolving any archive selections so a v1
+    // reference cannot be replayed with the v2 one-receipt shape (or vice
+    // versa).
+    const boundProvider = request.existingProviderOriginal
+      ? await loadProviderOriginalBinding(ctx.client, revision.id)
+      : null;
+    const requestedExistingProviderVersion =
+      request.existingProviderOriginal?.referenceVersion ??
+      "provider_original_v1";
+    if (
+      request.existingProviderOriginal &&
+      (!boundProvider ||
+        boundProvider.binding.spaceId !== source.spaceId ||
+        boundProvider.binding.sourceAccountId !== source.account.id ||
+        boundProvider.binding.sourceItemId !== current.item.id ||
+        boundProvider.reference.id !==
+          request.existingProviderOriginal.referenceId ||
+        boundProvider.reference.referenceVersion !==
+          requestedExistingProviderVersion ||
+        boundProvider.binding.bindingEpoch !==
+          request.existingProviderOriginal.bindingEpoch)
+    )
+      workerProtocolError("stale_observation");
     const artifact = await resolveParserArtifact(
       ctx,
       source,
@@ -1747,8 +1852,6 @@ export async function admitArchivedDiscovery(
     const originalBackup = byRole.get("original_bytes:independent_backup");
     const parserPrimary = byRole.get("parser_output:primary");
     const parserBackup = byRole.get("parser_output:independent_backup");
-    if (!originalPrimary || !parserPrimary || !parserBackup)
-      workerProtocolError("invalid_request");
     if (
       request.providerOriginal &&
       (request.providerOriginal.sourceContentHash !== revision.contentHash ||
@@ -1768,41 +1871,35 @@ export async function admitArchivedDiscovery(
           now: at(ctx.now)!,
         })
       : null;
-    // P2-104e. A later processing generation over bytes whose provider
-    // reference is already bound selects that binding. It is loaded from the
-    // revision this lease's own work row resolved to, never from the request,
-    // and the ids the client names must be the ones currently bound: a
-    // selection can only confirm what the server already holds for this item.
-    const boundProvider = request.existingProviderOriginal
-      ? await loadProviderOriginalBinding(ctx.client, revision.id)
-      : null;
-    if (
-      request.existingProviderOriginal &&
-      (!boundProvider ||
-        boundProvider.binding.spaceId !== source.spaceId ||
-        boundProvider.binding.sourceAccountId !== source.account.id ||
-        boundProvider.binding.sourceItemId !== current.item.id ||
-        boundProvider.reference.id !==
-          request.existingProviderOriginal.referenceId ||
-        boundProvider.binding.bindingEpoch !==
-          request.existingProviderOriginal.bindingEpoch)
-    )
-      workerProtocolError("stale_observation");
     const providerOriginal = declaredProvider ?? boundProvider;
+    const providerV2 =
+      providerOriginal?.reference.referenceVersion === "provider_original_v2";
+    if (!parserPrimary) workerProtocolError("invalid_request");
     if (
-      (!originalBackup && !providerOriginal) ||
-      (originalBackup && providerOriginal)
+      providerV2
+        ? Boolean(originalPrimary || originalBackup || parserBackup)
+        : !originalPrimary ||
+          !parserBackup ||
+          (!originalBackup && !providerOriginal) ||
+          Boolean(originalBackup && providerOriginal)
     )
       workerProtocolError("invalid_request");
     if (originalBackup)
       requireIndependentArchivePair(
-        originalPrimary.receipt,
+        originalPrimary!.receipt,
         originalBackup.receipt,
       );
-    requireIndependentArchivePair(parserPrimary.receipt, parserBackup.receipt);
+    if (parserBackup)
+      requireIndependentArchivePair(
+        parserPrimary.receipt,
+        parserBackup.receipt,
+      );
     const provider = providerOriginal
       ? {
-          reference: { id: providerOriginal.reference.id },
+          reference: {
+            id: providerOriginal.reference.id,
+            referenceVersion: providerOriginal.reference.referenceVersion,
+          },
           bindingEpoch: providerOriginal.binding.bindingEpoch,
         }
       : null;
@@ -1813,19 +1910,25 @@ export async function admitArchivedDiscovery(
       parserPrimary,
       parserBackup,
     );
-    const recovery: ArchiveRecovery = originalBackup
+    const recovery: ArchiveRecovery = providerV2
       ? {
-          originalPrimaryReceiptId: originalPrimary.receipt.id,
-          originalPrimaryBindingEpoch: originalPrimary.binding.bindingEpoch,
-          originalBackupReceiptId: originalBackup.receipt.id,
-          originalBackupBindingEpoch: originalBackup.binding.bindingEpoch,
-        }
-      : {
-          originalPrimaryReceiptId: originalPrimary.receipt.id,
-          originalPrimaryBindingEpoch: originalPrimary.binding.bindingEpoch,
           originalProviderReferenceId: providerOriginal!.reference.id,
           originalProviderBindingEpoch: providerOriginal!.binding.bindingEpoch,
-        };
+        }
+      : originalBackup
+        ? {
+            originalPrimaryReceiptId: originalPrimary!.receipt.id,
+            originalPrimaryBindingEpoch: originalPrimary!.binding.bindingEpoch,
+            originalBackupReceiptId: originalBackup.receipt.id,
+            originalBackupBindingEpoch: originalBackup.binding.bindingEpoch,
+          }
+        : {
+            originalPrimaryReceiptId: originalPrimary!.receipt.id,
+            originalPrimaryBindingEpoch: originalPrimary!.binding.bindingEpoch,
+            originalProviderReferenceId: providerOriginal!.reference.id,
+            originalProviderBindingEpoch:
+              providerOriginal!.binding.bindingEpoch,
+          };
     const textVersion = await createOrGetParsedTextVersion(ctx.client, {
       spaceId: source.spaceId,
       sourceRevisionId: revision.id,
@@ -1845,7 +1948,9 @@ export async function admitArchivedDiscovery(
       parsedText: request.parsedText,
       recovery,
       parserPrimaryReceiptId: parserPrimary.receipt.id,
-      parserBackupReceiptId: parserBackup.receipt.id,
+      ...(parserBackup
+        ? { parserBackupReceiptId: parserBackup.receipt.id }
+        : {}),
     });
     await exec(
       ctx,
