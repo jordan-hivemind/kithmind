@@ -180,6 +180,30 @@ export function SourcesTable({
       request("/api/kith/sources", "GET") as Promise<Page>,
     initialData: initial,
   });
+  // Older workers omit the alias advertisement. Keep their existing watched
+  // roots usable, scoped to this connection rather than borrowing other roots.
+  const sourcesWithAliases = useMemo(
+    () =>
+      data.sources.map((source) => ({
+        ...source,
+        allowedRootAliases:
+          source.allowedRootAliases.length > 0
+            ? source.allowedRootAliases
+            : [
+                ...new Set(
+                  data.roots
+                    .filter(
+                      (root) =>
+                        root.sourceAccountId === source.id &&
+                        root.state !== "retired",
+                    )
+                    .map((root) => root.rootAlias)
+                    .filter((alias): alias is string => alias !== null),
+                ),
+              ],
+      })),
+    [data.sources, data.roots],
+  );
   const mutate = useMutation<
     void,
     Error,
@@ -470,7 +494,7 @@ export function SourcesTable({
     ],
     [data.roots, data.sources, updateConnection, updateRoot],
   );
-  const canWatch = data.sources.some(
+  const canWatch = sourcesWithAliases.some(
     (source) => source.enabled && source.allowedRootAliases.length > 0,
   );
   return (
@@ -508,19 +532,21 @@ export function SourcesTable({
       ) : null}
       <WatchFolderDrawer
         draft={watchDraft}
-        sources={data.sources}
+        sources={sourcesWithAliases}
         areas={areas}
         onChange={setWatchDraft}
         onSave={createWatch}
       />
       <EditRootDrawer
+        key={editingRoot?.id ?? "closed"}
         root={editingRoot}
-        sources={data.sources}
+        sources={sourcesWithAliases}
         areas={areas}
         onClose={() => setEditingRoot(null)}
         onSave={editRoot}
       />
       <EditConnectionDrawer
+        key={editing?.id ?? "closed"}
         source={editing}
         onClose={() => setEditing(null)}
         onSave={(name) => {

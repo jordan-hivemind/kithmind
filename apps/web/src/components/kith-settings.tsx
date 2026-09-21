@@ -212,7 +212,8 @@ function DestinationSection({
       settings: { ...current.settings, defaultWriteSpaceId: spaceId },
     }),
   });
-  if (writableSpaces.length <= 1) return null;
+  // A revoked default still needs an explicit reset before captures can resume.
+  if (writableSpaces.length <= 1 && !unavailable) return null;
 
   return (
     <Section id="destination" title="Where new items are saved">

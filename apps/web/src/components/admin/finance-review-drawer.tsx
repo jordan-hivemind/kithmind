@@ -5,7 +5,7 @@ import type {
   FinanceReviewItem,
   FinanceReviewItemDetail,
 } from "@repo/finance-archive";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 
 import { Tag } from "@/components/ui/data-table";
@@ -81,6 +81,7 @@ export function FinanceReviewDrawer({
   onOpenChange: (open: boolean) => void;
   onChanged: (outcome: FinanceReviewActionOutcome) => void;
 }) {
+  const queryClient = useQueryClient();
   const { data, error } = useQuery({
     queryKey: ["finance-review-detail", item.id],
     queryFn: () => fetchDetail(item.id),
@@ -133,6 +134,10 @@ export function FinanceReviewDrawer({
       setProblem(caught instanceof Error ? caught.message : "Request failed");
     } finally {
       setBusy(false);
+      // Refresh the audit outcome and any state changed by a competing action.
+      void queryClient.invalidateQueries({
+        queryKey: ["finance-review-detail", item.id],
+      });
     }
   }
 
