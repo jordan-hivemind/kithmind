@@ -1167,6 +1167,161 @@ test(
 );
 
 test(
+  "a later safe projection closes only the open mismatch and remains stable",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    await client.query(
+      "INSERT INTO instruments (id, symbol) VALUES ('inst_original', 'ORG'), ('inst_recovered', 'RCV')",
+    );
+    const original = document("ab".padEnd(64, "0"), [], {
+      positions: [
+        position({ instrumentId: "inst_original", marketValueText: "100" }),
+      ],
+    });
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [original] },
+      NOW,
+    );
+    await authoritativeReparse(client, {
+      ...original,
+      positions: [
+        position({ instrumentId: "inst_original", marketValueText: "120" }),
+      ],
+    });
+
+    const recovered = {
+      ...original,
+      positions: [
+        position({
+          instrumentId: "inst_original",
+          marketValueText: "100",
+          sourceLocator: "verified",
+        }),
+        position({
+          instrumentId: "inst_recovered",
+          quantity: "2",
+          marketValueText: "40",
+          costBasis: "30",
+          unrealized: "10",
+          sourceLocator: "grounded-addition",
+        }),
+      ],
+    };
+    const first = await authoritativeReparse(client, recovered);
+    assert.equal(first.rowsInserted, 1);
+    assert.equal(first.reviewItemsResolved, 1);
+    assert.equal(
+      (
+        await one(client, "SELECT parsed_ok FROM documents WHERE sha256 = $1", [
+          original.sha256,
+        ])
+      ).parsed_ok,
+      true,
+    );
+    assert.equal(
+      await count(
+        client,
+        "review_items",
+        "WHERE kind = 'reparse_projection_mismatch' AND status = 'open'",
+      ),
+      0,
+    );
+    assert.equal(
+      await count(
+        client,
+        "review_items",
+        "WHERE kind = 'reparse_projection_mismatch' AND status = 'resolved'",
+      ),
+      1,
+    );
+
+    const repeat = await authoritativeReparse(client, recovered);
+    assert.equal(repeat.rowsInserted, 0);
+    assert.equal(repeat.reviewItemsResolved, 0);
+    assert.equal(await count(client, "positions"), 2);
+  },
+);
+
+test(
+  "authoritative activity is not replayed after a holdings mismatch makes parsed_ok false",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const original = document(
+      "ac".padEnd(64, "0"),
+      [row({ sourceLocator: "original" })],
+      {
+        positions: [position({ marketValueText: "100" })],
+      },
+    );
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [original] },
+      NOW,
+    );
+
+    const bad = {
+      ...original,
+      rows: [row({ sourceLocator: "reparsed" })],
+      positions: [position({ marketValueText: "120" })],
+    };
+    await authoritativeReparse(client, bad);
+    await authoritativeReparse(client, bad);
+    await authoritativeReparse(client, {
+      ...original,
+      rows: [row({ sourceLocator: "restored" })],
+    });
+
+    assert.equal(await count(client, "transactions"), 1);
+    assert.deepEqual(
+      await all(client, "SELECT source_locator FROM transactions"),
+      [{ source_locator: "original" }],
+    );
+  },
+);
+
+test(
+  "authoritative projection comparison canonicalizes equivalent stored decimals",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const original = document("ad".padEnd(64, "0"), [], {
+      positions: [position({ price: "10" })],
+    });
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [original] },
+      NOW,
+    );
+    await client.query("UPDATE positions SET price = '10.00'");
+
+    const summary = await authoritativeReparse(client, original);
+    assert.equal(summary.rowsInserted, 0);
+    assert.equal(
+      (
+        await one(client, "SELECT parsed_ok FROM documents WHERE sha256 = $1", [
+          original.sha256,
+        ])
+      ).parsed_ok,
+      true,
+    );
+    assert.equal(
+      await count(
+        client,
+        "review_items",
+        "WHERE kind = 'reparse_projection_mismatch'",
+      ),
+      0,
+    );
+  },
+);
+
+test(
   "authoritative reparse never borrows another document's hash provenance",
   { skip },
   async (t) => {

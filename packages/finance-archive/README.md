@@ -790,9 +790,12 @@ or a candidate hash currently owned by another document, leaves every old row
 and its evidence untouched, marks the document partial, and opens a
 `reparse_projection_mismatch` review item. Exact same-source replay may refresh
 its locator, and newly grounded rows may be added only after the complete
-three-table comparison passes. This is conservative because the current schema
-has no membership table that could prove a globally deduplicated holding also
-belongs to a second source document.
+three-table comparison passes. A later safe authoritative projection resolves
+the open mismatch item without changing dismissed or previously resolved
+history. Existing source-owned activity is never replayed merely because a
+holdings mismatch changed `parsed_ok` to false. This is conservative because
+the current schema has no membership table that could prove a globally
+deduplicated holding also belongs to a second source document.
 
 `scripts/nullNonCashAmounts.mjs` is what applies it. It reads the taxonomy off
 the adapter rather than naming activity types, so it cannot drift from the

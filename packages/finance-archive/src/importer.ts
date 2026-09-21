@@ -1825,6 +1825,20 @@ export async function importBatch(
 
   type HoldingTable = "positions" | "balances" | "liabilities";
 
+  const holdingNumericColumns = new Set([
+    "quantity",
+    "price",
+    "market_value",
+    "cost_basis",
+    "unrealized",
+    "total_value",
+    "cash",
+    "period_start_value",
+    "period_end_value",
+    "balance",
+    "rate",
+  ]);
+
   /**
    * An authoritative reparse may add newly grounded rows only when every row
    * this document already owns is restated exactly. The comparison covers all
@@ -1849,10 +1863,22 @@ export async function importBatch(
         column !== "source_locator",
     );
     const indexes = semanticColumns.map((column) => columns.indexOf(column));
+    const semanticValue = (column: string, value: unknown) => {
+      if (value === null || value === undefined) return null;
+      return holdingNumericColumns.has(column)
+        ? toNumericText(String(value))
+        : value;
+    };
     const keyFromValues = (values: readonly unknown[]) =>
-      JSON.stringify(indexes.map((index) => values[index] ?? null));
+      JSON.stringify(
+        indexes.map((index, position) =>
+          semanticValue(semanticColumns[position]!, values[index]),
+        ),
+      );
     const keyFromRow = (row: Record<string, unknown>) =>
-      JSON.stringify(semanticColumns.map((column) => row[column] ?? null));
+      JSON.stringify(
+        semanticColumns.map((column) => semanticValue(column, row[column])),
+      );
 
     const stored = await client.query<Record<string, unknown>>(
       `SELECT ${semanticColumns.join(", ")} FROM ${table} WHERE source_document_id = $1`,
@@ -2283,6 +2309,17 @@ export async function importBatch(
       }
 
       const documentId = existing?.id ?? randomUUID();
+      const hasPublishedActivity =
+        options.authoritativeReparse && existing !== undefined
+          ? (
+              await client.query<{ present: boolean }>(
+                `SELECT EXISTS (
+                   SELECT 1 FROM transactions WHERE source_document_id = $1
+                 ) AS present`,
+                [documentId],
+              )
+            ).rows[0]?.present === true
+          : false;
       if (!existing) {
         await client.query(
           `INSERT INTO documents
@@ -2426,11 +2463,13 @@ export async function importBatch(
         );
         reviewItemsResolved += resolved.rowCount ?? 0;
       }
-      if (options.authoritativeReparse && existing?.parsed_ok === true) {
+      if (options.authoritativeReparse && hasPublishedActivity) {
         // Activity occurrence ordinals were defined by the original import.
-        // A document-tier reparse is authoritative for parser status and
-        // holdings, but is not a new incremental activity batch and must not
-        // mint another occurrence or disturb transaction provenance.
+        // Once this source document owns activity, its later parser-status
+        // transitions cannot turn a document-tier reparse into a new
+        // incremental activity batch. `parsed_ok` is deliberately not this
+        // marker: a holdings mismatch sets it false without withdrawing the
+        // already-published activity provenance.
         rowsDeduplicated += document.rows.length;
         if (document.rows.length > 0) anySuccess = true;
       } else if (await importRows(document.rows, documentId, occurrences)) {
@@ -2446,6 +2485,23 @@ export async function importBatch(
       const holdings = await processHoldings(document, documentId);
       if (holdings.anySuccess) anySuccess = true;
       projectionSafe = holdings.projectionSafe;
+
+      if (options.authoritativeReparse && projectionSafe) {
+        const resolved = await client.query(
+          `UPDATE review_items
+              SET status = 'resolved', resolved_at = $2,
+                  resolution_note = $3
+            WHERE source_document_id = $1
+              AND kind = 'reparse_projection_mismatch'
+              AND status = 'open'`,
+          [
+            documentId,
+            now.toISOString(),
+            `resolved on reimport: the authoritative holdings projection now safely restates every stored row (import_runs.id=${importRunId})`,
+          ],
+        );
+        reviewItemsResolved += resolved.rowCount ?? 0;
+      }
 
       await flushReviews(documentId);
       await flushWeakInstrumentMatches(documentId);
