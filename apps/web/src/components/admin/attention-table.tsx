@@ -13,6 +13,7 @@
 // item leave quietly when it is not needed.
 
 import * as AlertDialog from "@radix-ui/react-alert-dialog";
+import type { FinanceReviewItem } from "@repo/finance-archive";
 import type { admin } from "@repo/kith-store";
 import {
   useInfiniteQuery,
@@ -22,6 +23,7 @@ import {
 import { type ColumnDef } from "@tanstack/react-table";
 import { useCallback, useMemo, useState } from "react";
 
+import { FinanceReviewDrawer } from "@/components/admin/finance-review-drawer";
 import { PageHeader } from "@/components/ui/controls";
 import {
   DataTable,
@@ -40,21 +42,32 @@ import type {
   DismissReason,
 } from "@/lib/kith/attention-schemas";
 import { SNOOZE_PRESETS_DAYS } from "@/lib/kith/attention-schemas";
+import {
+  type FinanceReviewPage,
+  financeReviewProblem,
+  financeReviewResolution,
+} from "@/lib/kith/finance-reviews";
 import { useLiveChanges } from "@/lib/kith/use-live-changes";
 
 const WATCHED = { attention: ["corrections", "attention_mutes"] } as const;
 const ATTENTION_KEY = ["attention"];
 
-type Item = admin.AttentionItem;
-type AttentionPage = { items: Item[]; nextCursor: string | null };
+type KithItem = admin.AttentionItem;
+type AttentionPage = { items: KithItem[]; nextCursor: string | null };
+type UnifiedItem =
+  | { id: string; source: "kith"; item: KithItem }
+  | { id: string; source: "finance"; item: FinanceReviewItem };
 
-const SEVERITY_TONE: Record<Item["severity"], "neutral" | "accent" | "warn"> = {
+const SEVERITY_TONE: Record<
+  KithItem["severity"],
+  "neutral" | "accent" | "warn"
+> = {
   info: "neutral",
   attention: "accent",
   alert: "warn",
 };
 
-const STATE_TONE: Record<Item["state"], "neutral" | "accent" | "warn"> = {
+const STATE_TONE: Record<KithItem["state"], "neutral" | "accent" | "warn"> = {
   open: "accent",
   snoozed: "neutral",
   dismissed: "neutral",
@@ -93,7 +106,7 @@ const REASON_COPY: Record<string, string> = {
     "The extraction returned conflicting values for the same field.",
 };
 
-function issueLabel(item: Item): string {
+function issueLabel(item: KithItem): string {
   if (item.detector === "investment_link_date") {
     return "Investment entry date changed";
   }
@@ -105,7 +118,7 @@ function issueLabel(item: Item): string {
   return `Couldn’t verify ${subject} in this ${kind}`;
 }
 
-function issueExplanation(item: Item): string {
+function issueExplanation(item: KithItem): string {
   if (item.detector === "investment_link_date") {
     return "A linked document changed this investment entry date.";
   }
@@ -142,6 +155,23 @@ async function fetchAttention(
   );
   if (!response.ok) throw new Error("attention fetch failed");
   return (await response.json()) as AttentionPage;
+}
+
+async function fetchFinanceReviews(
+  showEverything: boolean,
+  cursor?: string,
+): Promise<FinanceReviewPage> {
+  const params = new URLSearchParams({
+    status: showEverything ? "open,resolved,dismissed" : "open",
+  });
+  if (cursor !== undefined) params.set("cursor", cursor);
+  const response = await fetch(`/api/kith/finance-reviews?${params}`, {
+    headers: { "Content-Type": "application/json" },
+    cache: "no-store",
+  });
+  if (response.status === 404) return { items: [], nextCursor: null };
+  if (!response.ok) throw new Error("finance review fetch failed");
+  return (await response.json()) as FinanceReviewPage;
 }
 
 function todayPlusDays(days: number): string {
@@ -182,7 +212,7 @@ function AttentionDrawer({
   onSnooze,
   onUndo,
 }: {
-  item: Item;
+  item: KithItem;
   onOpenChange: (open: boolean) => void;
   onDismiss: (reason: DismissReason) => void;
   onSnooze: (until: string) => void;
@@ -282,7 +312,7 @@ export function AttentionTable({
   // the working queue look empty.
   const [showInfo, setShowInfo] = useState(true);
   const [showEverything, setShowEverything] = useState(false);
-  const [detailId, setDetailId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<UnifiedItem | null>(null);
   const [beforeDate, setBeforeDate] = useState("");
   const [confirmBeforeDate, setConfirmBeforeDate] = useState(false);
 
@@ -325,7 +355,43 @@ export function AttentionTable({
           }
         : undefined,
     });
-  const items = data?.pages.flatMap((page) => page.items) ?? [];
+  const kithItems = useMemo(
+    () => data?.pages.flatMap((page) => page.items) ?? [],
+    [data],
+  );
+  const {
+    data: financeData,
+    fetchNextPage: fetchNextFinancePage,
+    hasNextPage: hasNextFinancePage,
+    isFetchingNextPage: isFetchingNextFinancePage,
+    isPending: isFinancePending,
+    error: financeError,
+  } = useInfiniteQuery({
+    queryKey: ["finance-reviews", { showEverything }],
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ pageParam }) => fetchFinanceReviews(showEverything, pageParam),
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+    refetchInterval: 15_000,
+  });
+  const financeItems = useMemo(
+    () => financeData?.pages.flatMap((page) => page.items) ?? [],
+    [financeData],
+  );
+  const items = useMemo<UnifiedItem[]>(
+    () => [
+      ...financeItems.map((item) => ({
+        id: `finance:${item.id}`,
+        source: "finance" as const,
+        item,
+      })),
+      ...kithItems.map((item) => ({
+        id: `kith:${item.id}`,
+        source: "kith" as const,
+        item,
+      })),
+    ],
+    [financeItems, kithItems],
+  );
 
   const fail = useCallback((error: unknown) => {
     setToast(error instanceof Error ? error.message : "Request failed");
@@ -333,6 +399,10 @@ export function AttentionTable({
   }, []);
   const refresh = useCallback(
     () => queryClient.invalidateQueries({ queryKey: ATTENTION_KEY }),
+    [queryClient],
+  );
+  const refreshFinance = useCallback(
+    () => queryClient.invalidateQueries({ queryKey: ["finance-reviews"] }),
     [queryClient],
   );
 
@@ -428,42 +498,61 @@ export function AttentionTable({
     [spaceId, refresh, fail],
   );
 
-  const detail = items.find((item) => item.id === detailId) ?? null;
   const now = Date.now();
 
-  const columns = useMemo<ColumnDef<Item, unknown>[]>(
+  const columns = useMemo<ColumnDef<UnifiedItem, unknown>[]>(
     () => [
       {
         id: "severity",
         header: "Severity",
-        accessorFn: (row) => row.severity,
-        cell: ({ row }) => (
-          <Tag tone={SEVERITY_TONE[row.original.severity]}>
-            {row.original.severity}
-          </Tag>
-        ),
+        accessorFn: (row) =>
+          row.source === "finance" ? "attention" : row.item.severity,
+        cell: ({ row }) => {
+          const severity =
+            row.original.source === "finance"
+              ? "attention"
+              : row.original.item.severity;
+          return <Tag tone={SEVERITY_TONE[severity]}>{severity}</Tag>;
+        },
       },
       {
         id: "what",
         header: "Needs attention",
-        accessorFn: issueLabel,
+        accessorFn: (row) =>
+          row.source === "finance"
+            ? financeReviewProblem(row.item)
+            : issueLabel(row.item),
         cell: ({ row }) => (
           <Detail
             label={
               <span className="block max-w-[22rem] truncate">
-                {issueLabel(row.original)}
+                {row.original.source === "finance"
+                  ? financeReviewProblem(row.original.item)
+                  : issueLabel(row.original.item)}
               </span>
             }
-            detail={issueExplanation(row.original)}
+            detail={
+              row.original.source === "finance"
+                ? row.original.item.guidance.summary
+                : issueExplanation(row.original.item)
+            }
           />
         ),
       },
       {
         id: "resolution",
         header: "Resolution",
-        accessorFn: (row) => row.state,
+        accessorFn: (row) =>
+          row.source === "finance"
+            ? financeReviewResolution(row.item)
+            : row.item.state,
         cell: ({ row }) =>
-          row.original.state === "open" || row.original.state === "snoozed" ? (
+          row.original.source === "finance" ? (
+            <span className="whitespace-nowrap text-xs text-kith-text-muted">
+              {financeReviewResolution(row.original.item)}
+            </span>
+          ) : row.original.item.state === "open" ||
+            row.original.item.state === "snoozed" ? (
             <span className="whitespace-nowrap text-xs text-kith-text-muted">
               Not yet supported
             </span>
@@ -472,17 +561,27 @@ export function AttentionTable({
       {
         id: "document",
         header: "Document",
-        accessorFn: (row) => row.document?.title ?? "",
+        accessorFn: (row) =>
+          row.source === "finance"
+            ? (row.item.sourceDocumentId ?? "")
+            : (row.item.document?.title ?? ""),
         cell: ({ row }) =>
-          row.original.document === null ? null : (
+          row.original.source === "finance" ? (
+            row.original.item.sourceDocumentId === null ? null : (
+              <Detail
+                label={<span className="truncate">Finance source</span>}
+                detail={row.original.item.sourceDocumentId}
+              />
+            )
+          ) : row.original.item.document === null ? null : (
             <Detail
               label={
                 <span className="truncate">
-                  {row.original.document.title ??
-                    row.original.document.sourceItemId}
+                  {row.original.item.document.title ??
+                    row.original.item.document.sourceItemId}
                 </span>
               }
-              detail={row.original.document.uri}
+              detail={row.original.item.document.uri}
             />
           ),
       },
@@ -490,90 +589,149 @@ export function AttentionTable({
         id: "age",
         header: "Age",
         meta: { nowrap: true },
-        accessorFn: (row) => row.createdAt,
-        cell: ({ row }) => (
-          <span className="tabular-nums text-gray-500">
-            {ageLabel(row.original.createdAt, now)}
-          </span>
-        ),
+        accessorFn: (row) =>
+          row.source === "finance" ? 0 : row.item.createdAt,
+        cell: ({ row }) =>
+          row.original.source === "finance" ? null : (
+            <span className="tabular-nums text-gray-500">
+              {ageLabel(row.original.item.createdAt, now)}
+            </span>
+          ),
       },
       {
         id: "state",
         header: "State",
-        accessorFn: (row) => row.state,
-        cell: ({ row }) => (
-          <Tag tone={STATE_TONE[row.original.state]}>{row.original.state}</Tag>
-        ),
+        accessorFn: (row) =>
+          row.source === "finance" ? row.item.status : row.item.state,
+        cell: ({ row }) => {
+          const state =
+            row.original.source === "finance"
+              ? row.original.item.status
+              : row.original.item.state;
+          return <Tag tone={STATE_TONE[state]}>{state}</Tag>;
+        },
+      },
+      {
+        id: "source",
+        header: "Source",
+        accessorFn: (row) => row.source,
+        cell: ({ row }) => <Tag>{row.original.source}</Tag>,
       },
     ],
     [now],
   );
 
-  const actions = useMemo<RowAction<Item>[]>(
+  const actions = useMemo<RowAction<UnifiedItem>[]>(
     () => [
-      { label: "Review", onSelect: (item) => setDetailId(item.id) },
+      { label: "Review", onSelect: setDetail },
       {
         label: "Mark not needed",
         hidden: (item) =>
-          item.state === "dismissed" || item.state === "resolved",
-        onSelect: (item) => void dismissOne(item.id, "not_worth_backfilling"),
+          item.source === "finance" ||
+          item.item.state === "dismissed" ||
+          item.item.state === "resolved",
+        onSelect: (item) => {
+          if (item.source === "kith") {
+            void dismissOne(item.item.id, "not_worth_backfilling");
+          }
+        },
       },
       {
         label: "Snooze 7 days",
         hidden: (item) =>
-          item.state === "dismissed" || item.state === "resolved",
-        onSelect: (item) => void snoozeOne(item.id, todayPlusDays(7)),
+          item.source === "finance" ||
+          item.item.state === "dismissed" ||
+          item.item.state === "resolved",
+        onSelect: (item) => {
+          if (item.source === "kith")
+            void snoozeOne(item.item.id, todayPlusDays(7));
+        },
       },
       {
         label: "Snooze 30 days",
         hidden: (item) =>
-          item.state === "dismissed" || item.state === "resolved",
-        onSelect: (item) => void snoozeOne(item.id, todayPlusDays(30)),
+          item.source === "finance" ||
+          item.item.state === "dismissed" ||
+          item.item.state === "resolved",
+        onSelect: (item) => {
+          if (item.source === "kith")
+            void snoozeOne(item.item.id, todayPlusDays(30));
+        },
       },
       {
         label: "Mute this detector",
-        hidden: (item) => item.state === "resolved",
-        onSelect: (item) => void mute("detector", item.detector),
+        hidden: (item) =>
+          item.source === "finance" || item.item.state === "resolved",
+        onSelect: (item) => {
+          if (item.source === "kith") void mute("detector", item.item.detector);
+        },
       },
       {
         label: "Mute this document kind",
         hidden: (item) =>
-          item.document?.kind == null || item.state === "resolved",
-        onSelect: (item) => void mute("document_kind", item.document!.kind!),
+          item.source === "finance" ||
+          item.item.document?.kind == null ||
+          item.item.state === "resolved",
+        onSelect: (item) => {
+          if (item.source === "kith" && item.item.document?.kind != null) {
+            void mute("document_kind", item.item.document.kind);
+          }
+        },
       },
       {
         label: "Undo",
-        hidden: (item) => item.state !== "dismissed",
-        onSelect: (item) => void undoOne(item.id),
+        hidden: (item) =>
+          item.source === "finance" || item.item.state !== "dismissed",
+        onSelect: (item) => {
+          if (item.source === "kith") void undoOne(item.item.id);
+        },
       },
     ],
     [dismissOne, snoozeOne, undoOne, mute],
   );
 
-  const bulkActions = useMemo<RowAction<Item[]>[]>(
+  const bulkActions = useMemo<RowAction<UnifiedItem[]>[]>(
     () => [
       {
         label: "Mark selected not needed",
         danger: true,
+        hidden: (rows) => rows.some((row) => row.source === "finance"),
         onSelect: (rows) =>
           void dismissByFilter(
-            { kind: "ids", ids: rows.map((item) => item.id) },
+            {
+              kind: "ids",
+              ids: rows.flatMap((row) =>
+                row.source === "kith" ? [row.item.id] : [],
+              ),
+            },
             "not_worth_backfilling",
           ),
       },
       {
         label: "Snooze 7 days",
+        hidden: (rows) => rows.some((row) => row.source === "finance"),
         onSelect: (rows) =>
           void snoozeByFilter(
-            { kind: "ids", ids: rows.map((item) => item.id) },
+            {
+              kind: "ids",
+              ids: rows.flatMap((row) =>
+                row.source === "kith" ? [row.item.id] : [],
+              ),
+            },
             todayPlusDays(7),
           ),
       },
       {
         label: "Snooze 30 days",
+        hidden: (rows) => rows.some((row) => row.source === "finance"),
         onSelect: (rows) =>
           void snoozeByFilter(
-            { kind: "ids", ids: rows.map((item) => item.id) },
+            {
+              kind: "ids",
+              ids: rows.flatMap((row) =>
+                row.source === "kith" ? [row.item.id] : [],
+              ),
+            },
             todayPlusDays(30),
           ),
       },
@@ -617,20 +775,33 @@ export function AttentionTable({
             {toast}
           </span>
         )}
+        {financeError === null ? null : (
+          <span
+            role="alert"
+            className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-meta text-amber-800"
+          >
+            Finance reviews unavailable
+          </span>
+        )}
       </div>
 
       <DataTable
         id="admin-attention"
         data={items}
         columns={columns}
-        filterColumns={["detector", "state"]}
+        filterColumns={["source", "state"]}
         initialSorting={[{ id: "age", desc: true }]}
         actions={actions}
         selectable
+        getRowId={(item) => item.id}
         bulkActions={bulkActions}
-        onRowClick={(item) => setDetailId(item.id)}
+        onRowClick={setDetail}
         searchPlaceholder="Search attention items"
-        empty="Nothing needs attention"
+        empty={
+          isFinancePending
+            ? "Loading finance reviews…"
+            : "Nothing needs attention"
+        }
         toolbar={
           <>
             <input
@@ -652,36 +823,49 @@ export function AttentionTable({
         }
       />
 
-      {hasNextPage ? (
+      {hasNextPage || hasNextFinancePage ? (
         <div>
           <button
             type="button"
             className={buttonClass}
-            disabled={isFetchingNextPage}
-            onClick={() => void fetchNextPage()}
+            disabled={isFetchingNextPage || isFetchingNextFinancePage}
+            onClick={() => {
+              if (hasNextPage) void fetchNextPage();
+              if (hasNextFinancePage) void fetchNextFinancePage();
+            }}
           >
-            {isFetchingNextPage ? "Loading…" : "Load more"}
+            {isFetchingNextPage || isFetchingNextFinancePage
+              ? "Loading…"
+              : "Load more"}
           </button>
         </div>
       ) : null}
 
-      {detail === null ? null : (
-        <AttentionDrawer
-          item={detail}
+      {detail === null ? null : detail.source === "finance" ? (
+        <FinanceReviewDrawer
+          item={detail.item}
           onOpenChange={(open) => {
-            if (!open) setDetailId(null);
+            if (!open) setDetail(null);
+          }}
+          onChanged={() => void refreshFinance()}
+        />
+      ) : (
+        <AttentionDrawer
+          item={detail.item}
+          onOpenChange={(open) => {
+            if (!open) setDetail(null);
           }}
           onDismiss={(reason) => {
-            setDetailId(null);
-            void dismissOne(detail.id, reason);
+            setDetail(null);
+            void dismissOne(detail.item.id, reason);
           }}
           onSnooze={(until) => {
-            setDetailId(null);
-            void snoozeOne(detail.id, until);
+            setDetail(null);
+            void snoozeOne(detail.item.id, until);
           }}
           onUndo={() => {
-            setDetailId(null);
-            void undoOne(detail.id);
+            setDetail(null);
+            void undoOne(detail.item.id);
           }}
         />
       )}
