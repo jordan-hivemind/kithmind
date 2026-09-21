@@ -11,6 +11,8 @@ type DocumentMetadata = {
   mimeType: string | null;
   contentAvailable: boolean;
   textAvailable: boolean;
+  originalUnavailableReason?: string | null;
+  pages?: Array<{ pageNumber: number; text: string }>;
 };
 
 export type DocumentReference = {
@@ -56,7 +58,8 @@ export function DocumentViewer({
       })
       .then(setMetadata)
       .catch((error: unknown) => {
-        if (error instanceof DOMException && error.name === "AbortError") return;
+        if (error instanceof DOMException && error.name === "AbortError")
+          return;
         setFailed(true);
       });
 
@@ -64,7 +67,6 @@ export function DocumentViewer({
   }, [document, open]);
 
   const title = metadata?.title ?? document?.title ?? "Document";
-  const available = metadata?.contentAvailable || metadata?.textAvailable;
   const viewerUrl = document === null ? "" : documentUrl(document.sourceItemId);
   const downloadUrl =
     document === null ? "" : documentUrl(document.sourceItemId, true);
@@ -95,14 +97,20 @@ export function DocumentViewer({
           </div>
           <div className="min-h-0 flex-1 bg-kith-surface-muted p-3">
             {metadata === null && !failed ? (
-              <div role="status" className="flex h-full items-center justify-center text-sm text-kith-text-muted">
+              <div
+                role="status"
+                className="flex h-full items-center justify-center text-sm text-kith-text-muted"
+              >
                 Loading document…
               </div>
-            ) : failed || !available ? (
-              <div role="status" className="flex h-full items-center justify-center text-sm text-kith-text-muted">
+            ) : failed ? (
+              <div
+                role="status"
+                className="flex h-full items-center justify-center text-sm text-kith-text-muted"
+              >
                 Document content is unavailable.
               </div>
-            ) : (
+            ) : metadata?.contentAvailable ? (
               <iframe
                 key={viewerUrl}
                 src={viewerUrl}
@@ -110,6 +118,35 @@ export function DocumentViewer({
                 className="h-full w-full rounded-control border border-kith-border-subtle bg-kith-surface"
                 sandbox=""
               />
+            ) : metadata?.textAvailable && metadata.pages !== undefined ? (
+              <div className="h-full overflow-y-auto rounded-control border border-kith-border-subtle bg-kith-surface p-5 text-[15px] leading-6 text-kith-text">
+                {metadata.pages.map((page, index) => (
+                  <section
+                    key={page.pageNumber}
+                    aria-label={`Page ${page.pageNumber}`}
+                    className={
+                      index === metadata.pages!.length - 1
+                        ? ""
+                        : "mb-6 border-b border-kith-border-subtle pb-6"
+                    }
+                  >
+                    <h2 className="mb-3 text-meta font-medium text-kith-text-muted">
+                      Page {page.pageNumber}
+                    </h2>
+                    <pre className="font-sans whitespace-pre-wrap break-words">
+                      {page.text}
+                    </pre>
+                  </section>
+                ))}
+              </div>
+            ) : (
+              <div
+                role="status"
+                className="flex h-full items-center justify-center text-sm text-kith-text-muted"
+              >
+                {metadata?.originalUnavailableReason ??
+                  "Document content is unavailable."}
+              </div>
             )}
           </div>
         </Dialog.Content>

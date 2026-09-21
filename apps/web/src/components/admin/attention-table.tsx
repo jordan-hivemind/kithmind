@@ -32,8 +32,8 @@ import {
   Tag,
 } from "@/components/ui/data-table";
 import {
-  DocumentViewer,
   type DocumentReference,
+  DocumentViewer,
 } from "@/components/ui/document-viewer";
 import {
   buttonClass,
@@ -246,7 +246,10 @@ function AttentionDrawer({
             <span className="text-gray-400">Document</span>{" "}
             <button
               type="button"
-              onClick={() => onOpenDocument(item.document!)}
+              onClick={(event) => {
+                event.stopPropagation();
+                onOpenDocument(item.document!);
+              }}
               className="text-left text-accent-700 underline-offset-2 hover:underline"
             >
               {item.document.title ?? item.document.sourceItemId}
@@ -587,26 +590,33 @@ export function AttentionTable({
           row.source === "finance"
             ? (row.item.sourceDocumentId ?? "")
             : (row.item.document?.title ?? ""),
-        cell: ({ row }) =>
-          row.original.source === "finance" ? (
-            row.original.item.sourceDocumentId === null ? null : (
+        cell: ({ row }) => {
+          const item = row.original;
+          if (item.source === "finance") {
+            return item.item.sourceDocumentId === null ? null : (
               <Detail
                 label={<span className="truncate">Finance source</span>}
-                detail={row.original.item.sourceDocumentId}
+                detail={item.item.sourceDocumentId}
               />
-            )
-          ) : row.original.item.document === null ? null : (
+            );
+          }
+          const document = item.item.document;
+          if (document === null) return null;
+          return (
             <button
               type="button"
               data-row-click-ignore
-              title={row.original.item.document.uri ?? undefined}
-              onClick={() => setDocument(row.original.item.document)}
+              title={document.uri ?? undefined}
+              onClick={(event) => {
+                event.stopPropagation();
+                setDocument(document);
+              }}
               className="block w-full truncate text-left text-accent-700 underline-offset-2 hover:underline"
             >
-              {row.original.item.document.title ??
-                row.original.item.document.sourceItemId}
+              {document.title ?? document.sourceItemId}
             </button>
-          ),
+          );
+        },
       },
       {
         id: "age",
