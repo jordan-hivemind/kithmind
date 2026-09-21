@@ -368,3 +368,164 @@ test("discovery.recordPreview rejects ambiguous unit coverage and open metadata"
     );
   }
 });
+
+const archivedAdmissionReceipt = (subjectKind, copyRole, suffix) => ({
+  kind: "create",
+  subjectKind,
+  copyRole,
+  clientReceiptId: `01890a5d-ac96-7cc4-bb7e-6f4f5ca5c1${suffix}`,
+  archiveProfileFingerprint: "1".repeat(64),
+  archiveIdentityFingerprint: "2".repeat(64),
+  recipientFingerprint: "3".repeat(64),
+  repositoryKeyDomainFingerprint: "4".repeat(64),
+  storageFailureDomainFingerprint: "5".repeat(64),
+  archiveObjectId: `01890a5d-ac96-7cc4-bb7e-6f4f5ca5d1${suffix}`,
+  ciphertextHash: "6".repeat(64),
+  ciphertextByteLength: 32,
+  readbackVerifiedAt: 1_758_196_800_000,
+  createdAt: 1_758_196_800_000,
+});
+
+const providerV2Admission = {
+  ...source,
+  operation: "discovery.admitArchived",
+  requestId: "provider-v2-admission",
+  workId: "j1234567890123456789012345678903",
+  leaseEpoch: 1,
+  leaseToken: "7".repeat(64),
+  parserArtifact: {
+    kind: "create",
+    clientArtifactId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c140",
+    outputHash: "8".repeat(64),
+    outputByteLength: 20,
+    outputMediaType: "application/vnd.docling+json",
+    createdAt: 1_758_196_800_000,
+  },
+  archives: [archivedAdmissionReceipt("parser_output", "primary", "41")],
+  parsedText: {
+    extractionFingerprint: "9".repeat(64),
+    textHash: "a".repeat(64),
+    byteLength: 8,
+    utf16Length: 8,
+    pageCount: 1,
+    mappingManifestHash: "b".repeat(64),
+    normalizedBundleDigest: "c".repeat(64),
+    expectedEvidenceSpanCount: 1,
+    expectedDocumentCount: 1,
+    expectedChunkCount: 1,
+  },
+  providerOriginal: {
+    referenceVersion: "provider_original_v2",
+    providerKind: "dropbox_v1",
+    clientReferenceId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c149",
+    sourceContentHash: "d".repeat(64),
+    sourceByteLength: 10,
+    providerAccountIdHash: "e".repeat(64),
+    providerRootDirectoryIdHash: "f".repeat(64),
+    providerFileIdHash: "0".repeat(64),
+    providerRevision: "rev-synthetic-provider",
+    providerContentHash: "1".repeat(64),
+    verifiedAt: 1_758_196_800_000,
+    createdAt: 1_758_196_800_000,
+  },
+};
+
+test("provider original v2 admits exactly one parser primary and no locator bundle", () => {
+  assert.deepEqual(parseWorkerRequest(providerV2Admission), providerV2Admission);
+  assert.throws(
+    () =>
+      parseWorkerRequest({
+        ...providerV2Admission,
+        providerOriginal: {
+          ...providerV2Admission.providerOriginal,
+          locatorBundle: {},
+        },
+      }),
+    WorkerProtocolParseError,
+  );
+  assert.throws(
+    () =>
+      parseWorkerRequest({
+        ...providerV2Admission,
+        archives: [
+          archivedAdmissionReceipt("original_bytes", "primary", "42"),
+          ...providerV2Admission.archives,
+          archivedAdmissionReceipt(
+            "parser_output",
+            "independent_backup",
+            "43",
+          ),
+        ],
+      }),
+    WorkerProtocolParseError,
+  );
+});
+
+test("existing provider original selection binds archive cardinality to its version", () => {
+  const { providerOriginal: _, ...base } = providerV2Admission;
+  const selectedV2 = {
+    ...base,
+    existingProviderOriginal: {
+      referenceVersion: "provider_original_v2",
+      referenceId: "j1234567890123456789012345678904",
+      bindingEpoch: 0,
+    },
+  };
+  assert.deepEqual(parseWorkerRequest(selectedV2), selectedV2);
+  assert.throws(
+    () =>
+      parseWorkerRequest({
+        ...selectedV2,
+        existingProviderOriginal: {
+          referenceId: "j1234567890123456789012345678904",
+          bindingEpoch: 0,
+        },
+      }),
+    WorkerProtocolParseError,
+  );
+  const selectedV1 = {
+    ...base,
+    archives: [
+      archivedAdmissionReceipt("original_bytes", "primary", "42"),
+      ...base.archives,
+      archivedAdmissionReceipt(
+        "parser_output",
+        "independent_backup",
+        "43",
+      ),
+    ],
+    existingProviderOriginal: {
+      referenceId: "j1234567890123456789012345678904",
+      bindingEpoch: 0,
+    },
+  };
+  assert.deepEqual(parseWorkerRequest(selectedV1), selectedV1);
+  const explicitV1 = {
+    ...selectedV1,
+    existingProviderOriginal: {
+      ...selectedV1.existingProviderOriginal,
+      referenceVersion: "provider_original_v1",
+    },
+  };
+  assert.deepEqual(parseWorkerRequest(explicitV1), explicitV1);
+});
+
+test("provider original v2 detach acknowledgement is locator-free and closed", () => {
+  const request = {
+    ...source,
+    operation: "providerOriginal.ackDetach",
+    requestId: "provider-v2-detach",
+    sourceItemId: "j1234567890123456789012345678903",
+    expectedForgetEpoch: 1,
+    detachId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c140",
+    referenceId: "j1234567890123456789012345678904",
+    referenceVersion: "provider_original_v2",
+    referenceOutcome: "detached",
+    providerSourceOutcome: "retained_unchanged",
+  };
+  assert.deepEqual(parseWorkerRequest(request), request);
+  assert.throws(
+    () => parseWorkerRequest({ ...request, locatorObjectName: "forbidden.age" }),
+    WorkerProtocolParseError,
+  );
+});

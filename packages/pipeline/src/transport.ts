@@ -969,18 +969,23 @@ function archivedLookup(value: Record<string, unknown>): void {
         failure("existingParserArtifact is not a processing answer");
       }
       const artifact = record(value.existingParserArtifact);
-      exact(artifact, [
-        "parserArtifactId",
-        "primaryReceiptId",
-        "primaryBindingEpoch",
-        "backupReceiptId",
-        "backupBindingEpoch",
-      ]);
+      exact(
+        artifact,
+        ["parserArtifactId", "primaryReceiptId", "primaryBindingEpoch"],
+        ["backupReceiptId", "backupBindingEpoch"],
+      );
       id(artifact.parserArtifactId, "parserArtifactId");
       id(artifact.primaryReceiptId, "primaryReceiptId");
       integer(artifact.primaryBindingEpoch, "primaryBindingEpoch", 0);
-      id(artifact.backupReceiptId, "backupReceiptId");
-      integer(artifact.backupBindingEpoch, "backupBindingEpoch", 0);
+      if (
+        (artifact.backupReceiptId === undefined) !==
+        (artifact.backupBindingEpoch === undefined)
+      )
+        failure("parser backup selection is incomplete");
+      if (artifact.backupReceiptId !== undefined) {
+        id(artifact.backupReceiptId, "backupReceiptId");
+        integer(artifact.backupBindingEpoch, "backupBindingEpoch", 0);
+      }
     }
     return;
   }
@@ -989,24 +994,28 @@ function archivedLookup(value: Record<string, unknown>): void {
     const provider =
       "originalProviderReferenceId" in value ||
       "originalProviderBindingEpoch" in value;
+    const providerV2 = provider && !("originalPrimaryReceiptId" in value);
     exact(value, [
       "operation",
       "mode",
       "found",
       "sourceRevisionId",
-      "originalPrimaryReceiptId",
-      "originalPrimaryBindingEpoch",
+      ...(providerV2
+        ? []
+        : ["originalPrimaryReceiptId", "originalPrimaryBindingEpoch"]),
       ...(provider
         ? ["originalProviderReferenceId", "originalProviderBindingEpoch"]
         : ["originalBackupReceiptId", "originalBackupBindingEpoch"]),
     ]);
     id(value.sourceRevisionId, "sourceRevisionId");
-    id(value.originalPrimaryReceiptId, "originalPrimaryReceiptId");
-    integer(
-      value.originalPrimaryBindingEpoch,
-      "originalPrimaryBindingEpoch",
-      0,
-    );
+    if (!providerV2) {
+      id(value.originalPrimaryReceiptId, "originalPrimaryReceiptId");
+      integer(
+        value.originalPrimaryBindingEpoch,
+        "originalPrimaryBindingEpoch",
+        0,
+      );
+    }
     if (provider) {
       id(value.originalProviderReferenceId, "originalProviderReferenceId");
       integer(
@@ -1027,6 +1036,7 @@ function archivedLookup(value: Record<string, unknown>): void {
   const provider =
     "originalProviderReferenceId" in value ||
     "originalProviderBindingEpoch" in value;
+  const providerV2 = provider && !("originalPrimaryReceiptId" in value);
   exact(value, [
     "operation",
     "mode",
@@ -1038,15 +1048,17 @@ function archivedLookup(value: Record<string, unknown>): void {
     "ingestJobId",
     "desiredProcessingEpoch",
     "archiveSetDigest",
-    "originalPrimaryReceiptId",
-    "originalPrimaryBindingEpoch",
+    ...(providerV2
+      ? []
+      : ["originalPrimaryReceiptId", "originalPrimaryBindingEpoch"]),
     ...(provider
       ? ["originalProviderReferenceId", "originalProviderBindingEpoch"]
       : ["originalBackupReceiptId", "originalBackupBindingEpoch"]),
     "parserPrimaryReceiptId",
     "parserPrimaryBindingEpoch",
-    "parserBackupReceiptId",
-    "parserBackupBindingEpoch",
+    ...(providerV2
+      ? []
+      : ["parserBackupReceiptId", "parserBackupBindingEpoch"]),
   ]);
   for (const field of [
     "sourceRevisionId",
@@ -1054,24 +1066,24 @@ function archivedLookup(value: Record<string, unknown>): void {
     "sourceTextVersionId",
     "processingGenerationId",
     "ingestJobId",
-    "originalPrimaryReceiptId",
+    ...(providerV2 ? [] : ["originalPrimaryReceiptId"]),
     ...(provider
       ? ["originalProviderReferenceId"]
       : ["originalBackupReceiptId"]),
     "parserPrimaryReceiptId",
-    "parserBackupReceiptId",
+    ...(providerV2 ? [] : ["parserBackupReceiptId"]),
   ]) {
     id(value[field], field);
   }
   integer(value.desiredProcessingEpoch, "desiredProcessingEpoch");
   digest(value.archiveSetDigest, "archiveSetDigest");
   for (const field of [
-    "originalPrimaryBindingEpoch",
+    ...(providerV2 ? [] : ["originalPrimaryBindingEpoch"]),
     ...(provider
       ? ["originalProviderBindingEpoch"]
       : ["originalBackupBindingEpoch"]),
     "parserPrimaryBindingEpoch",
-    "parserBackupBindingEpoch",
+    ...(providerV2 ? [] : ["parserBackupBindingEpoch"]),
   ]) {
     integer(value[field], field, 0);
   }
@@ -1081,6 +1093,7 @@ function archivedAdmit(value: Record<string, unknown>): void {
   const provider =
     "originalProviderReferenceId" in value ||
     "originalProviderBindingEpoch" in value;
+  const providerV2 = provider && !("originalPrimaryReceiptId" in value);
   exact(value, [
     "operation",
     "workId",
@@ -1092,15 +1105,17 @@ function archivedAdmit(value: Record<string, unknown>): void {
     "ingestJobId",
     "desiredProcessingEpoch",
     "archiveSetDigest",
-    "originalPrimaryReceiptId",
-    "originalPrimaryBindingEpoch",
+    ...(providerV2
+      ? []
+      : ["originalPrimaryReceiptId", "originalPrimaryBindingEpoch"]),
     ...(provider
       ? ["originalProviderReferenceId", "originalProviderBindingEpoch"]
       : ["originalBackupReceiptId", "originalBackupBindingEpoch"]),
     "parserPrimaryReceiptId",
     "parserPrimaryBindingEpoch",
-    "parserBackupReceiptId",
-    "parserBackupBindingEpoch",
+    ...(providerV2
+      ? []
+      : ["parserBackupReceiptId", "parserBackupBindingEpoch"]),
     "state",
     "reused",
   ]);
@@ -1112,24 +1127,24 @@ function archivedAdmit(value: Record<string, unknown>): void {
     "sourceTextVersionId",
     "processingGenerationId",
     "ingestJobId",
-    "originalPrimaryReceiptId",
+    ...(providerV2 ? [] : ["originalPrimaryReceiptId"]),
     ...(provider
       ? ["originalProviderReferenceId"]
       : ["originalBackupReceiptId"]),
     "parserPrimaryReceiptId",
-    "parserBackupReceiptId",
+    ...(providerV2 ? [] : ["parserBackupReceiptId"]),
   ]) {
     id(value[field], field);
   }
   integer(value.desiredProcessingEpoch, "desiredProcessingEpoch");
   digest(value.archiveSetDigest, "archiveSetDigest");
   for (const field of [
-    "originalPrimaryBindingEpoch",
+    ...(providerV2 ? [] : ["originalPrimaryBindingEpoch"]),
     ...(provider
       ? ["originalProviderBindingEpoch"]
       : ["originalBackupBindingEpoch"]),
     "parserPrimaryBindingEpoch",
-    "parserBackupBindingEpoch",
+    ...(providerV2 ? [] : ["parserBackupBindingEpoch"]),
   ]) {
     integer(value[field], field, 0);
   }

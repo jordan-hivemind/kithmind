@@ -453,16 +453,30 @@ export type WorkerRequest =
       expectedForgetEpoch: number;
       detachId: string;
       referenceId: string;
-      locatorBindingId: string;
-      locatorRepositoryId: string;
-      locatorSnapshotId: string;
-      locatorObjectName: string;
       referenceOutcome: "detached" | "already_detached";
-      locatorBundleOutcome: ArchiveDeletionOutcome;
-      locatorAbsenceAuthority: "worker_asserted_live_repository_absence";
-      retentionDisclosure: ArchiveDeletionRetentionDisclosure;
       providerSourceOutcome: "retained_unchanged";
-    })
+    } & (
+        | {
+            referenceVersion?: "provider_original_v1";
+            locatorBindingId: string;
+            locatorRepositoryId: string;
+            locatorSnapshotId: string;
+            locatorObjectName: string;
+            locatorBundleOutcome: ArchiveDeletionOutcome;
+            locatorAbsenceAuthority: "worker_asserted_live_repository_absence";
+            retentionDisclosure: ArchiveDeletionRetentionDisclosure;
+          }
+        | {
+            referenceVersion: "provider_original_v2";
+            locatorBindingId?: never;
+            locatorRepositoryId?: never;
+            locatorSnapshotId?: never;
+            locatorObjectName?: never;
+            locatorBundleOutcome?: never;
+            locatorAbsenceAuthority?: never;
+            retentionDisclosure?: never;
+          }
+      ))
   | (WorkerSourceRequest & {
       operation: "source.inventoryPage";
       scanId: string;
@@ -590,7 +604,12 @@ export type WorkerRequest =
        * `providerOriginal`, and like it stands in for the original's
        * independent backup receipt.
        */
-      existingProviderOriginal?: { referenceId: string; bindingEpoch: number };
+      existingProviderOriginal?: {
+        referenceId: string;
+        bindingEpoch: number;
+        /** Absent is the legacy v1 selector shape. */
+        referenceVersion?: "provider_original_v1" | "provider_original_v2";
+      };
     })
   | (WorkerSourceRequest & {
       operation: "jobs.reserve";
@@ -1041,6 +1060,28 @@ export type WorkerOriginalRecoverySelection =
       originalProviderBindingEpoch: number;
       originalBackupReceiptId?: never;
       originalBackupBindingEpoch?: never;
+    }
+  | {
+      originalProviderReferenceId: string;
+      originalProviderBindingEpoch: number;
+      originalPrimaryReceiptId?: never;
+      originalPrimaryBindingEpoch?: never;
+      originalBackupReceiptId?: never;
+      originalBackupBindingEpoch?: never;
+    };
+
+export type WorkerParserRecoverySelection =
+  | {
+      parserPrimaryReceiptId: string;
+      parserPrimaryBindingEpoch: number;
+      parserBackupReceiptId: string;
+      parserBackupBindingEpoch: number;
+    }
+  | {
+      parserPrimaryReceiptId: string;
+      parserPrimaryBindingEpoch: number;
+      parserBackupReceiptId?: never;
+      parserBackupBindingEpoch?: never;
     };
 
 /**
@@ -1061,9 +1102,10 @@ export type WorkerExistingParserArtifact = {
   parserArtifactId: string;
   primaryReceiptId: string;
   primaryBindingEpoch: number;
-  backupReceiptId: string;
-  backupBindingEpoch: number;
-};
+} & (
+  | { backupReceiptId: string; backupBindingEpoch: number }
+  | { backupReceiptId?: never; backupBindingEpoch?: never }
+);
 
 export type WorkerArchivedLookupResult =
   | (
@@ -1091,11 +1133,8 @@ export type WorkerArchivedLookupResult =
       ingestJobId: string;
       desiredProcessingEpoch: number;
       archiveSetDigest: string;
-      parserPrimaryReceiptId: string;
-      parserPrimaryBindingEpoch: number;
-      parserBackupReceiptId: string;
-      parserBackupBindingEpoch: number;
-    } & WorkerOriginalRecoverySelection);
+    } & WorkerOriginalRecoverySelection &
+      WorkerParserRecoverySelection);
 
 export type WorkerArchivedAdmitResult = {
   operation: "discovery.admitArchived";
@@ -1108,13 +1147,10 @@ export type WorkerArchivedAdmitResult = {
   ingestJobId: string;
   desiredProcessingEpoch: number;
   archiveSetDigest: string;
-  parserPrimaryReceiptId: string;
-  parserPrimaryBindingEpoch: number;
-  parserBackupReceiptId: string;
-  parserBackupBindingEpoch: number;
   state: "admitted";
   reused: boolean;
-} & WorkerOriginalRecoverySelection;
+} & WorkerOriginalRecoverySelection &
+  WorkerParserRecoverySelection;
 
 export type WorkerJobReserveResult = {
   operation: "jobs.reserve";
@@ -1301,7 +1337,7 @@ export type WorkerArchiveAckDeletionResult = WorkerArchiveDeletionAckSummary & {
   reused: boolean;
 };
 
-export type WorkerProviderOriginalDetachAckSummary = {
+export type WorkerProviderOriginalDetachAckSummaryV1 = {
   detachId: string;
   referenceId: string;
   forgetEpoch: number;
@@ -1313,7 +1349,21 @@ export type WorkerProviderOriginalDetachAckSummary = {
   completedAt: number;
 };
 
-export type WorkerProviderOriginalForgetTarget = {
+export type WorkerProviderOriginalDetachAckSummaryV2 = {
+  referenceVersion: "provider_original_v2";
+  detachId: string;
+  referenceId: string;
+  forgetEpoch: number;
+  referenceOutcome: "detached" | "already_detached";
+  providerSourceOutcome: "retained_unchanged";
+  completedAt: number;
+};
+
+export type WorkerProviderOriginalDetachAckSummary =
+  | WorkerProviderOriginalDetachAckSummaryV1
+  | WorkerProviderOriginalDetachAckSummaryV2;
+
+export type WorkerProviderOriginalForgetTargetV1 = {
   referenceId: string;
   referenceFingerprint: string;
   locatorBindingId: string;
@@ -1323,8 +1373,19 @@ export type WorkerProviderOriginalForgetTarget = {
   locatorCiphertextHash: string;
   locatorCiphertextByteLength: number;
   forgetEpoch: number;
-  ack?: WorkerProviderOriginalDetachAckSummary;
+  ack?: WorkerProviderOriginalDetachAckSummaryV1;
 };
+
+export type WorkerProviderOriginalForgetTargetV2 = {
+  referenceVersion: "provider_original_v2";
+  referenceId: string;
+  referenceFingerprint: string;
+  forgetEpoch: number;
+  ack?: WorkerProviderOriginalDetachAckSummaryV2;
+};
+
+export type WorkerProviderOriginalForgetTarget =
+  WorkerProviderOriginalForgetTargetV1 | WorkerProviderOriginalForgetTargetV2;
 
 export type WorkerProviderOriginalForgetTargetsResult = {
   operation: "providerOriginal.forgetTargets";
@@ -2031,7 +2092,7 @@ function providerOriginalDeclaration(
   value: unknown,
 ): ProviderOriginalDeclaration {
   const input = object(value);
-  exactKeys(input, [
+  const sharedKeys = [
     "referenceVersion",
     "providerKind",
     "clientReferenceId",
@@ -2043,31 +2104,18 @@ function providerOriginalDeclaration(
     "providerRevision",
     "providerContentHash",
     "verifiedAt",
-    "locatorBundle",
     "createdAt",
-  ]);
-  if (
-    input.referenceVersion !== "provider_original_v1" ||
-    input.providerKind !== "dropbox_v1"
-  )
-    invalid();
-  const locator = object(input.locatorBundle);
-  exactKeys(locator, [
-    "bindingId",
-    "manifestFingerprint",
-    "recipientFingerprint",
-    "repositoryKeyDomainFingerprint",
-    "repositoryId",
-    "snapshotId",
-    "objectName",
-    "ciphertextHash",
-    "ciphertextByteLength",
-    "readbackVerifiedAt",
-  ]);
+  ] as const;
+  if (input.providerKind !== "dropbox_v1") invalid();
+  if (input.referenceVersion === "provider_original_v2") {
+    exactKeys(input, [...sharedKeys]);
+  } else if (input.referenceVersion === "provider_original_v1") {
+    exactKeys(input, [...sharedKeys, "locatorBundle"]);
+  } else invalid();
   const hash = (entry: unknown) =>
     string(entry, { maxUtf16: 64, pattern: SHA256 });
-  return {
-    referenceVersion: "provider_original_v1",
+  const shared = {
+    referenceVersion: input.referenceVersion,
     providerKind: "dropbox_v1",
     clientReferenceId: string(input.clientReferenceId, {
       maxUtf16: 36,
@@ -2084,6 +2132,26 @@ function providerOriginalDeclaration(
     }),
     providerContentHash: hash(input.providerContentHash),
     verifiedAt: epoch(input.verifiedAt),
+    createdAt: epoch(input.createdAt),
+  } as const;
+  if (input.referenceVersion === "provider_original_v2")
+    return { ...shared, referenceVersion: "provider_original_v2" };
+  const locator = object(input.locatorBundle);
+  exactKeys(locator, [
+    "bindingId",
+    "manifestFingerprint",
+    "recipientFingerprint",
+    "repositoryKeyDomainFingerprint",
+    "repositoryId",
+    "snapshotId",
+    "objectName",
+    "ciphertextHash",
+    "ciphertextByteLength",
+    "readbackVerifiedAt",
+  ]);
+  return {
+    ...shared,
+    referenceVersion: "provider_original_v1",
     locatorBundle: {
       bindingId: string(locator.bindingId, {
         maxUtf16: 36,
@@ -2108,7 +2176,6 @@ function providerOriginalDeclaration(
       ),
       readbackVerifiedAt: epoch(locator.readbackVerifiedAt),
     },
-    createdAt: epoch(input.createdAt),
   };
 }
 
@@ -2447,24 +2514,61 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
           return parsed;
         })(),
       };
-    case "providerOriginal.ackDetach":
-      exactKeys(input, [
+    case "providerOriginal.ackDetach": {
+      const shared = [
         ...baseKeys,
         "requestId",
         "sourceItemId",
         "expectedForgetEpoch",
         "detachId",
         "referenceId",
-        "locatorBindingId",
-        "locatorRepositoryId",
-        "locatorSnapshotId",
-        "locatorObjectName",
         "referenceOutcome",
-        "locatorBundleOutcome",
-        "locatorAbsenceAuthority",
-        "retentionDisclosure",
         "providerSourceOutcome",
-      ]);
+      ] as const;
+      if (input.referenceVersion === "provider_original_v2") {
+        exactKeys(input, [...shared, "referenceVersion"]);
+        if (
+          (input.referenceOutcome !== "detached" &&
+            input.referenceOutcome !== "already_detached") ||
+          input.providerSourceOutcome !== "retained_unchanged"
+        )
+          invalid();
+        return {
+          ...base,
+          operation: "providerOriginal.ackDetach",
+          requestId: requestId(input.requestId),
+          sourceItemId: string(input.sourceItemId, { maxUtf16: 256 }),
+          expectedForgetEpoch: integer(
+            input.expectedForgetEpoch,
+            1,
+            Number.MAX_SAFE_INTEGER,
+          ),
+          detachId: string(input.detachId, { maxUtf16: 36, pattern: UUID }),
+          referenceId: string(input.referenceId, { maxUtf16: 256 }),
+          referenceVersion: "provider_original_v2",
+          referenceOutcome: input.referenceOutcome,
+          providerSourceOutcome: "retained_unchanged",
+        };
+      }
+      exactKeys(
+        input,
+        [
+          ...shared,
+          "locatorBindingId",
+          "locatorRepositoryId",
+          "locatorSnapshotId",
+          "locatorObjectName",
+          "locatorBundleOutcome",
+          "locatorAbsenceAuthority",
+          "retentionDisclosure",
+        ],
+        ["referenceVersion"],
+      );
+      if (
+        input.referenceVersion !== undefined &&
+        input.referenceVersion !== "provider_original_v1"
+      )
+        invalid();
       if (
         (input.referenceOutcome !== "detached" &&
           input.referenceOutcome !== "already_detached") ||
@@ -2511,6 +2615,7 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         retentionDisclosure: "provider_retained_deleted_history_possible",
         providerSourceOutcome: "retained_unchanged",
       };
+    }
     case "source.inventoryPage":
       exactKeys(input, [
         ...baseKeys,
@@ -2814,10 +2919,25 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         invalid();
       }
       let existingProviderOriginal:
-        { referenceId: string; bindingEpoch: number } | undefined;
+        | {
+            referenceId: string;
+            bindingEpoch: number;
+            referenceVersion?: "provider_original_v1" | "provider_original_v2";
+          }
+        | undefined;
       if (input.existingProviderOriginal !== undefined) {
         const selected = object(input.existingProviderOriginal);
-        exactKeys(selected, ["referenceId", "bindingEpoch"]);
+        exactKeys(
+          selected,
+          ["referenceId", "bindingEpoch"],
+          ["referenceVersion"],
+        );
+        if (
+          selected.referenceVersion !== undefined &&
+          selected.referenceVersion !== "provider_original_v1" &&
+          selected.referenceVersion !== "provider_original_v2"
+        )
+          invalid();
         existingProviderOriginal = {
           referenceId: string(selected.referenceId, { maxUtf16: 256 }),
           bindingEpoch: integer(
@@ -2825,14 +2945,23 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
             0,
             Number.MAX_SAFE_INTEGER,
           ),
+          ...(selected.referenceVersion === undefined
+            ? {}
+            : { referenceVersion: selected.referenceVersion }),
         };
       }
       const provider =
         input.providerOriginal !== undefined ||
         existingProviderOriginal !== undefined;
+      const providerVersion = input.providerOriginal
+        ? object(input.providerOriginal).referenceVersion
+        : (existingProviderOriginal?.referenceVersion ??
+          (existingProviderOriginal ? "provider_original_v1" : null));
+      const allowedArchiveCounts =
+        providerVersion === "provider_original_v2" ? [1] : provider ? [3] : [4];
       if (
         !Array.isArray(input.archives) ||
-        input.archives.length !== (provider ? 3 : 4)
+        !allowedArchiveCounts.includes(input.archives.length)
       ) {
         invalid();
       }
@@ -2841,13 +2970,15 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         archives.map((entry) => `${entry.subjectKind}:${entry.copyRole}`),
       );
       if (
-        roles.size !== (provider ? 3 : 4) ||
-        !roles.has("original_bytes:primary") ||
+        roles.size !== input.archives.length ||
         !roles.has("parser_output:primary") ||
-        !roles.has("parser_output:independent_backup") ||
-        (provider
-          ? roles.has("original_bytes:independent_backup")
-          : !roles.has("original_bytes:independent_backup"))
+        (input.archives.length === 1
+          ? roles.size !== 1
+          : !roles.has("original_bytes:primary") ||
+            !roles.has("parser_output:independent_backup") ||
+            (provider
+              ? roles.has("original_bytes:independent_backup")
+              : !roles.has("original_bytes:independent_backup")))
       ) {
         invalid();
       }

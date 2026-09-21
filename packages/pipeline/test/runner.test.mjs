@@ -2053,7 +2053,7 @@ test("backup replay accepts a changed remote root only for the cataloged artifac
   }
 });
 
-test("the narrow priority replay settles an answered provider locator snapshot and preserves failure", async () => {
+test("ordinary replay refuses an answered legacy locator action without invoking backup work", async () => {
   const setup = await fixture(0);
   const age = join(setup.base, "age");
   const restic = join(setup.base, "restic");
@@ -2159,12 +2159,181 @@ test("the narrow priority replay settles an answered provider locator snapshot a
     throw new Error("provider side effect must not run");
   };
   try {
-    await runner.settleAnsweredArchivedRequest();
+    await assert.rejects(
+      () => runner.settleAnsweredArchivedRequest(),
+      (error) => error.code === "provider_v2_transition_required",
+    );
     assert.equal(published, 0);
-    assert.deepEqual(sent, [body]);
-    assert.equal(journal.pending, undefined);
-    assert.equal(journal.checkpoint.phase, "terminal");
-    assert.equal(journal.checkpoint.code, "not_authorized");
+    assert.deepEqual(sent, []);
+    assert.ok(journal.pending?.result);
+    assert.equal(journal.checkpoint.phase, "archived");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("provider v2 transition restarts after catalog persistence without weakening pending-body validation", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = archivedCheckpoint(plan, {
+    preflightAction: "provider_locator_snapshot",
+  });
+  let journal = await openJournal(setup.journalDir, checkpoint);
+  const catalog = await openArchiveCatalog({ journal });
+  const originalInput = {
+    originalCatalogId: checkpoint.originalCatalogId,
+    sourceExternalId: plan.externalId,
+    origin: {
+      scanId: checkpoint.scanId,
+      observationEpoch: plan.observationEpoch,
+      sha256: plan.sha256,
+      byteLength: plan.byteLength,
+      mediaType: "application/pdf",
+    },
+    copies: { primary: archiveCopy("primary") },
+    providerOriginal: {
+      clientReferenceId: randomUUID(),
+      bindingId: randomUUID(),
+      locator: archiveCopy("independent_backup"),
+    },
+    createdAt: 1,
+  };
+  const original = await catalog.createOriginalIntent(originalInput);
+  const parserBackup = archiveCopy("independent_backup");
+  for (const field of [
+    "archiveIdentityFingerprint",
+    "archiveProfileFingerprint",
+    "recipientFingerprint",
+    "repositoryKeyDomainFingerprint",
+    "storageFailureDomainFingerprint",
+  ])
+    parserBackup[field] = "b".repeat(64);
+  const processing = await catalog.createProcessingIntent({
+    processingCatalogId: checkpoint.processingCatalogId,
+    originalCatalogId: checkpoint.originalCatalogId,
+    currentObservation: {
+      scanId: checkpoint.scanId,
+      observationEpoch: plan.observationEpoch,
+      processingEpoch: plan.processingEpoch,
+    },
+    fingerprints: {
+      parserFingerprint: plan.parserFingerprint,
+      extractionConfigurationFingerprint:
+        plan.extractionConfigurationFingerprint,
+      discoveryProfileFingerprint: "b".repeat(64),
+      processingPolicyFingerprint: "c".repeat(64),
+      correctionFingerprint: "d".repeat(64),
+    },
+    captureIntent: {
+      captureId: randomUUID(),
+      directory: { device: 1, inode: 2 },
+    },
+    parserIntent: {
+      outputId: randomUUID(),
+      outputRoot: { device: 1, inode: 3 },
+      outputDirectory: { device: 1, inode: 4 },
+      parserArtifactClientId: randomUUID(),
+    },
+    spoolIntent: {
+      spoolId: randomUUID(),
+      root: { device: 1, inode: 5 },
+    },
+    copies: {
+      primary: archiveCopy("primary"),
+      independent_backup: parserBackup,
+    },
+    createdAt: 1,
+  });
+  const identity = archivedCheckpointIdentity(checkpoint, plan);
+  const requestId = randomUUID();
+  const body = {
+    protocolVersion: 1,
+    operation: "discovery.preflightArchived",
+    spaceId: "space",
+    sourceAccountId: "source",
+    requestId,
+    identity,
+    archiveIntentDigest: digestArchiveIntent({
+      identity,
+      original,
+      processing,
+    }),
+  };
+  await journal.planRequest({
+    operation: body.operation,
+    requestId,
+    requestBody: JSON.stringify(body),
+    createdAt: 1,
+  });
+  await journal.recordValidatedResult(
+    {
+      operation: body.operation,
+      sourceItemId: plan.sourceItemId,
+      workId: "work",
+      expectedDesiredProcessingEpoch: plan.processingEpoch - 1,
+      archiveIntentDigest: body.archiveIntentDigest,
+    },
+    2,
+  );
+  const noTransport = {
+    async call() {
+      throw new Error("transition must not call the server");
+    },
+  };
+  try {
+    const first = await new PipelineRunner(
+      setup.config,
+      journal,
+      noTransport,
+    ).prepareProviderV2Transition();
+    assert.equal(first.step, "parser_archive");
+    assert.ok(journal.pending?.result, "journal half was intentionally not committed");
+    const converted = await openArchiveCatalog({ journal });
+    const convertedOriginal = converted.listOriginals()[0];
+    const convertedProcessing = converted.listProcessings()[0];
+    assert.equal(
+      convertedOriginal.providerOriginal.referenceVersion,
+      "provider_original_v2",
+    );
+    assert.deepEqual(
+      convertedOriginal.providerOriginal.legacyPrimary,
+      original.copies.primary,
+    );
+    assert.deepEqual(
+      convertedOriginal.providerOriginal.legacyLocator,
+      original.providerOriginal.locator,
+    );
+    assert.deepEqual(
+      convertedProcessing.legacyIndependentBackup,
+      processing.copies.independent_backup,
+    );
+    assert.deepEqual(Object.keys(convertedOriginal.copies), []);
+    assert.deepEqual(Object.keys(convertedProcessing.copies), ["primary"]);
+
+    await journal.close();
+    journal = await openJournal(setup.journalDir);
+    const restarted = await new PipelineRunner(
+      setup.config,
+      journal,
+      noTransport,
+    ).prepareProviderV2Transition();
+    assert.deepEqual(restarted, first);
+
+    const changedBody = JSON.parse(journal.pending.requestBody);
+    changedBody.archiveIntentDigest = "f".repeat(64);
+    const saved = journal.pending.requestBody;
+    journal.state.pending.requestBody = JSON.stringify(changedBody);
+    await assert.rejects(
+      () =>
+        new PipelineRunner(
+          setup.config,
+          journal,
+          noTransport,
+        ).prepareProviderV2Transition(),
+      (error) => error.code === "journal_phase_conflict",
+    );
+    journal.state.pending.requestBody = saved;
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });
@@ -2233,7 +2402,7 @@ test("a durable provider admission replay does not expire its persisted declarat
   }
 });
 
-test("provider verification projects the full verifier result into the closed catalog shape", async () => {
+test("legacy provider verification cannot bypass the explicit v2 transition", async () => {
   const setup = await fixture(0);
   const registryPath = join(setup.base, "provider-registry");
   await mkdir(registryPath, { mode: 0o700 });
@@ -2261,7 +2430,7 @@ test("provider verification projects the full verifier result into the closed ca
     sourceByteLength: plan.byteLength,
     verifiedAt: Date.now(),
   };
-  const persisted = await persistProviderBinding({
+  await persistProviderBinding({
     registryDirectory,
     verified: {
       metadata,
@@ -2322,27 +2491,18 @@ test("provider verification projects the full verifier result into the closed ca
   );
   runner.archiveCatalog = catalog;
   try {
-    const next = await runner.driveProviderOriginal(
-      checkpoint,
-      original,
-      processing,
-      join(setup.root, plan.relativePath),
-      "provider_verify",
+    await assert.rejects(
+      () =>
+        runner.driveProviderOriginal(
+          checkpoint,
+          original,
+          processing,
+          join(setup.root, plan.relativePath),
+          "provider_verify",
+        ),
+      (error) => error.code === "provider_v2_transition_required",
     );
-    assert.equal(next.step, "parser_archive");
-    assert.equal(next.expectedOriginalRevision, 2);
-    assert.deepEqual(catalog.listOriginals()[0].providerOriginal.verified, {
-      providerAccountIdHash: metadata.providerAccountIdHash,
-      providerRootDirectoryIdHash: metadata.providerRootDirectoryIdHash,
-      providerFileIdHash: metadata.providerFileIdHash,
-      providerRevision: metadata.providerRevision,
-      providerContentHash: metadata.providerContentHash,
-      sourceContentHash: metadata.sourceContentHash,
-      sourceByteLength: metadata.sourceByteLength,
-      verifiedAt: metadata.verifiedAt,
-      manifestFingerprint: persisted.manifestFingerprint,
-      manifestByteLength: persisted.manifestByteLength,
-    });
+    assert.equal(catalog.listOriginals()[0].providerOriginal.verified, undefined);
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });
@@ -2795,6 +2955,114 @@ function admissionCatalog(read, write) {
     },
   };
 }
+
+test("provider v2 admission replay carries only the parser primary artifact", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = admitCheckpoint(plan);
+  checkpoint.discoveryLease.leaseExpiresAt = Date.now() + 5 * 60_000;
+  let journal = await openJournal(setup.journalDir, checkpoint);
+  let rows = durableProviderRows(checkpoint, Date.now());
+  const v1 = rows.original.providerOriginal;
+  rows = {
+    original: {
+      ...rows.original,
+      copies: {},
+      providerOriginal: {
+        referenceVersion: "provider_original_v2",
+        clientReferenceId: v1.clientReferenceId,
+        bindingId: v1.bindingId,
+        verified: v1.verified,
+        legacyPrimary: rows.original.copies.primary,
+        legacyLocator: v1.locator,
+      },
+    },
+    processing: {
+      ...rows.processing,
+      copies: { primary: rows.processing.copies.primary },
+      legacyIndependentBackup: rows.processing.copies.independent_backup,
+    },
+  };
+  const declaration = parsedDeclaration();
+  const configure = (transport) => {
+    const runner = new PipelineRunner(setup.config, journal, transport);
+    runner.archivedRows = () => rows;
+    runner.mappedProcessing = async () => ({ ...rows, declaration });
+    runner.archiveCatalog = admissionCatalog(
+      () => rows,
+      (value) => {
+        rows = value;
+      },
+    );
+    runner.recordArchiveAction = async () => {
+      throw new Error("v2 must not execute archive copy or backup actions");
+    };
+    return runner;
+  };
+  const builder = configure({ async call() { throw new Error("unused"); } });
+  const provider = builder.admissionProvider(checkpoint, rows.original, false);
+  const selections = builder.admissionSelections(
+    checkpoint,
+    rows,
+    provider.providerOriginal,
+  );
+  assert.deepEqual(
+    selections.archives.map(({ subjectKind, copyRole }) => [
+      subjectKind,
+      copyRole,
+    ]),
+    [["parser_output", "primary"]],
+  );
+  assert.equal(provider.providerOriginal.referenceVersion, "provider_original_v2");
+  assert.equal("locatorBundle" in provider.providerOriginal, false);
+  const requestId = randomUUID();
+  const body = {
+    protocolVersion: 1,
+    operation: "discovery.admitArchived",
+    spaceId: "space",
+    sourceAccountId: "source",
+    requestId,
+    workId: checkpoint.discoveryLease.workId,
+    leaseEpoch: checkpoint.discoveryLease.leaseEpoch,
+    leaseToken: checkpoint.discoveryLease.leaseToken,
+    ...selections,
+    ...provider,
+    parsedText: declaration,
+  };
+  await journal.planRequest({
+    operation: body.operation,
+    requestId,
+    requestBody: JSON.stringify(body),
+    createdAt: Date.now(),
+  });
+  await journal.close();
+  journal = await openJournal(setup.journalDir);
+  const sent = [];
+  const response = admittedResponse(plan);
+  delete response.originalPrimaryReceiptId;
+  delete response.originalPrimaryBindingEpoch;
+  delete response.parserBackupReceiptId;
+  delete response.parserBackupBindingEpoch;
+  try {
+    await configure({
+      async call(value) {
+        sent.push(structuredClone(value));
+        return response;
+      },
+    }).driveArchivedAdmit();
+    assert.deepEqual(sent, [body]);
+    assert.equal(journal.pending, undefined);
+    assert.equal(journal.checkpoint.step, "parsed_reserve");
+    assert.deepEqual(Object.keys(rows.original.copies), []);
+    assert.deepEqual(Object.keys(rows.processing.copies), ["primary"]);
+    assert.equal(rows.original.cloud.primaryReceiptId, undefined);
+    assert.equal(rows.original.cloud.backupReceiptId, undefined);
+    assert.equal(rows.original.cloud.providerReferenceId, "provider-reference");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
 
 /** The 2026-09-18 receipt: ids from a deployment that no longer serves this account. */
 function voidReceiptRows(checkpoint, admittedAt) {

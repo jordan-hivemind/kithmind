@@ -24,6 +24,7 @@ import {
 import { initialCheckpoint, journalCodec, PipelineRunner } from "./runner.js";
 import { HttpWorkerTransport } from "./transport.js";
 import { reprioritizeFromPaths } from "./reprioritize.js";
+import { transitionProviderV2FromPaths } from "./providerV2Transition.js";
 import type {
   PipelineConfig,
   PipelineRunResult,
@@ -34,7 +35,7 @@ import type { RunnerCheckpoint } from "./runnerState.js";
 
 function usage(): never {
   throw new Error(
-    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked [--operator-clear --max-clears <n>]] and [--accept-retirement <root_selection_would_retire_items|root_contents_collapsed|journal_behind_server>], or reprioritize --config <path> --manifest <private-json>, or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
+    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked [--operator-clear --max-clears <n>]] and [--accept-retirement <root_selection_would_retire_items|root_contents_collapsed|journal_behind_server>], or adopt-provider-v2 --previous-config <old-path> --config <new-path>, or reprioritize --config <path> --manifest <private-json>, or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
   );
 }
 export function argumentsFor(argv: string[]):
@@ -50,6 +51,11 @@ export function argumentsFor(argv: string[]):
   | { command: "doctor"; configPath: string; json: boolean }
   | { command: "reprioritize"; configPath: string; manifestPath: string }
   | {
+      command: "adopt-provider-v2";
+      previousConfigPath: string;
+      configPath: string;
+    }
+  | {
       command: "reconcile-receipts";
       configPath: string;
       apply: boolean;
@@ -64,6 +70,22 @@ export function argumentsFor(argv: string[]):
       json: boolean;
     } {
   const forwarded = argv[0] === "--" ? argv.slice(1) : argv;
+  if (forwarded[0] === "adopt-provider-v2") {
+    const values = new Map<string, string>();
+    for (let index = 1; index < forwarded.length; index += 1) {
+      const flag = forwarded[index];
+      if (flag !== "--previous-config" && flag !== "--config") usage();
+      if (values.has(flag)) usage();
+      const value = forwarded[index + 1];
+      if (!value || value.startsWith("--")) usage();
+      values.set(flag, value);
+      index += 1;
+    }
+    const previousConfigPath = values.get("--previous-config");
+    const configPath = values.get("--config");
+    if (!previousConfigPath || !configPath) usage();
+    return { command: "adopt-provider-v2", previousConfigPath, configPath };
+  }
   if (forwarded[0] === "reprioritize") {
     const values = new Map<string, string>();
     for (let index = 1; index < forwarded.length; index += 1) {
@@ -461,6 +483,16 @@ export async function runWatch(
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const parsed = argumentsFor(argv);
   const { command, configPath } = parsed;
+  if (command === "adopt-provider-v2") {
+    const result = await transitionProviderV2FromPaths({
+      previousConfigPath: parsed.previousConfigPath,
+      proposedConfigPath: configPath,
+    });
+    process.stdout.write(
+      `${JSON.stringify({ state: result.state, previousConfigSha256: result.previousConfigSha256, proposedConfigSha256: result.proposedConfigSha256 })}\n`,
+    );
+    return;
+  }
   if (command === "reprioritize") {
     const result = await reprioritizeFromPaths(configPath, parsed.manifestPath);
     process.stdout.write(`${JSON.stringify(result)}\n`);

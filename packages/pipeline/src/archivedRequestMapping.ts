@@ -63,9 +63,11 @@ export function digestArchiveIntent(input: {
   processing: Pick<ProcessingCatalogRow, "processingCatalogId" | "copies">;
 }): string {
   const value = [
-    input.original.providerOriginal
-      ? "kith-archive-intent:provider-original:v1"
-      : ARCHIVE_INTENT_DOMAIN,
+    input.original.providerOriginal?.referenceVersion === "provider_original_v2"
+      ? "kith-archive-intent:provider-original:v2"
+      : input.original.providerOriginal
+        ? "kith-archive-intent:provider-original:v1"
+        : ARCHIVE_INTENT_DOMAIN,
     input.identity.sourceItemId,
     input.identity.scanId,
     input.identity.observationEpoch,
@@ -82,26 +84,108 @@ export function digestArchiveIntent(input: {
     input.identity.chunkerFingerprint,
     input.identity.correctionRevision,
     input.original.originalCatalogId,
-    copyIntent(input.original.copies.primary),
-    ...(input.original.providerOriginal
+    ...(input.original.providerOriginal?.referenceVersion ===
+    "provider_original_v2"
       ? [
+          input.original.providerOriginal.clientReferenceId,
+          input.original.providerOriginal.bindingId,
+        ]
+      : input.original.providerOriginal
+        ? [
+          copyIntent(input.original.copies.primary!),
           input.original.providerOriginal.clientReferenceId,
           input.original.providerOriginal.bindingId,
           copyIntent(input.original.providerOriginal.locator),
         ]
-      : [copyIntent(input.original.copies.independent_backup)]),
+        : [
+            copyIntent(input.original.copies.primary!),
+            copyIntent(input.original.copies.independent_backup!),
+          ]),
     input.processing.processingCatalogId,
     copyIntent(input.processing.copies.primary),
-    copyIntent(input.processing.copies.independent_backup),
+    ...(input.processing.copies.independent_backup === undefined
+      ? []
+      : [copyIntent(input.processing.copies.independent_backup)]),
   ] as const;
   return createHash("sha256")
     .update(JSON.stringify(value), "utf8")
     .digest("hex");
 }
 
+/**
+ * Reconstructs the exact v1 intent after the catalog half of the explicit
+ * provider-v2 transition was durably written but before the journal half was.
+ * The retained records are immutable evidence. This keeps full pending-body
+ * validation available on restart without making any legacy copy active.
+ */
+export function digestRetainedProviderV1ArchiveIntent(input: {
+  identity: ArchivedWorkIdentity;
+  original: Pick<
+    OriginalCatalogRow,
+    "originalCatalogId" | "copies" | "providerOriginal"
+  >;
+  processing: Pick<ProcessingCatalogRow, "processingCatalogId" | "copies"> &
+    Pick<ProcessingCatalogRow, "legacyIndependentBackup">;
+}): string {
+  const provider = input.original.providerOriginal;
+  const primary = provider?.referenceVersion === "provider_original_v2"
+    ? provider.legacyPrimary
+    : undefined;
+  const locator = provider?.referenceVersion === "provider_original_v2"
+    ? provider.legacyLocator
+    : undefined;
+  const parserBackup = input.processing.legacyIndependentBackup;
+  if (!provider || !primary || !locator || !parserBackup) {
+    throw new Error("Retained provider v1 intent is incomplete");
+  }
+  return digestArchiveIntent({
+    identity: input.identity,
+    original: {
+      originalCatalogId: input.original.originalCatalogId,
+      copies: { primary },
+      providerOriginal: {
+        clientReferenceId: provider.clientReferenceId,
+        bindingId: provider.bindingId,
+        locator,
+        ...(provider.verified === undefined
+          ? {}
+          : { verified: provider.verified }),
+      },
+    },
+    processing: {
+      processingCatalogId: input.processing.processingCatalogId,
+      copies: {
+        primary: input.processing.copies.primary,
+        independent_backup: parserBackup,
+      },
+    },
+  });
+}
+
 export function providerOriginalReferenceFingerprint(
   value: ProviderOriginalDeclaration,
 ): string {
+  if (value.referenceVersion === "provider_original_v2") {
+    return createHash("sha256")
+      .update(
+        `provider-original-reference:v2\0${JSON.stringify([
+          value.referenceVersion,
+          value.providerKind,
+          value.clientReferenceId,
+          value.sourceContentHash,
+          value.sourceByteLength,
+          value.providerAccountIdHash,
+          value.providerRootDirectoryIdHash,
+          value.providerFileIdHash,
+          value.providerRevision,
+          value.providerContentHash,
+          value.verifiedAt,
+          value.createdAt,
+        ])}`,
+        "utf8",
+      )
+      .digest("hex");
+  }
   return createHash("sha256")
     .update(
       `provider-original-reference:v1\0${JSON.stringify([
@@ -144,8 +228,8 @@ export function createParserArtifactSelection(
   const output = processing.parserOutput;
   if (!output) throw new Error("Parser output is not durable");
   const primary = processing.copies.primary.readbackVerifiedAt;
-  const backup = processing.copies.independent_backup.readbackVerifiedAt;
-  if (primary === undefined || backup === undefined)
+  const backup = processing.copies.independent_backup?.readbackVerifiedAt;
+  if (primary === undefined)
     throw new Error("Parser archive readback times are not durable");
   return {
     kind: "create",
@@ -155,7 +239,11 @@ export function createParserArtifactSelection(
     // P2-70i3: the class that produced the artifact names its media type, and
     // the server checks it against the discovery work's own class.
     outputMediaType: output.rawArtifact.mediaType,
-    createdAt: provenanceCreatedAt(processing.createdAt, primary, backup),
+    createdAt: provenanceCreatedAt(
+      processing.createdAt,
+      primary,
+      ...(backup === undefined ? [] : [backup]),
+    ),
   };
 }
 
@@ -178,6 +266,7 @@ export function createArchiveReceiptSelection(
   copyRole: "primary" | "independent_backup",
 ): ArchiveReceiptSelection {
   const copy = row.copies[copyRole];
+  if (!copy) throw new Error("Archive copy is not present");
   if (!copy.published || (copyRole === "independent_backup" && !copy.backup)) {
     throw new Error("Archive copy is not durable");
   }

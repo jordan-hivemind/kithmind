@@ -311,6 +311,12 @@ const PROVIDER_ACCOUNT_FIELDS = [
   "refreshPath",
   "registryDirectory",
 ] as const;
+const PROVIDER_CREDENTIAL_FIELDS = [
+  "remoteName",
+  "rcloneBinary",
+  "configPath",
+  "configIdentityFingerprint",
+] as const;
 
 function providerRoot(
   entry: Record<string, unknown>,
@@ -363,7 +369,13 @@ function providerOriginalConfig(
     legacy
       ? [...PROVIDER_ROOT_FIELDS, ...PROVIDER_ACCOUNT_FIELDS]
       : [...PROVIDER_ACCOUNT_FIELDS, "roots"],
+    PROVIDER_CREDENTIAL_FIELDS,
   );
+  const credentialCount = PROVIDER_CREDENTIAL_FIELDS.filter((field) =>
+    Object.hasOwn(provider, field),
+  ).length;
+  if (credentialCount !== 0 && credentialCount !== PROVIDER_CREDENTIAL_FIELDS.length)
+    fail("pdfDocQa provider credentials must be complete");
   let parsed: PdfDocQaProviderRoot[];
   if (legacy) parsed = [providerRoot(provider, roots, label)];
   else {
@@ -388,6 +400,31 @@ function providerOriginalConfig(
       provider.providerAccountIdHash,
       `${label}.providerAccountIdHash`,
     ),
+    ...(credentialCount === 0
+      ? {}
+      : {
+          remoteName: (() => {
+            const name = profileText(
+              provider.remoteName,
+              `${label}.remoteName`,
+            );
+            if (!RCLONE_REMOTE.test(name))
+              fail("provider remoteName is invalid");
+            return name;
+          })(),
+          rcloneBinary: absolutePath(
+            provider.rcloneBinary,
+            `${label}.rcloneBinary`,
+          ),
+          configPath: absolutePath(
+            provider.configPath,
+            `${label}.configPath`,
+          ),
+          configIdentityFingerprint: sha256(
+            provider.configIdentityFingerprint,
+            `${label}.configIdentityFingerprint`,
+          ),
+        }),
     refreshPath: remoteRootPath(provider.refreshPath, {
       minSegments: 1,
       label: `${label}.refreshPath`,
@@ -578,7 +615,7 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
     );
   }
   const archiveInput = object(input.archive, "pdfDocQa.archive");
-  exact(archiveInput, ["ageBinary", "primary", "independentBackup"]);
+  exact(archiveInput, ["ageBinary", "primary"], ["independentBackup"]);
   const primaryInput = object(archiveInput.primary, "pdfDocQa.archive.primary");
   exact(primaryInput, [
     "directory",
@@ -611,142 +648,150 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
       "pdfDocQa.archive.primary",
     ),
   };
-  const backupInput = object(
-    archiveInput.independentBackup,
-    "pdfDocQa.archive.independentBackup",
-  );
-  const commonBackupFields = [
-    "directory",
-    "recipient",
-    "resticBinary",
-    "expectedRepositoryId",
-    "passwordCommand",
-    "host",
-    "archiveProfileFingerprint",
-    "archiveIdentityFingerprint",
-    "recipientFingerprint",
-    "repositoryKeyDomainFingerprint",
-    "storageFailureDomainFingerprint",
-  ] as const;
-  const remoteInput = Object.hasOwn(backupInput, "repository")
-    ? object(
-        backupInput.repository,
-        "pdfDocQa.archive.independentBackup.repository",
-      )
-    : undefined;
-  exact(backupInput, [
-    ...commonBackupFields,
-    remoteInput ? "repository" : "repositoryPath",
-  ]);
-  const repository = remoteInput
-    ? (() => {
-        exact(remoteInput, [
-          "kind",
-          "remoteName",
-          "rootPath",
-          "rcloneBinary",
-          "configPath",
-          "configIdentityFingerprint",
-          "expectedRootDirectoryIdHash",
-        ]);
-        if (remoteInput.kind !== "rclone_dropbox_v1")
-          fail("rclone repository kind is invalid");
-        const remoteName = profileText(
-          remoteInput.remoteName,
-          "rclone repository remoteName",
-        );
-        if (!RCLONE_REMOTE.test(remoteName))
-          fail("rclone remoteName is invalid");
-        return {
-          repository: {
-            kind: "rclone_dropbox_v1" as const,
-            remoteName,
-            rootPath: remoteRootPath(remoteInput.rootPath),
-            rcloneBinary: absolutePath(
-              remoteInput.rcloneBinary,
-              "rclone repository rcloneBinary",
+  const independentBackup =
+    archiveInput.independentBackup === undefined
+      ? undefined
+      : (() => {
+          const backupInput = object(
+            archiveInput.independentBackup,
+            "pdfDocQa.archive.independentBackup",
+          );
+          const commonBackupFields = [
+            "directory",
+            "recipient",
+            "resticBinary",
+            "expectedRepositoryId",
+            "passwordCommand",
+            "host",
+            "archiveProfileFingerprint",
+            "archiveIdentityFingerprint",
+            "recipientFingerprint",
+            "repositoryKeyDomainFingerprint",
+            "storageFailureDomainFingerprint",
+          ] as const;
+          const remoteInput = Object.hasOwn(backupInput, "repository")
+            ? object(
+                backupInput.repository,
+                "pdfDocQa.archive.independentBackup.repository",
+              )
+            : undefined;
+          exact(backupInput, [
+            ...commonBackupFields,
+            remoteInput ? "repository" : "repositoryPath",
+          ]);
+          const repository = remoteInput
+            ? (() => {
+                exact(remoteInput, [
+                  "kind",
+                  "remoteName",
+                  "rootPath",
+                  "rcloneBinary",
+                  "configPath",
+                  "configIdentityFingerprint",
+                  "expectedRootDirectoryIdHash",
+                ]);
+                if (remoteInput.kind !== "rclone_dropbox_v1")
+                  fail("rclone repository kind is invalid");
+                const remoteName = profileText(
+                  remoteInput.remoteName,
+                  "rclone repository remoteName",
+                );
+                if (!RCLONE_REMOTE.test(remoteName))
+                  fail("rclone remoteName is invalid");
+                return {
+                  repository: {
+                    kind: "rclone_dropbox_v1" as const,
+                    remoteName,
+                    rootPath: remoteRootPath(remoteInput.rootPath),
+                    rcloneBinary: absolutePath(
+                      remoteInput.rcloneBinary,
+                      "rclone repository rcloneBinary",
+                    ),
+                    configPath: absolutePath(
+                      remoteInput.configPath,
+                      "rclone repository configPath",
+                    ),
+                    configIdentityFingerprint: sha256(
+                      remoteInput.configIdentityFingerprint,
+                      "rclone repository configIdentityFingerprint",
+                    ),
+                    expectedRootDirectoryIdHash: sha256(
+                      remoteInput.expectedRootDirectoryIdHash,
+                      "rclone repository expectedRootDirectoryIdHash",
+                    ),
+                  },
+                };
+              })()
+            : {
+                repositoryPath: absolutePath(
+                  backupInput.repositoryPath,
+                  "pdfDocQa.archive.independentBackup.repositoryPath",
+                ),
+              };
+          const result = {
+            directory: absolutePath(
+              backupInput.directory,
+              "pdfDocQa.archive.independentBackup.directory",
             ),
-            configPath: absolutePath(
-              remoteInput.configPath,
-              "rclone repository configPath",
+            recipient: recipient(
+              backupInput.recipient,
+              "pdfDocQa.archive.independentBackup.recipient",
             ),
-            configIdentityFingerprint: sha256(
-              remoteInput.configIdentityFingerprint,
-              "rclone repository configIdentityFingerprint",
+            resticBinary: absolutePath(
+              backupInput.resticBinary,
+              "pdfDocQa.archive.independentBackup.resticBinary",
             ),
-            expectedRootDirectoryIdHash: sha256(
-              remoteInput.expectedRootDirectoryIdHash,
-              "rclone repository expectedRootDirectoryIdHash",
+            ...repository,
+            expectedRepositoryId: sha256(
+              backupInput.expectedRepositoryId,
+              "pdfDocQa.archive.independentBackup.expectedRepositoryId",
             ),
-          },
-        };
-      })()
-    : {
-        repositoryPath: absolutePath(
-          backupInput.repositoryPath,
-          "pdfDocQa.archive.independentBackup.repositoryPath",
-        ),
-      };
-  const independentBackup = {
-    directory: absolutePath(
-      backupInput.directory,
-      "pdfDocQa.archive.independentBackup.directory",
-    ),
-    recipient: recipient(
-      backupInput.recipient,
-      "pdfDocQa.archive.independentBackup.recipient",
-    ),
-    resticBinary: absolutePath(
-      backupInput.resticBinary,
-      "pdfDocQa.archive.independentBackup.resticBinary",
-    ),
-    ...repository,
-    expectedRepositoryId: sha256(
-      backupInput.expectedRepositoryId,
-      "pdfDocQa.archive.independentBackup.expectedRepositoryId",
-    ),
-    passwordCommand: passwordCommand(backupInput.passwordCommand),
-    host: profileText(
-      backupInput.host,
-      "pdfDocQa.archive.independentBackup.host",
-    ),
-    ...archiveIdentity(
-      {
-        archiveProfileFingerprint: backupInput.archiveProfileFingerprint,
-        archiveIdentityFingerprint: backupInput.archiveIdentityFingerprint,
-        recipientFingerprint: backupInput.recipientFingerprint,
-        repositoryKeyDomainFingerprint:
-          backupInput.repositoryKeyDomainFingerprint,
-        storageFailureDomainFingerprint:
-          backupInput.storageFailureDomainFingerprint,
-      },
-      "pdfDocQa.archive.independentBackup",
-    ),
-  };
-  if (!HOST.test(independentBackup.host))
-    fail("pdfDocQa archive host is invalid");
-  if (primary.recipient === independentBackup.recipient) {
-    fail("pdfDocQa archive recipients must differ");
-  }
+            passwordCommand: passwordCommand(backupInput.passwordCommand),
+            host: profileText(
+              backupInput.host,
+              "pdfDocQa.archive.independentBackup.host",
+            ),
+            ...archiveIdentity(
+              {
+                archiveProfileFingerprint:
+                  backupInput.archiveProfileFingerprint,
+                archiveIdentityFingerprint:
+                  backupInput.archiveIdentityFingerprint,
+                recipientFingerprint: backupInput.recipientFingerprint,
+                repositoryKeyDomainFingerprint:
+                  backupInput.repositoryKeyDomainFingerprint,
+                storageFailureDomainFingerprint:
+                  backupInput.storageFailureDomainFingerprint,
+              },
+              "pdfDocQa.archive.independentBackup",
+            ),
+          };
+          if (!HOST.test(result.host)) fail("pdfDocQa archive host is invalid");
+          if (primary.recipient === result.recipient)
+            fail("pdfDocQa archive recipients must differ");
+          return result;
+        })();
   const providerOriginal =
     input.providerOriginal === undefined
       ? undefined
       : providerOriginalConfig(input.providerOriginal, roots);
-  if (providerOriginal !== undefined && !("repository" in independentBackup))
-    fail("pdfDocQa provider original requires remote independent backup");
-  // ADM-4c review. A provider original config forces a remote independent
-  // backup, and `resticLocation` refuses a remote repository for original
-  // bytes on purpose: the provider reference is what holds the original, so
-  // there is nowhere for a provider-less root's independent copy to go. Such a
-  // root would fail `archive_remote_original_unsupported` on every pass, for
-  // every document under it. Refuse it here, where the operator can see why,
-  // rather than in the middle of a pass.
+  if (providerOriginal === undefined && independentBackup === undefined)
+    fail("pdfDocQa non-provider roots require an independent backup");
+  if (
+    providerOriginal !== undefined &&
+    providerOriginal.rcloneBinary === undefined &&
+    (independentBackup === undefined || !("repository" in independentBackup))
+  )
+    fail("pdfDocQa provider credentials are required without a legacy remote backup config");
   if (providerOriginal !== undefined) {
     const bound = new Set(providerOriginal.roots.map((root) => root.rootAlias));
     const unbound = roots.filter((root) => !bound.has(root.alias));
-    if (unbound.length > 0)
+    if (
+      unbound.length > 0 &&
+      (independentBackup === undefined || "repository" in independentBackup)
+    )
       fail(
-        `pdfDocQa provider original must name every watched root; ${unbound
+        `pdfDocQa roots without a provider require a local independent backup; ${unbound
           .map((root) => root.alias)
           .join(", ")} has no provider folder`,
       );
@@ -756,8 +801,9 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
     parserOutputRoot,
     spoolDirectory,
     primary.directory,
-    independentBackup.directory,
-    ...("repositoryPath" in independentBackup
+    ...(independentBackup === undefined ? [] : [independentBackup.directory]),
+    ...(independentBackup !== undefined &&
+    "repositoryPath" in independentBackup
       ? [independentBackup.repositoryPath]
       : []),
     ...(providerOriginal === undefined
@@ -792,11 +838,18 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
     parser.launcherPath,
     parser.modelLockPath,
     absolutePath(archiveInput.ageBinary, "pdfDocQa.archive.ageBinary"),
-    independentBackup.resticBinary,
-    independentBackup.passwordCommand.executable,
-    ...("repository" in independentBackup
+    ...(independentBackup === undefined
+      ? []
+      : [
+          independentBackup.resticBinary,
+          independentBackup.passwordCommand.executable,
+        ]),
+    ...(independentBackup !== undefined && "repository" in independentBackup
       ? [independentBackup.repository.rcloneBinary]
       : []),
+    ...(providerOriginal?.rcloneBinary === undefined
+      ? []
+      : [providerOriginal.rcloneBinary]),
   ];
   for (const path of executablePaths) {
     if (
@@ -808,6 +861,7 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
     }
   }
   if (
+    independentBackup !== undefined &&
     "repository" in independentBackup &&
     (containsPath(journalDir, independentBackup.repository.configPath) ||
       roots.some((root) =>
@@ -818,6 +872,14 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
       ))
   )
     fail("pdfDocQa credential config path must not be in writable roots");
+  const providerConfigPath = providerOriginal?.configPath;
+  if (
+    providerConfigPath !== undefined &&
+    (containsPath(journalDir, providerConfigPath) ||
+      roots.some((root) => containsPath(root.path, providerConfigPath)) ||
+      privatePaths.some((path) => containsPath(path, providerConfigPath)))
+  )
+    fail("pdfDocQa provider credential config path must not be in writable roots");
   return {
     captureDirectory,
     parserOutputRoot,
@@ -827,7 +889,7 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
     archive: {
       ageBinary: executablePaths[3]!,
       primary,
-      independentBackup,
+      ...(independentBackup === undefined ? {} : { independentBackup }),
     },
     ...(providerOriginal === undefined ? {} : { providerOriginal }),
   };

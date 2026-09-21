@@ -1,7 +1,14 @@
 # Dropbox backup and provider-original boundary
 
-**Status:** Adopted P2-26 transport design. Provider-original admission is
-tracked separately.
+**Status:** Historical transport design. Superseded by the owner storage policy
+adopted 2026-09-21.
+
+New Dropbox ingestion uses `provider_original_v2`. It verifies and references
+the exact provider revision and creates no original copy, locator snapshot, or
+parser-output independent backup. One parser-output primary artifact remains
+the processing evidence. The restic/rclone design below documents existing v1
+records and tooling only; it is not an ingestion prerequisite and must not run
+for v2 rows.
 
 ## Boundary
 
@@ -10,8 +17,8 @@ Dropbox has two different roles and they must use different contracts.
 | Data | Dropbox role | Kith action |
 | --- | --- | --- |
 | Existing source PDF | Provider-owned original | Verify and reference the exact existing file. Do not upload or delete another copy. |
-| Lossless parser output | Kith-created recovery data | Store an age-encrypted object in a dedicated restic repository through rclone. |
-| Native database export | Kith-created recovery data | Reuse the same transport in the separately scoped native-export work. |
+| Lossless parser output | Kith-created processing evidence | Store one primary parser artifact. |
+| Native database state | Provider-owned hosted state | Rely on Neon under the current owner policy. |
 
 The current binary-admission contract requires two Kith-owned encrypted
 archive receipts for original bytes. A Dropbox source file is not such a

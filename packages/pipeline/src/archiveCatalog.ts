@@ -31,6 +31,7 @@ import type {
   OriginalCatalogIdentity,
   OriginalCatalogRow,
   OriginalReuseIdentity,
+  ProviderOriginalCatalog,
   ProcessingCatalogIdentity,
   ProcessingCatalogRow,
   ReceiptReconcileNote,
@@ -779,13 +780,29 @@ function copyPair(value: unknown) {
   return { primary, independent_backup };
 }
 
-function originalCopies(value: unknown, provider: boolean) {
+function processingCopies(value: unknown) {
   const row = object(value);
+  if (!own(row, "independent_backup")) {
+    exact(row, ["primary"]);
+    return { primary: archiveCopy(row.primary, "primary") };
+  }
+  return copyPair(row);
+}
+
+function originalCopies(
+  value: unknown,
+  provider: ProviderOriginalCatalog | undefined,
+) {
+  const row = object(value);
+  if (provider?.referenceVersion === "provider_original_v2") {
+    exact(row, []);
+    return {};
+  }
   if (provider) {
     exact(row, ["primary"]);
     return { primary: archiveCopy(row.primary, "primary") } as {
       primary: ArchiveCopyRecord;
-      independent_backup: never;
+      independent_backup?: never;
     };
   }
   return copyPair(row);
@@ -793,12 +810,36 @@ function originalCopies(value: unknown, provider: boolean) {
 
 function providerOriginal(value: unknown) {
   const row = object(value);
-  exact(row, ["clientReferenceId", "bindingId", "locator"], ["verified"]);
-  const result: NonNullable<OriginalCatalogRow["providerOriginal"]> = {
-    clientReferenceId: uuid(row.clientReferenceId),
-    bindingId: uuid(row.bindingId),
-    locator: archiveCopy(row.locator, "independent_backup"),
-  };
+  const v2 = row.referenceVersion === "provider_original_v2";
+  exact(
+    row,
+    v2
+      ? ["referenceVersion", "clientReferenceId", "bindingId"]
+      : ["clientReferenceId", "bindingId", "locator"],
+    v2 ? ["verified", "legacyPrimary", "legacyLocator"] : ["verified"],
+  );
+  const result: ProviderOriginalCatalog = v2
+    ? {
+        referenceVersion: "provider_original_v2",
+        clientReferenceId: uuid(row.clientReferenceId),
+        bindingId: uuid(row.bindingId),
+        ...(row.legacyPrimary === undefined
+          ? {}
+          : { legacyPrimary: archiveCopy(row.legacyPrimary, "primary") }),
+        ...(row.legacyLocator === undefined
+          ? {}
+          : {
+              legacyLocator: archiveCopy(
+                row.legacyLocator,
+                "independent_backup",
+              ),
+            }),
+      }
+    : {
+        clientReferenceId: uuid(row.clientReferenceId),
+        bindingId: uuid(row.bindingId),
+        locator: archiveCopy(row.locator, "independent_backup"),
+      };
   if (row.verified !== undefined) {
     const verified = object(row.verified);
     exact(verified, [
@@ -985,7 +1026,7 @@ function originalRow(value: unknown): OriginalCatalogRow {
       byteLength: integer(origin.byteLength, 1, 16 * 1024 * 1024),
       mediaType: origin.mediaType,
     },
-    copies: originalCopies(row.copies, provider !== undefined),
+    copies: originalCopies(row.copies, provider),
     ...(provider === undefined ? {} : { providerOriginal: provider }),
     createdAt: integer(row.createdAt),
     rowRevision: integer(row.rowRevision, 1),
@@ -993,9 +1034,15 @@ function originalRow(value: unknown): OriginalCatalogRow {
   };
   if (row.cloud !== undefined) {
     const cloud = object(row.cloud);
+    const providerV2 = provider?.referenceVersion === "provider_original_v2";
     exact(
       cloud,
-      ["sourceItemId", "sourceRevisionId", "primaryReceiptId", "admittedAt"],
+      [
+        "sourceItemId",
+        "sourceRevisionId",
+        "admittedAt",
+        ...(providerV2 ? [] : ["primaryReceiptId"]),
+      ],
       provider === undefined
         ? ["backupReceiptId"]
         : ["providerReferenceId", "providerBindingEpoch"],
@@ -1003,14 +1050,23 @@ function originalRow(value: unknown): OriginalCatalogRow {
     const base = {
       sourceItemId: id(cloud.sourceItemId),
       sourceRevisionId: id(cloud.sourceRevisionId),
-      primaryReceiptId: id(cloud.primaryReceiptId),
       admittedAt: integer(cloud.admittedAt),
     };
-    result.cloud =
-      provider === undefined
-        ? { ...base, backupReceiptId: id(cloud.backupReceiptId) }
+    result.cloud = providerV2
+      ? {
+          ...base,
+          providerReferenceId: id(cloud.providerReferenceId),
+          providerBindingEpoch: integer(cloud.providerBindingEpoch),
+        }
+      : provider === undefined
+        ? {
+            ...base,
+            primaryReceiptId: id(cloud.primaryReceiptId),
+            backupReceiptId: id(cloud.backupReceiptId),
+          }
         : {
             ...base,
+            primaryReceiptId: id(cloud.primaryReceiptId),
             providerReferenceId: id(cloud.providerReferenceId),
             providerBindingEpoch: integer(cloud.providerBindingEpoch),
           };
@@ -1048,6 +1104,7 @@ function processingRow(value: unknown): ProcessingCatalogRow {
       "activation",
       "parseFailure",
       "receiptReconcile",
+      "legacyIndependentBackup",
     ],
   );
   const current = object(row.currentObservation);
@@ -1106,11 +1163,16 @@ function processingRow(value: unknown): ProcessingCatalogRow {
       spoolId: uuid(spoolIntent.spoolId),
       root: directoryIdentity(spoolIntent.root),
     },
-    copies: copyPair(row.copies),
+    copies: processingCopies(row.copies),
     createdAt: integer(row.createdAt),
     rowRevision: integer(row.rowRevision, 1),
     updatedAt: integer(row.updatedAt),
   };
+  if (row.legacyIndependentBackup !== undefined)
+    result.legacyIndependentBackup = archiveCopy(
+      row.legacyIndependentBackup,
+      "independent_backup",
+    );
   if (row.capture !== undefined) {
     const capture = object(row.capture);
     exact(capture, [
@@ -1253,7 +1315,22 @@ function parseSnapshot(value: unknown, authorityDigest: string) {
     ]);
     if (originalIdentities.has(originalIdentity)) fail("catalog_invalid");
     originalIdentities.add(originalIdentity);
-    for (const copy of Object.values(original.copies)) {
+    const provider = original.providerOriginal;
+    const providerV2 = provider?.referenceVersion === "provider_original_v2";
+    if (
+      (providerV2 && Object.keys(original.copies).length !== 0) ||
+      (!providerV2 && Object.keys(original.copies).length === 0)
+    )
+      fail("catalog_invalid");
+    for (const copy of [
+      ...Object.values(original.copies),
+      ...(providerV2 && provider.legacyPrimary
+        ? [provider.legacyPrimary]
+        : []),
+      ...(providerV2 && provider.legacyLocator
+        ? [provider.legacyLocator]
+        : []),
+    ]) {
       for (const candidate of [copy.clientReceiptId, copy.archiveObjectId]) {
         if (stableIds.has(candidate)) fail("catalog_invalid");
         stableIds.add(candidate);
@@ -1269,6 +1346,20 @@ function parseSnapshot(value: unknown, authorityDigest: string) {
     )
       fail("catalog_invalid");
     processingIds.add(processing.processingCatalogId);
+    const parent = snapshot.originals.find(
+      (original) => original.originalCatalogId === processing.originalCatalogId,
+    )!;
+    if (
+      processing.copies.independent_backup === undefined &&
+      parent.providerOriginal?.referenceVersion !== "provider_original_v2"
+    )
+      fail("catalog_invalid");
+    if (
+      processing.legacyIndependentBackup !== undefined &&
+      (parent.providerOriginal?.referenceVersion !== "provider_original_v2" ||
+        processing.copies.independent_backup !== undefined)
+    )
+      fail("catalog_invalid");
     const processingIdentity = JSON.stringify([
       processing.originalCatalogId,
       processing.currentObservation,
@@ -1284,7 +1375,12 @@ function parseSnapshot(value: unknown, authorityDigest: string) {
       if (stableIds.has(candidate)) fail("catalog_invalid");
       stableIds.add(candidate);
     }
-    for (const copy of Object.values(processing.copies)) {
+    for (const copy of [
+      ...Object.values(processing.copies),
+      ...(processing.legacyIndependentBackup
+        ? [processing.legacyIndependentBackup]
+        : []),
+    ]) {
       for (const candidate of [copy.clientReceiptId, copy.archiveObjectId]) {
         if (stableIds.has(candidate)) fail("catalog_invalid");
         stableIds.add(candidate);
@@ -1428,11 +1524,23 @@ function snapshotCopies(snapshot: ArchiveCatalogSnapshot): ArchiveCopyRecord[] {
       ...Object.values(original.copies),
       ...(original.providerOriginal === undefined
         ? []
-        : [original.providerOriginal.locator]),
+        : original.providerOriginal.referenceVersion === "provider_original_v2"
+          ? [
+              ...(original.providerOriginal.legacyPrimary
+                ? [original.providerOriginal.legacyPrimary]
+                : []),
+              ...(original.providerOriginal.legacyLocator
+                ? [original.providerOriginal.legacyLocator]
+                : []),
+            ]
+          : [original.providerOriginal.locator]),
     ]),
-    ...snapshot.processings.flatMap((processing) =>
-      Object.values(processing.copies),
-    ),
+    ...snapshot.processings.flatMap((processing) => [
+      ...Object.values(processing.copies),
+      ...(processing.legacyIndependentBackup
+        ? [processing.legacyIndependentBackup]
+        : []),
+    ]),
   ];
 }
 
@@ -1832,7 +1940,10 @@ export class ArchiveCatalog {
         const backup = original.copies.independent_backup;
         if (backup)
           collect(backup, "original_backup", original.originalCatalogId);
-        if (original.providerOriginal)
+        if (
+          original.providerOriginal &&
+          original.providerOriginal.referenceVersion !== "provider_original_v2"
+        )
           collect(
             original.providerOriginal.locator,
             "provider_locator",
@@ -1840,11 +1951,13 @@ export class ArchiveCatalog {
           );
       }
       for (const processing of this.snapshot.processings) {
-        collect(
-          processing.copies.independent_backup,
-          "parser_backup",
-          processing.processingCatalogId,
-        );
+        const backup = processing.copies.independent_backup;
+        if (backup)
+          collect(
+            backup,
+            "parser_backup",
+            processing.processingCatalogId,
+          );
       }
       artifacts.sort(artifactOrder);
       artifactBindings.sort((left, right) =>
@@ -1922,7 +2035,10 @@ export class ArchiveCatalog {
           );
           if (artifact) catalogArtifacts.push(artifact);
         }
-        if (original.providerOriginal) {
+        if (
+          original.providerOriginal &&
+          original.providerOriginal.referenceVersion !== "provider_original_v2"
+        ) {
           const artifact = relocationArtifactForCopy(
             original.providerOriginal.locator,
             candidate.oldBoundary,
@@ -2606,7 +2722,11 @@ export class ArchiveCatalog {
       args.subject,
       args.catalogId,
       args.expectedRevision,
-      (row) => update(row.copies[args.role], row),
+      (row) => {
+        const copy = row.copies[args.role];
+        if (!copy) fail("invalid_transition");
+        update(copy, row);
+      },
     );
   }
 
@@ -2625,25 +2745,40 @@ export class ArchiveCatalog {
           ...row,
           cloud: args.cloud,
         }).cloud!;
-        if (!row.copies.primary.cloudReceipt) fail("invalid_transition");
-        if (
-          cloud.primaryReceiptId !== row.copies.primary.cloudReceipt.receiptId
-        )
-          fail("catalog_conflict");
+        const providerV2 =
+          row.providerOriginal?.referenceVersion === "provider_original_v2";
+        if (providerV2) {
+          if (
+            !("providerReferenceId" in cloud) ||
+            cloud.primaryReceiptId !== undefined ||
+            !row.providerOriginal?.verified
+          )
+            fail("invalid_transition");
+        } else {
+          if (!row.copies.primary?.cloudReceipt) fail("invalid_transition");
+          if (
+            cloud.primaryReceiptId !== row.copies.primary.cloudReceipt.receiptId
+          )
+            fail("catalog_conflict");
+        }
         if (row.providerOriginal === undefined) {
           if (
-            !row.copies.independent_backup.cloudReceipt ||
+            !row.copies.independent_backup?.cloudReceipt ||
             !("backupReceiptId" in cloud) ||
             cloud.backupReceiptId !==
               row.copies.independent_backup.cloudReceipt.receiptId
           )
             fail("catalog_conflict");
-        } else if (
-          !("providerReferenceId" in cloud) ||
-          !row.providerOriginal.verified ||
-          !row.providerOriginal.locator.backup
-        )
-          fail("invalid_transition");
+        } else if (!providerV2) {
+          const provider = row.providerOriginal;
+          if (
+            !("providerReferenceId" in cloud) ||
+            !provider.verified ||
+            provider.referenceVersion === "provider_original_v2" ||
+            !provider.locator.backup
+          )
+            fail("invalid_transition");
+        }
         if (row.cloud && !equal(row.cloud, cloud)) fail("catalog_conflict");
         row.cloud = cloud;
       },
@@ -2684,6 +2819,119 @@ export class ArchiveCatalog {
   }
 
   /**
+   * Converts an unadmitted provider-original v1 intent into the no-backup v2
+   * shape. Any already-created v1 objects remain byte-for-byte catalogued as
+   * inert evidence and are never selected or executed by v2.
+   */
+  async adoptProviderOriginalV2(args: {
+    originalCatalogId: string;
+    expectedOriginalRevision: number;
+    processingCatalogId: string;
+    expectedProcessingRevision: number;
+  }): Promise<{
+    original: OriginalCatalogRow;
+    processing: ProcessingCatalogRow;
+  }> {
+    return await this.enter(async () => {
+      const originalId = uuid(args.originalCatalogId);
+      const processingId = uuid(args.processingCatalogId);
+      const originalIndex = this.snapshot.originals.findIndex(
+        (row) => row.originalCatalogId === originalId,
+      );
+      const processingIndex = this.snapshot.processings.findIndex(
+        (row) => row.processingCatalogId === processingId,
+      );
+      if (originalIndex < 0 || processingIndex < 0) fail("catalog_not_found");
+      const original = structuredClone(this.snapshot.originals[originalIndex]!);
+      const processing = structuredClone(
+        this.snapshot.processings[processingIndex]!,
+      );
+      if (
+        original.rowRevision !== integer(args.expectedOriginalRevision, 1) ||
+        processing.rowRevision !== integer(args.expectedProcessingRevision, 1) ||
+        processing.originalCatalogId !== original.originalCatalogId ||
+        original.cloud
+      )
+        fail("catalog_conflict");
+      const provider = original.providerOriginal;
+      if (!provider) fail("invalid_transition");
+      if (provider.referenceVersion !== "provider_original_v2") {
+        original.providerOriginal = providerOriginal({
+          referenceVersion: "provider_original_v2",
+          clientReferenceId: provider.clientReferenceId,
+          bindingId: provider.bindingId,
+          ...(provider.verified === undefined
+            ? {}
+            : { verified: provider.verified }),
+          ...(original.copies.primary === undefined
+            ? {}
+            : { legacyPrimary: original.copies.primary }),
+          legacyLocator: provider.locator,
+        });
+        original.copies = {};
+        original.rowRevision += 1;
+        original.updatedAt = Date.now();
+      }
+      if (processing.copies.independent_backup !== undefined) {
+        processing.legacyIndependentBackup =
+          processing.copies.independent_backup;
+        delete processing.copies.independent_backup;
+        processing.rowRevision += 1;
+        processing.updatedAt = Date.now();
+      }
+      const next = structuredClone(this.snapshot);
+      next.originals[originalIndex] = original;
+      next.processings[processingIndex] = processing;
+      next.revision += 1;
+      const parsed = parseSnapshot(next, this.snapshot.authorityDigest);
+      await this.persist(parsed);
+      this.snapshot = parsed;
+      return {
+        original: structuredClone(original),
+        processing: structuredClone(processing),
+      };
+    });
+  }
+
+  async refreshProviderVerificationV2(args: {
+    catalogId: string;
+    expectedRevision: number;
+    verified: NonNullable<ProviderOriginalCatalog["verified"]>;
+  }): Promise<OriginalCatalogRow> {
+    return (await this.updateRow(
+      "original_bytes",
+      args.catalogId,
+      args.expectedRevision,
+      (value) => {
+        const row = value as OriginalCatalogRow;
+        const provider = row.providerOriginal;
+        const stored = provider?.verified;
+        if (
+          row.cloud ||
+          provider?.referenceVersion !== "provider_original_v2" ||
+          !stored ||
+          args.verified.providerAccountIdHash !== stored.providerAccountIdHash ||
+          args.verified.providerRootDirectoryIdHash !==
+            stored.providerRootDirectoryIdHash ||
+          args.verified.providerFileIdHash !== stored.providerFileIdHash ||
+          args.verified.providerRevision !== stored.providerRevision ||
+          args.verified.providerContentHash !== stored.providerContentHash ||
+          args.verified.sourceContentHash !== stored.sourceContentHash ||
+          args.verified.sourceByteLength !== stored.sourceByteLength ||
+          args.verified.sourceContentHash !== row.origin.sha256 ||
+          args.verified.sourceByteLength !== row.origin.byteLength ||
+          args.verified.verifiedAt < stored.verifiedAt
+        )
+          fail("catalog_conflict");
+        provider.verified = providerOriginal({
+          ...provider,
+          verified: args.verified,
+        }).verified;
+      },
+    )) as OriginalCatalogRow;
+  }
+
+  /**
    * P2-31a. Advances only the two timestamps a provider original declaration
    * must carry fresh (`verified.verifiedAt` and the locator's
    * `readbackVerifiedAt`) after the worker redid both checks, for an original
@@ -2713,10 +2961,14 @@ export class ArchiveCatalog {
         const row = value as OriginalCatalogRow;
         const provider = row.providerOriginal;
         const stored = provider?.verified;
-        const backup = provider?.locator.backup;
+        const backup =
+          provider?.referenceVersion === "provider_original_v2"
+            ? undefined
+            : provider?.locator.backup;
         if (
           row.cloud ||
           !provider ||
+          provider.referenceVersion === "provider_original_v2" ||
           !stored ||
           !backup ||
           provider.locator.readbackVerifiedAt === undefined
@@ -2769,7 +3021,11 @@ export class ArchiveCatalog {
       args.expectedRevision,
       (value) => {
         const row = value as OriginalCatalogRow;
-        if (!row.providerOriginal) fail("invalid_transition");
+        if (
+          !row.providerOriginal ||
+          row.providerOriginal.referenceVersion === "provider_original_v2"
+        )
+          fail("invalid_transition");
         args.update(row.providerOriginal.locator);
         row.providerOriginal = providerOriginal(row.providerOriginal);
       },
@@ -2791,7 +3047,8 @@ export class ArchiveCatalog {
         if (
           !row.spool ||
           !row.copies.primary.cloudReceipt ||
-          !row.copies.independent_backup.cloudReceipt
+          (row.copies.independent_backup !== undefined &&
+            !row.copies.independent_backup.cloudReceipt)
         )
           fail("invalid_transition");
         if (row.cloud && !equal(row.cloud, cloud)) fail("catalog_conflict");
@@ -2930,6 +3187,7 @@ export class ArchiveCatalog {
     if (!row) fail("catalog_not_found");
     for (const role of ["primary", "independent_backup"] as const) {
       const copy = row.copies[role];
+      if (!copy) continue;
       if (
         copy.deletion?.state !== "pending" ||
         !copy.prepared ||

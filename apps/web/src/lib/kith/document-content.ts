@@ -138,7 +138,8 @@ export function providerOriginalAvailable(
   return (
     path !== null &&
     document.originalLinkAvailable === true &&
-    document.originalRecovery?.kind === "provider_original_v1" &&
+    (document.originalRecovery?.kind === "provider_original_v1" ||
+      document.originalRecovery?.kind === "provider_original_v2") &&
     document.originalRecovery.providerVerification === "verified_at_admission" &&
     /^[a-f0-9]{64}$/.test(document.contentHash)
   );

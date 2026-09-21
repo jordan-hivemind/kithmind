@@ -31,7 +31,8 @@ import {
 import { sha256Utf8 } from "./sql.js";
 
 const SHA256 = /^[a-f0-9]{64}$/;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const REVISION = /^[\x20-\x7e]{1,128}$/;
 const OBJECT_NAME = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,128}$/;
 export const PROVIDER_VERIFICATION_MAX_AGE_MS = 10 * 60 * 1_000;
@@ -56,46 +57,65 @@ export function validateProviderOriginalDeclaration(
   now: number,
 ): void {
   if (
-    value.referenceVersion !== "provider_original_v1" ||
+    (value.referenceVersion !== "provider_original_v1" &&
+      value.referenceVersion !== "provider_original_v2") ||
     value.providerKind !== "dropbox_v1" ||
     !UUID.test(value.clientReferenceId) ||
     !Number.isSafeInteger(value.sourceByteLength) ||
     value.sourceByteLength < 1 ||
-    !REVISION.test(value.providerRevision) ||
-    !UUID.test(value.locatorBundle.bindingId) ||
-    !OBJECT_NAME.test(value.locatorBundle.objectName) ||
-    !Number.isSafeInteger(value.locatorBundle.ciphertextByteLength) ||
-    value.locatorBundle.ciphertextByteLength < 1 ||
-    value.locatorBundle.ciphertextByteLength > 1_024 * 1_024
+    !REVISION.test(value.providerRevision)
   )
     invalid("Provider original declaration is invalid");
-  for (const [field, name] of [
+  const hashes: Array<readonly [string, string]> = [
     [value.sourceContentHash, "source content hash"],
     [value.providerAccountIdHash, "provider account ID hash"],
     [value.providerRootDirectoryIdHash, "provider root ID hash"],
     [value.providerFileIdHash, "provider file ID hash"],
     [value.providerContentHash, "provider content hash"],
-    [value.locatorBundle.manifestFingerprint, "locator manifest fingerprint"],
-    [value.locatorBundle.recipientFingerprint, "locator recipient fingerprint"],
-    [
-      value.locatorBundle.repositoryKeyDomainFingerprint,
-      "locator repository key-domain fingerprint",
-    ],
-    [value.locatorBundle.repositoryId, "locator repository ID"],
-    [value.locatorBundle.snapshotId, "locator snapshot ID"],
-    [value.locatorBundle.ciphertextHash, "locator ciphertext hash"],
-  ] as const)
-    digest(field, name);
+  ];
+  if (value.referenceVersion === "provider_original_v1") {
+    if (
+      !UUID.test(value.locatorBundle.bindingId) ||
+      !OBJECT_NAME.test(value.locatorBundle.objectName) ||
+      !Number.isSafeInteger(value.locatorBundle.ciphertextByteLength) ||
+      value.locatorBundle.ciphertextByteLength < 1 ||
+      value.locatorBundle.ciphertextByteLength > 1_024 * 1_024
+    )
+      invalid("Provider original declaration is invalid");
+    hashes.push(
+      [value.locatorBundle.manifestFingerprint, "locator manifest fingerprint"],
+      [
+        value.locatorBundle.recipientFingerprint,
+        "locator recipient fingerprint",
+      ],
+      [
+        value.locatorBundle.repositoryKeyDomainFingerprint,
+        "locator repository key-domain fingerprint",
+      ],
+      [value.locatorBundle.repositoryId, "locator repository ID"],
+      [value.locatorBundle.snapshotId, "locator snapshot ID"],
+      [value.locatorBundle.ciphertextHash, "locator ciphertext hash"],
+    );
+    timestamp(
+      value.locatorBundle.readbackVerifiedAt,
+      "locator readback verification time",
+    );
+    if (
+      value.locatorBundle.readbackVerifiedAt < value.createdAt ||
+      value.locatorBundle.readbackVerifiedAt <
+        now - PROVIDER_VERIFICATION_MAX_AGE_MS ||
+      value.locatorBundle.readbackVerifiedAt >
+        now + PROVIDER_VERIFICATION_FUTURE_SKEW_MS
+    )
+      invalid("Provider original verification is stale");
+  }
+  for (const [field, name] of hashes) digest(field, name);
   timestamp(value.createdAt, "provider reference creation time");
   timestamp(value.verifiedAt, "provider verification time");
-  timestamp(value.locatorBundle.readbackVerifiedAt, "locator readback verification time");
   if (
     value.verifiedAt < value.createdAt ||
-    value.locatorBundle.readbackVerifiedAt < value.createdAt ||
     value.verifiedAt < now - PROVIDER_VERIFICATION_MAX_AGE_MS ||
-    value.verifiedAt > now + PROVIDER_VERIFICATION_FUTURE_SKEW_MS ||
-    value.locatorBundle.readbackVerifiedAt < now - PROVIDER_VERIFICATION_MAX_AGE_MS ||
-    value.locatorBundle.readbackVerifiedAt > now + PROVIDER_VERIFICATION_FUTURE_SKEW_MS
+    value.verifiedAt > now + PROVIDER_VERIFICATION_FUTURE_SKEW_MS
   )
     invalid("Provider original verification is stale");
 }
@@ -103,19 +123,30 @@ export function validateProviderOriginalDeclaration(
 export async function providerOriginalReferenceFingerprint(
   value: ProviderOriginalDeclaration,
 ): Promise<string> {
+  const common = [
+    value.referenceVersion,
+    value.providerKind,
+    value.clientReferenceId,
+    value.sourceContentHash,
+    value.sourceByteLength,
+    value.providerAccountIdHash,
+    value.providerRootDirectoryIdHash,
+    value.providerFileIdHash,
+    value.providerRevision,
+    value.providerContentHash,
+    value.verifiedAt,
+  ];
+  if (value.referenceVersion === "provider_original_v2") {
+    return sha256Utf8(
+      `provider-original-reference:v2\0${JSON.stringify([
+        ...common,
+        value.createdAt,
+      ])}`,
+    );
+  }
   return sha256Utf8(
     `provider-original-reference:v1\0${JSON.stringify([
-      value.referenceVersion,
-      value.providerKind,
-      value.clientReferenceId,
-      value.sourceContentHash,
-      value.sourceByteLength,
-      value.providerAccountIdHash,
-      value.providerRootDirectoryIdHash,
-      value.providerFileIdHash,
-      value.providerRevision,
-      value.providerContentHash,
-      value.verifiedAt,
+      ...common,
       [
         value.locatorBundle.bindingId,
         value.locatorBundle.manifestFingerprint,
@@ -151,17 +182,33 @@ function sameReference(
     row.providerRevision === value.providerRevision &&
     row.providerContentHash === value.providerContentHash &&
     row.verifiedAt.getTime() === value.verifiedAt &&
-    row.locatorBindingId === value.locatorBundle.bindingId &&
-    row.locatorManifestFingerprint === value.locatorBundle.manifestFingerprint &&
-    row.locatorRecipientFingerprint === value.locatorBundle.recipientFingerprint &&
-    row.locatorRepositoryKeyDomainFingerprint ===
-      value.locatorBundle.repositoryKeyDomainFingerprint &&
-    row.locatorRepositoryId === value.locatorBundle.repositoryId &&
-    row.locatorSnapshotId === value.locatorBundle.snapshotId &&
-    row.locatorObjectName === value.locatorBundle.objectName &&
-    row.locatorCiphertextHash === value.locatorBundle.ciphertextHash &&
-    row.locatorCiphertextByteLength === value.locatorBundle.ciphertextByteLength &&
-    row.locatorReadbackVerifiedAt.getTime() === value.locatorBundle.readbackVerifiedAt &&
+    row.referenceVersion === value.referenceVersion &&
+    (value.referenceVersion === "provider_original_v2"
+      ? row.locatorBindingId === null &&
+        row.locatorManifestFingerprint === null &&
+        row.locatorRecipientFingerprint === null &&
+        row.locatorRepositoryKeyDomainFingerprint === null &&
+        row.locatorRepositoryId === null &&
+        row.locatorSnapshotId === null &&
+        row.locatorObjectName === null &&
+        row.locatorCiphertextHash === null &&
+        row.locatorCiphertextByteLength === null &&
+        row.locatorReadbackVerifiedAt === null
+      : row.locatorBindingId === value.locatorBundle.bindingId &&
+        row.locatorManifestFingerprint ===
+          value.locatorBundle.manifestFingerprint &&
+        row.locatorRecipientFingerprint ===
+          value.locatorBundle.recipientFingerprint &&
+        row.locatorRepositoryKeyDomainFingerprint ===
+          value.locatorBundle.repositoryKeyDomainFingerprint &&
+        row.locatorRepositoryId === value.locatorBundle.repositoryId &&
+        row.locatorSnapshotId === value.locatorBundle.snapshotId &&
+        row.locatorObjectName === value.locatorBundle.objectName &&
+        row.locatorCiphertextHash === value.locatorBundle.ciphertextHash &&
+        row.locatorCiphertextByteLength ===
+          value.locatorBundle.ciphertextByteLength &&
+        row.locatorReadbackVerifiedAt?.getTime() ===
+          value.locatorBundle.readbackVerifiedAt) &&
     row.createdAtField.getTime() === value.createdAt
   );
 }
@@ -201,20 +248,30 @@ export async function createAndBindProviderOriginal(
   const nowMs = input.now.getTime();
   validateProviderOriginalDeclaration(input.declaration, nowMs);
   digest(input.requestDigest, "provider reference request digest");
-  const fingerprint = await providerOriginalReferenceFingerprint(input.declaration);
+  const fingerprint = await providerOriginalReferenceFingerprint(
+    input.declaration,
+  );
   const byClient = await client.query<QueryResultRow>(
     `SELECT * FROM kith.source_provider_original_references
       WHERE source_account_id = $1 AND client_reference_id = $2 LIMIT 2`,
     [input.sourceAccountId, input.declaration.clientReferenceId],
   );
-  if (byClient.rowCount! > 1) invalid("Provider original identity is not unique");
-  let reference = byClient.rows[0] && camelizeSourceProviderOriginalReference(byClient.rows[0]);
+  if (byClient.rowCount! > 1)
+    invalid("Provider original identity is not unique");
+  let reference =
+    byClient.rows[0] &&
+    camelizeSourceProviderOriginalReference(byClient.rows[0]);
   if (
     reference &&
     (reference.spaceId !== input.spaceId ||
       reference.sourceItemId !== input.sourceItemId ||
       reference.sourceRevisionId !== input.sourceRevisionId ||
-      !sameReference(reference, input.declaration, input.requestDigest, fingerprint))
+      !sameReference(
+        reference,
+        input.declaration,
+        input.requestDigest,
+        fingerprint,
+      ))
   )
     invalid("Conflicting immutable provider original reference");
   if (!reference) {
@@ -252,16 +309,36 @@ export async function createAndBindProviderOriginal(
         value.providerRevision,
         value.providerContentHash,
         new Date(value.verifiedAt),
-        value.locatorBundle.bindingId,
-        value.locatorBundle.manifestFingerprint,
-        value.locatorBundle.recipientFingerprint,
-        value.locatorBundle.repositoryKeyDomainFingerprint,
-        value.locatorBundle.repositoryId,
-        value.locatorBundle.snapshotId,
-        value.locatorBundle.objectName,
-        value.locatorBundle.ciphertextHash,
-        value.locatorBundle.ciphertextByteLength,
-        new Date(value.locatorBundle.readbackVerifiedAt),
+        value.referenceVersion === "provider_original_v1"
+          ? value.locatorBundle.bindingId
+          : null,
+        value.referenceVersion === "provider_original_v1"
+          ? value.locatorBundle.manifestFingerprint
+          : null,
+        value.referenceVersion === "provider_original_v1"
+          ? value.locatorBundle.recipientFingerprint
+          : null,
+        value.referenceVersion === "provider_original_v1"
+          ? value.locatorBundle.repositoryKeyDomainFingerprint
+          : null,
+        value.referenceVersion === "provider_original_v1"
+          ? value.locatorBundle.repositoryId
+          : null,
+        value.referenceVersion === "provider_original_v1"
+          ? value.locatorBundle.snapshotId
+          : null,
+        value.referenceVersion === "provider_original_v1"
+          ? value.locatorBundle.objectName
+          : null,
+        value.referenceVersion === "provider_original_v1"
+          ? value.locatorBundle.ciphertextHash
+          : null,
+        value.referenceVersion === "provider_original_v1"
+          ? value.locatorBundle.ciphertextByteLength
+          : null,
+        value.referenceVersion === "provider_original_v1"
+          ? new Date(value.locatorBundle.readbackVerifiedAt)
+          : null,
         input.userId,
         input.actorCredentialId,
         new Date(value.createdAt),
@@ -273,8 +350,11 @@ export async function createAndBindProviderOriginal(
     `SELECT * FROM kith.source_provider_original_bindings WHERE source_revision_id = $1 LIMIT 2`,
     [input.sourceRevisionId],
   );
-  if (byRevision.rowCount! > 1) invalid("Provider original binding is not unique");
-  let binding = byRevision.rows[0] && camelizeSourceProviderOriginalBinding(byRevision.rows[0]);
+  if (byRevision.rowCount! > 1)
+    invalid("Provider original binding is not unique");
+  let binding =
+    byRevision.rows[0] &&
+    camelizeSourceProviderOriginalBinding(byRevision.rows[0]);
   if (
     binding &&
     (binding.spaceId !== input.spaceId ||
@@ -313,9 +393,10 @@ export async function createAndBindProviderOriginal(
     }
   } else {
     const priorRow = (
-      await client.query<QueryResultRow>(`SELECT * FROM kith.source_provider_original_references WHERE id = $1`, [
-        binding.referenceId,
-      ])
+      await client.query<QueryResultRow>(
+        `SELECT * FROM kith.source_provider_original_references WHERE id = $1`,
+        [binding.referenceId],
+      )
     ).rows[0];
     const prior = priorRow && camelizeSourceProviderOriginalReference(priorRow);
     if (
@@ -351,10 +432,10 @@ export async function createAndBindProviderOriginal(
 export async function loadProviderOriginalBinding(
   client: ClientBase,
   sourceRevisionId: string,
-): Promise<
-  | { binding: SourceProviderOriginalBindingRow; reference: SourceProviderOriginalReferenceRow }
-  | null
-> {
+): Promise<{
+  binding: SourceProviderOriginalBindingRow;
+  reference: SourceProviderOriginalReferenceRow;
+} | null> {
   const rows = await client.query<QueryResultRow>(
     `SELECT * FROM kith.source_provider_original_bindings WHERE source_revision_id = $1 LIMIT 2`,
     [sourceRevisionId],
@@ -397,9 +478,10 @@ export async function loadProviderOriginalReference(
   },
 ): Promise<SourceProviderOriginalReferenceRow> {
   const row = (
-    await client.query<QueryResultRow>(`SELECT * FROM kith.source_provider_original_references WHERE id = $1`, [
-      input.referenceId,
-    ])
+    await client.query<QueryResultRow>(
+      `SELECT * FROM kith.source_provider_original_references WHERE id = $1`,
+      [input.referenceId],
+    )
   ).rows[0];
   const reference = row && camelizeSourceProviderOriginalReference(row);
   if (
@@ -412,13 +494,14 @@ export async function loadProviderOriginalReference(
       reference.sourceContentHash !== input.expectedSourceContentHash) ||
     (input.expectedSourceByteLength !== undefined &&
       reference.sourceByteLength !== input.expectedSourceByteLength) ||
-    reference.referenceVersion !== "provider_original_v1" ||
+    (reference.referenceVersion !== "provider_original_v1" &&
+      reference.referenceVersion !== "provider_original_v2") ||
     reference.providerKind !== "dropbox_v1" ||
     reference.verificationAuthority !== "worker_asserted" ||
     !SHA256.test(reference.requestDigest)
   )
     invalid("Provider original reference parent is invalid");
-  const declaration: ProviderOriginalDeclaration = {
+  const common = {
     referenceVersion: reference.referenceVersion,
     providerKind: reference.providerKind,
     clientReferenceId: reference.clientReferenceId,
@@ -430,50 +513,73 @@ export async function loadProviderOriginalReference(
     providerRevision: reference.providerRevision,
     providerContentHash: reference.providerContentHash,
     verifiedAt: reference.verifiedAt.getTime(),
-    locatorBundle: {
-      bindingId: reference.locatorBindingId,
-      manifestFingerprint: reference.locatorManifestFingerprint,
-      recipientFingerprint: reference.locatorRecipientFingerprint,
-      repositoryKeyDomainFingerprint: reference.locatorRepositoryKeyDomainFingerprint,
-      repositoryId: reference.locatorRepositoryId,
-      snapshotId: reference.locatorSnapshotId,
-      objectName: reference.locatorObjectName,
-      ciphertextHash: reference.locatorCiphertextHash,
-      ciphertextByteLength: reference.locatorCiphertextByteLength,
-      readbackVerifiedAt: reference.locatorReadbackVerifiedAt.getTime(),
-    },
     createdAt: reference.createdAtField.getTime(),
   };
+  const declaration: ProviderOriginalDeclaration =
+    reference.referenceVersion === "provider_original_v2"
+      ? { ...common, referenceVersion: "provider_original_v2" }
+      : {
+          ...common,
+          referenceVersion: "provider_original_v1",
+          locatorBundle: {
+            bindingId: reference.locatorBindingId ?? "",
+            manifestFingerprint: reference.locatorManifestFingerprint ?? "",
+            recipientFingerprint: reference.locatorRecipientFingerprint ?? "",
+            repositoryKeyDomainFingerprint:
+              reference.locatorRepositoryKeyDomainFingerprint ?? "",
+            repositoryId: reference.locatorRepositoryId ?? "",
+            snapshotId: reference.locatorSnapshotId ?? "",
+            objectName: reference.locatorObjectName ?? "",
+            ciphertextHash: reference.locatorCiphertextHash ?? "",
+            ciphertextByteLength: reference.locatorCiphertextByteLength ?? 0,
+            readbackVerifiedAt:
+              reference.locatorReadbackVerifiedAt?.getTime() ?? -1,
+          },
+        };
   if (
     !UUID.test(declaration.clientReferenceId) ||
-    !UUID.test(declaration.locatorBundle.bindingId) ||
     !REVISION.test(declaration.providerRevision) ||
-    !OBJECT_NAME.test(declaration.locatorBundle.objectName) ||
     !Number.isSafeInteger(declaration.sourceByteLength) ||
     declaration.sourceByteLength < 1 ||
-    !Number.isSafeInteger(declaration.locatorBundle.ciphertextByteLength) ||
-    declaration.locatorBundle.ciphertextByteLength < 1 ||
-    declaration.locatorBundle.ciphertextByteLength > 1_024 * 1_024 ||
     !Number.isSafeInteger(declaration.createdAt) ||
     !Number.isSafeInteger(declaration.verifiedAt) ||
-    !Number.isSafeInteger(declaration.locatorBundle.readbackVerifiedAt) ||
     declaration.createdAt < 0 ||
     declaration.verifiedAt < declaration.createdAt ||
-    declaration.locatorBundle.readbackVerifiedAt < declaration.createdAt ||
     [
       declaration.sourceContentHash,
       declaration.providerAccountIdHash,
       declaration.providerRootDirectoryIdHash,
       declaration.providerFileIdHash,
       declaration.providerContentHash,
-      declaration.locatorBundle.manifestFingerprint,
-      declaration.locatorBundle.recipientFingerprint,
-      declaration.locatorBundle.repositoryKeyDomainFingerprint,
-      declaration.locatorBundle.repositoryId,
-      declaration.locatorBundle.snapshotId,
-      declaration.locatorBundle.ciphertextHash,
     ].some((value) => !SHA256.test(value)) ||
-    reference.referenceFingerprint !== (await providerOriginalReferenceFingerprint(declaration))
+    (declaration.referenceVersion === "provider_original_v2"
+      ? reference.locatorBindingId !== null ||
+        reference.locatorManifestFingerprint !== null ||
+        reference.locatorRecipientFingerprint !== null ||
+        reference.locatorRepositoryKeyDomainFingerprint !== null ||
+        reference.locatorRepositoryId !== null ||
+        reference.locatorSnapshotId !== null ||
+        reference.locatorObjectName !== null ||
+        reference.locatorCiphertextHash !== null ||
+        reference.locatorCiphertextByteLength !== null ||
+        reference.locatorReadbackVerifiedAt !== null
+      : !UUID.test(declaration.locatorBundle.bindingId) ||
+        !OBJECT_NAME.test(declaration.locatorBundle.objectName) ||
+        !Number.isSafeInteger(declaration.locatorBundle.ciphertextByteLength) ||
+        declaration.locatorBundle.ciphertextByteLength < 1 ||
+        declaration.locatorBundle.ciphertextByteLength > 1_024 * 1_024 ||
+        !Number.isSafeInteger(declaration.locatorBundle.readbackVerifiedAt) ||
+        declaration.locatorBundle.readbackVerifiedAt < declaration.createdAt ||
+        [
+          declaration.locatorBundle.manifestFingerprint,
+          declaration.locatorBundle.recipientFingerprint,
+          declaration.locatorBundle.repositoryKeyDomainFingerprint,
+          declaration.locatorBundle.repositoryId,
+          declaration.locatorBundle.snapshotId,
+          declaration.locatorBundle.ciphertextHash,
+        ].some((value) => !SHA256.test(value))) ||
+    reference.referenceFingerprint !==
+      (await providerOriginalReferenceFingerprint(declaration))
   )
     invalid("Provider original reference is invalid");
   return reference;

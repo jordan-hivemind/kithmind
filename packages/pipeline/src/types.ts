@@ -59,6 +59,10 @@ export type PdfDocQaProviderRoot = {
  */
 export type PdfDocQaProviderOriginal = {
   providerAccountIdHash: string;
+  remoteName?: string;
+  rcloneBinary?: string;
+  configPath?: string;
+  configIdentityFingerprint?: string;
   refreshPath: string;
   registryDirectory: string;
   roots: PdfDocQaProviderRoot[];
@@ -85,7 +89,7 @@ export type PdfDocQaConfig = {
   archive: {
     ageBinary: string;
     primary: PdfDocQaArchiveIdentity & { directory: string; recipient: string };
-    independentBackup: PdfDocQaArchiveIdentity & {
+    independentBackup?: PdfDocQaArchiveIdentity & {
       directory: string;
       recipient: string;
       resticBinary: string;

@@ -11,8 +11,12 @@ export function validateArchiveRelocationConfig(
 ): { previousBinding: JournalBinding; proposedBinding: JournalBinding } {
   const before = parseConfig(previous);
   const after = parseConfig(proposed);
-  const oldRepository = before.pdfDocQa?.archive.independentBackup.repository;
-  const newRepository = after.pdfDocQa?.archive.independentBackup.repository;
+  const oldBackup = before.pdfDocQa?.archive.independentBackup;
+  const newBackup = after.pdfDocQa?.archive.independentBackup;
+  const oldRepository =
+    oldBackup && "repository" in oldBackup ? oldBackup.repository : undefined;
+  const newRepository =
+    newBackup && "repository" in newBackup ? newBackup.repository : undefined;
   if (
     !oldRepository ||
     !newRepository ||
@@ -21,8 +25,11 @@ export function validateArchiveRelocationConfig(
     throw new Error("Archive relocation requires a changed remote root path");
   }
   const comparison = structuredClone(after);
-  comparison.pdfDocQa!.archive.independentBackup.repository!.rootPath =
-    oldRepository.rootPath;
+  const comparisonBackup = comparison.pdfDocQa?.archive.independentBackup;
+  if (!comparisonBackup || !("repository" in comparisonBackup)) {
+    throw new Error("Archive relocation requires a remote backup");
+  }
+  comparisonBackup.repository!.rootPath = oldRepository.rootPath;
   if (!isDeepStrictEqual(before, comparison)) {
     throw new Error("Archive relocation may change only the remote root path");
   }

@@ -1665,6 +1665,65 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
     this.parsedCheckpoint = structuredClone(parsedCheckpoint);
     this.parsedResult = undefined;
   }
+  /**
+   * One bounded active-pass config transition for provider-original v2. The
+   * caller validates the allowed config delta and exact archived checkpoint.
+   * This method makes clearing the already-answered request, advancing its
+   * checkpoint, and adopting the proposed config binding one durable write.
+   */
+  async commitProviderV2Transition(args: {
+    previousBinding: JournalBinding;
+    proposedBinding: JournalBinding;
+    checkpoint: C;
+    credentialSessionActive: boolean;
+  }): Promise<Journal<C, R>> {
+    this.assertUsable();
+    const previous = parseBinding(args.previousBinding);
+    const proposed = parseBinding(args.proposedBinding);
+    if (
+      !bindingEqual(this.binding, previous) ||
+      !sameAuthorityDifferentConfig(previous, proposed) ||
+      (this.state.pending !== undefined &&
+        (!this.state.pending.result || this.parsedResult === undefined))
+    )
+      fail("provider v2 transition state is invalid");
+    let checkpoint: C;
+    try {
+      checkpoint = this.codec.parseCheckpoint(args.checkpoint);
+    } catch {
+      fail("provider v2 transition checkpoint is invalid");
+    }
+    const { pending: _completed, ...retained } = this.state;
+    const next: StoredState = {
+      ...retained,
+      binding: proposed,
+      checkpoint: normalizeJson(checkpoint, MAX_CHECKPOINT_BYTES),
+      credentialSessionActive: boolean(args.credentialSessionActive),
+    };
+    await this.persistCandidate(next);
+    const storedAfter = await readStoredState(this.statePath);
+    if (storedAfter === undefined) fail("provider v2 transition journal is missing");
+    const parsedAfter = parseState(storedAfter, this.codec);
+    if (serializeState(parsedAfter.state) !== serializeState(next)) {
+      this.poisoned = true;
+      fail("provider v2 transition journal readback changed");
+    }
+    const transferredLocks = this.locks;
+    this.locks = [];
+    this.closed = true;
+    this.state = next;
+    this.parsedCheckpoint = checkpoint;
+    this.parsedResult = undefined;
+    return new Journal<C, R>({
+      directory: this.directory,
+      binding: proposed,
+      codec: this.codec,
+      locks: transferredLocks,
+      directoryIdentity: this.directoryIdentity,
+      state: next,
+      checkpoint,
+    });
+  }
   async transitionCheckpoint(
     transition: CheckpointTransition<C>,
   ): Promise<void> {

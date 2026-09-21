@@ -9,6 +9,13 @@ section already names the successor; see
 [`docs/database-backups.md`](database-backups.md) for the current recovery
 path.
 
+Status, 2026-09-21: the owner selected Dropbox as the sufficient file
+persistence boundary and Neon as the sufficient Postgres persistence boundary.
+Separate file copies, parser backup copies, database dumps, restic snapshots
+and restore drills are no longer prerequisites. The remaining material is a
+historical record and must not be used to enable backup jobs without a new
+explicit owner request.
+
 ## Status
 
 Kith Mind recovery has two separate parts. A native Convex snapshot preserves

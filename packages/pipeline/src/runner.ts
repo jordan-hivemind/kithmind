@@ -67,6 +67,7 @@ import {
   createArchiveReceiptSelection,
   createParserArtifactSelection,
   digestArchiveIntent,
+  digestRetainedProviderV1ArchiveIntent,
   existingArchiveReceiptSelection,
   existingParserArtifactSelection,
   parsedTextDeclaration,
@@ -337,6 +338,56 @@ function parseAttemptsSpent(rows: readonly ProcessingCatalogRow[]): number {
   );
 }
 
+function admittedOriginalCloud(input: {
+  original: OriginalCatalogRow;
+  sourceItemId: string;
+  sourceRevisionId: string;
+  value: Record<string, unknown>;
+  admittedAt: number;
+}): NonNullable<OriginalCatalogRow["cloud"]> {
+  const provider = input.original.providerOriginal;
+  const base = {
+    sourceItemId: input.sourceItemId,
+    sourceRevisionId: input.sourceRevisionId,
+    admittedAt: input.admittedAt,
+  };
+  if (provider?.referenceVersion === "provider_original_v2") {
+    return {
+      ...base,
+      providerReferenceId: text(
+        input.value.originalProviderReferenceId,
+        "original_provider_reference_id",
+      ),
+      providerBindingEpoch: integer(
+        input.value.originalProviderBindingEpoch,
+        "original_provider_binding_epoch",
+      ),
+    };
+  }
+  const primaryReceiptId = input.original.copies.primary?.cloudReceipt?.receiptId;
+  if (!primaryReceiptId)
+    throw new PipelineWorkerError("archived_original_recovery_incomplete");
+  if (provider) {
+    return {
+      ...base,
+      primaryReceiptId,
+      providerReferenceId: text(
+        input.value.originalProviderReferenceId,
+        "original_provider_reference_id",
+      ),
+      providerBindingEpoch: integer(
+        input.value.originalProviderBindingEpoch,
+        "original_provider_binding_epoch",
+      ),
+    };
+  }
+  const backupReceiptId =
+    input.original.copies.independent_backup?.cloudReceipt?.receiptId;
+  if (!backupReceiptId)
+    throw new PipelineWorkerError("archived_original_recovery_incomplete");
+  return { ...base, primaryReceiptId, backupReceiptId };
+}
+
 /**
  * P2-31f. Bumped whenever a build changes how it handles one of
  * `ADMISSION_BLOCK_CODES`, which releases every item parked by an earlier
@@ -396,10 +447,12 @@ function providerProofFresh(
   now = Date.now(),
 ): boolean {
   const verifiedAt = provider.verified?.verifiedAt;
-  const readbackVerifiedAt = provider.locator.readbackVerifiedAt;
-  if (verifiedAt === undefined || readbackVerifiedAt === undefined)
-    return false;
-  return [verifiedAt, readbackVerifiedAt].every(
+  const times =
+    provider.referenceVersion === "provider_original_v2"
+      ? [verifiedAt]
+      : [verifiedAt, provider.locator.readbackVerifiedAt];
+  if (times.some((at) => at === undefined)) return false;
+  return (times as number[]).every(
     (at) => at >= now - 9 * 60_000 && at <= now + 4 * 60_000,
   );
 }
@@ -982,6 +1035,17 @@ function parserArtifactReuse(
     throw new PipelineWorkerError("existing_parser_artifact_invalid");
   }
   const row = offered as Record<string, unknown>;
+  const backup = row.backupReceiptId === undefined
+    ? undefined
+    : {
+        backupReceiptId: text(row.backupReceiptId, "backup_receipt_id"),
+        backupBindingEpoch: integer(
+          row.backupBindingEpoch,
+          "backup_binding_epoch",
+        ),
+      };
+  if ((row.backupReceiptId === undefined) !== (row.backupBindingEpoch === undefined))
+    throw new PipelineWorkerError("existing_parser_artifact_invalid");
   return {
     parserArtifactId: text(row.parserArtifactId, "parser_artifact_id"),
     primaryReceiptId: text(row.primaryReceiptId, "primary_receipt_id"),
@@ -989,8 +1053,7 @@ function parserArtifactReuse(
       row.primaryBindingEpoch,
       "primary_binding_epoch",
     ),
-    backupReceiptId: text(row.backupReceiptId, "backup_receipt_id"),
-    backupBindingEpoch: integer(row.backupBindingEpoch, "backup_binding_epoch"),
+    ...(backup ?? {}),
   };
 }
 
@@ -1658,8 +1721,12 @@ export class PipelineRunner {
     seed: string,
   ) {
     const pdf = this.requirePdfConfig();
+    const backup = pdf.archive.independentBackup;
     const configured =
-      role === "primary" ? pdf.archive.primary : pdf.archive.independentBackup;
+      role === "primary" ? pdf.archive.primary : backup;
+    if (!configured) {
+      throw new PipelineWorkerError("archive_backup_configuration_missing");
+    }
     const archiveObjectId = stableUuid(seed, subject, role, "object");
     return {
       role,
@@ -1676,8 +1743,8 @@ export class PipelineRunner {
         ? {
             restic: {
               operationId: stableUuid(seed, subject, role, "restic"),
-              host: pdf.archive.independentBackup.host,
-              repositoryId: pdf.archive.independentBackup.expectedRepositoryId,
+              host: backup!.host,
+              repositoryId: backup!.expectedRepositoryId,
             },
           }
         : {}),
@@ -2081,27 +2148,17 @@ export class PipelineRunner {
                   originalSeed,
                 ),
               }
-            : ({
-                primary: this.copyIntent(
-                  "original_bytes",
-                  "primary",
-                  originalSeed,
-                ),
-              } as { primary: ArchiveCopyIntent; independent_backup: never }),
+            : {},
         ...(provider === undefined
           ? {}
           : {
               providerOriginal: {
+                referenceVersion: "provider_original_v2",
                 clientReferenceId: stableUuid(
                   originalSeed,
                   "provider-reference",
                 ),
                 bindingId: stableUuid(originalSeed, "provider-binding"),
-                locator: this.copyIntent(
-                  "parser_output",
-                  "independent_backup",
-                  stableUuid(originalSeed, "provider-locator"),
-                ),
               },
             }),
         createdAt,
@@ -2160,11 +2217,15 @@ export class PipelineRunner {
         },
         copies: {
           primary: this.copyIntent("parser_output", "primary", processingId),
-          independent_backup: this.copyIntent(
-            "parser_output",
-            "independent_backup",
-            processingId,
-          ),
+          ...(providerRootFor(pdf.providerOriginal, plan.rootAlias) === undefined
+            ? {
+                independent_backup: this.copyIntent(
+                  "parser_output",
+                  "independent_backup",
+                  processingId,
+                ),
+              }
+            : {}),
         },
         createdAt,
       });
@@ -3065,14 +3126,8 @@ export class PipelineRunner {
     if (this.providerFileIdSources) return this.providerFileIdSources;
     const pdf = this.config.pdfDocQa;
     const account = pdf?.providerOriginal;
-    const repository = pdf?.archive.independentBackup.repository;
-    if (!account || !repository) return [];
-    const credentials = {
-      rcloneBinary: repository.rcloneBinary,
-      configPath: repository.configPath,
-      remoteName: repository.remoteName,
-      configIdentityFingerprint: repository.configIdentityFingerprint,
-    };
+    if (!account) return [];
+    const credentials = this.providerCredentials();
     return providerRootsOf(account).map((root) => ({
       rootAlias: root.rootAlias,
       lookup: async (relativePaths) =>
@@ -4099,13 +4154,16 @@ export class PipelineRunner {
 
   private archiveConfiguration(role: ArchiveCopyRole) {
     const pdf = this.requirePdfConfig();
-    return role === "primary"
-      ? pdf.archive.primary
-      : pdf.archive.independentBackup;
+    if (role === "primary") return pdf.archive.primary;
+    if (!pdf.archive.independentBackup)
+      throw new PipelineWorkerError("archive_backup_configuration_missing");
+    return pdf.archive.independentBackup;
   }
 
   private resticLocation(subject: ArchiveSubject) {
     const backup = this.requirePdfConfig().archive.independentBackup;
+    if (!backup)
+      throw new PipelineWorkerError("archive_backup_configuration_missing");
     if ("repository" in backup) {
       if (subject !== "parser_output") {
         throw new PipelineWorkerError("archive_remote_original_unsupported");
@@ -4121,21 +4179,13 @@ export class PipelineRunner {
   ) {
     const provider = original.providerOriginal;
     const verified = provider?.verified;
-    const locator = provider?.locator;
-    if (
-      !provider ||
-      !verified ||
-      !locator?.published ||
-      !locator.backup ||
-      locator.readbackVerifiedAt === undefined
-    )
+    if (!provider || !verified)
       throw new PipelineWorkerError("provider_original_not_durable");
     if (requireFresh && !providerProofFresh(provider))
       throw new PipelineWorkerError(
         "provider_verification_stale_review_required",
       );
-    return {
-      referenceVersion: "provider_original_v1" as const,
+    const base = {
       providerKind: "dropbox_v1" as const,
       clientReferenceId: provider.clientReferenceId,
       sourceContentHash: verified.sourceContentHash,
@@ -4146,6 +4196,24 @@ export class PipelineRunner {
       providerRevision: verified.providerRevision,
       providerContentHash: verified.providerContentHash,
       verifiedAt: verified.verifiedAt,
+    };
+    if (provider.referenceVersion === "provider_original_v2") {
+      return {
+        referenceVersion: "provider_original_v2" as const,
+        ...base,
+        createdAt: provenanceCreatedAt(original.createdAt, verified.verifiedAt),
+      };
+    }
+    const locator = provider.locator;
+    if (
+      !locator.published ||
+      !locator.backup ||
+      locator.readbackVerifiedAt === undefined
+    )
+      throw new PipelineWorkerError("provider_original_not_durable");
+    return {
+      referenceVersion: "provider_original_v1" as const,
+      ...base,
       locatorBundle: {
         bindingId: provider.bindingId,
         manifestFingerprint: verified.manifestFingerprint,
@@ -4171,7 +4239,7 @@ export class PipelineRunner {
     role: ArchiveCopyRole,
   ) {
     const copy = row.copies[role];
-    if (!copy.prepared)
+    if (!copy?.prepared)
       throw new PipelineWorkerError("archive_prepare_missing");
     return {
       ...copy.prepared,
@@ -4218,6 +4286,7 @@ export class PipelineRunner {
     const { original, processing } = this.archivedRows(checkpoint);
     const row = subject === "original_bytes" ? original : processing;
     const copy = row.copies[role];
+    if (!copy) throw new PipelineWorkerError("archive_copy_missing");
     const configured = this.archiveConfiguration(role);
     const prepared = this.preparedArchiveObject(row, role);
     const pdf = this.requirePdfConfig();
@@ -4319,11 +4388,14 @@ export class PipelineRunner {
       } else if (recoveredBackup) {
         backup = recoveredBackup;
       } else {
+        const independentBackup = pdf.archive.independentBackup;
+        if (!independentBackup)
+          throw new PipelineWorkerError("archive_backup_configuration_missing");
         backup = await backupResticObject({
-          resticBinary: pdf.archive.independentBackup.resticBinary,
+          resticBinary: independentBackup.resticBinary,
           ...this.resticLocation(subject),
           expectedRepositoryId: copy.restic.repositoryId,
-          passwordCommand: pdf.archive.independentBackup.passwordCommand,
+          passwordCommand: independentBackup.passwordCommand,
           operationId: copy.restic.operationId,
           host: copy.restic.host,
           ciphertextPath: join(configured.directory, copy.objectName),
@@ -4354,6 +4426,99 @@ export class PipelineRunner {
     });
   }
 
+  private async adoptLegacyProviderCheckpoint(
+    checkpoint: ArchivedCheckpoint,
+  ): Promise<RunnerCheckpoint> {
+    const rows = this.archivedRows(checkpoint);
+    const pending = this.journal.pending;
+    if (pending) {
+      if (
+        pending.operation !== "discovery.preflightArchived" ||
+        pending.result === undefined
+      )
+        throw new PipelineWorkerError(
+          "provider_v2_transition_requires_answered_pending",
+        );
+      let body: Record<string, unknown>;
+      try {
+        body = JSON.parse(pending.requestBody) as Record<string, unknown>;
+      } catch {
+        throw new PipelineWorkerError("journal_phase_conflict");
+      }
+      if (
+        rows.original.providerOriginal?.referenceVersion ===
+        "provider_original_v2"
+      ) {
+        const identity = archivedIdentity(
+          checkpoint,
+          this.archivedPlan(checkpoint),
+        );
+        const expected = request(
+          this.config,
+          "discovery.preflightArchived",
+          {
+            requestId: text(body.requestId, "request_id"),
+            identity,
+            archiveIntentDigest: digestRetainedProviderV1ArchiveIntent({
+              identity,
+              original: rows.original,
+              processing: rows.processing,
+            }),
+          },
+        );
+        if (!equalJson(body, expected))
+          throw new PipelineWorkerError("journal_phase_conflict");
+      } else {
+        await this.validatePendingBody("discovery.preflightArchived", body);
+      }
+      const response = asWorkerResponse(pending.result.value);
+      const code = errorCode(response);
+      if (code) {
+        return scanTerminal(checkpoint, "failed", code, true);
+      }
+      const value = object(response, "discovery.preflightArchived");
+      const identity = archivedIdentity(
+        checkpoint,
+        this.archivedPlan(checkpoint),
+      );
+      if (
+        value.sourceItemId !== identity.sourceItemId ||
+        Number(value.expectedDesiredProcessingEpoch) + 1 !==
+          identity.processingEpoch ||
+        value.archiveIntentDigest !== body.archiveIntentDigest
+      )
+        throw new PipelineWorkerError("archived_preflight_parent_conflict");
+    }
+    const { original, processing } = rows;
+    const migratedRows =
+      original.providerOriginal?.referenceVersion === "provider_original_v2"
+        ? { original, processing }
+        : await this.requireCatalog().adoptProviderOriginalV2({
+            originalCatalogId: original.originalCatalogId,
+            expectedOriginalRevision: original.rowRevision,
+            processingCatalogId: processing.processingCatalogId,
+            expectedProcessingRevision: processing.rowRevision,
+          });
+    return archivedBase(checkpoint, {
+      step: "parser_archive",
+      preflightAction: undefined,
+      expectedOriginalRevision: migratedRows.original.rowRevision,
+      expectedProcessingRevision: migratedRows.processing.rowRevision,
+    });
+  }
+
+  async prepareProviderV2Transition(): Promise<RunnerCheckpoint> {
+    const checkpoint = this.journal.checkpoint;
+    if (
+      checkpoint.phase !== "archived" ||
+      checkpoint.step !== "preflight" ||
+      !checkpoint.preflightAction?.startsWith("provider_locator_")
+    )
+      throw new PipelineWorkerError("provider_v2_transition_checkpoint_invalid");
+    this.archiveCatalog = await openArchiveCatalog({ journal: this.journal });
+    return await this.adoptLegacyProviderCheckpoint(checkpoint);
+  }
+
   private async driveArchivedPreflight(): Promise<void> {
     const checkpoint = this.journal.checkpoint;
     if (
@@ -4362,6 +4527,12 @@ export class PipelineRunner {
       !checkpoint.preflightAction
     ) {
       throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    if (
+      checkpoint.preflightAction.startsWith("provider_locator_") &&
+      this.archivedRows(checkpoint).original.providerOriginal
+    ) {
+      throw new PipelineWorkerError("provider_v2_transition_required");
     }
     const rows = this.archivedRows(checkpoint);
     const identity = archivedIdentity(
@@ -4374,8 +4545,13 @@ export class PipelineRunner {
       processing: rows.processing,
     });
     let recoveredBackup: RecoveredResticBackup | undefined;
-    if (checkpoint.preflightAction !== "initial") {
+    if (
+      checkpoint.preflightAction !== "initial" &&
+      checkpoint.preflightAction.includes("backup")
+    ) {
       const pdf = this.requirePdfConfig();
+      if (!pdf.archive.independentBackup)
+        throw new PipelineWorkerError("archive_backup_configuration_missing");
       await probeArchiveTools({
         ageBinary: pdf.archive.ageBinary,
         resticBinary: pdf.archive.independentBackup.resticBinary,
@@ -4384,18 +4560,21 @@ export class PipelineRunner {
         checkpoint.preflightAction.endsWith("snapshot") &&
         !checkpoint.preflightAction.startsWith("provider_")
       ) {
+        const independentBackup = pdf.archive.independentBackup;
+        if (!independentBackup)
+          throw new PipelineWorkerError("archive_backup_configuration_missing");
         const repository = await probeResticRepository({
-          resticBinary: pdf.archive.independentBackup.resticBinary,
+          resticBinary: independentBackup.resticBinary,
           ...this.resticLocation(
             checkpoint.preflightAction.startsWith("original_")
               ? "original_bytes"
               : "parser_output",
           ),
-          passwordCommand: pdf.archive.independentBackup.passwordCommand,
+          passwordCommand: independentBackup.passwordCommand,
         });
         if (
           repository.repositoryId !==
-          pdf.archive.independentBackup.expectedRepositoryId
+          independentBackup.expectedRepositoryId
         ) {
           throw new PipelineWorkerError("archive_repository_conflict");
         }
@@ -4405,15 +4584,15 @@ export class PipelineRunner {
           : "parser_output";
         const row = subject === "original_bytes" ? original : processing;
         const copy = row.copies.independent_backup;
-        if (!copy.published || !copy.restic) {
+        if (!copy?.published || !copy.restic) {
           throw new PipelineWorkerError("archive_backup_parent_missing");
         }
         try {
           recoveredBackup = await recoverResticBackup({
-            resticBinary: pdf.archive.independentBackup.resticBinary,
+            resticBinary: independentBackup.resticBinary,
             ...this.resticLocation(subject),
             expectedRepositoryId: copy.restic.repositoryId,
-            passwordCommand: pdf.archive.independentBackup.passwordCommand,
+            passwordCommand: independentBackup.passwordCommand,
             operationId: copy.restic.operationId,
             host: copy.restic.host,
             objectName: copy.objectName,
@@ -4547,11 +4726,14 @@ export class PipelineRunner {
     const roles =
       subject === "parser_output" && checkpoint.parserReuse
         ? ([] as const)
-        : subject === "original_bytes" && original.providerOriginal
-          ? (["primary"] as const)
+        : original.providerOriginal
+          ? subject === "original_bytes"
+            ? ([] as const)
+            : (["primary"] as const)
           : (["primary", "independent_backup"] as const);
     for (const role of roles) {
       const copy = row.copies[role];
+      if (!copy) throw new PipelineWorkerError("archive_copy_missing");
       if (!copy.prepared) {
         const configured = this.archiveConfiguration(role);
         const catalogId =
@@ -4679,366 +4861,219 @@ export class PipelineRunner {
     });
   }
 
-  private async driveProviderOriginal(
-    checkpoint: ArchivedCheckpoint,
-    original: OriginalCatalogRow,
-    processing: ProcessingCatalogRow,
-    capturePath: string,
-    authorizedAction?: NonNullable<ArchivedCheckpoint["preflightAction"]>,
-  ): Promise<RunnerCheckpoint | void> {
+  private providerCredentials() {
     const pdf = this.requirePdfConfig();
-    const account = pdf.providerOriginal;
-    const state = original.providerOriginal;
-    if (!account || !state || !("repository" in pdf.archive.independentBackup))
+    const provider = pdf.providerOriginal;
+    if (!provider)
       throw new PipelineWorkerError("provider_original_configuration_missing");
-    const remoteRepository = pdf.archive.independentBackup.repository!;
-    const plan = this.archivedPlan(checkpoint);
-    const provider = providerBinding(account, plan.rootAlias);
-    if (state.locator.reviewCode)
-      throw new PipelineWorkerError(
-        "provider_locator_recovery_review_required",
-      );
-    let loaded = await loadProviderBinding({
-      registryDirectory: provider.registryDirectory,
-      bindingId: state.bindingId,
-    });
-    const requiredAction = !state.verified
-      ? "provider_verify"
-      : !state.locator.prepared
-        ? "provider_locator_prepare"
-        : !state.locator.published
-          ? "provider_locator_publish"
-          : !state.locator.backup
-            ? "provider_locator_snapshot"
-            : undefined;
-    if (authorizedAction === undefined) {
-      if (requiredAction === undefined) {
-        await this.journal.transitionCheckpoint({
-          checkpoint: archivedBase(checkpoint, { step: "reserve" }),
-          credentialSessionActive: true,
-        });
-      } else {
-        await this.journal.transitionCheckpoint({
-          checkpoint: archivedBase(checkpoint, {
-            step: "preflight",
-            preflightAction: requiredAction,
-          }),
-          credentialSessionActive: true,
-        });
-      }
-      return;
-    }
-    if (authorizedAction !== requiredAction)
-      throw new PipelineWorkerError("provider_action_conflict");
-    if (!state.verified) {
-      if (!loaded) {
-        const verified = await verifyDropboxOriginal({
-          credentials: {
-            rcloneBinary: remoteRepository.rcloneBinary,
-            configPath: remoteRepository.configPath,
-            remoteName: remoteRepository.remoteName,
-            configIdentityFingerprint:
-              remoteRepository.configIdentityFingerprint,
-          },
-          refreshPath: provider.refreshPath,
-          capturePath,
-          sourceContentHash: original.origin.sha256,
-          sourceByteLength: original.origin.byteLength,
-          providerAccountIdHash: provider.providerAccountIdHash,
-          providerRootDirectoryIdHash: provider.providerRootDirectoryIdHash,
-          providerRootDirectoryId: provider.providerRootDirectoryId,
-          relativePath: plan.relativePath,
-          bindingId: state.bindingId,
-        });
-        const persisted = await persistProviderBinding({
-          registryDirectory: provider.registryDirectory,
-          verified,
-        });
-        loaded = { persisted, verified };
-      }
-      if (
-        loaded.verified.metadata.providerAccountIdHash !==
-          provider.providerAccountIdHash ||
-        loaded.verified.metadata.providerRootDirectoryIdHash !==
-          provider.providerRootDirectoryIdHash ||
-        loaded.verified.metadata.sourceContentHash !== original.origin.sha256 ||
-        loaded.verified.metadata.sourceByteLength !==
-          original.origin.byteLength ||
-        loaded.verified.binding.providerRootDirectoryId !==
-          provider.providerRootDirectoryId ||
-        loaded.verified.binding.relativePath !== plan.relativePath
-      )
-        throw new PipelineWorkerError("provider_locator_registry_conflict");
-      const next = await this.requireCatalog().recordProviderVerified({
-        catalogId: original.originalCatalogId,
-        expectedRevision: original.rowRevision,
-        verified: {
-          providerAccountIdHash: loaded.verified.metadata.providerAccountIdHash,
-          providerRootDirectoryIdHash:
-            loaded.verified.metadata.providerRootDirectoryIdHash,
-          providerFileIdHash: loaded.verified.metadata.providerFileIdHash,
-          providerRevision: loaded.verified.metadata.providerRevision,
-          providerContentHash: loaded.verified.metadata.providerContentHash,
-          sourceContentHash: loaded.verified.metadata.sourceContentHash,
-          sourceByteLength: loaded.verified.metadata.sourceByteLength,
-          verifiedAt: loaded.verified.metadata.verifiedAt,
-          manifestFingerprint: loaded.persisted.manifestFingerprint,
-          manifestByteLength: loaded.persisted.manifestByteLength,
-        },
-      });
-      return archivedBase(checkpoint, {
-        step: "parser_archive",
-        preflightAction: undefined,
-        expectedOriginalRevision: next.rowRevision,
-      });
-    }
     if (
-      !loaded ||
-      loaded.persisted.manifestFingerprint !==
-        state.verified.manifestFingerprint
-    )
-      throw new PipelineWorkerError("provider_locator_registry_missing");
-    const copy = state.locator;
-    const configured = pdf.archive.independentBackup;
-    if (!copy.preparationIntent) {
-      const next = await this.requireCatalog().updateProviderLocator({
-        catalogId: original.originalCatalogId,
-        expectedRevision: original.rowRevision,
-        update: (value) => {
-          value.preparationIntent = {
-            tempName: `${value.archiveObjectId}.tmp`,
-          };
-        },
-      });
-      return archivedBase(checkpoint, {
-        step: "parser_archive",
-        preflightAction: undefined,
-        expectedOriginalRevision: next.rowRevision,
-      });
-    }
-    if (!copy.prepared) {
-      let prepared;
-      try {
-        prepared = await encryptAgeObject({
-          ageBinary: pdf.archive.ageBinary,
-          sourcePath: loaded.persisted.manifestPath,
-          tempOutputPath: join(
-            configured.directory,
-            copy.preparationIntent.tempName,
-          ),
-          recipient: configured.recipient,
-          expectedSource: {
-            sha256: state.verified.manifestFingerprint,
-            byteLength: state.verified.manifestByteLength,
-          },
-        });
-      } catch (error) {
-        if (
-          error instanceof ArchiveCommandError &&
-          error.code === "destination_exists"
-        ) {
-          const reviewed = await this.requireCatalog().updateProviderLocator({
-            catalogId: original.originalCatalogId,
-            expectedRevision: original.rowRevision,
-            update: (value) => {
-              value.reviewCode = "replacement_detected";
-            },
-          });
-          return scanTerminal(
-            archivedBase(checkpoint, {
-              expectedOriginalRevision: reviewed.rowRevision,
-              preflightAction: undefined,
-            }),
-            "incomplete",
-            "provider_locator_recovery_review_required",
-          );
-        }
-        throw error;
-      }
-      const next = await this.requireCatalog().updateProviderLocator({
-        catalogId: original.originalCatalogId,
-        expectedRevision: original.rowRevision,
-        update: (value) => {
-          value.prepared = preparedArchiveCatalogRecord(prepared);
-        },
-      });
-      return archivedBase(checkpoint, {
-        step: "parser_archive",
-        preflightAction: undefined,
-        expectedOriginalRevision: next.rowRevision,
-      });
-    }
-    const prepared = {
-      ...copy.prepared,
-      tempPath: join(configured.directory, copy.prepared.tempName),
-    };
-    if (!copy.published) {
-      const finalPath = join(configured.directory, copy.objectName);
-      let published;
-      try {
-        published = await publishAgeObject(prepared, finalPath);
-      } catch (error) {
-        if (
-          !(error instanceof ArchiveCommandError) ||
-          error.code !== "destination_exists"
-        )
-          throw error;
-        await recoverPublishedAgeObject(prepared, finalPath);
-        published = {
-          state: "published" as const,
-          objectPath: finalPath,
-          source: prepared.source,
-          ciphertext: prepared.ciphertext,
-          ciphertextDevice: prepared.ciphertextDevice,
-          ciphertextInode: prepared.ciphertextInode,
-          ageVersion: prepared.ageVersion,
-        };
-      }
-      const next = await this.requireCatalog().updateProviderLocator({
-        catalogId: original.originalCatalogId,
-        expectedRevision: original.rowRevision,
-        update: (value) => {
-          value.published = publishedArchiveCatalogRecord(published);
-        },
-      });
-      return archivedBase(checkpoint, {
-        step: "parser_archive",
-        preflightAction: undefined,
-        expectedOriginalRevision: next.rowRevision,
-      });
-    }
-    if (!copy.backup) {
-      const common = {
-        resticBinary: configured.resticBinary,
-        repository: remoteRepository,
-        expectedRepositoryId: configured.expectedRepositoryId,
-        passwordCommand: configured.passwordCommand,
-        operationId: copy.restic!.operationId,
-        host: copy.restic!.host,
-        objectName: copy.objectName,
-        expectedCiphertext: copy.published.ciphertext,
+      provider.remoteName !== undefined &&
+      provider.rcloneBinary !== undefined &&
+      provider.configPath !== undefined &&
+      provider.configIdentityFingerprint !== undefined
+    ) {
+      return {
+        rcloneBinary: provider.rcloneBinary,
+        configPath: provider.configPath,
+        remoteName: provider.remoteName,
+        configIdentityFingerprint: provider.configIdentityFingerprint,
       };
-      let backup: RecoveredResticBackup | ResticBackupResult | undefined;
-      try {
-        backup = await recoverResticBackup(common);
-      } catch (error) {
-        if (
-          !(error instanceof ArchiveCommandError) ||
-          error.code !== "not_found"
-        )
-          throw error;
-      }
-      backup ??= await backupResticObject({
-        ...common,
-        ciphertextPath: join(configured.directory, copy.objectName),
-        primaryArchiveRoot: pdf.archive.primary.directory,
-        backupMode: "independent_backup",
-      });
-      const next = await this.requireCatalog().updateProviderLocator({
-        catalogId: original.originalCatalogId,
-        expectedRevision: original.rowRevision,
-        update: (value) => {
-          value.backup = backup;
-          value.readbackVerifiedAt = Date.now();
-        },
-      });
-      return archivedBase(checkpoint, {
-        step: "parser_archive",
-        preflightAction: undefined,
-        expectedOriginalRevision: next.rowRevision,
-      });
     }
-    return archivedBase(checkpoint, {
-      step: "reserve",
-      preflightAction: undefined,
-    });
+    const legacy = pdf.archive.independentBackup;
+    if (legacy && "repository" in legacy) {
+      const repository = legacy.repository;
+      if (!repository)
+        throw new PipelineWorkerError("provider_original_configuration_missing");
+      return {
+        rcloneBinary: repository.rcloneBinary,
+        configPath: repository.configPath,
+        remoteName: repository.remoteName,
+        configIdentityFingerprint: repository.configIdentityFingerprint,
+      };
+    }
+    throw new PipelineWorkerError("provider_original_configuration_missing");
   }
 
-  /**
-   * P2-31a. Redoes the two checks a provider original declaration must carry
-   * fresh, for an original whose admission was interrupted after its locator
-   * was durable. Nothing else in the archived flow re-verifies once the locator
-   * is complete, so a resumed pass would otherwise declare a proof the server
-   * refuses, forever.
-   *
-   * This reads the provider and the backup snapshot again and writes two local
-   * timestamps. It mutates no archive object and nothing server side, so unlike
-   * the locator actions it needs no `discovery.preflightArchived` round trip to
-   * authorize it. That is also the only route that works here:
-   * `preflightArchivedDiscovery` refuses a row that holds any lease, expired or
-   * not, and a row resumed at `admit` always holds one.
-   *
-   * The registry manifest is deliberately not rewritten. Its `verifiedAt`
-   * records the first successful verification, which stays true, and rewriting
-   * it would change `manifestFingerprint` and invalidate the published
-   * ciphertext and its snapshot. Only an original this space has never admitted
-   * may refresh; the caller checks that, and `refreshProviderProof` on the
-   * catalog refuses an admitted row and any moved identity.
-   *
-   * The catalog write commits before the checkpoint does. A crash in between is
-   * harmless: the next pass sees a fresh proof and skips straight to admitting.
-   */
-  private async refreshProviderProof(
-    checkpoint: ArchivedCheckpoint,
-  ): Promise<void> {
-    const { original, processing } = this.archivedRows(checkpoint);
-    const pdf = this.requirePdfConfig();
-    const account = pdf.providerOriginal;
-    const state = original.providerOriginal;
-    if (!account || !state || !("repository" in pdf.archive.independentBackup))
+  private async verifyProviderOriginal(
+    original: OriginalCatalogRow,
+    plan: FilePlan,
+    capturePath: string,
+  ) {
+    const account = this.requirePdfConfig().providerOriginal;
+    if (!account || !original.providerOriginal)
       throw new PipelineWorkerError("provider_original_configuration_missing");
-    const verified = state.verified;
-    const copy = state.locator;
-    if (!verified || !copy.published || !copy.backup || !copy.restic)
-      throw new PipelineWorkerError("provider_original_not_durable");
-    if (copy.reviewCode)
-      throw new PipelineWorkerError(
-        "provider_locator_recovery_review_required",
-      );
-    const plan = this.archivedPlan(checkpoint);
     const provider = providerBinding(account, plan.rootAlias);
-    const remoteRepository = pdf.archive.independentBackup.repository!;
-    const configured = pdf.archive.independentBackup;
-    const loaded = await loadProviderBinding({
-      registryDirectory: provider.registryDirectory,
-      bindingId: state.bindingId,
-    });
-    if (loaded?.persisted.manifestFingerprint !== verified.manifestFingerprint)
-      throw new PipelineWorkerError("provider_locator_registry_missing");
-    const reverified = await verifyDropboxOriginal({
-      credentials: {
-        rcloneBinary: remoteRepository.rcloneBinary,
-        configPath: remoteRepository.configPath,
-        remoteName: remoteRepository.remoteName,
-        configIdentityFingerprint: remoteRepository.configIdentityFingerprint,
-      },
+    const loaded = await verifyDropboxOriginal({
+      credentials: this.providerCredentials(),
       refreshPath: provider.refreshPath,
-      capturePath: captureFromRows(pdf, original, processing).path,
+      capturePath,
       sourceContentHash: original.origin.sha256,
       sourceByteLength: original.origin.byteLength,
       providerAccountIdHash: provider.providerAccountIdHash,
       providerRootDirectoryIdHash: provider.providerRootDirectoryIdHash,
       providerRootDirectoryId: provider.providerRootDirectoryId,
       relativePath: plan.relativePath,
-      bindingId: state.bindingId,
-      expectedProviderFileIdHash: verified.providerFileIdHash,
+      bindingId: original.providerOriginal.bindingId,
+      ...(original.providerOriginal.verified === undefined
+        ? {}
+        : {
+            expectedProviderFileIdHash:
+              original.providerOriginal.verified.providerFileIdHash,
+          }),
     });
-    const readback = await recoverResticBackup({
-      resticBinary: configured.resticBinary,
-      repository: remoteRepository,
-      expectedRepositoryId: configured.expectedRepositoryId,
-      passwordCommand: configured.passwordCommand,
-      operationId: copy.restic.operationId,
-      host: copy.restic.host,
-      objectName: copy.objectName,
-      expectedCiphertext: copy.published.ciphertext,
+    const persisted = await persistProviderBinding({
+      registryDirectory: provider.registryDirectory,
+      verified: loaded,
     });
-    const next = await this.requireCatalog().refreshProviderProof({
-      catalogId: original.originalCatalogId,
-      expectedRevision: original.rowRevision,
-      verified: reverified.metadata,
-      readback,
+    return {
+      ...loaded.metadata,
+      manifestFingerprint: persisted.manifestFingerprint,
+      manifestByteLength: persisted.manifestByteLength,
+    };
+  }
+
+  private async driveProviderOriginal(
+    checkpoint: ArchivedCheckpoint,
+    original: OriginalCatalogRow,
+    _processing: ProcessingCatalogRow,
+    capturePath: string,
+    authorizedAction?: NonNullable<ArchivedCheckpoint["preflightAction"]>,
+  ): Promise<RunnerCheckpoint | void> {
+    const state = original.providerOriginal;
+    if (!state)
+      throw new PipelineWorkerError("provider_original_configuration_missing");
+    if (state.referenceVersion !== "provider_original_v2") {
+      throw new PipelineWorkerError("provider_v2_transition_required");
+    }
+    const providerV2 = state;
+    if (authorizedAction !== undefined && authorizedAction !== "provider_verify")
+      throw new PipelineWorkerError("provider_action_conflict");
+    if (authorizedAction === "provider_verify") {
+      const verified = await this.verifyProviderOriginal(
+        original,
+        this.archivedPlan(checkpoint),
+        capturePath,
+      );
+      const next = providerV2.verified
+        ? await this.requireCatalog().refreshProviderVerificationV2({
+            catalogId: original.originalCatalogId,
+            expectedRevision: original.rowRevision,
+            verified,
+          })
+        : await this.requireCatalog().recordProviderVerified({
+            catalogId: original.originalCatalogId,
+            expectedRevision: original.rowRevision,
+            verified,
+          });
+      return archivedBase(checkpoint, {
+        step: "parser_archive",
+        preflightAction: undefined,
+        expectedOriginalRevision: next.rowRevision,
+      });
+    }
+    if (!state.verified || !providerProofFresh(state)) {
+      await this.journal.transitionCheckpoint({
+        checkpoint: archivedBase(checkpoint, {
+          step: "preflight",
+          preflightAction: "provider_verify",
+        }),
+        credentialSessionActive: true,
+      });
+      return;
+    }
+    await this.journal.transitionCheckpoint({
+      checkpoint: archivedBase(checkpoint, {
+        step: "reserve",
+        preflightAction: undefined,
+      }),
+      credentialSessionActive: true,
     });
+  }
+
+  private async refreshProviderProof(
+    checkpoint: ArchivedCheckpoint,
+  ): Promise<void> {
+    const { original, processing } = this.archivedRows(checkpoint);
+    const state = original.providerOriginal;
+    if (!state)
+      throw new PipelineWorkerError("provider_original_configuration_missing");
+    let next: OriginalCatalogRow;
+    if (state.referenceVersion === "provider_original_v2") {
+      const verified = await this.verifyProviderOriginal(
+        original,
+        this.archivedPlan(checkpoint),
+        captureFromRows(this.requirePdfConfig(), original, processing).path,
+      );
+      next = await this.requireCatalog().refreshProviderVerificationV2({
+        catalogId: original.originalCatalogId,
+        expectedRevision: original.rowRevision,
+        verified,
+      });
+    } else {
+      const pdf = this.requirePdfConfig();
+      const account = pdf.providerOriginal;
+      const configured = pdf.archive.independentBackup;
+      if (
+        !account ||
+        !configured ||
+        !("repository" in configured) ||
+        !configured.repository
+      )
+        throw new PipelineWorkerError(
+          "provider_original_configuration_missing",
+        );
+      const verified = state.verified;
+      const copy = state.locator;
+      if (!verified || !copy.published || !copy.backup || !copy.restic)
+        throw new PipelineWorkerError("provider_original_not_durable");
+      if (copy.reviewCode)
+        throw new PipelineWorkerError(
+          "provider_locator_recovery_review_required",
+        );
+      const plan = this.archivedPlan(checkpoint);
+      const provider = providerBinding(account, plan.rootAlias);
+      const loaded = await loadProviderBinding({
+        registryDirectory: provider.registryDirectory,
+        bindingId: state.bindingId,
+      });
+      if (loaded?.persisted.manifestFingerprint !== verified.manifestFingerprint)
+        throw new PipelineWorkerError("provider_locator_registry_missing");
+      const reverified = await verifyDropboxOriginal({
+        credentials: {
+          rcloneBinary: configured.repository.rcloneBinary,
+          configPath: configured.repository.configPath,
+          remoteName: configured.repository.remoteName,
+          configIdentityFingerprint:
+            configured.repository.configIdentityFingerprint,
+        },
+        refreshPath: provider.refreshPath,
+        capturePath: captureFromRows(pdf, original, processing).path,
+        sourceContentHash: original.origin.sha256,
+        sourceByteLength: original.origin.byteLength,
+        providerAccountIdHash: provider.providerAccountIdHash,
+        providerRootDirectoryIdHash: provider.providerRootDirectoryIdHash,
+        providerRootDirectoryId: provider.providerRootDirectoryId,
+        relativePath: plan.relativePath,
+        bindingId: state.bindingId,
+        expectedProviderFileIdHash: verified.providerFileIdHash,
+      });
+      const readback = await recoverResticBackup({
+        resticBinary: configured.resticBinary,
+        repository: configured.repository,
+        expectedRepositoryId: configured.expectedRepositoryId,
+        passwordCommand: configured.passwordCommand,
+        operationId: copy.restic.operationId,
+        host: copy.restic.host,
+        objectName: copy.objectName,
+        expectedCiphertext: copy.published.ciphertext,
+      });
+      next = await this.requireCatalog().refreshProviderProof({
+        catalogId: original.originalCatalogId,
+        expectedRevision: original.rowRevision,
+        verified: reverified.metadata,
+        readback,
+      });
+    }
     if (!providerProofFresh(next.providerOriginal!))
       throw new PipelineWorkerError(
         "provider_verification_stale_review_required",
@@ -5256,6 +5291,8 @@ export class PipelineRunner {
         }
         let { original } = this.archivedRows(current);
         const provider = original.providerOriginal !== undefined;
+        const providerV2 =
+          original.providerOriginal?.referenceVersion === "provider_original_v2";
         const responseProvider = "originalProviderReferenceId" in value;
         if (provider !== responseProvider)
           throw new PipelineWorkerError("archived_recovery_branch_conflict");
@@ -5270,18 +5307,20 @@ export class PipelineRunner {
             "original_receipt_revision_conflict",
           );
         const originalReceipts = [
-          ["primary", "originalPrimaryReceiptId"],
+          ...(providerV2
+            ? []
+            : [["primary", "originalPrimaryReceiptId"] as const]),
           ...(provider
             ? []
             : [["independent_backup", "originalBackupReceiptId"] as const]),
         ] as const;
         for (const [role, receiptField] of originalReceipts) {
-          if (!original.copies[role].published) {
+          if (!original.copies[role]?.published) {
             throw new PipelineWorkerError(
               "archived_original_recovery_incomplete",
             );
           }
-          if (!original.copies[role].cloudReceipt) {
+          if (!original.copies[role]?.cloudReceipt) {
             original = (await this.requireCatalog().recordCloudReceipt({
               subject: "original_bytes",
               catalogId: original.originalCatalogId,
@@ -5297,31 +5336,16 @@ export class PipelineRunner {
           original = await this.requireCatalog().recordOriginalCloud({
             catalogId: original.originalCatalogId,
             expectedRevision: original.rowRevision,
-            cloud: {
+            cloud: admittedOriginalCloud({
+              original,
               sourceItemId: identity.sourceItemId,
               sourceRevisionId: text(
                 value.sourceRevisionId,
                 "source_revision_id",
               ),
-              primaryReceiptId: original.copies.primary.cloudReceipt!.receiptId,
-              ...(provider
-                ? {
-                    providerReferenceId: text(
-                      value.originalProviderReferenceId,
-                      "original_provider_reference_id",
-                    ),
-                    providerBindingEpoch: integer(
-                      value.originalProviderBindingEpoch,
-                      "original_provider_binding_epoch",
-                    ),
-                  }
-                : {
-                    backupReceiptId:
-                      original.copies.independent_backup.cloudReceipt!
-                        .receiptId,
-                  }),
+              value,
               admittedAt: pending.receivedAt,
-            },
+            }),
           });
         }
         return archivedBase(current, {
@@ -5343,14 +5367,18 @@ export class PipelineRunner {
           ...(provider
             ? {
                 originalReuse: {
-                  primaryReceiptId: text(
-                    value.originalPrimaryReceiptId,
-                    "original_primary_receipt_id",
-                  ),
-                  primaryBindingEpoch: integer(
-                    value.originalPrimaryBindingEpoch,
-                    "original_primary_binding_epoch",
-                  ),
+                  ...(providerV2
+                    ? { providerReferenceVersion: "provider_original_v2" as const }
+                    : {
+                        primaryReceiptId: text(
+                          value.originalPrimaryReceiptId,
+                          "original_primary_receipt_id",
+                        ),
+                        primaryBindingEpoch: integer(
+                          value.originalPrimaryBindingEpoch,
+                          "original_primary_binding_epoch",
+                        ),
+                      }),
                   providerReferenceId: text(
                     value.originalProviderReferenceId,
                     "original_provider_reference_id",
@@ -5757,9 +5785,20 @@ export class PipelineRunner {
           // Record the selection so `parser_archive` skips its copies and
           // `admit` names these ids. Cleared when the server offers nothing,
           // so a later pass that re-parses to different bytes archives again.
+          const reuse = parserArtifactReuse(value);
+          const providerV2 =
+            mapped.original.providerOriginal?.referenceVersion ===
+            "provider_original_v2";
+          if (
+            reuse !== undefined &&
+            (reuse.backupReceiptId === undefined) !== providerV2
+          )
+            throw new PipelineWorkerError(
+              "archived_recovery_branch_conflict",
+            );
           return archivedBase(current, {
             step: "parser_archive",
-            parserReuse: parserArtifactReuse(value),
+            parserReuse: reuse,
           });
         }
         if (value.desiredProcessingEpoch !== identity.processingEpoch) {
@@ -5767,6 +5806,8 @@ export class PipelineRunner {
         }
         let { original, processing } = this.archivedRows(current);
         const provider = original.providerOriginal !== undefined;
+        const providerV2 =
+          original.providerOriginal?.referenceVersion === "provider_original_v2";
         const responseProvider = "originalProviderReferenceId" in value;
         if (provider !== responseProvider)
           throw new PipelineWorkerError("archived_recovery_branch_conflict");
@@ -5781,7 +5822,14 @@ export class PipelineRunner {
             "original_receipt_revision_conflict",
           );
         const receipts = [
-          ["original_bytes", original, "primary", "originalPrimaryReceiptId"],
+          ...(providerV2
+            ? []
+            : [[
+                "original_bytes",
+                original,
+                "primary",
+                "originalPrimaryReceiptId",
+              ] as const]),
           ...(provider
             ? []
             : [
@@ -5793,26 +5841,28 @@ export class PipelineRunner {
                 ] as const,
               ]),
           ["parser_output", processing, "primary", "parserPrimaryReceiptId"],
-          [
-            "parser_output",
-            processing,
-            "independent_backup",
-            "parserBackupReceiptId",
-          ],
+          ...(providerV2
+            ? []
+            : [[
+                "parser_output",
+                processing,
+                "independent_backup",
+                "parserBackupReceiptId",
+              ] as const]),
         ] as const;
         // P2-104d. A generation admitted against a parser artifact it did not
         // archive has no published parser-output copies of its own, and that
         // is the whole shape of a reuse, not a missing parent.
         const reusedParserOutput =
           !processing.copies.primary.published &&
-          !processing.copies.independent_backup.published;
+          !processing.copies.independent_backup?.published;
         for (const [subject, row, role, field] of receipts) {
           const live = subject === "original_bytes" ? original : processing;
           const reused = subject === "parser_output" && reusedParserOutput;
-          if (!reused && !live.copies[role].published) {
+          if (!reused && !live.copies[role]?.published) {
             throw new PipelineWorkerError("archived_receipt_parent_missing");
           }
-          if (!live.copies[role].cloudReceipt) {
+          if (!live.copies[role]?.cloudReceipt) {
             const updated = await this.requireCatalog().recordCloudReceipt({
               subject,
               catalogId:
@@ -5838,31 +5888,16 @@ export class PipelineRunner {
           original = await this.requireCatalog().recordOriginalCloud({
             catalogId: original.originalCatalogId,
             expectedRevision: original.rowRevision,
-            cloud: {
+            cloud: admittedOriginalCloud({
+              original,
               sourceItemId: identity.sourceItemId,
               sourceRevisionId: text(
                 value.sourceRevisionId,
                 "source_revision_id",
               ),
-              primaryReceiptId: original.copies.primary.cloudReceipt!.receiptId,
-              ...(provider
-                ? {
-                    providerReferenceId: text(
-                      value.originalProviderReferenceId,
-                      "original_provider_reference_id",
-                    ),
-                    providerBindingEpoch: integer(
-                      value.originalProviderBindingEpoch,
-                      "original_provider_binding_epoch",
-                    ),
-                  }
-                : {
-                    backupReceiptId:
-                      original.copies.independent_backup.cloudReceipt!
-                        .receiptId,
-                  }),
+              value,
               admittedAt: pending.receivedAt,
-            },
+            }),
           });
         }
         if (!processing.cloud) {
@@ -6016,6 +6051,72 @@ export class PipelineRunner {
   } {
     const reuse = checkpoint.parserReuse;
     const original = checkpoint.originalReuse;
+    const providerV2 =
+      mapped.original.providerOriginal?.referenceVersion ===
+      "provider_original_v2";
+    const originalSelections: ArchiveReceiptSelection[] = [];
+    if (original?.primaryReceiptId !== undefined) {
+      originalSelections.push(
+        existingArchiveReceiptSelection({
+          subjectKind: "original_bytes",
+          copyRole: "primary",
+          receiptId: original.primaryReceiptId,
+          bindingEpoch: original.primaryBindingEpoch!,
+        }),
+      );
+      if (original.backupReceiptId !== undefined)
+        originalSelections.push(
+          existingArchiveReceiptSelection({
+            subjectKind: "original_bytes",
+            copyRole: "independent_backup",
+            receiptId: original.backupReceiptId,
+            bindingEpoch: original.backupBindingEpoch!,
+          }),
+        );
+    } else if (!providerV2) {
+      originalSelections.push(
+        createArchiveReceiptSelection("original_bytes", mapped.original, "primary"),
+      );
+      if (providerOriginal === undefined)
+        originalSelections.push(
+          createArchiveReceiptSelection(
+            "original_bytes",
+            mapped.original,
+            "independent_backup",
+          ),
+        );
+    }
+    const parserSelections: ArchiveReceiptSelection[] = [
+      reuse
+        ? existingArchiveReceiptSelection({
+            subjectKind: "parser_output",
+            copyRole: "primary",
+            receiptId: reuse.primaryReceiptId!,
+            bindingEpoch: reuse.primaryBindingEpoch!,
+          })
+        : createArchiveReceiptSelection(
+            "parser_output",
+            mapped.processing,
+            "primary",
+          ),
+    ];
+    if (reuse?.backupReceiptId !== undefined)
+      parserSelections.push(
+        existingArchiveReceiptSelection({
+          subjectKind: "parser_output",
+          copyRole: "independent_backup",
+          receiptId: reuse.backupReceiptId,
+          bindingEpoch: reuse.backupBindingEpoch!,
+        }),
+      );
+    else if (!reuse && mapped.processing.copies.independent_backup)
+      parserSelections.push(
+        createArchiveReceiptSelection(
+          "parser_output",
+          mapped.processing,
+          "independent_backup",
+        ),
+      );
     return {
       // Either this document archived its own parser output, or it reused the
       // copies already bound to the artifact it is selecting. The two go
@@ -6024,70 +6125,7 @@ export class PipelineRunner {
       parserArtifact: reuse
         ? existingParserArtifactSelection(reuse.parserArtifactId)
         : createParserArtifactSelection(mapped.processing),
-      archives: [
-        ...(original
-          ? [
-              existingArchiveReceiptSelection({
-                subjectKind: "original_bytes",
-                copyRole: "primary",
-                receiptId: original.primaryReceiptId,
-                bindingEpoch: original.primaryBindingEpoch,
-              }),
-              ...(original.backupReceiptId === undefined
-                ? []
-                : [
-                    existingArchiveReceiptSelection({
-                      subjectKind: "original_bytes",
-                      copyRole: "independent_backup",
-                      receiptId: original.backupReceiptId,
-                      bindingEpoch: original.backupBindingEpoch!,
-                    }),
-                  ]),
-            ]
-          : [
-              createArchiveReceiptSelection(
-                "original_bytes",
-                mapped.original,
-                "primary",
-              ),
-              ...(providerOriginal === undefined
-                ? [
-                    createArchiveReceiptSelection(
-                      "original_bytes",
-                      mapped.original,
-                      "independent_backup",
-                    ),
-                  ]
-                : []),
-            ]),
-        ...(reuse
-          ? [
-              existingArchiveReceiptSelection({
-                subjectKind: "parser_output",
-                copyRole: "primary",
-                receiptId: reuse.primaryReceiptId,
-                bindingEpoch: reuse.primaryBindingEpoch,
-              }),
-              existingArchiveReceiptSelection({
-                subjectKind: "parser_output",
-                copyRole: "independent_backup",
-                receiptId: reuse.backupReceiptId,
-                bindingEpoch: reuse.backupBindingEpoch,
-              }),
-            ]
-          : [
-              createArchiveReceiptSelection(
-                "parser_output",
-                mapped.processing,
-                "primary",
-              ),
-              createArchiveReceiptSelection(
-                "parser_output",
-                mapped.processing,
-                "independent_backup",
-              ),
-            ]),
-      ],
+      archives: [...originalSelections, ...parserSelections],
     };
   }
 
@@ -6108,6 +6146,9 @@ export class PipelineRunner {
         existingProviderOriginal: {
           referenceId: reuse.providerReferenceId,
           bindingEpoch: reuse.providerBindingEpoch!,
+          ...(reuse.providerReferenceVersion === undefined
+            ? {}
+            : { referenceVersion: reuse.providerReferenceVersion }),
         },
       };
     }
@@ -6276,6 +6317,8 @@ export class PipelineRunner {
         let { original, processing } = this.archivedRows(current);
         const responseProvider = "originalProviderReferenceId" in value;
         const viaProvider = Object.keys(provider).length > 0;
+        const providerV2 =
+          original.providerOriginal?.referenceVersion === "provider_original_v2";
         if (viaProvider !== responseProvider)
           throw new PipelineWorkerError("archived_recovery_branch_conflict");
         // P2-31f: two admissions disagree about which revision was accepted
@@ -6289,7 +6332,13 @@ export class PipelineRunner {
             "original_receipt_revision_conflict",
           );
         for (const [subject, role, receiptField] of [
-          ["original_bytes", "primary", "originalPrimaryReceiptId"],
+          ...(providerV2
+            ? []
+            : [[
+                "original_bytes",
+                "primary",
+                "originalPrimaryReceiptId",
+              ] as const]),
           ...(!viaProvider
             ? [
                 [
@@ -6300,7 +6349,13 @@ export class PipelineRunner {
               ]
             : []),
           ["parser_output", "primary", "parserPrimaryReceiptId"],
-          ["parser_output", "independent_backup", "parserBackupReceiptId"],
+          ...(providerV2
+            ? []
+            : [[
+                "parser_output",
+                "independent_backup",
+                "parserBackupReceiptId",
+              ] as const]),
         ] as const) {
           const live = subject === "original_bytes" ? original : processing;
           // P2-104d. A reused parser output was archived by the row that
@@ -6310,7 +6365,7 @@ export class PipelineRunner {
           // otherwise look never admitted.
           const reused =
             subject === "parser_output" && current.parserReuse !== undefined;
-          if (!live.copies[role].cloudReceipt) {
+          if (!live.copies[role]?.cloudReceipt) {
             const updated = await this.requireCatalog().recordCloudReceipt({
               subject,
               catalogId:
@@ -6333,31 +6388,16 @@ export class PipelineRunner {
           original = await this.requireCatalog().recordOriginalCloud({
             catalogId: original.originalCatalogId,
             expectedRevision: original.rowRevision,
-            cloud: {
+            cloud: admittedOriginalCloud({
+              original,
               sourceItemId: lease.sourceItemId,
               sourceRevisionId: text(
                 value.sourceRevisionId,
                 "source_revision_id",
               ),
-              primaryReceiptId: original.copies.primary.cloudReceipt!.receiptId,
-              ...(!viaProvider
-                ? {
-                    backupReceiptId:
-                      original.copies.independent_backup.cloudReceipt!
-                        .receiptId,
-                  }
-                : {
-                    providerReferenceId: text(
-                      value.originalProviderReferenceId,
-                      "original_provider_reference_id",
-                    ),
-                    providerBindingEpoch: integer(
-                      value.originalProviderBindingEpoch,
-                      "original_provider_binding_epoch",
-                    ),
-                  }),
+              value,
               admittedAt: pending.receivedAt,
-            },
+            }),
           });
         }
         if (!processing.cloud) {

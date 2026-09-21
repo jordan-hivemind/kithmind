@@ -59,6 +59,28 @@ describe("authenticated document content helpers", () => {
       ),
     ).toBe(false);
     expect(providerOriginalAvailable(eligible, null)).toBe(false);
+    const providerV2 = {
+      ...eligible,
+      originalRecovery: {
+        kind: "provider_original_v2",
+        providerVerification: "verified_at_admission",
+      },
+    };
+    expect(
+      providerOriginalAvailable(providerV2, "/Synthetic Inbox/file.pdf"),
+    ).toBe(true);
+    expect(
+      providerOriginalAvailable(
+        {
+          ...providerV2,
+          originalRecovery: {
+            ...providerV2.originalRecovery,
+            providerVerification: "audit_unavailable",
+          },
+        },
+        "/Synthetic Inbox/file.pdf",
+      ),
+    ).toBe(false);
   });
 
   test("provider paths stay within the stored connection and configured root", () => {

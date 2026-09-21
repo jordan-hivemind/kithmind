@@ -1,5 +1,10 @@
 # Dated encrypted database backups
 
+**Status:** Historical. Superseded by the 2026-09-21 owner decision that Neon
+is the sufficient Postgres persistence boundary. This recipe is not a
+deployment or ingestion prerequisite and must not be scheduled without a new
+explicit owner request.
+
 ## Design
 
 Create a dated native Convex ZIP that includes file storage. Treat the ZIP and

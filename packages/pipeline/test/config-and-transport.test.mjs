@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
 import { validateArchiveRelocationConfig } from "../dist/archiveRelocationConfig.js";
+import { validateProviderV2ConfigTransition } from "../dist/providerV2Transition.js";
 
 import {
   journalBindingForConfig,
@@ -238,6 +239,81 @@ test("archive relocation permits only a remote root path change", () => {
     const changed = structuredClone(after);
     mutate(changed);
     assert.throws(() => validateArchiveRelocationConfig(before, changed));
+  }
+});
+
+test("provider v2 config transition accepts only the exact credential move and backup removal", () => {
+  const base = {
+    protocolVersion: 1,
+    endpoint: "http://127.0.0.1:3100/api/worker",
+    spaceId: "space_1",
+    sourceAccountId: "source_1",
+    credentialEnv: "PIPELINE_TOKEN",
+    roots: [{ alias: "notes", path: "/tmp/root" }],
+    journalDir: "/tmp/journal",
+  };
+  const oldPdf = pdfDocQaConfig();
+  delete oldPdf.archive.independentBackup.repositoryPath;
+  oldPdf.archive.independentBackup.repository = {
+    kind: "rclone_dropbox_v1",
+    remoteName: "kithmind_dropbox",
+    rootPath: "Kith Mind Backups/Processing",
+    rcloneBinary: "/tools/rclone",
+    configPath: "/credentials/kithmind-rclone.conf",
+    configIdentityFingerprint: "c".repeat(64),
+    expectedRootDirectoryIdHash: "d".repeat(64),
+  };
+  const providerRootId = "id:synthetic_root";
+  oldPdf.providerOriginal = {
+    rootAlias: "notes",
+    providerRootDirectoryId: providerRootId,
+    providerAccountIdHash: "e".repeat(64),
+    providerRootDirectoryIdHash: createHash("sha256")
+      .update(providerRootId)
+      .digest("hex"),
+    refreshPath: "Kith Mind/Inbox",
+    registryDirectory: "/private/provider-registry",
+  };
+  const previous = parseConfig({ ...base, pdfDocQa: oldPdf });
+  const proposedInput = structuredClone(oldPdf);
+  const moved = proposedInput.archive.independentBackup.repository;
+  delete proposedInput.archive.independentBackup;
+  Object.assign(proposedInput.providerOriginal, {
+    remoteName: moved.remoteName,
+    rcloneBinary: moved.rcloneBinary,
+    configPath: moved.configPath,
+    configIdentityFingerprint: moved.configIdentityFingerprint,
+  });
+  const proposed = parseConfig({ ...base, pdfDocQa: proposedInput });
+  assert.doesNotThrow(() =>
+    validateProviderV2ConfigTransition(previous, proposed),
+  );
+  assert.notEqual(
+    journalBindingForConfig(previous).configFingerprint,
+    journalBindingForConfig(proposed).configFingerprint,
+  );
+  for (const mutate of [
+    (value) => {
+      value.endpoint = "http://127.0.0.1:3200/api/worker";
+    },
+    (value) => {
+      value.spaceId = "other";
+    },
+    (value) => {
+      value.roots[0].path = "/tmp/other";
+    },
+    (value) => {
+      value.pdfDocQa.profile.parserFingerprint = "f".repeat(64);
+    },
+    (value) => {
+      value.pdfDocQa.providerOriginal.remoteName = "other";
+    },
+  ]) {
+    const changed = structuredClone(proposed);
+    mutate(changed);
+    assert.throws(() =>
+      validateProviderV2ConfigTransition(previous, changed),
+    );
   }
 });
 
