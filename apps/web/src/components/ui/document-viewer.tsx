@@ -41,6 +41,7 @@ export function DocumentViewer({
 }) {
   const [metadata, setMetadata] = useState<DocumentMetadata | null>(null);
   const [failed, setFailed] = useState(false);
+  const [view, setView] = useState<"original" | "text">("original");
 
   useEffect(() => {
     if (!open || document === null) return;
@@ -48,6 +49,7 @@ export function DocumentViewer({
     const controller = new AbortController();
     setMetadata(null);
     setFailed(false);
+    setView("original");
     void fetch(
       `/api/kith/documents/${encodeURIComponent(document.sourceItemId)}`,
       { cache: "no-store", signal: controller.signal },
@@ -56,7 +58,14 @@ export function DocumentViewer({
         if (!response.ok) throw new Error("document metadata fetch failed");
         return (await response.json()) as DocumentMetadata;
       })
-      .then(setMetadata)
+      .then((next) => {
+        setMetadata(next);
+        setView(
+          next.contentAvailable && next.mimeType === "application/pdf"
+            ? "original"
+            : "text",
+        );
+      })
       .catch((error: unknown) => {
         if (error instanceof DOMException && error.name === "AbortError")
           return;
@@ -70,6 +79,11 @@ export function DocumentViewer({
   const viewerUrl = document === null ? "" : documentUrl(document.sourceItemId);
   const downloadUrl =
     document === null ? "" : documentUrl(document.sourceItemId, true);
+  const canViewOriginal =
+    metadata?.contentAvailable === true &&
+    metadata.mimeType === "application/pdf";
+  const pages = metadata?.pages ?? [];
+  const canViewText = metadata?.textAvailable === true && pages.length > 0;
 
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
@@ -81,6 +95,30 @@ export function DocumentViewer({
               {title}
             </Dialog.Title>
             <div className="flex shrink-0 items-center gap-2">
+              {canViewOriginal && canViewText ? (
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    aria-pressed={view === "original"}
+                    onClick={() => setView("original")}
+                    className={buttonClass(
+                      view === "original" ? "primary" : "secondary",
+                    )}
+                  >
+                    Original
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={view === "text"}
+                    onClick={() => setView("text")}
+                    className={buttonClass(
+                      view === "text" ? "primary" : "secondary",
+                    )}
+                  >
+                    Retained text
+                  </button>
+                </div>
+              ) : null}
               {metadata?.contentAvailable ? (
                 <a href={downloadUrl} className={buttonClass()}>
                   <Download className="mr-1.5 size-3.5" aria-hidden="true" />
@@ -110,7 +148,7 @@ export function DocumentViewer({
               >
                 Document content is unavailable.
               </div>
-            ) : metadata?.contentAvailable ? (
+            ) : view === "original" && canViewOriginal ? (
               <iframe
                 key={viewerUrl}
                 src={viewerUrl}
@@ -118,14 +156,14 @@ export function DocumentViewer({
                 className="h-full w-full rounded-control border border-kith-border-subtle bg-kith-surface"
                 sandbox=""
               />
-            ) : metadata?.textAvailable && metadata.pages !== undefined ? (
+            ) : canViewText ? (
               <div className="h-full overflow-y-auto rounded-control border border-kith-border-subtle bg-kith-surface p-5 text-[15px] leading-6 text-kith-text">
-                {metadata.pages.map((page, index) => (
+                {pages.map((page, index) => (
                   <section
                     key={page.pageNumber}
                     aria-label={`Page ${page.pageNumber}`}
                     className={
-                      index === metadata.pages!.length - 1
+                      index === pages.length - 1
                         ? ""
                         : "mb-6 border-b border-kith-border-subtle pb-6"
                     }
