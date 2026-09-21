@@ -65,6 +65,7 @@ import {
   type FinanceSnapshotMetricSummary,
   type FinanceTransactionRecord,
   FinanceContractError,
+  FINANCE_INVENTORY_BALANCE_DATES,
   type GetCoverageRequest,
   type GetEvidenceRequest,
   type ListAccountInventoryRequest,
@@ -1156,6 +1157,8 @@ type AccountInventoryRow = AccountDescriptorRow & {
   holdings_currency_count: string;
   holdings_currency: string | null;
   holdings_not_marked: string;
+  balance_dates: string[] | null;
+  latest_balance_holds_securities: boolean | null;
 };
 
 function statedValue(
@@ -1182,7 +1185,8 @@ function statedValue(
  * | The account has | Reported |
  * | --- | --- |
  * | one balance carrying a total on its latest such date | that total, dated by that balance |
- * | two or more balances on that date | nothing: which one is the account's total is not stated |
+ * | two or more balances on that date stating the same total and currency | that total: they agree, so nothing is picked |
+ * | two or more balances on that date that differ | nothing: which one is the account's total is not stated |
  * | a latest balance with no total, and an older one with a total | the older one, dated by itself |
  * | no balance with a total, and holdings that pass every test below | their sum, dated by that holdings date |
  * | anything else | nothing |
@@ -1308,10 +1312,28 @@ async function listAccountInventory(
             coalesce(hv.missing, 0)::text AS holdings_missing,
             coalesce(hv.currency_count, 0)::text AS holdings_currency_count,
             hv.currency::text AS holdings_currency,
-            coalesce(hv.not_marked, 0)::text AS holdings_not_marked
+            coalesce(hv.not_marked, 0)::text AS holdings_not_marked,
+            (SELECT array_agg(bd.as_of::text ORDER BY bd.as_of DESC)
+               FROM (SELECT DISTINCT b.as_of FROM balances b
+                      WHERE b.account_id = d.account_id
+                      ORDER BY b.as_of DESC
+                      LIMIT ${FINANCE_INVENTORY_BALANCE_DATES}) bd
+            ) AS balance_dates,
+            (SELECT CASE WHEN count(DISTINCT (b.total_value <> b.cash)) = 1
+                         THEN bool_or(b.total_value <> b.cash) END
+               FROM balances b
+              WHERE b.account_id = d.account_id
+                AND b.total_value IS NOT NULL AND b.cash IS NOT NULL
+                AND b.as_of = (SELECT max(y.as_of) FROM balances y
+                                WHERE y.account_id = d.account_id)
+            ) AS latest_balance_holds_securities
        FROM account_descriptors d
+       -- n counts distinct stated totals, not rows: one statement imported as
+       -- two balance rows that print the same total is one answer, not a
+       -- choice between two.
        LEFT JOIN LATERAL (
-         SELECT b.as_of, count(*) AS n, min(b.total_value) AS total_value,
+         SELECT b.as_of, count(DISTINCT (b.total_value, b.currency)) AS n,
+                min(b.total_value) AS total_value,
                 min(b.currency::text) AS currency
            FROM balances b
           WHERE b.account_id = d.account_id AND b.total_value IS NOT NULL
@@ -1360,6 +1382,17 @@ async function listAccountInventory(
         : {}),
       ...(ranged && row.latest_snapshot_as_of !== null
         ? { latestSnapshotAsOf: row.latest_snapshot_as_of }
+        : {}),
+      // FIN-FRESHNESS-1: the dates of balance rows that exist, never a
+      // cadence or an expected date. The consumer infers cadence from them.
+      ...(ranged && row.balance_dates !== null && row.balance_dates.length > 0
+        ? { balanceDates: row.balance_dates }
+        : {}),
+      ...(ranged &&
+      row.balance_dates !== null &&
+      row.balance_dates.length > 0 &&
+      row.latest_balance_holds_securities !== null
+        ? { latestBalanceHoldsSecurities: row.latest_balance_holds_securities }
         : {}),
       ...(currentValue === null ? {} : { currentValue }),
     };

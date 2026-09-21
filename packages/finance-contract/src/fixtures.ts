@@ -417,6 +417,8 @@ export const syntheticFinanceReadExchanges = [
           activityFrom: "2026-01-01",
           activityTo: "2026-07-31",
           latestSnapshotAsOf: "2026-07-31",
+          balanceDates: ["2026-07-31", "2026-06-30", "2026-05-31"],
+          latestBalanceHoldsSecurities: true,
           openReviewCount: 0,
           currentValue: {
             value: { decimal: "1250.5", currency: "USD" },

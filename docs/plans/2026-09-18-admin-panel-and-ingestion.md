@@ -695,3 +695,60 @@ code, and only one space, so `$ 165 .00` reads as one amount while
 `APPLES 12 .99` stays a quantity beside a price. A column-rendered amount with
 no currency mark beside it opens a correction instead, which is the cheaper of
 the two errors.
+
+## 14. Institutions freshness (FIN-FRESHNESS-1)
+
+One 45-day threshold on the latest holdings date marked three kinds of
+account stale for the wrong reason: a quiet account that files quarterly, an
+all-cash account with nothing to snapshot, and an account whose statements
+kept arriving while the holdings in them stopped being recorded. Only the
+third is a real gap. The rule is now `accountFreshness` in
+`apps/web/src/lib/kith/account-freshness.ts`.
+
+The archive's `list_account_inventory` adds two fields, both facts about rows
+that exist: `balanceDates`, the account's latest distinct balance dates, newest
+first and at most 12; and `latestBalanceHoldsSecurities`, whether the latest
+balance that states both a total and cash holds anything besides cash. An
+expected date is never stored or returned as data. `latestSnapshotAsOf` and
+`currentValue.asOf` keep their meanings and are never merged with a balance
+date.
+
+**Cadence** comes from the balance dates. Consecutive months are `monthly`.
+Gaps of at most three months, each long gap ending on a quarter end, are
+`quarterly` (monthly while active, quarterly while quiet). Anything else, or
+fewer than two months, is `unknown`, which is held to the monthly allowance and
+says so in the tooltip.
+
+A statement is **due** by the first period end after the latest balance plus
+20 days of grace. An account is **dormant** after 100 days without activity
+(204 for quarterly). Only the owner's Closed flag closes an account. A balance's
+size never does.
+
+| Synthetic account on 2026-09-18 | Status | Reason |
+| --- | --- | --- |
+| Balances monthly to 2026-08-31, holdings 2026-08-31 | fresh | current |
+| Balances quarterly to 2026-06-30, holdings 2026-06-30 | fresh | current, next expected by 2026-10-20 |
+| Balances monthly to 2026-06-30, last activity 2026-06-30 | stale | statement overdue |
+| Balances monthly to 2026-08-31, holdings 2025-09-30 | stale | holdings behind |
+| Latest balance holds securities, no holdings ever | stale | holdings missing |
+| Latest balance all cash, last holdings 2025-04-30 | fresh | balance only |
+| Bank or credit line type | fresh | balance only |
+| Transactions only, no balance or holdings | fresh | no balance |
+| No activity since 2022-12-31 | inactive | dormant |
+
+**Parents** are honest aggregates. A group is stale when any live account is,
+and its tooltip counts stale accounts by reason, because an overdue statement
+and a holdings gap call for different actions. A group total is stale when any
+part of it is stale by that account's own cadence, and stays dated by its
+oldest part.
+
+The inventory's current value also treats two balance rows on the latest date
+that state the same total and currency as one answer, not an ambiguity. Rows
+that differ still report nothing.
+
+Known limits, left for later work: a monthly account that misses the one
+statement just before a quarter end reads as quarterly until its next
+statement arrives. Holdings that the statement parser refuses (a security
+printed as several lots with no Total row) show as `holdings behind`. They
+are not suppressed, and the fix belongs in the parser, followed by an
+auditable reimport.

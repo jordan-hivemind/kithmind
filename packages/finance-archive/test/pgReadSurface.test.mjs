@@ -2368,7 +2368,7 @@ test(
  * Replaces one account's money rows with exactly the scenario named, so a
  * `currentValue` assertion is about the rule under test and nothing else.
  *
- * `balances` are `[asOf, totalValue, currency]` and `positions` are
+ * `balances` are `[asOf, totalValue, currency, cash]` and `positions` are
  * `[asOf, marketValue, currency, valuationBasis]`, both with `null` allowed
  * wherever the column is nullable, which is the whole point: an archive whose
  * every column is populated is not the archive this rule exists for.
@@ -2377,12 +2377,12 @@ async function moneyRows(owner, accountId, { balances = [], positions = [] }) {
   await owner.query("DELETE FROM positions WHERE account_id = $1", [accountId]);
   await owner.query("DELETE FROM balances WHERE account_id = $1", [accountId]);
   let index = 0;
-  for (const [asOf, totalValue, currency] of balances) {
+  for (const [asOf, totalValue, currency, cash = null] of balances) {
     index += 1;
     await owner.query(
-      `INSERT INTO balances (id, account_id, as_of, total_value, currency)
-       VALUES ($1, $2, $3::date, $4::numeric, $5)`,
-      [`cv-balance-${index}`, accountId, asOf, totalValue, currency],
+      `INSERT INTO balances (id, account_id, as_of, total_value, currency, cash)
+       VALUES ($1, $2, $3::date, $4::numeric, $5, $6::numeric)`,
+      [`cv-balance-${index}`, accountId, asOf, totalValue, currency, cash],
     );
   }
   index = 0;
@@ -2547,6 +2547,88 @@ test(
       asOf: "2026-03-31",
       source: "positions",
     });
+  },
+);
+
+test(
+  "list_account_inventory reports balance dates, the all-cash flag, and one total from agreeing duplicate balances (FIN-FRESHNESS-1)",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const accountId = seeded.settled.accountIds[0];
+    const inventory = async () =>
+      (
+        await serve(r, { operation: "list_account_inventory", limit: 100 })
+      ).items.find((item) => item.account.accountId === accountId);
+
+    // One statement imported as two balance rows with the same total, one of
+    // them also stating cash: the same answer twice is not a choice.
+    await moneyRows(owner, accountId, {
+      balances: [
+        ["2026-03-31", "1000", "USD", "10"],
+        ["2026-03-31", "1000", "USD"],
+        ["2025-12-31", "900", "USD", "10"],
+        ["2025-09-30", "800", "USD", "10"],
+      ],
+      positions: [["2026-03-31", "990", "USD"]],
+    });
+    let row = await inventory();
+    assert.deepEqual(row.currentValue, {
+      value: { decimal: "1000", currency: "USD" },
+      asOf: "2026-03-31",
+      source: "balance",
+    });
+    assert.deepEqual(row.balanceDates, ["2026-03-31", "2025-12-31", "2025-09-30"]);
+    assert.equal(row.latestBalanceHoldsSecurities, true);
+
+    // All cash on the latest date: nothing besides cash is held.
+    await moneyRows(owner, accountId, {
+      balances: [
+        ["2026-03-31", "25", "USD", "25"],
+        ["2025-12-31", "900", "USD", "10"],
+      ],
+      positions: [["2025-12-31", "890", "USD"]],
+    });
+    row = await inventory();
+    assert.equal(row.latestBalanceHoldsSecurities, false);
+    assert.equal(row.latestSnapshotAsOf, "2025-12-31");
+
+    // The latest date states no cash: the flag is absent, never carried
+    // forward from an older date.
+    await moneyRows(owner, accountId, {
+      balances: [
+        ["2026-03-31", "1000", "USD"],
+        ["2025-12-31", "25", "USD", "25"],
+      ],
+    });
+    row = await inventory();
+    assert.equal(row.latestBalanceHoldsSecurities, undefined);
+    assert.deepEqual(row.balanceDates, ["2026-03-31", "2025-12-31"]);
+
+    // Rows on the latest date that disagree about holding securities: absent.
+    await moneyRows(owner, accountId, {
+      balances: [
+        ["2026-03-31", "1000", "USD", "1000"],
+        ["2026-03-31", "1000", "USD", "10"],
+      ],
+    });
+    assert.equal((await inventory()).latestBalanceHoldsSecurities, undefined);
+
+    // At most twelve dates, newest first; no balances at all is no field.
+    await moneyRows(owner, accountId, {
+      balances: Array.from({ length: 14 }, (_, i) => [
+        `2025-${String(i < 12 ? 12 - i : 1).padStart(2, "0")}-${i < 12 ? "01" : String(10 + i)}`,
+        "1",
+        "USD",
+      ]),
+    });
+    row = await inventory();
+    assert.equal(row.balanceDates.length, 12);
+    assert.equal(row.balanceDates[0], "2025-12-01");
+    await moneyRows(owner, accountId, {});
+    row = await inventory();
+    assert.equal(row.balanceDates, undefined);
+    assert.equal(row.latestBalanceHoldsSecurities, undefined);
   },
 );
 
