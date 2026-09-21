@@ -444,11 +444,21 @@ async function resolveScope(
   const membership = await requireSpaceAccess(ctx, p, query.spaceId, "read");
   if ("entityId" in query && query.entityId !== undefined) {
     const e = await ctx.client.query(
-      "SELECT space_id FROM kith.entities WHERE id=$1",
+      `WITH RECURSIVE entity_chain AS (
+         SELECT id, space_id, merged_into, 0 AS merge_depth
+           FROM kith.entities WHERE id = $1
+         UNION ALL
+         SELECT e.id, e.space_id, e.merged_into, c.merge_depth + 1
+           FROM kith.entities e JOIN entity_chain c ON e.id = c.merged_into
+          WHERE c.merge_depth < 16
+       )
+       SELECT id, space_id FROM entity_chain WHERE merged_into IS NULL
+       ORDER BY merge_depth DESC LIMIT 1`,
       [query.entityId],
     );
     if (e.rows.length !== 1 || e.rows[0].space_id !== query.spaceId)
       throw new Error("Entity not found");
+    query.entityId = String(e.rows[0].id);
   }
   let requested = query.sourceAccountIds;
   if (query.operation === "sum_money" && query.sourceAccountId !== undefined) {

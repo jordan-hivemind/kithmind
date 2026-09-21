@@ -229,7 +229,17 @@ export async function composeCardTargetInput(
       return "";
     const entity = await row<{ space_id: string; canonical_name: string }>(
       ctx,
-      "SELECT space_id, canonical_name FROM kith.entities WHERE id = $1",
+      `WITH RECURSIVE entity_chain AS (
+         SELECT id, space_id, canonical_name, merged_into, 0 AS merge_depth
+           FROM kith.entities WHERE id = $1
+         UNION ALL
+         SELECT e.id, e.space_id, e.canonical_name, e.merged_into,
+                c.merge_depth + 1
+           FROM kith.entities e JOIN entity_chain c ON e.id = c.merged_into
+          WHERE c.merge_depth < 16
+       )
+       SELECT space_id, canonical_name FROM entity_chain
+        WHERE merged_into IS NULL ORDER BY merge_depth DESC LIMIT 1`,
       [typed.entityId],
     );
     return entity && entity.space_id === spaceId ? entity.canonical_name : "";

@@ -10,7 +10,8 @@ export const CARD_RECORD_KINDS = [
 ] as const;
 
 export type CardRecordKind = (typeof CARD_RECORD_KINDS)[number];
-export type EntityKind = "person" | "organization" | "project" | "place" | "other";
+export type EntityKind =
+  "person" | "organization" | "project" | "place" | "vehicle" | "other";
 
 type Field = {
   valueTypes: readonly ObservationValue["type"][];

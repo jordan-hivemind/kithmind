@@ -30,13 +30,14 @@ import { IdentityError } from "../identity/errors.js";
 import { assertKithId, newKithId } from "../ids.js";
 
 export type EntityKind =
-  "person" | "organization" | "project" | "place" | "other";
+  "person" | "organization" | "project" | "place" | "vehicle" | "other";
 
 const ENTITY_KINDS = new Set<string>([
   "person",
   "organization",
   "project",
   "place",
+  "vehicle",
   "other",
 ]);
 
@@ -57,6 +58,7 @@ export type Entity = {
   normalizedName: string;
   aliases: readonly string[];
   normalizedAliases: readonly string[];
+  mergedIntoId: string | null;
   createdAt: number;
   updatedAt: number | null;
 };
@@ -71,6 +73,7 @@ type EntityRow = {
   normalized_name: string;
   aliases: unknown;
   normalized_aliases: unknown;
+  merged_into: string | null;
   created_at: Date;
   updated_at: Date | null;
 };
@@ -98,6 +101,7 @@ function toEntity(record: EntityRow): Entity {
     normalizedName: record.normalized_name,
     aliases: stringArray(record.aliases),
     normalizedAliases: stringArray(record.normalized_aliases),
+    mergedIntoId: record.merged_into,
     createdAt: ms(record.created_at)!,
     updatedAt: ms(record.updated_at),
   };
@@ -167,24 +171,48 @@ function normalizeAliases(
       byNormalized.set(normalized, cleaned);
   }
   return {
-    aliases: [...byNormalized.values()].slice(0, 20),
-    normalizedAliases: [...byNormalized.keys()].slice(0, 20),
+    aliases: [...byNormalized.values()],
+    normalizedAliases: [...byNormalized.keys()],
   };
 }
 
 /** One entity row by id, unchecked against any space. Callers space-check. */
-export async function getEntity(
+async function getEntityRow(
   ctx: IdentityCtx,
   id: string,
 ): Promise<Entity | null> {
   const record = await row<EntityRow>(
     ctx,
     `SELECT id, space_id, user_id, key, kind, canonical_name, normalized_name,
-            aliases, normalized_aliases, created_at, updated_at
+            aliases, normalized_aliases, merged_into, created_at, updated_at
        FROM kith.entities WHERE id = $1`,
     [assertKithId(id, "invalid_entity_id")],
   );
   return record ? toEntity(record) : null;
+}
+
+/**
+ * One entity by id, following an explicit merge to its canonical survivor.
+ * The bound prevents a corrupted chain from turning a read into an unbounded
+ * walk. `mergeEntities` locks both rows and refuses cycles before writing.
+ */
+export async function getEntity(
+  ctx: IdentityCtx,
+  id: string,
+): Promise<Entity | null> {
+  let entity = await getEntityRow(ctx, id);
+  const seen = new Set<string>();
+  for (let depth = 0; entity?.mergedIntoId && depth < 16; depth += 1) {
+    if (seen.has(entity.id)) throw new Error("Entity merge chain is invalid");
+    seen.add(entity.id);
+    const target = await getEntityRow(ctx, entity.mergedIntoId);
+    if (!target || target.spaceId !== entity.spaceId) {
+      throw new Error("Entity merge chain is invalid");
+    }
+    entity = target;
+  }
+  if (entity?.mergedIntoId) throw new Error("Entity merge chain is too deep");
+  return entity;
 }
 
 /**
@@ -219,9 +247,10 @@ export async function listEntities(
   const records = await rows<EntityRow>(
     ctx,
     `SELECT id, space_id, user_id, key, kind, canonical_name, normalized_name,
-            aliases, normalized_aliases, created_at, updated_at
+            aliases, normalized_aliases, merged_into, created_at, updated_at
        FROM kith.entities
       WHERE space_id = ANY($1::text[])
+        AND merged_into IS NULL
         AND ($2::text IS NULL OR kind = $2)
         AND ($3::text IS NULL OR normalized_name = $3
              OR normalized_aliases ? $3)
@@ -317,18 +346,33 @@ export async function resolveEntity(
     return person;
   }
 
-  const key = normalizeEntityKey(selector.key, selector.kind, canonicalName);
+  let resolvedKey = selector.key;
+  if (resolvedKey === undefined) {
+    const index = await loadSpaceEntityIndex(ctx, spaceId);
+    // Only the requested primary name proves identity. Incoming aliases are
+    // metadata and may legitimately overlap across people (for example, two
+    // different people both known as "Sam").
+    const resolution = resolveLiteralName(index, canonicalName, [
+      selector.kind,
+    ]);
+    if (resolution.entity) {
+      resolvedKey = resolution.entity.key;
+    } else if (resolution.candidateCount > 0 || index.truncated) {
+      throw new Error("Entity name is ambiguous; provide an explicit key");
+    }
+  }
+  const key = normalizeEntityKey(resolvedKey, selector.kind, canonicalName);
   const incomingAliases = normalizeAliases(selector.aliases, canonicalName);
   const existing = await row<EntityRow>(
     ctx,
     `SELECT id, space_id, user_id, key, kind, canonical_name, normalized_name,
-            aliases, normalized_aliases, created_at, updated_at
+            aliases, normalized_aliases, merged_into, created_at, updated_at
        FROM kith.entities WHERE space_id = $1 AND key = $2`,
     [spaceId, key],
   );
 
   if (existing) {
-    const entity = toEntity(existing);
+    const entity = (await getEntity(ctx, existing.id))!;
     if (entity.kind !== selector.kind) {
       throw new Error("Entity key is already assigned to a different kind");
     }
@@ -342,8 +386,8 @@ export async function resolveEntity(
     if (entity.normalizedName !== normalizedName) {
       aliasMap.set(normalizedName, canonicalName);
     }
-    const mergedAliases = [...aliasMap.values()].slice(0, 20);
-    const mergedNormalizedAliases = [...aliasMap.keys()].slice(0, 20);
+    const mergedAliases = [...aliasMap.values()];
+    const mergedNormalizedAliases = [...aliasMap.keys()];
     // Did this resolve actually teach the entity a name it did not have? The
     // merge appends, so a comparison of the normalized list against the
     // stored one answers it exactly. Almost every call arrives with nothing
@@ -436,8 +480,8 @@ export async function loadSpaceEntityIndex(
   const records = await rows<EntityRow>(
     ctx,
     `SELECT id, space_id, user_id, key, kind, canonical_name, normalized_name,
-            aliases, normalized_aliases, created_at, updated_at
-       FROM kith.entities WHERE space_id = $1 LIMIT $2`,
+            aliases, normalized_aliases, merged_into, created_at, updated_at
+       FROM kith.entities WHERE space_id = $1 AND merged_into IS NULL LIMIT $2`,
     [assertKithId(spaceId, "invalid_space_id"), MAX_ENTITY_SCAN_ROWS + 1],
   );
   const truncated = records.length > MAX_ENTITY_SCAN_ROWS;

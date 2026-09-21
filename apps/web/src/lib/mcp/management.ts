@@ -96,6 +96,73 @@ export function postgresManagement(withPrincipal: WithMcpPrincipal) {
         entity: await memory.setEntityAliases(ctx, { principal, ...args }),
       })),
 
+    manageProfileEntity: async (
+      args:
+        | {
+            action: "create";
+            spaceId: string;
+            kind: memory.ProfileKind;
+            name: string;
+            aliases?: readonly string[];
+          }
+        | {
+            action: "update";
+            entityId: string;
+            name?: string;
+            aliases?: readonly string[];
+          }
+        | {
+            action: "link_me";
+            spaceId: string;
+            entityId: string;
+          }
+        | {
+            action: "link_document";
+            entityId: string;
+            sourceItemId: string;
+          }
+        | {
+            action: "merge";
+            sourceEntityId: string;
+            targetEntityId: string;
+          },
+    ) =>
+      await withPrincipal(async ({ ctx, principal }) => {
+        switch (args.action) {
+          case "create":
+            return {
+              action: args.action,
+              ...(await memory.createNamedEntity(ctx, { principal, ...args })),
+            };
+          case "update":
+            return {
+              action: args.action,
+              entity: await memory.updateNamedEntity(ctx, {
+                principal,
+                ...args,
+              }),
+            };
+          case "link_me":
+            return {
+              action: args.action,
+              entity: await memory.linkMeToPerson(ctx, { principal, ...args }),
+            };
+          case "link_document":
+            return {
+              action: args.action,
+              ...(await memory.linkProfileDocument(ctx, {
+                principal,
+                ...args,
+              })),
+            };
+          case "merge":
+            return {
+              action: args.action,
+              ...(await memory.mergeEntities(ctx, { principal, ...args })),
+            };
+        }
+      }),
+
     manageInvestment: async (args: InvestmentAction) =>
       await withPrincipal(async ({ ctx, principal }) => {
         if (args.action === "create") {

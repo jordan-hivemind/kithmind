@@ -8,6 +8,7 @@ export const KITH_HELP_TOPICS = [
   "entries",
   "document_links",
   "entities",
+  "profiles",
   "attention",
   "memory",
   "accounts",
@@ -22,7 +23,7 @@ export type KithHelpTopic = (typeof KITH_HELP_TOPICS)[number];
 const HELP: Record<KithHelpTopic, string> = {
   start: `Kith Mind stores facts, narrative thoughts, indexed documents, investments and exact records.
 
-Use get_kith_capabilities first when a task may write or ingest. Use get_kith_help only for the domain you need. Available topics: recall_capture, capabilities, investments, entries, document_links, entities, attention, memory, accounts, corrections, documents, finance_reviews, coverage.
+Use get_kith_capabilities first when a task may write or ingest. Use get_kith_help only for the domain you need. Available topics: recall_capture, capabilities, investments, entries, document_links, entities, profiles, attention, memory, accounts, corrections, documents, finance_reviews, coverage.
 
 Use list_spaces before choosing a space. Authentication, credential capabilities, current membership, space grants, source-account grants and sensitivity ceilings are enforced on every call. A userId is an author, not the owner of a shared-space row. Never infer that similarly named IDs are interchangeable.`,
 
@@ -50,11 +51,17 @@ Example create arguments: {"request":{"action":"create","investmentId":"<investm
 
 A linkId identifies the relationship. sourceItemId identifies the stable source item used by matching and corrections. documentId identifies one parsed Brain document revision. They are different IDs. Confirming a link can replace an estimated entry date when the document provides a stronger date; the result reports dateReplaced.`,
 
-  entities: `Entities are people, organizations, projects, places or other named subjects. list_entities matches the canonical name and existing aliases and paginates. manage_entity_aliases replaces the complete alias list, so omission removes an alias. Canonical name and stable entity key are unchanged.
+  entities: `Entities are people, organizations, projects, places, vehicles or other named subjects. list_entities matches the canonical name and existing aliases and paginates. manage_entity_aliases replaces the complete alias list, so omission removes an alias. Canonical name and stable entity key are unchanged.
 
 Investment document matching uses investment.entityId to reach that entity's aliases. Finance account display overrides are separate and do not participate in entity or investment matching. Do not use a bank accountId as an entityId or investmentId.
 
 Example replacement: {"entityId":"<entityId>","aliases":["Northstar Fund II","Northstar II"]}`,
+
+  profiles: `Use list_profile_fields to discover the compact starter catalog for person and vehicle facts. Custom snake_case predicates remain legal. Use get_profile to read current typed facts, available fact history, recorded relationships and a bounded related-document list. If documentsTruncated is true, use document search and get_document for further retrieval.
+
+manage_profile_entity creates or renames a person or vehicle, links the caller's own membership to one person, links a sourceItemId as a supporting_document fact, and explicitly merges a duplicate into a chosen survivor. A vehicle's canonical name is its friendly display name. Shared aliases are allowed and resolve only when unambiguous. Relationship labels resolve only from the caller's linked person and must be unambiguous. Mother, father, son, daughter, husband, wife, brother and sister require their qualified predicates; the server never guesses them from a generic relationship fact.
+
+The profile uses the same facts as remember_fact. Use manage_memory update_fact to correct a returned single-valued fact, or retire_fact to end it while preserving history. Retiring a supporting_document fact unlinks the profile without deleting the source item. A duplicate merge preserves facts and reports conflicting current single-valued factIds for the same update or retire flow.`,
 
   attention: `list_attention returns a bounded page plus active mutes. By default it includes open items at all severity levels, matching the web queue; use severity or state to narrow it or inspect history. Current producers mainly create extraction items and many are informational. An item targetKind of document uses targetId as a sourceItemId, not a Brain documentId.
 

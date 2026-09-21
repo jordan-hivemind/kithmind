@@ -611,9 +611,14 @@ function observationFromRow(row: Record<string, unknown>): ObservationRow {
 function entityFromRow(row: Record<string, unknown>): EntityRow {
   const value = camelize<EntityRow>(row);
   if (
-    !["person", "organization", "project", "place", "other"].includes(
-      value.kind,
-    )
+    ![
+      "person",
+      "organization",
+      "project",
+      "place",
+      "vehicle",
+      "other",
+    ].includes(value.kind)
   ) {
     throw new Error("Record entity kind is invalid");
   }
@@ -1114,7 +1119,19 @@ async function requireEntity(
   entityId: string,
   spaceId: string,
 ): Promise<EntityRow> {
-  const entity = await getRow(client, "entities", entityId, entityFromRow);
+  const resolved = await client.query(
+    `WITH RECURSIVE entity_chain AS (
+       SELECT *, 0 AS merge_depth FROM kith.entities WHERE id = $1
+       UNION ALL
+       SELECT e.*, c.merge_depth + 1 FROM kith.entities e
+       JOIN entity_chain c ON e.id = c.merged_into
+       WHERE c.merge_depth < 16
+     )
+     SELECT * FROM entity_chain WHERE merged_into IS NULL
+     ORDER BY merge_depth DESC LIMIT 1`,
+    [entityId],
+  );
+  const entity = resolved.rows[0] ? entityFromRow(resolved.rows[0]) : null;
   if (!entity) throw new Error("Record entity does not exist");
   if (entity.spaceId !== spaceId) {
     throw new Error("Record entity belongs to another space");
@@ -1788,7 +1805,7 @@ export async function stageRecordBatch(
     eventVersionIds.push(version.id);
 
     for (const staged of record.observations) {
-      const value = requireObservationValue(staged.value, false);
+      let value = requireObservationValue(staged.value, false);
       requireObservationSchema(
         record.eventType,
         staged.observationType,
@@ -1796,7 +1813,12 @@ export async function stageRecordBatch(
         value,
       );
       if (value.type === "entity") {
-        await requireEntity(client, value.entityId, input.spaceId);
+        const valueEntity = await requireEntity(
+          client,
+          value.entityId,
+          input.spaceId,
+        );
+        value = { type: "entity", entityId: valueEntity.id };
       }
       await requireEvidence(
         client,

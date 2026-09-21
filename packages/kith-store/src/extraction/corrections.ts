@@ -357,13 +357,23 @@ export async function applyAuthorizedCorrection(
   if (found.rowCount !== 1) {
     throw new IdentityError("Source item not found");
   }
-  const correctedValue = validateOwnerCorrectionValue(input.correctedValue);
+  let correctedValue = validateOwnerCorrectionValue(input.correctedValue);
   if (correctedValue.type === "entity") {
-    const entity = await ctx.client.query(
-      "SELECT 1 FROM kith.entities WHERE id = $1 AND space_id = $2",
+    const entity = await ctx.client.query<{ id: string }>(
+      `WITH RECURSIVE entity_chain AS (
+         SELECT id, space_id, merged_into, 0 AS merge_depth
+           FROM kith.entities WHERE id = $1
+         UNION ALL
+         SELECT e.id, e.space_id, e.merged_into, c.merge_depth + 1
+           FROM kith.entities e JOIN entity_chain c ON e.id = c.merged_into
+          WHERE c.merge_depth < 16
+       )
+       SELECT id FROM entity_chain WHERE merged_into IS NULL AND space_id = $2
+       ORDER BY merge_depth DESC LIMIT 1`,
       [assertKithId(correctedValue.entityId, "invalid_entity_id"), spaceId],
     );
     if (entity.rowCount !== 1) throw new IdentityError("Entity not found");
+    correctedValue = { type: "entity", entityId: entity.rows[0]!.id };
   }
   const result = await applyCorrectionDetailed(ctx.client, {
     spaceId,

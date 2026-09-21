@@ -31,6 +31,7 @@ export {
   setEntityAliases,
 } from "./entities.js";
 export * from "./facts.js";
+export * from "./profiles.js";
 export {
   boundedThoughtLimit,
   captureThought,

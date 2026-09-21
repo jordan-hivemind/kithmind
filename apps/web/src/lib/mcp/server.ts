@@ -131,6 +131,19 @@ const CLIENT_SAFE_TOOL_ERRORS: ReadonlySet<string> = new Set([
   "Invalid cursor",
   "order is invalid",
   "Entity not found",
+  "Profile entity not found",
+  "Profile entity is ambiguous",
+  "Relationship label is not recognized",
+  "Relationship is not recorded; use a name or entity ID",
+  "Relationship is ambiguous; use a name or entity ID",
+  "Me is not linked to a person in this space",
+  "Entity name is ambiguous; use an existing entity ID",
+  "Entity name is ambiguous; provide an explicit key",
+  "Entity name or alias matches another entity",
+  "An entity can have at most 20 aliases",
+  "Merge entities must be different",
+  "Merge requires two current entities",
+  "Merge entities must have the same kind",
   "Investment not found",
   "Investment entry not found",
   "Investment document link not found",
@@ -344,7 +357,14 @@ const entitySelectorSchema = z.object({
     .describe(
       "Stable lowercase identity key such as person:alex, or me for the current member in the selected space. Reuse the same key across facts about this entity.",
     ),
-  kind: z.enum(["person", "organization", "project", "place", "other"]),
+  kind: z.enum([
+    "person",
+    "organization",
+    "project",
+    "place",
+    "vehicle",
+    "other",
+  ]),
   name: z.string().trim().min(1).max(200),
   aliases: z.array(z.string().trim().min(1).max(200)).max(20).optional(),
 });
@@ -385,7 +405,17 @@ const entityKindSchema = z.enum([
   "organization",
   "project",
   "place",
+  "vehicle",
   "other",
+]);
+const profileKindSchema = z.enum(["person", "vehicle"]);
+const profileSelectorSchema = z.union([
+  z.object({ entityId: spaceIdSchema }),
+  z.object({
+    name: z.string().trim().min(1).max(200),
+    kind: profileKindSchema.optional(),
+  }),
+  z.object({ relationship: z.string().trim().min(1).max(80) }),
 ]);
 const attentionFilterSchema = z.discriminatedUnion("kind", [
   z.object({
@@ -922,7 +952,7 @@ export function createMcpServer(
 
   const rememberFactTool = registerTool(
     MCP_TOOL_NAMES.rememberFact,
-    "Store one precise, independently changeable fact explicitly stated or confirmed by the user. Use one subject, one snake_case predicate, and one typed value. Use an entity value for relationships. Never store a derived age: store date_of_birth only if an exact date is known. Never use this directly for connector-derived or inferred information; preview those candidates and call only after user confirmation. Single-valued predicates preserve prior values as history; use changeKind corrected when the prior value was inaccurate.",
+    "Store one precise, independently changeable fact explicitly stated or confirmed by the user. Use one subject, one snake_case predicate, and one typed value. Call list_profile_fields for the compact person and vehicle starter vocabulary; custom predicates remain legal. Use an entity value for relationships and the exact qualified predicate for mother, father, son, daughter, husband, wife, brother or sister. Never store a derived age: store date_of_birth only if an exact date is known. Never use this directly for connector-derived or inferred information; preview those candidates and call only after user confirmation. Single-valued predicates preserve prior values as history; use changeKind corrected when the prior value was inaccurate.",
     {
       spaceId: writeSpaceSchema,
       subject: entitySelectorSchema.describe("The entity this fact is about"),
@@ -1793,6 +1823,93 @@ export function createMcpServer(
     }),
   );
 
+  const listProfileFieldsTool = registerTool(
+    MCP_TOOL_NAMES.listProfileFields,
+    "List the compact starter field catalog for person and vehicle profiles, including value type, cardinality, history and sensitivity guidance. Custom snake_case fact predicates remain legal.",
+    { kind: profileKindSchema.optional() },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listProfileFields],
+    async (args) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(await reads.listProfileFields(args), null, 2),
+        },
+      ],
+    }),
+  );
+
+  const getProfileTool = registerTool(
+    MCP_TOOL_NAMES.getProfile,
+    "Read one person or vehicle profile from current facts, with typed values, history availability, relationships and related indexed documents. Resolve by entity ID, an unambiguous name or alias, or an unambiguous relationship from the caller's linked person.",
+    { spaceId: spaceIdSchema, selector: profileSelectorSchema },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.getProfile],
+    async (args) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(await reads.getProfile(args), null, 2),
+        },
+      ],
+      _meta: { "anthropic/maxResultSizeChars": 50000 },
+    }),
+  );
+
+  const manageProfileEntityTool = registerTool(
+    MCP_TOOL_NAMES.manageProfileEntity,
+    "Create or update a named person or vehicle, link the current caller's own person in one space, attach an indexed source item as a supporting document, or explicitly merge a duplicate into a canonical entity. A vehicle's canonical name is its friendly display name. Create reuses an exact unambiguous primary name or alias; incoming aliases are metadata and may be shared. A document link is a supporting_document fact and manage_memory retire_fact unlinks it without deleting the document. Merge preserves facts and reports conflicting current single-valued fact IDs for resolution with manage_memory.",
+    {
+      request: z.discriminatedUnion("action", [
+        z.object({
+          action: z.literal("create"),
+          spaceId: spaceIdSchema,
+          kind: profileKindSchema,
+          name: z.string().trim().min(1).max(200),
+          aliases: z
+            .array(z.string().trim().min(1).max(200))
+            .max(20)
+            .optional(),
+        }),
+        z.object({
+          action: z.literal("update"),
+          entityId: spaceIdSchema,
+          name: z.string().trim().min(1).max(200).optional(),
+          aliases: z
+            .array(z.string().trim().min(1).max(200))
+            .max(20)
+            .optional(),
+        }),
+        z.object({
+          action: z.literal("link_me"),
+          spaceId: spaceIdSchema,
+          entityId: spaceIdSchema,
+        }),
+        z.object({
+          action: z.literal("link_document"),
+          entityId: spaceIdSchema,
+          sourceItemId: spaceIdSchema,
+        }),
+        z.object({
+          action: z.literal("merge"),
+          sourceEntityId: spaceIdSchema,
+          targetEntityId: spaceIdSchema,
+        }),
+      ]),
+    },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.manageProfileEntity],
+    async ({ request }) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            await management.manageProfileEntity(request),
+            null,
+            2,
+          ),
+        },
+      ],
+    }),
+  );
+
   const manageEntityAliasesTool = registerTool(
     MCP_TOOL_NAMES.manageEntityAliases,
     "Replace one entity's complete alias list. Omitted aliases are removed. Canonical name and key stay unchanged. Investment matching uses the investment entity's aliases; finance account overrides do not.",
@@ -2332,6 +2449,9 @@ export function createMcpServer(
     [MCP_TOOL_NAMES.getKithHelp]: getKithHelpTool,
     [MCP_TOOL_NAMES.getKithCapabilities]: getKithCapabilitiesTool,
     [MCP_TOOL_NAMES.listEntities]: listEntitiesTool,
+    [MCP_TOOL_NAMES.listProfileFields]: listProfileFieldsTool,
+    [MCP_TOOL_NAMES.getProfile]: getProfileTool,
+    [MCP_TOOL_NAMES.manageProfileEntity]: manageProfileEntityTool,
     [MCP_TOOL_NAMES.manageEntityAliases]: manageEntityAliasesTool,
     [MCP_TOOL_NAMES.manageInvestment]: manageInvestmentTool,
     [MCP_TOOL_NAMES.manageInvestmentEntry]: manageInvestmentEntryTool,

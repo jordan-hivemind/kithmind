@@ -21,6 +21,25 @@ This extends the typed extraction backend in
 `packages/kith-store/src/extraction/`. The gate, the corrections queue and the
 evidence spans are unchanged.
 
+
+## Front-of-return extraction priority
+
+Owner clarification, 2026-09-20: an assembled return can exceed 300 pages
+because most pages are appended supporting statements. The return forms and
+schedules needed to schematize the return are in the front section.
+
+Start with the front return forms and schedules. Bookmarks, a contents page
+or form headings can help choose an initial page range; keep that selection
+lightweight. Expand the inspected range when a required form, schedule or
+total is missing. A useful first pass can report the forms it covered without
+classifying every attachment. Keep original PDF page numbers in citations and
+report any missing coverage explicitly.
+
+Attached K-1s and brokerage statements may be useful separate documents, but
+they are not prerequisites for extracting the return totals. Do not count an
+attachment amount again as a return total. Total PDF length alone must not
+block the first useful tax-return extraction slice.
+
 ## 1. What "every total" means
 
 A line is captured when it matches one rule below. Everything else is skipped.
