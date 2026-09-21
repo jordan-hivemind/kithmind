@@ -30,12 +30,14 @@
 //    source/year/month directory, so the same capture id reused with a
 //    different source or a different capture month passed it and wrote a
 //    second, disagreeing record. `<root>/captures/.by-id/<captureId>` is now
-//    the index of every capture id in this space: one hard link, claimed
-//    atomically before the partitioned record is written, so a reuse
-//    anywhere is a conflict. The index entry is a hard link to the manifest
-//    itself, so it carries no second copy of the bytes and can never dangle
-//    or disagree with what it indexes. The name is dot-prefixed, which no
-//    valid source id can be, so it cannot collide with a source's directory.
+//    the index of every capture id in this space: an independent copy claimed
+//    atomically before the partitioned record is written, so a reuse anywhere
+//    is a conflict. The index and canonical files are each published from a
+//    separately written temp file. They therefore have byte-identical content
+//    but share neither an inode nor copied extended attributes, which keeps a
+//    desktop sync provider from treating one path as a relocation of the
+//    other. The name is dot-prefixed, which no valid source id can be, so it
+//    cannot collide with a source's directory.
 // 3. Reading a capture back verifies it (`readCaptureManifest`): a closed
 //    versioned schema, the manifest hash in its own file name, the partition
 //    it sits in, and the existence and hash of the retained object it
@@ -229,6 +231,29 @@ function captureDir(root: string, sourceId: string, capturedAt: string): string 
 }
 
 /**
+ * Publishes freshly written bytes at one final path without overwriting an
+ * existing entry. The hard link is only the atomic no-clobber operation from
+ * this path's private temp inode to this one final name. The temp name is
+ * removed before returning, and callers use a separate invocation, and thus
+ * a separately written inode, for every other final path.
+ */
+function publishFreshCopy(path: string, bytes: Buffer): "written" | "already_exists" {
+  const tmpPath = join(dirname(path), `.tmp-${randomUUID()}`);
+  writeFileSync(tmpPath, bytes, { flag: "wx" });
+  try {
+    try {
+      linkSync(tmpPath, path);
+      return "written";
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      return "already_exists";
+    }
+  } finally {
+    rmSync(tmpPath, { force: true });
+  }
+}
+
+/**
  * Writes one capture's manifest, write-once and content-addressed by its own
  * hash, under `<root>/captures/<sourceId>/<yyyy>/<mm>/`, `yyyy`/`mm` taken
  * from `capturedAt` (UTC). The file name is
@@ -238,13 +263,17 @@ function captureDir(root: string, sourceId: string, capturedAt: string): string 
  *
  * `captureId` is claimed in one index for the whole space,
  * `<root>/captures/.by-id/<captureId>`, before the partitioned record is
- * written. The claim is a `linkSync`, which fails with EEXIST rather than
- * overwriting, so it is atomic against a concurrent writer as well as
- * against the partition-hopping the old per-directory scan missed: reusing
- * an id under a different source or a different capture month is a
- * `CaptureConflictError` like any other reuse, not a second record. A retry
- * of the same attempt hashes identically, so its claim resolves to the same
- * bytes and the write stays an idempotent no-op.
+ * written. The claim is published with a no-clobber `linkSync` from a freshly
+ * written, index-local temp file, which fails with EEXIST rather than
+ * overwriting. It is atomic against a concurrent writer as well as against
+ * the partition-hopping the old per-directory scan missed: reusing an id
+ * under a different source or a different capture month is a
+ * `CaptureConflictError` like any other reuse, not a second record. The
+ * partitioned record is published from a second freshly written temp inode.
+ * The two final files are byte-identical but never share an inode or copied
+ * extended attributes. A retry of the same attempt hashes identically, so
+ * its claim resolves to the same bytes and the write stays an idempotent
+ * no-op.
  */
 export function writeCaptureManifest(
   root: string,
@@ -267,35 +296,18 @@ export function writeCaptureManifest(
   const indexPath = join(indexDir, manifest.captureId);
   mkdirSync(indexDir, { recursive: true });
 
-  const tmpPath = join(dir, `.tmp-${randomUUID()}`);
-  writeFileSync(tmpPath, bytes, { flag: "wx" });
-  try {
-    try {
-      linkSync(tmpPath, indexPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      // The id is already claimed. Identical content is a retry of that same
-      // attempt; anything else is two acquisitions wearing one id.
-      if (sha256HexOf(readFileSync(indexPath)) !== manifestSha256) {
-        throw new CaptureConflictError(manifest.captureId, indexPath);
-      }
+  const claimStatus = publishFreshCopy(indexPath, bytes);
+  if (claimStatus === "already_exists") {
+    // The id is already claimed. Identical content is a retry of that same
+    // attempt; anything else is two acquisitions wearing one id.
+    if (sha256HexOf(readFileSync(indexPath)) !== manifestSha256) {
+      throw new CaptureConflictError(manifest.captureId, indexPath);
     }
-
-    if (existsSync(finalPath)) {
-      readAndVerify(finalPath, manifestSha256);
-      return { path: finalPath, status: "already_exists", manifestSha256 };
-    }
-    try {
-      linkSync(tmpPath, finalPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      readAndVerify(finalPath, manifestSha256);
-      return { path: finalPath, status: "already_exists", manifestSha256 };
-    }
-    return { path: finalPath, status: "written", manifestSha256 };
-  } finally {
-    rmSync(tmpPath, { force: true });
   }
+
+  const status = publishFreshCopy(finalPath, bytes);
+  if (status === "already_exists") readAndVerify(finalPath, manifestSha256);
+  return { path: finalPath, status, manifestSha256 };
 }
 
 /** What `readCaptureManifestById` found: the verified manifest, the
@@ -312,9 +324,9 @@ export type CaptureManifestLookup = {
 
 /**
  * Reads a capture manifest knowing only its id (`documents.capture_id`),
- * via the space-wide `.by-id` index (above): a hard link to the canonical
- * partitioned file, so its bytes -- and therefore its hash and content --
- * are identical. The canonical path itself is only knowable from the
+ * via the space-wide `.by-id` index (above): an independently written,
+ * byte-identical copy of the canonical partitioned file. The canonical path
+ * itself is only knowable from the
  * manifest's own `sourceId`/`capturedAt`, which is why this reads the index
  * copy first rather than asking the caller to already know the partition.
  * Delegates to `readCaptureManifest` for the full verification (schema,

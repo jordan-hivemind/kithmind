@@ -1831,10 +1831,11 @@ confirms both are still identifiable from the raw tree alone.
 #### The capture id index (F1-34)
 
 `<root>/captures/.by-id/<captureId>` is the index of every capture id in one
-space: a hard link to the manifest itself, claimed with `linkSync` before
-the partitioned record is written, so a second claim on an id fails with
-`EEXIST` and is compared by hash -- identical content is a retry, anything
-else is `CaptureConflictError`. One index, not one per partition, because
+space: an independent byte-identical copy of the manifest, claimed with a
+no-clobber `linkSync` from a freshly written, index-local temp file before the
+partitioned record is written. A second claim on an id fails with `EEXIST` and
+is compared by hash -- identical content is a retry, anything else is
+`CaptureConflictError`. One index, not one per partition, because
 capture identity is not partition-scoped: the old check scanned only the one
 source/year/month directory the new record was headed for, so the same
 capture id reused under a different source, or with a `capturedAt` in a
@@ -1842,23 +1843,21 @@ different month, passed it and landed a second, disagreeing record under one
 id. Claiming the id atomically also closes the concurrent-writer race the
 scan-then-write had.
 
-The entry is a hard link rather than a copy or a pointer file, so it cannot
-dangle and cannot disagree with the record it indexes, and it costs no
-second copy of the bytes. The directory name is dot-prefixed, which the path
-grammar above forbids in a source id, so it can never collide with a
-source's own directory. A directory walk for `*.json` skips it: the index
-entries carry no extension.
+The partitioned record is published with the same no-clobber operation from a
+second separately written temp file. The temp name is removed before another
+endpoint is exposed from that inode. The two final paths therefore have the
+same immutable bytes but different inodes and no extended attributes copied
+from one another. This matters for desktop sync providers that otherwise treat
+linked files, or copies carrying the same sync metadata, as one object being
+relocated. The directory name is dot-prefixed, which the path grammar above
+forbids in a source id, so it can never collide with a source's own directory.
+A directory walk for `*.json` skips it: the index entries carry no extension.
 
-That guarantee is a property of one filesystem, not of the tree's bytes, so
-it is the one thing a copy of the tree has to be deliberate about. A backup,
-a replication or a root relocation must either preserve the link or write a
-second copy of the same bytes; a tool that copies `captures/` without
-preserving hard links still produces a correct tree, but one that skips
-dot-prefixed entries, or that copies the index entry as an empty placeholder
-because it treated a link as a pointer, produces an index that names
-captures nothing can read. The check that matters after any copy is
-therefore per entry, not per directory: every `captures/.by-id/<captureId>`
-resolves to a readable capture manifest whose `captureId` is that same id.
+A backup, replication or root relocation must preserve both independent
+files. The per-entry check after any copy remains the same: every
+`captures/.by-id/<captureId>` resolves to a readable capture manifest whose
+`captureId` is that same id, and the canonical path reconstructed from its
+bytes also verifies.
 
 #### Source identity is opaque (F1-34)
 
