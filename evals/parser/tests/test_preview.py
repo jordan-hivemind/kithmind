@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import io
 import json
 import unittest
 import zipfile
 from unittest import mock
-
-from PIL import Image
-from reportlab.lib.utils import ImageReader
-from reportlab.pdfgen import canvas
 
 from parser_eval.preview import (
     PDF_MEDIA_TYPE,
@@ -20,9 +17,17 @@ from parser_eval.preview import (
 
 
 BOUNDARY = PreviewExecutionBoundary(network_denied=True, resource_bounded=True)
+PDF_TEST_DEPENDENCIES_AVAILABLE = all(
+    importlib.util.find_spec(name) is not None
+    for name in ("PIL", "pdfplumber", "reportlab")
+)
 
 
 def _pdf(page_count: int, *, image_page: int | None = None) -> bytes:
+    from PIL import Image
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
     output = io.BytesIO()
     document = canvas.Canvas(output, pagesize=(300, 300), pageCompression=0)
     raster = io.BytesIO()
@@ -67,6 +72,10 @@ def _preview(
     )
 
 
+@unittest.skipUnless(
+    PDF_TEST_DEPENDENCIES_AVAILABLE,
+    "PDF preview fixture dependencies are not installed",
+)
 class PdfPreviewTests(unittest.TestCase):
     def test_more_than_64_pages_inspects_only_requested_original_pages(self) -> None:
         original = _pdf(65)
@@ -151,6 +160,8 @@ class PdfPreviewTests(unittest.TestCase):
         self.assertEqual(malformed, {"state": "failed", "code": "malformed_document"})
 
     def test_text_is_bounded(self) -> None:
+        from reportlab.pdfgen import canvas
+
         output = io.BytesIO()
         document = canvas.Canvas(output, pagesize=(300, 300), pageCompression=0)
         text = document.beginText(10, 290)
@@ -253,6 +264,10 @@ class XlsxPreviewTests(unittest.TestCase):
                 )
 
 
+@unittest.skipUnless(
+    PDF_TEST_DEPENDENCIES_AVAILABLE,
+    "PDF preview fixture dependencies are not installed",
+)
 class BoundaryTests(unittest.TestCase):
     def test_parent_execution_attestations_are_required(self) -> None:
         data = _pdf(1)
