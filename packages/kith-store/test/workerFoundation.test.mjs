@@ -14,7 +14,10 @@ import {
   records,
   withKithTransaction,
 } from "../dist/index.js";
-import { listSources } from "../dist/documents/index.js";
+import {
+  getDocumentsForSourceItem,
+  listSources,
+} from "../dist/documents/index.js";
 import {
   MAX_INLINE_TEXT_CHUNK_UTF8_BYTES,
   planInlineText,
@@ -2309,7 +2312,7 @@ test(
 );
 
 test(
-  "provider-original archived admission publishes and assesses through HTTP",
+  "provider-original v2 admission retains one parser artifact and assesses through HTTP",
   { skip },
   async (t) => {
     const f = await fixture(t);
@@ -2522,13 +2525,9 @@ test(
           outputMediaType: "application/vnd.docling+json",
           createdAt: NOW,
         },
-        archives: [
-          receipt("original_bytes", "primary", 1),
-          receipt("parser_output", "primary", 3),
-          receipt("parser_output", "independent_backup", 4),
-        ],
+        archives: [receipt("parser_output", "primary", 3)],
         providerOriginal: {
-          referenceVersion: "provider_original_v1",
+          referenceVersion: "provider_original_v2",
           providerKind: "dropbox_v1",
           clientReferenceId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c149",
           sourceContentHash: HASH_A,
@@ -2539,18 +2538,6 @@ test(
           providerRevision: "rev-synthetic-provider",
           providerContentHash: "7".repeat(64),
           verifiedAt: NOW,
-          locatorBundle: {
-            bindingId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c148",
-            manifestFingerprint: "8".repeat(64),
-            recipientFingerprint: "9".repeat(64),
-            repositoryKeyDomainFingerprint: "a".repeat(64),
-            repositoryId: "b".repeat(64),
-            snapshotId: "c".repeat(64),
-            objectName: "provider-locator.json.age",
-            ciphertextHash: "d".repeat(64),
-            ciphertextByteLength: 512,
-            readbackVerifiedAt: NOW,
-          },
           createdAt: NOW,
         },
         parsedText: {
@@ -2585,19 +2572,73 @@ test(
         ).rows[0].count,
         0,
       );
+      await assert.rejects(
+        call((ctx) =>
+          admitArchivedDiscovery(ctx, f.principal, {
+            ...admitRequest,
+            requestId: "archive-admit-provider-mismatch",
+            providerOriginal: {
+              ...admitRequest.providerOriginal,
+              sourceContentHash: "f".repeat(64),
+            },
+          }),
+        ),
+        expectProtocolCode("stale_observation"),
+      );
+      const rolledBack = (
+        await f.client.query(
+          `SELECT
+             (SELECT count(*)::int FROM kith.source_revisions WHERE source_item_id=$1) revisions,
+             (SELECT count(*)::int FROM kith.source_parser_artifacts WHERE source_item_id=$1) artifacts,
+             (SELECT count(*)::int FROM kith.source_artifact_archive_receipts WHERE source_item_id=$1) receipts,
+             (SELECT count(*)::int FROM kith.source_provider_original_references WHERE source_item_id=$1) provider_refs`,
+          [work.source_item_id],
+        )
+      ).rows[0];
+      assert.deepEqual(rolledBack, {
+        revisions: 0,
+        artifacts: 0,
+        receipts: 0,
+        provider_refs: 0,
+      });
       const admitted = await call((ctx) =>
         admitArchivedDiscovery(ctx, f.principal, admitRequest),
       );
       assert.equal(admitted.reused, false);
       assert.equal(admitted.state, "admitted");
-      assert.equal(
-        (
-          await call((ctx) =>
-            admitArchivedDiscovery(ctx, f.principal, admitRequest),
-          )
-        ).reused,
-        true,
+      assert.equal("originalPrimaryReceiptId" in admitted, false);
+      assert.equal("parserBackupReceiptId" in admitted, false);
+      const generationReceipts = (
+        await f.client.query(
+          `SELECT original_primary_receipt_id, original_backup_receipt_id,
+                  original_provider_reference_id, parser_primary_receipt_id,
+                  parser_backup_receipt_id
+             FROM kith.processing_generations WHERE id = $1`,
+          [admitted.processingGenerationId],
+        )
+      ).rows[0];
+      assert.equal(generationReceipts.original_primary_receipt_id, null);
+      assert.equal(generationReceipts.original_backup_receipt_id, null);
+      assert.ok(generationReceipts.original_provider_reference_id);
+      assert.ok(generationReceipts.parser_primary_receipt_id);
+      assert.equal(generationReceipts.parser_backup_receipt_id, null);
+      const storedProvider = (
+        await f.client.query(
+          `SELECT reference_version, locator_binding_id, locator_repository_id
+             FROM kith.source_provider_original_references WHERE id = $1`,
+          [generationReceipts.original_provider_reference_id],
+        )
+      ).rows[0];
+      assert.deepEqual(storedProvider, {
+        reference_version: "provider_original_v2",
+        locator_binding_id: null,
+        locator_repository_id: null,
+      });
+      const replayed = await call((ctx) =>
+        admitArchivedDiscovery(ctx, f.principal, admitRequest),
       );
+      assert.equal(replayed.reused, true);
+      assert.deepEqual({ ...replayed, reused: false }, admitted);
       const lookup = await call((ctx) =>
         lookupArchivedAdmission(ctx, f.principal, {
           ...common,
@@ -2621,6 +2662,8 @@ test(
         admitted.processingGenerationId,
       );
       assert.equal(lookup.ingestJobId, admitted.ingestJobId);
+      assert.equal("originalPrimaryReceiptId" in lookup, false);
+      assert.equal("parserBackupReceiptId" in lookup, false);
       assert.equal(
         (
           await f.client.query(
@@ -3056,6 +3099,20 @@ test(
       assert.equal(published.lease_token, null);
       assert.equal(Number(published.activation_epoch), 1);
       assert.equal(published.activated_at.getTime(), snapshotClock + 1);
+      const documentResult = await getDocumentsForSourceItem(
+        f.client,
+        [f.spaceId],
+        work.source_item_id,
+      );
+      assert.deepEqual(documentResult.documents[0].originalRecovery, {
+        kind: "provider_original_v2",
+        localPrimaryArchived: false,
+        parserArtifactArchived: true,
+        providerVerification: "verified_at_admission",
+        verifiedAt: NOW,
+        continuousAvailability: false,
+        desktopRecoveryRequired: true,
+      });
       const parsedEmbedding = (
         await f.client.query(
           `SELECT s.eligibility_epoch,s.eligible_counts,t.state,
@@ -3113,6 +3170,52 @@ test(
       const validAssessment = await assessBinary("valid");
       assert.equal(validAssessment.state, "complete");
       assert.equal(validAssessment.counts.items.ready, 1);
+      const unexpectedBackup = await provenance.createOrGetArchiveReceipt(
+        f.client,
+        {
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          sourceItemId: work.source_item_id,
+          sourceRevisionId: admitted.sourceRevisionId,
+          parserArtifactId: admitted.parserArtifactId,
+          subjectKind: "parser_output",
+          copyRole: "independent_backup",
+          clientReceiptId: randomUUID(),
+          requestDigest: await sha256Hex("unexpected parser backup"),
+          archiveProfileFingerprint: "1".repeat(64),
+          archiveIdentityFingerprint: "2".repeat(64),
+          recipientFingerprint: "3".repeat(64),
+          repositoryKeyDomainFingerprint: "4".repeat(64),
+          storageFailureDomainFingerprint: "5".repeat(64),
+          archiveObjectId: randomUUID(),
+          plaintextHash: outputHash,
+          plaintextByteLength: 20,
+          plaintextMediaType: "application/vnd.docling+json",
+          ciphertextHash: "6".repeat(64),
+          ciphertextByteLength: 30,
+          readbackVerifiedAt: new Date(NOW),
+          userId: f.userId,
+          actorCredentialId: f.credential.id,
+          createdAt: new Date(NOW),
+        },
+      );
+      await provenance.bindInitialArchiveReceipt(f.client, {
+        receipt: unexpectedBackup,
+        userId: f.userId,
+        actorCredentialId: f.credential.id,
+        now: new Date(NOW),
+      });
+      const extraBackupAssessment = await assessBinary("extra-parser-backup");
+      assert.equal(extraBackupAssessment.state, "incomplete");
+      assert.equal(extraBackupAssessment.counts.items.needsReview, 1);
+      await f.client.query(
+        "DELETE FROM kith.source_artifact_archive_bindings WHERE receipt_id=$1",
+        [unexpectedBackup.id],
+      );
+      await f.client.query(
+        "DELETE FROM kith.source_artifact_archive_receipts WHERE id=$1",
+        [unexpectedBackup.id],
+      );
       await f.client.query(
         `UPDATE kith.source_parser_artifacts SET parser_fingerprint=$2
          WHERE id=(SELECT parser_artifact_id FROM kith.processing_generations WHERE id=$1)`,
@@ -3753,6 +3856,190 @@ test(
           }),
         ),
         expectProtocolCode("request_conflict"),
+      );
+    } finally {
+      await pool.end();
+    }
+  },
+);
+
+test(
+  "provider-original v2 forget is locator-free, isolated, replayable, and version-bound",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const pool = createKithPool(f.databaseUrl, 2);
+    const contentHash = await sha256Hex("synthetic provider-only original");
+    const item = await provenance.createOrGetSourceItem(f.client, {
+      spaceId: f.spaceId,
+      sourceAccountId: f.sourceAccountId,
+      externalId: "fixture/provider-only.pdf",
+    });
+    const revision = await provenance.createOrGetArchivedRevision(f.client, {
+      spaceId: f.spaceId,
+      sourceItemId: item.id,
+      contentHash,
+      byteLength: 32,
+      mediaType: "application/pdf",
+      capturedAt: new Date(NOW),
+      userId: f.userId,
+    });
+    const { reference } = await provenance.createAndBindProviderOriginal(
+      f.client,
+      {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        sourceItemId: item.id,
+        sourceRevisionId: revision.id,
+        declaration: {
+          referenceVersion: "provider_original_v2",
+          providerKind: "dropbox_v1",
+          clientReferenceId: randomUUID(),
+          sourceContentHash: contentHash,
+          sourceByteLength: 32,
+          providerAccountIdHash: "1".repeat(64),
+          providerRootDirectoryIdHash: "2".repeat(64),
+          providerFileIdHash: "3".repeat(64),
+          providerRevision: "rev-provider-only",
+          providerContentHash: "4".repeat(64),
+          verifiedAt: NOW,
+          createdAt: NOW,
+        },
+        requestDigest: await sha256Hex("provider-only request"),
+        userId: f.userId,
+        actorCredentialId: f.credential.id,
+        now: new Date(NOW),
+      },
+    );
+    const forgetEpoch = await provenance.beginSourceItemForget(f.client, {
+      spaceId: f.spaceId,
+      sourceItemId: item.id,
+      forgottenAt: new Date(NOW),
+      forgottenBy: f.userId,
+    });
+    const common = {
+      protocolVersion: 1,
+      spaceId: f.spaceId,
+      sourceAccountId: f.sourceAccountId,
+      sourceItemId: item.id,
+      expectedForgetEpoch: forgetEpoch,
+    };
+    const call = (work) => withWorkerTransaction(pool, work, NOW);
+    try {
+      const targets = await call((ctx) =>
+        getProviderOriginalForgetTargets(ctx, f.principal, {
+          ...common,
+          operation: "providerOriginal.forgetTargets",
+          requestId: "provider-v2-targets",
+          paginationOpts: { cursor: null, numItems: 10 },
+        }),
+      );
+      assert.deepEqual(targets.targets, [
+        {
+          referenceVersion: "provider_original_v2",
+          referenceId: reference.id,
+          referenceFingerprint: reference.referenceFingerprint,
+          forgetEpoch,
+        },
+      ]);
+
+      const secondSourceAccountId = newKithId();
+      await f.client.query(
+        `INSERT INTO kith.source_accounts
+           (id,space_id,created_at,connector,account_id,name,enabled,
+            cursor_version,freshness_ms,inventory_epoch,
+            completed_inventory_epoch,manifest_version,created_by)
+         VALUES ($1,$2,transaction_timestamp(),'fs','other-synthetic-fs',
+                 'Other synthetic filesystem',true,0,60000,0,0,0,$3)`,
+        [secondSourceAccountId, f.spaceId, f.userId],
+      );
+      const secondCredential = await makeApiKey(f.ctx(NOW), {
+        userId: f.userId,
+        capabilities: ["ingest"],
+        spaceIds: [f.spaceId],
+        sourceAccountIds: [secondSourceAccountId],
+      });
+      await assert.rejects(
+        call((ctx) =>
+          getProviderOriginalForgetTargets(
+            ctx,
+            { userId: f.userId, credentialId: secondCredential.id },
+            {
+              ...common,
+              sourceAccountId: secondSourceAccountId,
+              operation: "providerOriginal.forgetTargets",
+              requestId: "provider-v2-cross-source",
+              paginationOpts: { cursor: null, numItems: 10 },
+            },
+          ),
+        ),
+        expectProtocolCode("not_found"),
+      );
+
+      const detachRequest = {
+        ...common,
+        operation: "providerOriginal.ackDetach",
+        requestId: "provider-v2-detach",
+        detachId: randomUUID(),
+        referenceId: reference.id,
+        referenceVersion: "provider_original_v2",
+        referenceOutcome: "detached",
+        providerSourceOutcome: "retained_unchanged",
+      };
+      const acknowledged = await call((ctx) =>
+        acknowledgeProviderOriginalDetach(ctx, f.principal, detachRequest),
+      );
+      assert.equal(acknowledged.reused, false);
+      assert.equal(acknowledged.referenceVersion, "provider_original_v2");
+      assert.equal(
+        (
+          await call((ctx) =>
+            acknowledgeProviderOriginalDetach(
+              ctx,
+              f.principal,
+              detachRequest,
+            ),
+          )
+        ).reused,
+        true,
+      );
+      const storedAck = (
+        await f.client.query(
+          `SELECT ack_version, locator_binding_id, locator_repository_id,
+                  locator_snapshot_id, locator_object_name,
+                  locator_bundle_outcome, locator_absence_authority,
+                  retention_disclosure
+             FROM kith.source_provider_original_detach_acks
+            WHERE reference_id=$1`,
+          [reference.id],
+        )
+      ).rows[0];
+      assert.deepEqual(storedAck, {
+        ack_version: "provider_original_detach_ack_v2",
+        locator_binding_id: null,
+        locator_repository_id: null,
+        locator_snapshot_id: null,
+        locator_object_name: null,
+        locator_bundle_outcome: null,
+        locator_absence_authority: null,
+        retention_disclosure: null,
+      });
+      await f.client.query(
+        `UPDATE kith.source_provider_original_detach_acks
+            SET ack_version='provider_original_detach_ack_v1'
+          WHERE reference_id=$1`,
+        [reference.id],
+      );
+      await assert.rejects(
+        call((ctx) =>
+          getProviderOriginalForgetTargets(ctx, f.principal, {
+            ...common,
+            operation: "providerOriginal.forgetTargets",
+            requestId: "provider-v2-targets-corrupt-ack",
+            paginationOpts: { cursor: null, numItems: 10 },
+          }),
+        ),
+        expectProtocolCode("scan_conflict"),
       );
     } finally {
       await pool.end();
