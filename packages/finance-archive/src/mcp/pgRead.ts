@@ -1496,6 +1496,20 @@ async function listAccountInventory(
         ORDER BY d.account_id
         LIMIT $2
      ),
+     inventory_position_source_dates AS MATERIALIZED (
+       SELECT DISTINCT p.source_document_id, p.account_id, p.as_of
+         FROM positions p
+         JOIN inventory_accounts ia ON ia.account_id = p.account_id
+        WHERE p.source_document_id IS NOT NULL
+     ),
+     inventory_review_sources AS MATERIALIZED (
+       SELECT r.account_id, r.source_document_id,
+              bool_or(r.status = 'open') AS has_open
+         FROM review_items r
+         JOIN inventory_accounts ia ON ia.account_id = r.account_id
+        WHERE r.source_document_id IS NOT NULL
+        GROUP BY r.account_id, r.source_document_id
+     ),
      inventory_partial_source_dates AS MATERIALIZED (
        SELECT pd.account_id, pd.doc_date AS as_of
          FROM documents pd
@@ -1506,14 +1520,16 @@ async function listAccountInventory(
        UNION
        SELECT partial_p.account_id, partial_p.as_of
          FROM documents pd
-         JOIN positions partial_p ON partial_p.source_document_id = pd.id
+         JOIN inventory_position_source_dates partial_p
+           ON partial_p.source_document_id = pd.id
          JOIN inventory_accounts ia ON ia.account_id = partial_p.account_id
         WHERE pd.parsed_ok = FALSE
           AND pd.superseded_by IS NULL
        UNION
        SELECT partial_r.account_id, pd.doc_date
          FROM documents pd
-         JOIN review_items partial_r ON partial_r.source_document_id = pd.id
+         JOIN inventory_review_sources partial_r
+           ON partial_r.source_document_id = pd.id
          JOIN inventory_accounts ia ON ia.account_id = partial_r.account_id
         WHERE pd.parsed_ok = FALSE
           AND pd.superseded_by IS NULL
@@ -1521,21 +1537,19 @@ async function listAccountInventory(
      ),
      inventory_open_review_dates AS MATERIALIZED (
        SELECT open_r.account_id, open_d.doc_date AS as_of
-         FROM review_items open_r
+         FROM inventory_review_sources open_r
          JOIN documents open_d ON open_d.id = open_r.source_document_id
-         JOIN inventory_accounts ia ON ia.account_id = open_r.account_id
-        WHERE open_r.status = 'open'
+        WHERE open_r.has_open
           AND open_d.superseded_by IS NULL
           AND open_d.doc_date IS NOT NULL
        UNION
        SELECT open_r.account_id, open_p.as_of
-         FROM review_items open_r
+         FROM inventory_review_sources open_r
          JOIN documents open_d ON open_d.id = open_r.source_document_id
-         JOIN positions open_p
+         JOIN inventory_position_source_dates open_p
            ON open_p.source_document_id = open_r.source_document_id
           AND open_p.account_id = open_r.account_id
-         JOIN inventory_accounts ia ON ia.account_id = open_r.account_id
-        WHERE open_r.status = 'open'
+        WHERE open_r.has_open
           AND open_d.superseded_by IS NULL
      ),
      inventory_reconciliation_dates AS MATERIALIZED (
