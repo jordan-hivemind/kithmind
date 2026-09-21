@@ -237,6 +237,7 @@ export type SourceInventoryRow = {
   connector: string;
   accountId: string;
   enabled: boolean;
+  allowedRootAliases: string[];
   /** Null until a root row gives the source an area. */
   area: string | null;
   kind: SourceRootKind | null;
@@ -393,6 +394,7 @@ type SourceInventoryDbRow = {
   connector: string | null;
   account_id: string | null;
   enabled: boolean | null;
+  allowed_root_aliases: unknown;
   last_enumerated_at: Date | null;
   last_processed_at: Date | null;
   root_kind: string | null;
@@ -430,6 +432,7 @@ export async function listSourcesInventory(
   const records = await rows<SourceInventoryDbRow>(
     ctx,
     `SELECT a.id, a.space_id, a.name, a.connector, a.account_id, a.enabled,
+            a.allowed_root_aliases,
             a.last_enumerated_at, a.last_processed_at,
             r.kind AS root_kind, r.area, r.last_known_path,
             r.state AS root_state,
@@ -463,7 +466,7 @@ export async function listSourcesInventory(
           ORDER BY q.observed_at DESC, q.id DESC
           LIMIT 1
        ) p ON true
-      WHERE ${predicate.sql}
+      WHERE ${predicate.sql} AND a.disconnected_at IS NULL
       ORDER BY a.space_id, a.id
       LIMIT $2`,
     [predicate.value, MAX_LISTED + 1],
@@ -505,6 +508,9 @@ function toInventoryRow(
     connector: record.connector ?? "",
     accountId: record.account_id ?? "",
     enabled: record.enabled ?? false,
+    allowedRootAliases: Array.isArray(record.allowed_root_aliases)
+      ? record.allowed_root_aliases.filter((alias): alias is string => typeof alias === "string")
+      : [],
     area: record.area,
     kind: (record.root_kind as SourceRootKind | null) ?? null,
     location: record.last_known_path,
@@ -887,6 +893,35 @@ export async function retireSourceRoot(
       WHERE id = $2 AND space_id = $3`,
     [new Date(ctx.now), root.id, root.spaceId],
   );
+}
+
+/** Move a watched location by creating/reviving its new configuration and
+ * retiring the old row. Reports stay with the old location rather than being
+ * presented as a report about a folder the worker has not scanned yet. */
+export async function editSourceRoot(
+  ctx: IdentityCtx,
+  args: { principal: Principal; sourceRootId: string; rootAlias: string; relativePath: string; area?: string | null },
+): Promise<{ id: string }> {
+  const old = await row<{ id: string; source_account_id: string; kind: SourceRootKind; expected_types: unknown }>(
+    ctx,
+    "SELECT id, source_account_id, kind, expected_types FROM kith.source_roots WHERE id = $1",
+    [assertKithId(args.sourceRootId, "invalid_source_root_id")],
+  );
+  if (!old) sourceRootNotFound();
+  const writable = await requireWritableRoot(ctx, args.principal, old.id);
+  const next = await upsertSourceRoot(ctx, {
+    principal: args.principal,
+    sourceAccountId: old.source_account_id,
+    kind: old.kind,
+    rootAlias: args.rootAlias,
+    relativePath: args.relativePath,
+    expectedTypes: Array.isArray(old.expected_types) ? old.expected_types as string[] : [],
+    ...(args.area === undefined ? {} : { area: args.area }),
+  });
+  if (next.id !== old.id) {
+    await exec(ctx, "UPDATE kith.source_roots SET state = 'retired', updated_at = $1 WHERE id = $2 AND space_id = $3", [new Date(ctx.now), old.id, writable.spaceId]);
+  }
+  return { id: next.id };
 }
 
 /**

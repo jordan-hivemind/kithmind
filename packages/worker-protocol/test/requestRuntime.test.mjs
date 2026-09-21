@@ -235,3 +235,27 @@ test("diagnostics.heartbeat takes an optional per-process nonce", () => {
     assert.throws(() => parseWorkerRequest(bad), WorkerProtocolParseError);
   }
 });
+
+test("diagnostics.heartbeat accepts only sorted unique allowed root aliases", () => {
+  const heartbeat = {
+    ...source,
+    operation: "diagnostics.heartbeat",
+    watcherId: outcome.watcherId,
+    connectorVersion: "1.2.3",
+  };
+  const withAliases = {
+    ...heartbeat,
+    allowedRootAliases: ["documents", "photos"],
+  };
+  assert.deepEqual(parseWorkerRequest(withAliases), withAliases);
+
+  for (const bad of [
+    { ...heartbeat, allowedRootAliases: ["photos", "documents"] },
+    { ...heartbeat, allowedRootAliases: ["documents", "documents"] },
+    { ...heartbeat, allowedRootAliases: ["Documents"] },
+    { ...heartbeat, allowedRootAliases: ["documents", "/private"] },
+    { ...heartbeat, allowedRootAliases: null },
+  ]) {
+    assert.throws(() => parseWorkerRequest(bad), WorkerProtocolParseError);
+  }
+});

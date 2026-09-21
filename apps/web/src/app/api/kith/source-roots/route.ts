@@ -30,6 +30,7 @@ import {
   noContent,
   noStoreJson,
   parsedBody,
+  problem,
   withPrincipal,
 } from "@/lib/kith/api-route";
 
@@ -56,7 +57,10 @@ const createSchema = z.object({
 
 const patchSchema = z.object({
   sourceRootId: kithId,
-  state: z.enum(["active", "paused"]),
+  state: z.enum(["active", "paused"]).optional(),
+  rootAlias: z.string().min(1).max(64).optional(),
+  relativePath: z.string().min(1).max(1024).optional(),
+  area: z.string().trim().min(1).max(100).nullable().optional(),
 });
 
 /** DELETE retires: the row and its reports stay. See `retireSourceRoot`. */
@@ -100,7 +104,12 @@ export async function PATCH(request: Request): Promise<Response> {
   return withPrincipal(request, async ({ ctx, principal }) => {
     const body = await parsedBody(request, patchSchema);
     if ("response" in body) return body.response;
-    await admin.setSourceRootState(ctx, { principal, ...body.value });
+    if (body.value.state !== undefined) {
+      if (body.value.rootAlias !== undefined || body.value.relativePath !== undefined || body.value.area !== undefined) return problem(400, "Invalid request");
+      await admin.setSourceRootState(ctx, { principal, sourceRootId: body.value.sourceRootId, state: body.value.state });
+    } else if (body.value.rootAlias !== undefined && body.value.relativePath !== undefined) {
+      await admin.editSourceRoot(ctx, { principal, ...body.value, rootAlias: body.value.rootAlias, relativePath: body.value.relativePath });
+    } else return problem(400, "Invalid request");
     return noContent();
   });
 }

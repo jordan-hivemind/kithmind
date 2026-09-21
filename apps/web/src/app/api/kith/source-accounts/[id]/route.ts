@@ -32,3 +32,14 @@ export async function PATCH(
     return noContent();
   });
 }
+
+export async function DELETE(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> },
+): Promise<Response> {
+  const { id } = await params;
+  return withPrincipal(request, async ({ ctx, principal }) => {
+    const result = await sources.disconnectSourceAccount(ctx, { principal, sourceAccountId: id });
+    return new Response(JSON.stringify(result), { status: 200, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+  });
+}

@@ -261,6 +261,28 @@ export async function updateSourceAccount(
   );
 }
 
+/** Disconnect retains the account, its worker grants, roots, and all indexed
+ * provenance. It retires every watched location and removes the account from
+ * the ordinary inventory; it is deliberately not the Enable/Disable toggle. */
+export async function disconnectSourceAccount(
+  ctx: IdentityCtx,
+  args: { principal: Principal; sourceAccountId: string },
+): Promise<{ affectedRootCount: number }> {
+  const id = assertKithId(args.sourceAccountId, "invalid_source_account_id");
+  const account = await row<{ space_id: string; enabled: boolean; disconnected_at: Date | null }>(ctx, "SELECT space_id, enabled, disconnected_at FROM kith.source_accounts WHERE id = $1 FOR UPDATE", [id]);
+  if (!account) sourceAccountNotFound();
+  try { await requireSpaceAccess(ctx, args.principal, account.space_id, "write"); } catch { sourceAccountNotFound(); }
+  const affected = await rows<{ id: string }>(ctx, "UPDATE kith.source_roots SET state = 'retired', updated_at = $1 WHERE source_account_id = $2 AND space_id = $3 AND state <> 'retired' RETURNING id", [new Date(ctx.now), id, account.space_id]);
+  if (account.disconnected_at === null) {
+    if (account.enabled) {
+      await advanceSourceAssessmentEpoch(ctx, account.space_id, id);
+      await onSourceEnabledChanged(ctx, { id, spaceId: account.space_id, enabled: true }, false);
+    }
+    await exec(ctx, "UPDATE kith.source_accounts SET enabled = false, disconnected_at = $3, disconnected_by = $4 WHERE id = $1 AND space_id = $2", [id, account.space_id, new Date(ctx.now), assertKithId(args.principal.userId, "invalid_user_id")]);
+  }
+  return { affectedRootCount: affected.length };
+}
+
 /**
  * `models/ingestion/model.ts` `advanceSourceAssessmentEpoch`, ported as a
  * private helper the same way `../ingestion/inlineWork.ts` ports its own

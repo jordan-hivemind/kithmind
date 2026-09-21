@@ -38,6 +38,7 @@ type Routes = {
   defaultWriteSpace: (r: Request) => Promise<Response>;
   sourceAccountsCreate: (r: Request) => Promise<Response>;
   sourceAccountUpdate: (r: Request, ctx: { params: Promise<{ id: string }> }) => Promise<Response>;
+  sourceAccountDisconnect: (r: Request, ctx: { params: Promise<{ id: string }> }) => Promise<Response>;
   familySpacesCreate: (r: Request) => Promise<Response>;
   familySpaceAction: (r: Request, ctx: { params: Promise<{ id: string }> }) => Promise<Response>;
   invitationsCreate: (r: Request) => Promise<Response>;
@@ -169,6 +170,7 @@ describeWithDatabase("the /api/kith/* mutation routes", () => {
       defaultWriteSpace: (await import("./settings/default-write-space/route")).POST,
       sourceAccountsCreate: (await import("./source-accounts/route")).POST,
       sourceAccountUpdate: (await import("./source-accounts/[id]/route")).PATCH,
+      sourceAccountDisconnect: (await import("./source-accounts/[id]/route")).DELETE,
       familySpacesCreate: (await import("./family/spaces/route")).POST,
       familySpaceAction: (await import("./family/spaces/[id]/route")).POST,
       invitationsCreate: (await import("./family/invitations/route")).POST,
@@ -365,6 +367,20 @@ describeWithDatabase("the /api/kith/* mutation routes", () => {
       params(id),
     );
     expect(ownUpdate.status).toBe(204);
+
+    const deniedDisconnect = await routes.sourceAccountDisconnect(
+      jsonRequest(`${ORIGIN}/api/kith/source-accounts/${id}`, "DELETE", undefined, stranger.cookie),
+      params(id),
+    );
+    expect(deniedDisconnect.status).toBe(400);
+    expect(await bodyOf(deniedDisconnect)).toEqual({ error: "Source account not found" });
+
+    const disconnected = await routes.sourceAccountDisconnect(
+      jsonRequest(`${ORIGIN}/api/kith/source-accounts/${id}`, "DELETE", undefined, owner.cookie),
+      params(id),
+    );
+    expect(disconnected.status).toBe(200);
+    expect(await disconnected.json()).toEqual({ affectedRootCount: 0 });
   });
 
   test("shared space lifecycle: create, invite, accept, self-approve refused, approve, role change, leave", async () => {
