@@ -37,6 +37,13 @@ case. Metadata-only is a valid deferred state, distinct from failed, excluded,
 fully indexed and complete. An assistant must surface that limitation when an
 answer requires unprocessed content rather than treating it as absent.
 
+Preview persistence happens before original-byte archival. A preview is bound
+to the current source item, observed content hash and preview-method
+fingerprint. It remains provisional until the same bytes receive a retained
+source revision, and it cannot create facts, evidence or citations. The worker
+rejects a preview recorded against a stale observation. Later retention may
+link the immutable preview to the matching source revision exactly once.
+
 ## Goal-aware stopping for tax bundles
 
 The owner explicitly prefers stopping when the needed information has been
