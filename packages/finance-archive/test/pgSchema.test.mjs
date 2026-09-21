@@ -147,8 +147,10 @@ test(
            (id, document_id, generation_number, generation_kind,
             retained_sha256, projection_digest, created_at, activated_at)
          VALUES ('other-generation', 'other-doc', 1, 'baseline', $1, $2,
+                 now(), now()),
+                ('scope-generation', 'scope-doc', 1, 'baseline', $3, $4,
                  now(), now())`,
-        ["b".repeat(64), "c".repeat(64)],
+        ["b".repeat(64), "c".repeat(64), "a".repeat(64), "f".repeat(64)],
       );
 
       await assert.rejects(
@@ -223,6 +225,38 @@ test(
                  1, 2, 2, 1, 1, 'USD', 'market_price', 'synthetic',
                  '{"row":{"source":"synthetic","index":1}}')`,
         ["d".repeat(64), accountId],
+      );
+      await client.query(
+        `INSERT INTO position_scope_observations
+           (id, source_document_id, holding_projection_generation_id,
+            retained_sha256, account_id, as_of, proof_version, status,
+            emitted_position_count, gap_codes, evidence, created_at)
+         VALUES ('scope-versioned', 'scope-doc', 'scope-generation', $1, $2,
+                 DATE '2026-03-31', 'position_scope_v1', 'complete', 1, '{}',
+                 '{"tables":[{"headers":[{}],"end":{}}],"scopeEnd":{}}',
+                 now())`,
+        ["a".repeat(64), accountId],
+      );
+      await client.query(
+        `INSERT INTO position_scope_memberships
+           (source_document_id, scope_id, position_row_hash, account_id,
+            as_of, quantity, price, market_value, cost_basis, unrealized,
+            currency, valuation_basis, valuation_note, source_locator)
+         VALUES ('scope-doc', 'scope-versioned', $1, $2,
+                 DATE '2026-03-31', 1, 2, 2, 1, 1, 'USD', 'market_price',
+                 'synthetic versioned',
+                 '{"row":{"source":"synthetic","index":2}}')`,
+        ["e".repeat(64), accountId],
+      );
+      assert.equal(
+        Number(
+          (
+            await client.query(
+              "SELECT count(*)::text AS n FROM position_scope_observations",
+            )
+          ).rows[0].n,
+        ),
+        2,
       );
 
       await assert.rejects(
