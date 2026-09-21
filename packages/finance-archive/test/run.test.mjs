@@ -398,6 +398,41 @@ function makeReparseRunner({ adapterModulePath, schema, rawDir }) {
   };
 }
 
+function makeHoldingCorrectionCandidateRunner({
+  adapterModulePath,
+  schema,
+  rawDir,
+  documentId,
+  retainedSha256,
+}) {
+  return function runHoldingCorrectionCandidate(extraArgs = []) {
+    return execFileSync(
+      process.execPath,
+      [
+        runScript,
+        "holding-correction-candidate",
+        "--adapter",
+        adapterModulePath,
+        "--document-id",
+        documentId,
+        "--retained-sha256",
+        retainedSha256,
+        ...extraArgs,
+      ],
+      {
+        env: {
+          ...process.env,
+          FINANCE_ARCHIVE_DATABASE_URL: url,
+          FINANCE_ARCHIVE_SCHEMA: schema,
+          FINANCE_ARCHIVE_RAW_TREE_ROOT: rawDir,
+          FINANCE_ARCHIVE_SPACE_ID: SPACE_ID,
+        },
+        encoding: "utf8",
+      },
+    );
+  };
+}
+
 test(
   "the run command takes an adapter from acquisition through both gate verdicts, prints only a summary, and a second pass inserts nothing new",
   { skip },
@@ -2135,6 +2170,135 @@ test(
     assert.equal(await count(client, "transactions"), transactionsBefore);
     assert.equal(await count(client, "positions"), positionsBefore);
     assert.equal(await count(client, "review_items", "WHERE kind = 'document_unparsed'"), 0);
+  },
+);
+
+test(
+  "holding correction candidate binds one exact retained document and rolls every mapping write back",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+    const rawDir = mkdtempSync(
+      join(tmpdir(), "kith-finance-correction-candidate-raw-"),
+    );
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeReparseAdapterFixtures(t);
+    const selectionPath = reparseSelection(fixturesDir);
+    makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    })();
+
+    const [document] = await all(
+      client,
+      "SELECT id, retained_sha256 FROM documents",
+    );
+    const tables = [
+      "positions",
+      "balances",
+      "liabilities",
+      "transactions",
+      "instruments",
+      "review_items",
+      "import_runs",
+    ];
+    const before = {};
+    for (const table of tables) before[table] = await count(client, table);
+    const output = makeHoldingCorrectionCandidateRunner({
+      adapterModulePath,
+      schema,
+      rawDir,
+      documentId: document.id,
+      retainedSha256: document.retained_sha256,
+    })();
+    const manifest = JSON.parse(output);
+
+    assert.equal(manifest.kind, "holding_correction_candidate_v1");
+    assert.equal(manifest.documentId, document.id);
+    assert.equal(manifest.retainedSha256, document.retained_sha256);
+    assert.equal(manifest.completeness.state, "partial");
+    assert.equal(manifest.completeness.removalsAuthorized, false);
+    assert.deepEqual(manifest.completeness.reasons, [
+      "adapter_has_no_holding_completeness_attestation",
+      "adapter_mapping_review_required",
+    ]);
+    assert.deepEqual(manifest.tables.positions, {
+      oldRows: 4,
+      candidateRows: 4,
+      unchanged: 4,
+      changed: 0,
+      added: 0,
+      removed: 0,
+    });
+    assert.deepEqual(manifest.tables.balances, {
+      oldRows: 1,
+      candidateRows: 1,
+      unchanged: 1,
+      changed: 0,
+      added: 0,
+      removed: 0,
+    });
+    assert.deepEqual(manifest.tables.liabilities, {
+      oldRows: 1,
+      candidateRows: 1,
+      unchanged: 1,
+      changed: 0,
+      added: 0,
+      removed: 0,
+    });
+    assert.doesNotMatch(output, /Synthetic Neutral Fund|holdings:/i);
+    for (const table of tables) {
+      assert.equal(
+        await count(client, table),
+        before[table],
+        `${table} is unchanged by the dry run`,
+      );
+    }
+
+    assert.throws(
+      () =>
+        makeHoldingCorrectionCandidateRunner({
+          adapterModulePath,
+          schema,
+          rawDir,
+          documentId: document.id,
+          retainedSha256: "b".repeat(64),
+        })(),
+      (error) => {
+        assert.match(
+          error.stderr,
+          /no current retained document matches the exact document id and retained sha256/,
+        );
+        return true;
+      },
+    );
+
+    await client.query(
+      `UPDATE positions
+          SET source_document_id = NULL
+        WHERE id = (SELECT id FROM positions ORDER BY id LIMIT 1)`,
+    );
+    assert.throws(
+      () =>
+        makeHoldingCorrectionCandidateRunner({
+          adapterModulePath,
+          schema,
+          rawDir,
+          documentId: document.id,
+          retainedSha256: document.retained_sha256,
+        })(),
+      (error) => {
+        assert.match(
+          error.stderr,
+          /positions candidate row hash is owned by another document/,
+        );
+        return true;
+      },
+    );
   },
 );
 

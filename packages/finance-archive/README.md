@@ -803,6 +803,43 @@ resolutions remain closed. This is conservative because the current schema has
 no membership table that could prove a globally deduplicated holding also
 belongs to a second source document.
 
+### Preparing one holding correction candidate
+
+`reparse` can prove an exact replay or add newly grounded rows, but it cannot
+replace a changed or removed holding safely without immutable projection
+history. The read-only prerequisite is:
+
+```sh
+node dist/run.js holding-correction-candidate \
+  --adapter <module path> \
+  --document-id <documents.id> \
+  --retained-sha256 <documents.retained_sha256>
+```
+
+Both selectors are required. The command accepts one current, document-tier
+row only, verifies the capture manifest and retained bytes against that exact
+revision, parses it without discovery or acquisition, and emits one JSON
+manifest. The manifest contains the opaque document id and retained SHA-256,
+old and candidate projection digests, per-table old/candidate/unchanged/add/
+change/remove counts, an explicit completeness state, and a digest over the
+whole manifest. It contains no holding values, account labels or locators.
+
+Adapter mapping runs inside a savepoint and is rolled back before comparison;
+the enclosing transaction is rolled back too. A newly minted instrument
+identity, a candidate hash owned by another document, ambiguous locators among
+rows that would need change pairing or a revision mismatch refuses the
+candidate. The command has no activation, update or deletion path.
+
+The current adapter contract carries parse gaps but no positive declaration
+that all three holding tables were extracted completely. A missing
+`parseNote` is therefore not completeness proof. Candidate manifests are
+`partial` when parsing or row preparation reported a gap and otherwise
+`unproven`; `removalsAuthorized` is always false. In particular, a zero-row
+candidate or a reported removal is an observation for review, never an
+instruction to delete. A later generation/activation contract must add
+positive completeness evidence and compare the reviewed candidate digest
+before it can replace any current row.
+
 `scripts/nullNonCashAmounts.mjs` is what applies it. It reads the taxonomy off
 the adapter rather than naming activity types, so it cannot drift from the
 declaration it is applying and it serves the next declaration too. For every
