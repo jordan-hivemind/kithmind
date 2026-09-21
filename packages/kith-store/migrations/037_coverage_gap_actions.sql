@@ -55,7 +55,7 @@ CREATE TABLE kith.coverage_gap_actions (
   space_id kith.kith_id NOT NULL REFERENCES kith.spaces (id) ON DELETE CASCADE,
   coverage_gap_id kith.kith_id NOT NULL,
   created_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
-  actor_user_id kith.kith_id REFERENCES kith.users (id) ON DELETE SET NULL,
+  actor_user_id kith.kith_id REFERENCES kith.users (id),
   actor_kind text NOT NULL CHECK (actor_kind IN ('user', 'system')),
   action text NOT NULL CHECK (action IN
     ('condition_cleared', 'mark_unavailable', 'mark_not_expected')),
