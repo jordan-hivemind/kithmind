@@ -1,8 +1,8 @@
-"""Bounded subprocess entry point for one production PDF conversion.
+"""Bounded subprocess entry point for production conversion and preview.
 
 This launcher is invoked only inside the parent-created macOS sandbox. It
-applies supported process limits before importing the production converter and
-emits one small JSON result. It never writes source or parser content to stdio.
+applies supported process limits before importing a parser and emits one small
+JSON result. It never writes source or parser content to stdio.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import json
 import os
 import resource
 import socket
+import stat
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_RAW_BYTES = 64 * 1024 * 1024
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
 MAX_TABLE_STRUCTURE_BYPASS_ARGUMENT_BYTES = 12 * 1024
+MAX_PREVIEW_WINDOWS_ARGUMENT_BYTES = 2 * 1024
 SHA256 = frozenset("0123456789abcdef")
 _PROTOCOL_STDOUT: int | None = None
 
@@ -100,6 +102,18 @@ def _table_structure_bypass(value: str) -> dict[str, Any]:
     return parsed
 
 
+def _preview_windows(value: str) -> list[dict[str, Any]]:
+    if not 0 < len(value.encode("utf-8")) <= MAX_PREVIEW_WINDOWS_ARGUMENT_BYTES:
+        raise argparse.ArgumentTypeError("preview windows are out of range")
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("preview windows are invalid") from exc
+    if not isinstance(parsed, list):
+        raise argparse.ArgumentTypeError("preview windows are invalid")
+    return parsed
+
+
 def _apply_limits(cpu_seconds: int, file_bytes: int, open_files: int) -> None:
     resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
     resource.setrlimit(resource.RLIMIT_FSIZE, (file_bytes, file_bytes))
@@ -116,6 +130,55 @@ def _absolute(path: str) -> Path:
 
 def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _read_stable_input(path: Path, maximum: int) -> bytes:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size < 1
+            or before.st_size > maximum
+        ):
+            raise ValueError("input is invalid")
+        chunks: list[bytes] = []
+        remaining = maximum + 1
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError("input changed") from exc
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+    if (
+        len(data) != before.st_size
+        or len(data) > maximum
+        or identity(before) != identity(after)
+        or identity(after) != identity(current)
+    ):
+        raise ValueError("input changed")
+    return data
 
 
 def _canonical(value: Any) -> bytes:
@@ -235,6 +298,58 @@ def _profile(args: argparse.Namespace) -> int:
             "extractionConfiguration": extraction,
         }
     )
+
+
+def _preview(args: argparse.Namespace) -> int:
+    input_path = _absolute(args.input)
+    expected_sha256 = args.expected_sha256
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in SHA256 for character in expected_sha256)
+    ):
+        return _safe_result({"state": "failed", "code": "invalid_input"}, 2)
+    try:
+        data = _read_stable_input(input_path, MAX_INPUT_BYTES)
+    except (OSError, ValueError):
+        return _safe_result({"state": "failed", "code": "invalid_input"}, 2)
+    if _digest(data) != expected_sha256:
+        return _safe_result(
+            {"state": "failed", "code": "input_digest_mismatch"}, 2
+        )
+    from parser_eval.preview import (
+        PreviewExecutionBoundary,
+        preview_captured_document,
+    )
+
+    result = preview_captured_document(
+        data=data,
+        expected_sha256=expected_sha256,
+        media_type=args.media_type,
+        requested_windows=args.preview_windows,
+        parent_boundary=PreviewExecutionBoundary(
+            network_denied=True,
+            resource_bounded=True,
+        ),
+        timeout_seconds=float(args.preview_timeout_seconds),
+    )
+    data = b""
+    if result.get("state") != "complete":
+        code = result.get("code")
+        if not isinstance(code, str) or not code or len(code) > 64:
+            code = "preview_failed"
+        return _safe_result({"state": "failed", "code": code}, 2)
+    if (
+        result.get("provisional") is not True
+        or result.get("sourceSha256") != expected_sha256
+        or result.get("mediaType") != args.media_type
+        or not isinstance(result.get("method"), dict)
+        or not isinstance(result["method"].get("fingerprint"), str)
+    ):
+        return _safe_result(
+            {"state": "failed", "code": "preview_output_invalid"}, 2
+        )
+    return _safe_result(result)
 
 
 def _convert(args: argparse.Namespace) -> int:
@@ -357,6 +472,7 @@ def main(argv: list[str] | None = None) -> int:
             "exec-probe",
             "profile",
             "convert",
+            "preview",
         ),
         required=True,
     )
@@ -377,6 +493,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--input")
     parser.add_argument("--expected-sha256")
+    parser.add_argument(
+        "--media-type",
+        choices=(
+            "application/pdf",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
+    )
+    parser.add_argument("--preview-windows", type=_preview_windows)
+    parser.add_argument(
+        "--preview-timeout-seconds",
+        type=lambda value: _positive_integer(value, 30),
+    )
     parser.add_argument("--output-directory")
     parser.add_argument("--raw-output")
     parser.add_argument("--bundle-output")
@@ -412,6 +540,18 @@ def main(argv: list[str] | None = None) -> int:
                     {"state": "failed", "code": "invalid_input"}, 2
                 )
             return _profile(args)
+        if args.mode == "preview":
+            required = (
+                args.input,
+                args.expected_sha256,
+                args.media_type,
+                args.preview_timeout_seconds,
+            )
+            if any(value is None for value in required):
+                return _safe_result(
+                    {"state": "failed", "code": "invalid_input"}, 2
+                )
+            return _preview(args)
         required = (
             args.input,
             args.expected_sha256,

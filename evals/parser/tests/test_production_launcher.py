@@ -12,6 +12,146 @@ from pathlib import Path
 
 
 class ProductionLauncherTests(unittest.TestCase):
+    def test_preview_runs_through_bounded_protocol_without_source_logs(self) -> None:
+        launcher_source = (
+            Path(__file__).parents[1] / "src" / "parser_eval" / "production_launcher.py"
+        )
+        data = b"captured private bytes"
+        digest = hashlib.sha256(data).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "parser_eval"
+            package.mkdir()
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            shutil.copy2(launcher_source, package / "production_launcher.py")
+            (package / "preview.py").write_text(
+                """
+import os
+
+
+class PreviewExecutionBoundary:
+    def __init__(self, *, network_denied, resource_bounded):
+        if not network_denied or not resource_bounded:
+            raise ValueError("boundary missing")
+
+
+def preview_captured_document(*, data, expected_sha256, media_type, requested_windows, parent_boundary, timeout_seconds):
+    if data != b"captured private bytes":
+        raise ValueError("wrong bytes")
+    if requested_windows != [{"startPage": 70, "pageCount": 1}]:
+        raise ValueError("wrong windows")
+    if timeout_seconds != 3.0:
+        raise ValueError("wrong timeout")
+    os.write(1, b"source-derived stdout noise\\n")
+    os.write(2, b"source-derived stderr noise\\n")
+    return {
+        "state": "complete",
+        "schemaVersion": 1,
+        "provisional": True,
+        "sourceSha256": expected_sha256,
+        "mediaType": media_type,
+        "pageCount": 80,
+        "inspectedPageNumbers": [70],
+        "units": [{"pageNumber": 70, "state": "unknown", "text": "", "textTruncated": False}],
+        "method": {"fingerprint": "a" * 64},
+    }
+""",
+                encoding="utf-8",
+            )
+            source = root / "private-name.pdf"
+            source.write_bytes(data)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "parser_eval.production_launcher",
+                    "--mode",
+                    "preview",
+                    "--cpu-seconds",
+                    "4",
+                    "--file-bytes",
+                    "4096",
+                    "--open-files",
+                    "64",
+                    "--input",
+                    str(source),
+                    "--expected-sha256",
+                    digest,
+                    "--media-type",
+                    "application/pdf",
+                    "--preview-windows",
+                    '[{"startPage":70,"pageCount":1}]',
+                    "--preview-timeout-seconds",
+                    "3",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": temporary},
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "")
+        response = json.loads(result.stdout)
+        self.assertEqual(response["state"], "complete")
+        self.assertEqual(response["pageCount"], 80)
+        self.assertEqual(response["inspectedPageNumbers"], [70])
+        self.assertNotIn("private-name", result.stdout)
+        self.assertNotIn("source-derived", result.stdout)
+
+    def test_preview_rejects_hash_mismatch_before_parser_import(self) -> None:
+        launcher_source = (
+            Path(__file__).parents[1] / "src" / "parser_eval" / "production_launcher.py"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "parser_eval"
+            package.mkdir()
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            shutil.copy2(launcher_source, package / "production_launcher.py")
+            (package / "preview.py").write_text(
+                'raise RuntimeError("preview parser must not import")\n',
+                encoding="utf-8",
+            )
+            source = root / "input.pdf"
+            source.write_bytes(b"captured bytes")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "parser_eval.production_launcher",
+                    "--mode",
+                    "preview",
+                    "--cpu-seconds",
+                    "2",
+                    "--file-bytes",
+                    "4096",
+                    "--open-files",
+                    "64",
+                    "--input",
+                    str(source),
+                    "--expected-sha256",
+                    "0" * 64,
+                    "--media-type",
+                    "application/pdf",
+                    "--preview-windows",
+                    '[{"startPage":1,"pageCount":1}]',
+                    "--preview-timeout-seconds",
+                    "1",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": temporary},
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"state": "failed", "code": "input_digest_mismatch"},
+        )
+
     def test_native_stdout_and_stderr_cannot_pollute_protocol_result(self) -> None:
         launcher_source = (
             Path(__file__).parents[1] / "src" / "parser_eval" / "production_launcher.py"
