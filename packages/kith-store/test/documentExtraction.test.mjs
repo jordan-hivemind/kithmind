@@ -1138,6 +1138,96 @@ test("a document past the page bound is read partially and says so", { skip }, a
   assert.equal(document.extraction.openCorrections.length, 1);
 });
 
+test("two unsigned federal returns retain separate years, totals and citations without attachments", { skip }, async (t) => {
+  const f = await fixture(t);
+  async function extractReturn(year, totalTax) {
+    const ingested = await f.ingest("placeholder", `synthetic-front-return-${year}`);
+    const textVersionId = (
+      await f.rows(
+        `SELECT source_text_version_id FROM kith.processing_generations WHERE id = $1`,
+        [ingested.generationId],
+      )
+    )[0].source_text_version_id;
+    const pages = [
+      "Contents\nForm 1040\nForm W-2\nForm 1099-DIV",
+      `Form 1040\nU.S. Individual Income Tax Return\n${year}\nTotal income $100.00\nTotal tax $${totalTax}\nWages from Form W-2`,
+      "Schedule E\nSupplemental Income and Loss\nTotal supplemental income or loss $20.00\nSchedule K-1 income is included above",
+      "Form W-2\nWage and Tax Statement\nAttachment wages $999.00",
+    ];
+    await f.client.query(
+      `UPDATE kith.source_pages SET text = $1, "end" = $2, text_hash = $3
+        WHERE source_text_version_id = $4 AND ordinal = 0`,
+      [pages[0], pages[0].length, "a".repeat(64), textVersionId],
+    );
+    for (const [index, text] of pages.slice(1).entries()) {
+      await f.client.query(
+        `INSERT INTO kith.source_pages
+           (id,space_id,created_at,source_text_version_id,ordinal,start,"end",text,text_hash)
+         VALUES ($1,$2,transaction_timestamp(),$3,$4,0,$5,$6,$7)`,
+        [newKithId(), f.spaceId, textVersionId, index + 1, text.length, text, "b".repeat(64)],
+      );
+    }
+    const model = stubModel({
+      kind: "tax_return_1040",
+      summary: `Synthetic ${year} federal return.`,
+      statements: [
+        { field: "tax_year", value: year, page: 2, quote: year },
+        { field: "total_income", value: "$100.00", page: 2, quote: "Total income $100.00" },
+        { field: "total_tax", value: `$${totalTax}`, page: 2, quote: `Total tax $${totalTax}` },
+        { field: "schedule_e_total_supplemental_income_or_loss", value: "$20.00", page: 3, quote: "Total supplemental income or loss $20.00" },
+      ],
+    });
+    const outcome = await f.extract(model, ingested.sourceItemId, ingested.generationId);
+    assert.equal(outcome.kind, "tax_return_1040");
+    assert.equal(outcome.truncated, false);
+    return { ingested, model };
+  }
+
+  const first = await extractReturn("2024", "9.00");
+  const second = await extractReturn("2025", "10.00");
+  assert.match(first.model.calls[0], /tax_return_1040:/);
+  assert.match(first.model.calls[0], /=== page 3 ===/);
+  assert.doesNotMatch(first.model.calls[0], /Attachment wages \$999\.00/);
+
+  const documents = await Promise.all(
+    [first, second].map(({ ingested }) =>
+      getDocument(f.client, [f.spaceId], ingested.documentId),
+    ),
+  );
+  const statements = documents.map((document) => document.extraction.statements);
+  assert.deepEqual(
+    statements.map((reading) => reading.find((statement) => statement.field === "tax_year").value),
+    [
+      { type: "decimal", value: "2024", unitCode: "1" },
+      { type: "decimal", value: "2025", unitCode: "1" },
+    ],
+  );
+  assert.deepEqual(
+    statements.map((reading) => reading.find((statement) => statement.field === "total_tax").value),
+    [
+      { type: "money", amount: "9", currency: "USD" },
+      { type: "money", amount: "10", currency: "USD" },
+    ],
+  );
+  assert.deepEqual(
+    statements.map((reading) => reading.find((statement) => statement.field === "total_tax").quote),
+    ["Total tax $9.00", "Total tax $10.00"],
+  );
+  for (const reading of statements) {
+    const total = reading.find((statement) => statement.field === "total_tax");
+    assert.equal(total.page, 2);
+    assert.ok(total.evidenceSpanId);
+    assert.equal(reading.some((statement) => statement.field === "signature_date"), false);
+  }
+  for (const { ingested } of [first, second]) {
+    const truncations = await f.rows(
+      "SELECT id FROM kith.corrections WHERE target_kind = 'document' AND target_id = $1 AND reason = 'input_truncated'",
+      [ingested.sourceItemId],
+    );
+    assert.equal(truncations.length, 0);
+  }
+});
+
 poolSizes.set("no database connection is held across the model call", 1);
 test("no database connection is held across the model call", { skip }, async (t) => {
   const f = await fixture(t);

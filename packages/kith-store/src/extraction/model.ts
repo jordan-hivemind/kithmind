@@ -81,6 +81,8 @@ import {
   resolvedCorrections,
 } from "./corrections.js";
 import { seedDocumentTypes } from "./seed.js";
+import { FEDERAL_TAX_STARTER_CATALOG } from "./taxCatalog.js";
+import { selectTaxFrontForms } from "./taxFrontForms.js";
 import { sweepUnreferencedExtractionSpans } from "./spanSweep.js";
 import {
   amountsInText,
@@ -502,6 +504,13 @@ type Loaded = {
   pagesTotal: number;
   pagesWithText: number;
   allWithText: LoadedPage[];
+  /** The return ended at an attachment boundary. Those attachment pages are
+   * intentionally outside this front-form pass, rather than silently lost. */
+  taxFrontSelection: {
+    pages: LoadedPage[];
+    stoppedAtAttachment: boolean;
+    truncated: boolean;
+  } | null;
   types: LoadedType[];
   /** A durable owner decision that the model may not replace. */
   ownerKind: string | null;
@@ -590,12 +599,32 @@ async function loadDocument(
   const priorBounds = priorKind
     ? types.find((type) => type.kind === priorKind)
     : undefined;
-  const shownPages = shownFrom(
-    boundPages(withText, {
-      maxPages: priorBounds?.maxPages ?? null,
-      maxChars: priorBounds?.maxChars ?? null,
-    }),
+  const selectedTaxFront = selectTaxFrontForms(
+    withText.map((page) => ({ pageNumber: page.ordinal, text: page.text })),
   );
+  const taxFrontPages = selectedTaxFront.pages
+    .map((page) =>
+      withText.find((candidate) => candidate.ordinal === page.pageNumber),
+    )
+    .filter((page): page is LoadedPage => page !== undefined);
+  const taxFrontSelection =
+    taxFrontPages.length > 0
+      ? {
+          pages: taxFrontPages,
+          stoppedAtAttachment: selectedTaxFront.stoppedAtAttachment,
+          truncated: selectedTaxFront.truncated,
+        }
+      : null;
+  const initialPages =
+    priorKind === "tax_return_1040" && taxFrontSelection
+      ? taxFrontSelection.pages
+      : taxFrontSelection
+        ? taxFrontSelection.pages
+        : boundPages(withText, {
+            maxPages: priorBounds?.maxPages ?? null,
+            maxChars: priorBounds?.maxChars ?? null,
+          });
+  const shownPages = shownFrom(initialPages);
   if (shownPages.length === 0) return null;
   return {
     spaceId,
@@ -618,6 +647,7 @@ async function loadDocument(
     /** Every page with words on it, kept so a wider bound can be applied
      * after the reply names a kind without reading the document again. */
     allWithText: withText,
+    taxFrontSelection,
   };
 }
 
@@ -655,6 +685,10 @@ function shownFrom(pages: readonly LoadedPage[]): LoadedPage[] {
  * a page the model has already been shown and may already have cited.
  */
 function withKindBounds(loaded: Loaded, kind: string | null): Loaded {
+  if (kind === "tax_return_1040" && loaded.taxFrontSelection) {
+    const pages = shownFrom(loaded.taxFrontSelection.pages);
+    return pages.length === loaded.pages.length ? loaded : { ...loaded, pages };
+  }
   const type = kind
     ? loaded.types.find((candidate) => candidate.kind === kind)
     : undefined;
@@ -687,6 +721,14 @@ async function loadTypes(
   );
   if (any.rows.length === 0) {
     await seedDocumentTypes({ client, now }, spaceId);
+  } else {
+    // Existing spaces already have the generic starter kinds. Seed only this
+    // additive catalog, preserving any owner-created tax version.
+    await seedDocumentTypes(
+      { client, now },
+      spaceId,
+      FEDERAL_TAX_STARTER_CATALOG,
+    );
   }
   // The highest active version of each kind: "editing creates a new version"
   // and an extraction runs against the current one.
@@ -766,9 +808,12 @@ export function buildRequest(loaded: Loaded): ExtractionRequest {
     .join("\n\n");
   const longest = Math.max(0, ...loaded.pages.map((p) => p.lines.length));
   const truncated = [
-    loaded.pages.length < loaded.pagesWithText
-      ? `Only the first ${loaded.pages.length} of ${loaded.pagesTotal} pages are shown.`
-      : "",
+    loaded.taxFrontSelection?.stoppedAtAttachment &&
+    !loaded.taxFrontSelection.truncated
+      ? "Supporting attachments after the return forms are intentionally excluded from this pass."
+      : loaded.pages.length < loaded.pagesWithText
+        ? `Only the first ${loaded.pages.length} of ${loaded.pagesTotal} pages are shown.`
+        : "",
     longest > MAX_PAGE_LINES
       ? `Only the first ${MAX_PAGE_LINES} lines of a page are shown.`
       : "",
@@ -2259,7 +2304,12 @@ async function store(
   // Partially read either way: fewer pages shown than the document has, or a
   // page longer than the model was shown. A limitation the owner cannot see is
   // the same as no limitation at all.
-  const droppedPages = loaded.pages.length < loaded.pagesWithText;
+  const droppedPages =
+    loaded.pages.length < loaded.pagesWithText &&
+    !(
+      loaded.taxFrontSelection?.stoppedAtAttachment &&
+      !loaded.taxFrontSelection.truncated
+    );
   const droppedLines = loaded.pages.some(
     (page) => page.lines.length > MAX_PAGE_LINES,
   );
