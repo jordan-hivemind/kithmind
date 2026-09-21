@@ -1365,6 +1365,54 @@ export async function readPdfFile(
   return pdfDiscoveryFile(result);
 }
 
+/**
+ * Resolve one already-inventoried binary for the preview subprocess. The
+ * subprocess performs the final descriptor read and SHA check; this function
+ * keeps the path inside its configured root and binds the same size/mtime the
+ * sealed scan recorded before that handoff.
+ */
+export async function resolvePreviewSource(input: {
+  root: SafeRoot;
+  relativePath: string;
+  expectedByteLength: number;
+  expectedModifiedAt: number;
+}): Promise<string> {
+  const deadline = Date.now() + FILESYSTEM_DEADLINE_MS;
+  pathParts(input.relativePath);
+  const candidate = join(input.root.canonicalPath, input.relativePath);
+  if (!contains(input.root.canonicalPath, candidate))
+    throw new FilesystemFailure("unstable", "preview path escapes root");
+  const parent = await verifyAncestors(
+    input.root,
+    input.relativePath,
+    deadline,
+  );
+  const resolved = await beforeDeadline(
+    realpath(candidate),
+    deadline,
+    "enumeration_interrupted",
+    "preview source resolution timed out",
+  );
+  const entry = await beforeDeadline(
+    lstat(candidate),
+    deadline,
+    "enumeration_interrupted",
+    "preview source check timed out",
+  );
+  if (
+    resolved !== candidate ||
+    !contains(input.root.canonicalPath, resolved) ||
+    dirname(resolved) !== parent ||
+    entry.isSymbolicLink() ||
+    !entry.isFile() ||
+    entry.nlink !== 1 ||
+    entry.size !== input.expectedByteLength ||
+    Math.trunc(entry.mtimeMs) !== input.expectedModifiedAt
+  )
+    throw new FilesystemFailure("unstable", "preview source changed");
+  return resolved;
+}
+
 const ZIP_LOCAL_HEADER = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
 const OLE_HEADER = Buffer.from([0xd0, 0xcf, 0x11, 0xe0]);
 

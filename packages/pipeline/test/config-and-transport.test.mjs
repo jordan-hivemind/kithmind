@@ -697,6 +697,31 @@ test("transport response parser rejects extra and malformed success fields", () 
   );
 });
 
+test("preview persistence responses are closed and identity-bound", () => {
+  const response = {
+    operation: "discovery.recordPreview",
+    previewId: "preview_1",
+    sourceItemId: "source_1",
+    observedContentHash: "a".repeat(64),
+    previewFingerprint: "b".repeat(64),
+    sourceRevisionId: "revision_1",
+    state: "provisional",
+    reused: false,
+  };
+  assert.deepEqual(
+    parseWorkerResponse(JSON.stringify(response), response.operation),
+    response,
+  );
+  for (const invalid of [
+    { ...response, observedContentHash: "short" },
+    { ...response, state: "complete" },
+    { ...response, extra: true },
+  ])
+    assert.throws(() =>
+      parseWorkerResponse(JSON.stringify(invalid), response.operation),
+    );
+});
+
 test("scan append accepts optional epochs on needs_review and ignored_forgotten entries", () => {
   const page = {
     operation: "scan.appendPage",

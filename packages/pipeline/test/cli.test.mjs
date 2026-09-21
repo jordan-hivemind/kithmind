@@ -83,6 +83,36 @@ test("reprioritize requires one config and one private manifest path", () => {
   }
 });
 
+test("preview-selected requires one config and one private manifest path", () => {
+  assert.deepEqual(
+    argumentsFor([
+      "preview-selected",
+      "--config",
+      "/tmp/config.json",
+      "--manifest",
+      "/tmp/preview.json",
+    ]),
+    {
+      command: "preview-selected",
+      configPath: "/tmp/config.json",
+      manifestPath: "/tmp/preview.json",
+    },
+  );
+  for (const args of [
+    ["preview-selected", "--config", "/tmp/config.json"],
+    ["preview-selected", "--manifest", "/tmp/preview.json"],
+    [
+      "preview-selected",
+      "--config",
+      "/tmp/config.json",
+      "--manifest",
+      "/tmp/preview.json",
+      "--json",
+    ],
+  ])
+    assert.throws(() => argumentsFor(args));
+});
+
 // P2-31f: the operator release, on `run` and nowhere else.
 test("run takes --retry-parked and no other command does", () => {
   assert.deepEqual(

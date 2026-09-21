@@ -1422,6 +1422,27 @@ function assessment(value: Record<string, unknown>, page: boolean): void {
   }
 }
 
+function recordedPreview(value: Record<string, unknown>): void {
+  exact(value, [
+    "operation",
+    "previewId",
+    "sourceItemId",
+    "observedContentHash",
+    "previewFingerprint",
+    "state",
+    "reused",
+  ], ["sourceRevisionId"]);
+  if (value.operation !== "discovery.recordPreview")
+    failure("preview operation is invalid");
+  id(value.previewId, "previewId");
+  id(value.sourceItemId, "sourceItemId");
+  digest(value.observedContentHash, "observedContentHash");
+  digest(value.previewFingerprint, "previewFingerprint");
+  optionalId(value.sourceRevisionId, "sourceRevisionId");
+  enumValue(value.state, "preview state", ["provisional", "retained"] as const);
+  boolean(value.reused, "reused");
+}
+
 export function parseWorkerResponse(
   value: string,
   expectedOperation: string,
@@ -1523,6 +1544,9 @@ export function parseWorkerResponse(
       break;
     case "discovery.preflightArchived":
       archivedPreflight(result);
+      break;
+    case "discovery.recordPreview":
+      recordedPreview(result);
       break;
     case "discovery.reserveArchived":
       archivedReserve(result);
