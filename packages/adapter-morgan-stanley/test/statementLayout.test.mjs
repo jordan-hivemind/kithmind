@@ -1183,6 +1183,71 @@ test("a complete non-holdings tail can finish an account before the next page-on
   );
 });
 
+test("continuous global numbering can cross account summaries before the next holdings table", () => {
+  const [originalFirstPage, originalSecondPage] =
+    CONSOLIDATED_LAYOUT_TEXT.split(`\n${PAGE_SEPARATOR}\n`);
+  const firstLines = originalFirstPage.split("\n");
+  const firstHoldings = firstLines.indexOf("        HOLDINGS");
+  const secondLines = originalSecondPage.split("\n");
+  const secondHoldings = secondLines.indexOf("        HOLDINGS");
+  const numberedPage = (number, title) =>
+    [
+      `        Page ${number} of 10`,
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      `        ${title}`,
+    ].join("\n");
+  const pages = [
+    firstLines
+      .slice(0, firstHoldings)
+      .join("\n")
+      .replace("Page 1 of 2", "Page 1 of 10"),
+    [
+      numberedPage(2, "Synthetic Active Assets Account"),
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Synthetic Household",
+      ...firstLines.slice(firstHoldings),
+    ].join("\n"),
+    numberedPage(3, "ACTIVITY"),
+    numberedPage(4, "ACTIVITY CONTINUED"),
+    numberedPage(5, "DISCLOSURES"),
+    secondLines
+      .slice(0, secondHoldings)
+      .join("\n")
+      .replace("Page 2 of 2", "Page 6 of 10"),
+    numberedPage(7, "ACCOUNT SUMMARY CONTINUED"),
+    [
+      numberedPage(8, "Synthetic Retirement Assets Account"),
+      CONSOLIDATED_ACCOUNT_TWO,
+      "        Account Synthetic Household",
+      ...secondLines.slice(secondHoldings),
+      "        TOTAL",
+    ].join("\n"),
+    numberedPage(9, "DISCLOSURES"),
+    numberedPage(10, "END OF STATEMENT"),
+  ];
+  const parsed = parseStatementLines(pages.join(`\n${PAGE_SEPARATOR}\n`), kind);
+  assert.equal(parsed.holdings.positions.length, 2);
+  assert.deepEqual(
+    parsed.holdings.positionScopes.map((scope) => ({
+      accountExternalKey: scope.accountExternalKey,
+      status: scope.status,
+      gapCodes: scope.gapCodes,
+    })),
+    [
+      {
+        accountExternalKey: CONSOLIDATED_ACCOUNT_ONE,
+        status: "complete",
+        gapCodes: [],
+      },
+      {
+        accountExternalKey: CONSOLIDATED_ACCOUNT_TWO,
+        status: "complete",
+        gapCodes: [],
+      },
+    ],
+  );
+});
+
 test("one consolidated account can be complete while another has a zero-emitted typed gap", () => {
   const [firstPage, originalSecondPage] = CONSOLIDATED_LAYOUT_TEXT.split(
     `\n${PAGE_SEPARATOR}\n`,

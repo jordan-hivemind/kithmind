@@ -805,6 +805,42 @@ function printedPageRunEndsAt(
   }
   return true;
 }
+
+/** Every physical page in one declared run from `startPage` through
+ * `endPage` is present, even when `endPage` is not that run's final page. */
+function printedPageRunContinuesThrough(
+  startPage,
+  endPage,
+  printedByPage,
+  populatedPages,
+) {
+  if (endPage < startPage) return false;
+  const first = printedByPage.get(startPage);
+  const last = printedByPage.get(endPage);
+  if (
+    first === null ||
+    first === undefined ||
+    last === null ||
+    last === undefined ||
+    first.total !== last.total ||
+    last.number - first.number !== endPage - startPage ||
+    !printedPageSequenceIsAnchored(endPage, printedByPage, populatedPages)
+  ) {
+    return false;
+  }
+  for (let page = startPage; page <= endPage; page += 1) {
+    const declaration = printedByPage.get(page);
+    if (
+      declaration === null ||
+      declaration === undefined ||
+      declaration.total !== first.total ||
+      declaration.number !== first.number + page - startPage
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
 /**
  * F1-61. The sub-header a table reprints above a section's own totals rows
  * ("Percentage of Holdings", then the value columns again). Everything from
@@ -1616,14 +1652,12 @@ function parseHoldings(
         "holdings table account boundary",
         textMeta,
       );
-      const contiguousGlobalRun =
-        nextHeaderIndex !== null &&
-        continuesOnAdjacentPrintedPage(
-          carried,
-          lines[nextHeaderIndex],
-          printedByPage,
-          populatedPages,
-        );
+      const contiguousGlobalRun = printedPageRunContinuesThrough(
+        carried.page,
+        lines[nextMarker].page,
+        printedByPage,
+        populatedPages,
+      );
       const priorAccountRunEnded = printedPageRunEndsAt(
         carried.page,
         lines[nextMarker].page - 1,
