@@ -299,6 +299,10 @@ export async function grantProofAppRole(
   // Coverage: the validated windows and the gaps between them.
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.coverage_windows, kith.coverage_gaps TO "${appRole}"`);
+  // Coverage-gap actions are append-only audit facts. The application may
+  // insert one while resolving a gap, but may never rewrite or delete it.
+  await owner.query(`GRANT INSERT ON
+    kith.coverage_gap_actions TO "${appRole}"`);
   // Inline ingestion (P2-39e2). `kith.ingest_jobs` was already granted with the
   // worker protocol, but the four tables the inline lane owns were not, and one
   // of them was already unreachable for a lane that had landed: `discovery.ts`

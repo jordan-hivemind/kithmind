@@ -198,7 +198,10 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
   {
     version: 26,
     name: "change feed trigger on space_members for the spaces page (UI-restyle)",
-    url: new URL("../migrations/026_space_members_change_feed.sql", import.meta.url),
+    url: new URL(
+      "../migrations/026_space_members_change_feed.sql",
+      import.meta.url,
+    ),
   },
   {
     version: 27,
@@ -283,6 +286,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
       "../migrations/036_document_classification_override.sql",
       import.meta.url,
     ),
+  },
+  {
+    version: 37,
+    name: "coverage gap actions: stable condition identity and immutable resolution audit (UI-IA)",
+    url: new URL("../migrations/037_coverage_gap_actions.sql", import.meta.url),
   },
 ]);
 
