@@ -159,27 +159,37 @@ class PdfPreviewTests(unittest.TestCase):
         self.assertEqual(mismatch, {"state": "failed", "code": "input_digest_mismatch"})
         self.assertEqual(malformed, {"state": "failed", "code": "malformed_document"})
 
-    def test_text_is_bounded(self) -> None:
+    def test_dense_text_is_bounded_without_dropping_later_units(self) -> None:
         from reportlab.pdfgen import canvas
 
         output = io.BytesIO()
         document = canvas.Canvas(output, pagesize=(300, 300), pageCompression=0)
-        text = document.beginText(10, 290)
-        for _ in range(200):
-            text.textLine("many native characters " * 12)
-        document.drawText(text)
-        document.showPage()
+        for _ in range(8):
+            text = document.beginText(10, 290)
+            for _ in range(200):
+                text.textLine("many native characters " * 12)
+            document.drawText(text)
+            document.showPage()
         document.save()
 
         result = _preview(
             output.getvalue(),
             PDF_MEDIA_TYPE,
-            [{"startPage": 1, "pageCount": 1}],
+            [{"startPage": 1, "pageCount": 8}],
         )
 
         self.assertEqual(result["state"], "complete")
-        self.assertLessEqual(len(result["units"][0]["text"]), 384)
-        self.assertTrue(result["units"][0]["textTruncated"])
+        self.assertEqual(result["inspectedPageNumbers"], list(range(1, 9)))
+        self.assertEqual(len(result["units"]), 8)
+        self.assertLessEqual(
+            sum(len(unit["text"]) for unit in result["units"]),
+            768,
+        )
+        self.assertLessEqual(
+            sum(len(unit["text"].encode("utf-8")) for unit in result["units"]),
+            4 * 1024,
+        )
+        self.assertTrue(all(unit["textTruncated"] for unit in result["units"]))
 
 
 class XlsxPreviewTests(unittest.TestCase):
