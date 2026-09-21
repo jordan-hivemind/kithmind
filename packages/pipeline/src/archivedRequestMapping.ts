@@ -112,6 +112,56 @@ export function digestArchiveIntent(input: {
     .digest("hex");
 }
 
+/**
+ * Reconstructs the exact v1 intent after the catalog half of the explicit
+ * provider-v2 transition was durably written but before the journal half was.
+ * The retained records are immutable evidence. This keeps full pending-body
+ * validation available on restart without making any legacy copy active.
+ */
+export function digestRetainedProviderV1ArchiveIntent(input: {
+  identity: ArchivedWorkIdentity;
+  original: Pick<
+    OriginalCatalogRow,
+    "originalCatalogId" | "copies" | "providerOriginal"
+  >;
+  processing: Pick<ProcessingCatalogRow, "processingCatalogId" | "copies"> &
+    Pick<ProcessingCatalogRow, "legacyIndependentBackup">;
+}): string {
+  const provider = input.original.providerOriginal;
+  const primary = provider?.referenceVersion === "provider_original_v2"
+    ? provider.legacyPrimary
+    : undefined;
+  const locator = provider?.referenceVersion === "provider_original_v2"
+    ? provider.legacyLocator
+    : undefined;
+  const parserBackup = input.processing.legacyIndependentBackup;
+  if (!provider || !primary || !locator || !parserBackup) {
+    throw new Error("Retained provider v1 intent is incomplete");
+  }
+  return digestArchiveIntent({
+    identity: input.identity,
+    original: {
+      originalCatalogId: input.original.originalCatalogId,
+      copies: { primary },
+      providerOriginal: {
+        clientReferenceId: provider.clientReferenceId,
+        bindingId: provider.bindingId,
+        locator,
+        ...(provider.verified === undefined
+          ? {}
+          : { verified: provider.verified }),
+      },
+    },
+    processing: {
+      processingCatalogId: input.processing.processingCatalogId,
+      copies: {
+        primary: input.processing.copies.primary,
+        independent_backup: parserBackup,
+      },
+    },
+  });
+}
+
 export function providerOriginalReferenceFingerprint(
   value: ProviderOriginalDeclaration,
 ): string {
@@ -216,6 +266,7 @@ export function createArchiveReceiptSelection(
   copyRole: "primary" | "independent_backup",
 ): ArchiveReceiptSelection {
   const copy = row.copies[copyRole];
+  if (!copy) throw new Error("Archive copy is not present");
   if (!copy.published || (copyRole === "independent_backup" && !copy.backup)) {
     throw new Error("Archive copy is not durable");
   }

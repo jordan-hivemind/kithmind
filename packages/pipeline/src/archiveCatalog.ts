@@ -818,26 +818,28 @@ function providerOriginal(value: unknown) {
       : ["clientReferenceId", "bindingId", "locator"],
     v2 ? ["verified", "legacyPrimary", "legacyLocator"] : ["verified"],
   );
-  const result: ProviderOriginalCatalog = {
-    ...(v2 ? { referenceVersion: "provider_original_v2" as const } : {}),
-    clientReferenceId: uuid(row.clientReferenceId),
-    bindingId: uuid(row.bindingId),
-    ...(v2
-      ? {
-          ...(row.legacyPrimary === undefined
-            ? {}
-            : { legacyPrimary: archiveCopy(row.legacyPrimary, "primary") }),
-          ...(row.legacyLocator === undefined
-            ? {}
-            : {
-                legacyLocator: archiveCopy(
-                  row.legacyLocator,
-                  "independent_backup",
-                ),
-              }),
-        }
-      : { locator: archiveCopy(row.locator, "independent_backup") }),
-  };
+  const result: ProviderOriginalCatalog = v2
+    ? {
+        referenceVersion: "provider_original_v2",
+        clientReferenceId: uuid(row.clientReferenceId),
+        bindingId: uuid(row.bindingId),
+        ...(row.legacyPrimary === undefined
+          ? {}
+          : { legacyPrimary: archiveCopy(row.legacyPrimary, "primary") }),
+        ...(row.legacyLocator === undefined
+          ? {}
+          : {
+              legacyLocator: archiveCopy(
+                row.legacyLocator,
+                "independent_backup",
+              ),
+            }),
+      }
+    : {
+        clientReferenceId: uuid(row.clientReferenceId),
+        bindingId: uuid(row.bindingId),
+        locator: archiveCopy(row.locator, "independent_backup"),
+      };
   if (row.verified !== undefined) {
     const verified = object(row.verified);
     exact(verified, [
@@ -1048,16 +1050,23 @@ function originalRow(value: unknown): OriginalCatalogRow {
     const base = {
       sourceItemId: id(cloud.sourceItemId),
       sourceRevisionId: id(cloud.sourceRevisionId),
-      ...(providerV2
-        ? {}
-        : { primaryReceiptId: id(cloud.primaryReceiptId) }),
       admittedAt: integer(cloud.admittedAt),
     };
-    result.cloud =
-      provider === undefined
-        ? { ...base, backupReceiptId: id(cloud.backupReceiptId) }
+    result.cloud = providerV2
+      ? {
+          ...base,
+          providerReferenceId: id(cloud.providerReferenceId),
+          providerBindingEpoch: integer(cloud.providerBindingEpoch),
+        }
+      : provider === undefined
+        ? {
+            ...base,
+            primaryReceiptId: id(cloud.primaryReceiptId),
+            backupReceiptId: id(cloud.backupReceiptId),
+          }
         : {
             ...base,
+            primaryReceiptId: id(cloud.primaryReceiptId),
             providerReferenceId: id(cloud.providerReferenceId),
             providerBindingEpoch: integer(cloud.providerBindingEpoch),
           };
@@ -1306,8 +1315,8 @@ function parseSnapshot(value: unknown, authorityDigest: string) {
     ]);
     if (originalIdentities.has(originalIdentity)) fail("catalog_invalid");
     originalIdentities.add(originalIdentity);
-    const providerV2 =
-      original.providerOriginal?.referenceVersion === "provider_original_v2";
+    const provider = original.providerOriginal;
+    const providerV2 = provider?.referenceVersion === "provider_original_v2";
     if (
       (providerV2 && Object.keys(original.copies).length !== 0) ||
       (!providerV2 && Object.keys(original.copies).length === 0)
@@ -1315,11 +1324,11 @@ function parseSnapshot(value: unknown, authorityDigest: string) {
       fail("catalog_invalid");
     for (const copy of [
       ...Object.values(original.copies),
-      ...(providerV2 && original.providerOriginal?.legacyPrimary
-        ? [original.providerOriginal.legacyPrimary]
+      ...(providerV2 && provider.legacyPrimary
+        ? [provider.legacyPrimary]
         : []),
-      ...(providerV2 && original.providerOriginal?.legacyLocator
-        ? [original.providerOriginal.legacyLocator]
+      ...(providerV2 && provider.legacyLocator
+        ? [provider.legacyLocator]
         : []),
     ]) {
       for (const candidate of [copy.clientReceiptId, copy.archiveObjectId]) {
@@ -2713,7 +2722,11 @@ export class ArchiveCatalog {
       args.subject,
       args.catalogId,
       args.expectedRevision,
-      (row) => update(row.copies[args.role], row),
+      (row) => {
+        const copy = row.copies[args.role];
+        if (!copy) fail("invalid_transition");
+        update(copy, row);
+      },
     );
   }
 
@@ -2756,12 +2769,16 @@ export class ArchiveCatalog {
               row.copies.independent_backup.cloudReceipt.receiptId
           )
             fail("catalog_conflict");
-        } else if (!providerV2 && (
-          !("providerReferenceId" in cloud) ||
-          !row.providerOriginal.verified ||
-          !row.providerOriginal.locator.backup
-        ))
-          fail("invalid_transition");
+        } else if (!providerV2) {
+          const provider = row.providerOriginal;
+          if (
+            !("providerReferenceId" in cloud) ||
+            !provider.verified ||
+            provider.referenceVersion === "provider_original_v2" ||
+            !provider.locator.backup
+          )
+            fail("invalid_transition");
+        }
         if (row.cloud && !equal(row.cloud, cloud)) fail("catalog_conflict");
         row.cloud = cloud;
       },
@@ -3030,7 +3047,8 @@ export class ArchiveCatalog {
         if (
           !row.spool ||
           !row.copies.primary.cloudReceipt ||
-          !row.copies.independent_backup.cloudReceipt
+          (row.copies.independent_backup !== undefined &&
+            !row.copies.independent_backup.cloudReceipt)
         )
           fail("invalid_transition");
         if (row.cloud && !equal(row.cloud, cloud)) fail("catalog_conflict");
@@ -3169,6 +3187,7 @@ export class ArchiveCatalog {
     if (!row) fail("catalog_not_found");
     for (const role of ["primary", "independent_backup"] as const) {
       const copy = row.copies[role];
+      if (!copy) continue;
       if (
         copy.deletion?.state !== "pending" ||
         !copy.prepared ||

@@ -1,8 +1,23 @@
 # Provider original reference contract
 
-**Status:** First-binding implementation and development lifecycle checks are complete.
-Release checks and owner admission remain pending. Replacement-machine registry
-bootstrap and reference refresh are separate follow-ups.
+**Status:** Superseded for new Dropbox admissions by `provider_original_v2` on
+2026-09-21. The v1 contract below remains readable for historical rows.
+
+`provider_original_v2` binds the exact Dropbox account, root, file ID,
+revision, Dropbox content hash, source SHA-256 and byte length. It stores no
+locator bundle and creates no copy of the original. Its only Kith-created
+archive member is `parser_output:primary`. Parser output is provisional until
+the normal parsing and admission checks complete; it is not a second original.
+Existing v1 receipts and locator records remain immutable evidence but are
+inert after the supported journal transition.
+
+The transition command accepts an exact previous config and proposed config,
+moves the existing protected rclone identity to `providerOriginal`, removes
+`archive.independentBackup`, and permits no other config change. Under the
+journal lock it validates and settles the one already answered legacy locator
+request without issuing it again, converts the current catalog rows, preserves
+the checkpoint and scan inventory, and rebinds the journal. Ordinary replay
+refuses legacy locator work and cannot create another backup.
 
 ## Decision
 

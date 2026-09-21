@@ -872,11 +872,12 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
       ))
   )
     fail("pdfDocQa credential config path must not be in writable roots");
+  const providerConfigPath = providerOriginal?.configPath;
   if (
-    providerOriginal?.configPath !== undefined &&
-    (containsPath(journalDir, providerOriginal.configPath) ||
-      roots.some((root) => containsPath(root.path, providerOriginal.configPath)) ||
-      privatePaths.some((path) => containsPath(path, providerOriginal.configPath)))
+    providerConfigPath !== undefined &&
+    (containsPath(journalDir, providerConfigPath) ||
+      roots.some((root) => containsPath(root.path, providerConfigPath)) ||
+      privatePaths.some((path) => containsPath(path, providerConfigPath)))
   )
     fail("pdfDocQa provider credential config path must not be in writable roots");
   return {

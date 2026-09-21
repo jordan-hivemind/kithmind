@@ -1,5 +1,10 @@
 # Database backups
 
+**Status, 2026-09-21:** Historical operating guide. The owner selected Neon as
+the sufficient Postgres persistence boundary and does not require a separate
+database backup. The dump, encryption, restic, schedule, retention and restore
+steps below must not be enabled without a new explicit owner request.
+
 Kith Mind’s native database snapshot assurance covers the application database
 and its stored files. It does not duplicate original Dropbox PDFs; provider
 originals remain governed by their separate recovery references.

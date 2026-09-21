@@ -253,6 +253,12 @@ type ArchivedRun = ActiveScan & {
     selectedCount: number;
     selectedIdentitySha256: string;
   };
+  providerV2Transition?: {
+    version: 1;
+    previousConfigSha256: string;
+    proposedConfigSha256: string;
+    transitionedAt: number;
+  };
 };
 
 export type RunnerCheckpoint =
@@ -1046,6 +1052,7 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
         "stagePhase",
         "stageOrdinal",
         "priorityReceipt",
+        "providerV2Transition",
       ],
     );
     const steps: ArchivedStep[] = [
@@ -1168,6 +1175,34 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       ...(input.priorityReceipt === undefined
         ? {}
         : { priorityReceipt: priorityReceipt(input.priorityReceipt) }),
+      ...(input.providerV2Transition === undefined
+        ? {}
+        : {
+            providerV2Transition: (() => {
+              const receipt = object(input.providerV2Transition);
+              exact(receipt, [
+                "version",
+                "previousConfigSha256",
+                "proposedConfigSha256",
+                "transitionedAt",
+              ]);
+              if (receipt.version !== 1) fail();
+              return {
+                version: 1 as const,
+                previousConfigSha256: string(
+                  receipt.previousConfigSha256,
+                  64,
+                  HEX_64,
+                ),
+                proposedConfigSha256: string(
+                  receipt.proposedConfigSha256,
+                  64,
+                  HEX_64,
+                ),
+                transitionedAt: integer(receipt.transitionedAt),
+              };
+            })(),
+          }),
     };
     const catalogFieldCount = [
       result.originalCatalogId,

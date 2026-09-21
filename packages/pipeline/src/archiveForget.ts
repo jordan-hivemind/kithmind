@@ -414,14 +414,10 @@ function selectedRows(
 
 function allCopies(rows: SelectedRow[]): MatchedCopy[] {
   return rows.flatMap((selected) =>
-    (selected.subject === "original_bytes" && selected.row.providerOriginal
-      ? (["primary"] as const)
-      : (["primary", "independent_backup"] as const)
-    ).map((role) => ({
-      ...selected,
-      role,
-      copy: selected.row.copies[role],
-    })),
+    (["primary", "independent_backup"] as const).flatMap((role) => {
+      const copy = selected.row.copies[role];
+      return copy === undefined ? [] : [{ ...selected, role, copy }];
+    }),
   );
 }
 
@@ -526,7 +522,8 @@ function reconcileProviderTargets(
       selected,
     ): selected is { subject: "original_bytes"; row: OriginalCatalogRow } =>
       selected.subject === "original_bytes" &&
-      selected.row.providerOriginal !== undefined,
+      selected.row.providerOriginal !== undefined &&
+      selected.row.providerOriginal.referenceVersion !== "provider_original_v2",
   );
   const matched = new Map<string, OriginalCatalogRow>();
   for (const target of targets) {
@@ -554,7 +551,10 @@ function reconcileProviderTargets(
     });
     if (candidates.length !== 1)
       throw { code: "provider_target_identity_mismatch" };
-    const providerCopy = candidates[0]!.row.providerOriginal!.locator;
+    const provider = candidates[0]!.row.providerOriginal;
+    if (!provider || provider.referenceVersion === "provider_original_v2")
+      throw { code: "provider_target_identity_mismatch" };
+    const providerCopy = provider.locator;
     if (
       providerCopy.reviewCode ||
       !providerCopy.prepared ||
@@ -614,12 +614,9 @@ function currentRow(
 
 function preflightCopies(rows: SelectedRow[], forgetEpoch: number): void {
   for (const selected of rows) {
-    const roles =
-      selected.subject === "original_bytes" && selected.row.providerOriginal
-        ? (["primary"] as const)
-        : (["primary", "independent_backup"] as const);
-    for (const role of roles) {
+    for (const role of ["primary", "independent_backup"] as const) {
       const copy = selected.row.copies[role];
+      if (!copy) continue;
       if (copy.reviewCode) throw { code: copy.reviewCode };
       if (copy.preparationIntent && !copy.prepared)
         throw { code: "lost_encryption_result" };
@@ -656,6 +653,7 @@ async function deleteCopy(input: {
 }): Promise<boolean> {
   let selected = currentRow(input.catalog, input.selected);
   let copy = selected.row.copies[input.role];
+  if (!copy) throw { code: "archive_copy_missing" };
   if (!copy.published) return false;
   if (
     copy.deletion?.state === "complete" &&
@@ -680,6 +678,7 @@ async function deleteCopy(input: {
     });
     selected = currentRow(input.catalog, selected);
     copy = selected.row.copies[input.role];
+    if (!copy) throw { code: "archive_copy_missing" };
   }
   if (copy.deletion?.state === "complete") return true;
   const target = input.catalog.nextDeletionTarget(
@@ -691,24 +690,25 @@ async function deleteCopy(input: {
   const directory =
     input.role === "primary"
       ? input.config.archive.primary.directory
-      : input.config.archive.independentBackup.directory;
+      : input.config.archive.independentBackup?.directory;
+  if (directory === undefined) throw { code: "backup_configuration_missing" };
   const objectPath = join(directory, target.objectName);
   if (basename(objectPath) !== target.objectName)
     throw { code: "object_name_invalid" };
   let backup: "deleted" | "already_missing" | undefined;
   if (input.role === "independent_backup") {
+    const configuredBackup = input.config.archive.independentBackup;
+    if (!configuredBackup) throw { code: "backup_configuration_missing" };
     if (
       !target.operationId ||
       !target.host ||
       !target.repositoryId ||
       !target.snapshotId ||
-      target.host !== input.config.archive.independentBackup.host ||
-      target.repositoryId !==
-        input.config.archive.independentBackup.expectedRepositoryId
+      target.host !== configuredBackup.host ||
+      target.repositoryId !== configuredBackup.expectedRepositoryId
     )
       throw { code: "backup_identity_mismatch" };
     await input.authorize();
-    const configuredBackup = input.config.archive.independentBackup;
     if (
       "repository" in configuredBackup &&
       selected.subject !== "parser_output"
@@ -720,8 +720,8 @@ async function deleteCopy(input: {
         ? { repository: configuredBackup.repository! }
         : { repositoryPath: configuredBackup.repositoryPath }),
       expectedRepositoryId:
-        input.config.archive.independentBackup.expectedRepositoryId,
-      passwordCommand: input.config.archive.independentBackup.passwordCommand,
+        configuredBackup.expectedRepositoryId,
+      passwordCommand: configuredBackup.passwordCommand,
       operationId: target.operationId,
       host: target.host,
       snapshotId: target.snapshotId,
@@ -777,15 +777,22 @@ async function deleteProviderLocator(input: {
   const providerConfig = input.pdf.providerOriginal;
   if (
     !input.row.providerOriginal ||
+    input.row.providerOriginal.referenceVersion === "provider_original_v2" ||
     !providerConfig ||
+    !input.pdf.archive.independentBackup ||
     !("repository" in input.pdf.archive.independentBackup)
   )
     throw { code: "provider_locator_configuration_missing" };
   let row = input.catalog
     .listOriginals()
     .find((value) => value.originalCatalogId === input.row.originalCatalogId);
-  if (!row?.providerOriginal) throw { code: "catalog_not_found" };
-  let copy = row.providerOriginal.locator;
+  if (
+    !row?.providerOriginal ||
+    row.providerOriginal.referenceVersion === "provider_original_v2"
+  )
+    throw { code: "catalog_not_found" };
+  let provider = row.providerOriginal;
+  let copy = provider.locator;
   if (
     copy.reviewCode ||
     !copy.prepared ||
@@ -814,7 +821,10 @@ async function deleteProviderLocator(input: {
         };
       },
     });
-    copy = row.providerOriginal!.locator;
+    const nextProvider = row.providerOriginal;
+    if (!nextProvider || nextProvider.referenceVersion === "provider_original_v2")
+      throw { code: "provider_locator_incomplete" };
+    copy = nextProvider.locator;
   }
   if (copy.deletion?.state !== "complete") {
     const restic = copy.restic;
@@ -824,10 +834,10 @@ async function deleteProviderLocator(input: {
       throw { code: "provider_locator_incomplete" };
     await input.authorize();
     const backup = await input.commands.forgetBackup({
-      resticBinary: input.pdf.archive.independentBackup.resticBinary,
-      repository: input.pdf.archive.independentBackup.repository!,
+      resticBinary: input.pdf.archive.independentBackup!.resticBinary,
+      repository: input.pdf.archive.independentBackup!.repository!,
       expectedRepositoryId: input.target.locatorRepositoryId,
-      passwordCommand: input.pdf.archive.independentBackup.passwordCommand,
+      passwordCommand: input.pdf.archive.independentBackup!.passwordCommand,
       operationId: restic.operationId,
       host: restic.host,
       snapshotId: input.target.locatorSnapshotId,
@@ -840,7 +850,7 @@ async function deleteProviderLocator(input: {
     await input.authorize();
     const object = await input.commands.removeAge({
       objectPath: join(
-        input.pdf.archive.independentBackup.directory,
+        input.pdf.archive.independentBackup!.directory,
         copy.objectName,
       ),
       expectedDirectory: {
@@ -868,7 +878,10 @@ async function deleteProviderLocator(input: {
         };
       },
     });
-    copy = row.providerOriginal!.locator;
+    const nextProvider = row.providerOriginal;
+    if (!nextProvider || nextProvider.referenceVersion === "provider_original_v2")
+      throw { code: "provider_locator_incomplete" };
+    copy = nextProvider.locator;
   }
   const deletion = copy.deletion;
   if (deletion?.state !== "complete" || deletion.backup === undefined)
@@ -1193,11 +1206,14 @@ export async function runArchiveForget(input: {
       const matched = matches.get(target.receiptId)!;
       const current = currentRow(input.catalog, matched);
       const copy = current.row.copies[target.copyRole];
+      if (!copy) throw { code: "archive_copy_missing" };
       const deletion = completeDeletion(copy, input.forgetEpoch);
+      const independentBackup = input.config.pdfDocQa.archive.independentBackup;
       const liveRepository =
         matched.subject === "parser_output" &&
         matched.role === "independent_backup" &&
-        "repository" in input.config.pdfDocQa.archive.independentBackup;
+        independentBackup !== undefined &&
+        "repository" in independentBackup;
       const expectedAuthority = liveRepository
         ? ("worker_asserted_live_repository_absence" as const)
         : ("worker_asserted_physical_absence" as const);
@@ -1284,13 +1300,17 @@ export async function runArchiveForget(input: {
       const after = finalById.get(target.receiptId);
       if (!after?.ack) throw { code: "ack_not_observed" };
       const matched = matches.get(target.receiptId)!;
+      const independentBackup = input.config.pdfDocQa.archive.independentBackup;
       const liveRepository =
         matched.subject === "parser_output" &&
         matched.role === "independent_backup" &&
-        "repository" in input.config.pdfDocQa.archive.independentBackup;
+        independentBackup !== undefined &&
+        "repository" in independentBackup;
       const current = currentRow(input.catalog, matched);
+      const copy = current.row.copies[target.copyRole];
+      if (!copy) throw { code: "archive_copy_missing" };
       const deletion = completeDeletion(
-        current.row.copies[target.copyRole],
+        copy,
         input.forgetEpoch,
       );
       if (
@@ -1322,7 +1342,8 @@ export async function runArchiveForget(input: {
               "provider_original_reference_detached_source_retained" as const,
           }
         : {}),
-      ...("repository" in input.config.pdfDocQa.archive.independentBackup
+      ...(input.config.pdfDocQa.archive.independentBackup !== undefined &&
+      "repository" in input.config.pdfDocQa.archive.independentBackup
         ? { retainedProviderHistoryPossible: true as const }
         : {}),
       nextAction: "run_authenticated_owner_continue_forget",
