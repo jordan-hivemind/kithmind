@@ -57,6 +57,9 @@ export type HoldingProjectionDelta = {
   readonly added: number;
   readonly changed: number;
   readonly removed: number;
+  /** Remaining locator keys with multiple rows on either side. These rows
+   * remain additions/removals; no automatic change pairing is inferred. */
+  readonly ambiguousLocators: number;
 };
 
 export type HoldingCorrectionCompletenessReason =
@@ -476,17 +479,43 @@ function projectionDigest(
 function removeSemanticMatches(
   oldRows: readonly StoredHoldingRow[],
   candidateRows: readonly CandidateHoldingRow[],
-): { oldRemaining: StoredHoldingRow[]; candidateRemaining: CandidateHoldingRow[]; unchanged: number } {
+): {
+  oldRemaining: StoredHoldingRow[];
+  candidateRemaining: CandidateHoldingRow[];
+  unchanged: number;
+} {
   const oldBuckets = new Map<string, StoredHoldingRow[]>();
-  for (const row of oldRows) {
+  for (const row of sortedRows(oldRows, (row) => [
+    row.semantic,
+    row.sourceLocator,
+    row.rowHash,
+    row.id,
+  ])) {
     const key = canonical(row.semantic);
     const bucket = oldBuckets.get(key) ?? [];
     bucket.push(row);
     oldBuckets.set(key, bucket);
   }
   let unchanged = 0;
+  const pendingCandidates: CandidateHoldingRow[] = [];
+  // Preserve exact semantic+locator matches before matching equal semantics
+  // across locations. Otherwise input order can steal a later exact match and
+  // change the apparent locator ambiguity despite identical projections.
+  for (const row of sortedRows(candidateRows, (row) => [
+    row.semantic,
+    row.sourceLocator,
+    row.rowHash,
+  ])) {
+    const bucket = oldBuckets.get(canonical(row.semantic));
+    const exactIndex =
+      bucket?.findIndex((old) => old.sourceLocator === row.sourceLocator) ?? -1;
+    if (exactIndex >= 0) {
+      bucket!.splice(exactIndex, 1);
+      unchanged += 1;
+    } else pendingCandidates.push(row);
+  }
   const candidateRemaining: CandidateHoldingRow[] = [];
-  for (const row of candidateRows) {
+  for (const row of pendingCandidates) {
     const bucket = oldBuckets.get(canonical(row.semantic));
     const matched = bucket?.pop();
     if (matched === undefined) candidateRemaining.push(row);
@@ -500,33 +529,38 @@ function removeSemanticMatches(
 }
 
 function locatorMap<T extends { sourceLocator: string | null }>(
-  table: HoldingProjectionTable,
-  side: "old" | "candidate",
   rows: readonly T[],
-): Map<string, T> {
-  const result = new Map<string, T>();
+): Map<string, T[]> {
+  const result = new Map<string, T[]>();
   for (const row of rows) {
     if (row.sourceLocator === null || row.sourceLocator.length === 0) continue;
-    if (result.has(row.sourceLocator)) {
-      fail(`${table} ${side} projection has an ambiguous source locator`);
-    }
-    result.set(row.sourceLocator, row);
+    const bucket = result.get(row.sourceLocator) ?? [];
+    bucket.push(row);
+    result.set(row.sourceLocator, bucket);
   }
   return result;
 }
 
 function delta(
-  table: HoldingProjectionTable,
   oldRows: readonly StoredHoldingRow[],
   candidateRows: readonly CandidateHoldingRow[],
 ): HoldingProjectionDelta {
-  const { oldRemaining, candidateRemaining, unchanged } =
-    removeSemanticMatches(oldRows, candidateRows);
-  const oldByLocator = locatorMap(table, "old", oldRemaining);
-  const candidateByLocator = locatorMap(table, "candidate", candidateRemaining);
+  const { oldRemaining, candidateRemaining, unchanged } = removeSemanticMatches(
+    oldRows,
+    candidateRows,
+  );
+  const oldByLocator = locatorMap(oldRemaining);
+  const candidateByLocator = locatorMap(candidateRemaining);
   let changed = 0;
-  for (const locator of oldByLocator.keys()) {
-    if (candidateByLocator.has(locator)) changed += 1;
+  let ambiguousLocators = 0;
+  for (const locator of new Set([
+    ...oldByLocator.keys(),
+    ...candidateByLocator.keys(),
+  ])) {
+    const oldCount = oldByLocator.get(locator)?.length ?? 0;
+    const candidateCount = candidateByLocator.get(locator)?.length ?? 0;
+    if (oldCount > 1 || candidateCount > 1) ambiguousLocators += 1;
+    else if (oldCount === 1 && candidateCount === 1) changed += 1;
   }
   return {
     oldRows: oldRows.length,
@@ -535,6 +569,7 @@ function delta(
     changed,
     added: candidateRemaining.length - changed,
     removed: oldRemaining.length - changed,
+    ambiguousLocators,
   };
 }
 
@@ -574,21 +609,9 @@ export function buildHoldingCorrectionCandidateManifest(input: {
   if (built.rejectedRows > 0) reasons.add("candidate_row_rejected");
 
   const tables = {
-    positions: delta(
-      "positions",
-      input.stored.positions,
-      built.projection.positions,
-    ),
-    balances: delta(
-      "balances",
-      input.stored.balances,
-      built.projection.balances,
-    ),
-    liabilities: delta(
-      "liabilities",
-      input.stored.liabilities,
-      built.projection.liabilities,
-    ),
+    positions: delta(input.stored.positions, built.projection.positions),
+    balances: delta(input.stored.balances, built.projection.balances),
+    liabilities: delta(input.stored.liabilities, built.projection.liabilities),
   } as const;
   const completeness = {
     state:
