@@ -94,7 +94,7 @@ export function DocumentViewer({
             <Dialog.Title className="basis-full truncate kith-section-title sm:min-w-0 sm:flex-1 sm:basis-auto">
               {title}
             </Dialog.Title>
-            <div className="ml-auto flex shrink-0 flex-wrap justify-end gap-2">
+            <div className="ml-auto flex w-full flex-wrap justify-end gap-2 sm:w-auto sm:shrink-0">
               {canViewOriginal && canViewText ? (
                 <div className="flex items-center gap-1">
                   <button
