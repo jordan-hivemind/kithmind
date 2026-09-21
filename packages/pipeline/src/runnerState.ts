@@ -129,8 +129,8 @@ export type JobLease = {
  * absent for an original whose independent copy is a provider reference.
  */
 export type ArchiveReceiptReuse = {
-  primaryReceiptId: string;
-  primaryBindingEpoch: number;
+  primaryReceiptId?: string;
+  primaryBindingEpoch?: number;
   backupReceiptId?: string;
   backupBindingEpoch?: number;
   /**
@@ -140,6 +140,7 @@ export type ArchiveReceiptReuse = {
    */
   providerReferenceId?: string;
   providerBindingEpoch?: number;
+  providerReferenceVersion?: "provider_original_v2";
 };
 
 /**
@@ -149,8 +150,6 @@ export type ArchiveReceiptReuse = {
  */
 export type ParserArtifactReuse = ArchiveReceiptReuse & {
   parserArtifactId: string;
-  backupReceiptId: string;
-  backupBindingEpoch: number;
 };
 
 export type ArchivedDiscoveryLease = Omit<
@@ -734,25 +733,40 @@ function archiveReceiptReuse(value: unknown): ArchiveReceiptReuse {
   const row = object(value);
   exact(
     row,
-    ["primaryReceiptId", "primaryBindingEpoch"],
+    [],
     [
+      "primaryReceiptId",
+      "primaryBindingEpoch",
       "backupReceiptId",
       "backupBindingEpoch",
       "providerReferenceId",
       "providerBindingEpoch",
+      "providerReferenceVersion",
     ],
   );
   if (
+    (row.primaryReceiptId === undefined) !==
+      (row.primaryBindingEpoch === undefined) ||
     (row.backupReceiptId === undefined) !==
       (row.backupBindingEpoch === undefined) ||
     (row.providerReferenceId === undefined) !==
       (row.providerBindingEpoch === undefined) ||
-    (row.backupReceiptId !== undefined && row.providerReferenceId !== undefined)
+    (row.backupReceiptId !== undefined && row.providerReferenceId !== undefined) ||
+    (row.providerReferenceVersion !== undefined &&
+      (row.providerReferenceVersion !== "provider_original_v2" ||
+        row.providerReferenceId === undefined ||
+        row.primaryReceiptId !== undefined)) ||
+    (row.primaryReceiptId === undefined && row.providerReferenceId === undefined) ||
+    (row.backupReceiptId !== undefined && row.primaryReceiptId === undefined)
   )
     fail();
   return {
-    primaryReceiptId: id(row.primaryReceiptId),
-    primaryBindingEpoch: integer(row.primaryBindingEpoch),
+    ...(row.primaryReceiptId === undefined
+      ? {}
+      : {
+          primaryReceiptId: id(row.primaryReceiptId),
+          primaryBindingEpoch: integer(row.primaryBindingEpoch),
+        }),
     ...(row.backupReceiptId === undefined
       ? {}
       : {
@@ -764,6 +778,9 @@ function archiveReceiptReuse(value: unknown): ArchiveReceiptReuse {
       : {
           providerReferenceId: id(row.providerReferenceId),
           providerBindingEpoch: integer(row.providerBindingEpoch),
+          ...(row.providerReferenceVersion === undefined
+            ? {}
+            : { providerReferenceVersion: "provider_original_v2" as const }),
         }),
   };
 }
@@ -772,12 +789,14 @@ function parserArtifactReuse(value: unknown): ParserArtifactReuse {
   const row = object(value);
   const { parserArtifactId, ...receipts } = row;
   const copies = archiveReceiptReuse(receipts);
-  if (copies.backupReceiptId === undefined) fail();
+  if (
+    copies.primaryReceiptId === undefined ||
+    copies.providerReferenceId !== undefined
+  )
+    fail();
   return {
     parserArtifactId: id(parserArtifactId),
     ...copies,
-    backupReceiptId: copies.backupReceiptId,
-    backupBindingEpoch: copies.backupBindingEpoch!,
   };
 }
 

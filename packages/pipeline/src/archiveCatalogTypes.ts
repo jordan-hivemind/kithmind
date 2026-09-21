@@ -152,7 +152,8 @@ export type OriginalCatalogIdentity = {
   };
   copies:
     | { primary: ArchiveCopyIntent; independent_backup: ArchiveCopyIntent }
-    | { primary: ArchiveCopyIntent; independent_backup: never };
+    | { primary: ArchiveCopyIntent; independent_backup?: never }
+    | { primary?: never; independent_backup?: never };
   providerOriginal?: ProviderOriginalCatalog;
   createdAt: number;
 };
@@ -161,20 +162,22 @@ export type OriginalCatalogRow = Omit<OriginalCatalogIdentity, "copies"> & {
   rowRevision: number;
   copies:
     | { primary: ArchiveCopyRecord; independent_backup: ArchiveCopyRecord }
-    | { primary: ArchiveCopyRecord; independent_backup: never };
+    | { primary: ArchiveCopyRecord; independent_backup?: never }
+    | { primary?: never; independent_backup?: never };
   providerOriginal?: ProviderOriginalCatalog;
   cloud?: {
     sourceItemId: string;
     sourceRevisionId: string;
-    primaryReceiptId: string;
     admittedAt: number;
   } & (
     | {
+        primaryReceiptId: string;
         backupReceiptId: string;
         providerReferenceId?: never;
         providerBindingEpoch?: never;
       }
     | {
+        primaryReceiptId?: string;
         backupReceiptId?: never;
         providerReferenceId: string;
         providerBindingEpoch: number;
@@ -192,23 +195,37 @@ export type OriginalCatalogRow = Omit<OriginalCatalogIdentity, "copies"> & {
   updatedAt: number;
 };
 
+type ProviderOriginalVerified = {
+  providerAccountIdHash: string;
+  providerRootDirectoryIdHash: string;
+  providerFileIdHash: string;
+  providerRevision: string;
+  providerContentHash: string;
+  sourceContentHash: string;
+  sourceByteLength: number;
+  verifiedAt: number;
+  manifestFingerprint: string;
+  manifestByteLength: number;
+};
+
 export type ProviderOriginalCatalog = {
   clientReferenceId: string;
   bindingId: string;
-  locator: ArchiveCopyRecord;
-  verified?: {
-    providerAccountIdHash: string;
-    providerRootDirectoryIdHash: string;
-    providerFileIdHash: string;
-    providerRevision: string;
-    providerContentHash: string;
-    sourceContentHash: string;
-    sourceByteLength: number;
-    verifiedAt: number;
-    manifestFingerprint: string;
-    manifestByteLength: number;
-  };
-};
+  verified?: ProviderOriginalVerified;
+} & (
+  | {
+      /** Absent on legacy persisted rows; those rows are v1. */
+      referenceVersion?: "provider_original_v1";
+      locator: ArchiveCopyRecord;
+    }
+  | {
+      referenceVersion: "provider_original_v2";
+      locator?: never;
+      /** Preserved evidence from an interrupted v1 run. Never executed. */
+      legacyPrimary?: ArchiveCopyRecord;
+      legacyLocator?: ArchiveCopyRecord;
+    }
+);
 
 export type OriginalReuseIdentity = {
   sourceExternalId: string;
@@ -248,7 +265,7 @@ export type ProcessingCatalogIdentity = {
   };
   copies: {
     primary: ArchiveCopyIntent;
-    independent_backup: ArchiveCopyIntent;
+    independent_backup?: ArchiveCopyIntent;
   };
   createdAt: number;
 };
@@ -274,8 +291,10 @@ export type ProcessingCatalogRow = Omit<ProcessingCatalogIdentity, "copies"> & {
   rowRevision: number;
   copies: {
     primary: ArchiveCopyRecord;
-    independent_backup: ArchiveCopyRecord;
+    independent_backup?: ArchiveCopyRecord;
   };
+  /** Preserved evidence from an interrupted provider v1 run. Never executed. */
+  legacyIndependentBackup?: ArchiveCopyRecord;
   capture?: LocalFileIdentity & { sourceModifiedAt: number };
   parserOutput?: DurableParserOutput;
   spoolPrepared?: LocalFileIdentity;
