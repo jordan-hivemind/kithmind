@@ -598,7 +598,7 @@ function requireIdentity(
     workerProtocolError("stale_observation");
 }
 
-async function resolveCurrentArchivedWork(
+export async function resolveCurrentArchivedWork(
   ctx: WorkerCtx,
   source: LoadedWorkerSource,
   identity: ArchivedWorkIdentity,
@@ -632,6 +632,33 @@ async function resolveCurrentArchivedWork(
   const current = await requireCurrentDiscovery(ctx, source, matches[0]!.id);
   requireIdentity(current, identity);
   return current;
+}
+
+/** Links provisional previews only after the exact archived revision exists.
+ * The table trigger verifies every immutable byte and ownership field. The
+ * NULL predicate is intentional: an already-linked row is a read/reuse case,
+ * not an UPDATE that asks the immutability trigger to tolerate a no-op. */
+export async function linkTriagePreviewsToRevision(
+  ctx: WorkerCtx,
+  revision: SourceRevisionRow,
+): Promise<void> {
+  await exec(
+    ctx,
+    `UPDATE kith.source_triage_previews
+        SET source_revision_id = $1, linked_at = transaction_timestamp()
+      WHERE source_item_id = $2 AND space_id = $3
+        AND observed_content_hash = $4
+        AND observed_byte_length = $5 AND observed_media_type = $6
+        AND source_revision_id IS NULL`,
+    [
+      revision.id,
+      revision.sourceItemId,
+      revision.spaceId,
+      revision.contentHash,
+      revision.byteLength,
+      revision.mediaType,
+    ],
+  );
 }
 
 /**
@@ -1681,6 +1708,7 @@ export async function admitArchivedDiscovery(
       capturedAt: current.work.capturedAt,
       userId: current.work.actorUserId,
     });
+    await linkTriagePreviewsToRevision(ctx, revision);
     const artifact = await resolveParserArtifact(
       ctx,
       source,
