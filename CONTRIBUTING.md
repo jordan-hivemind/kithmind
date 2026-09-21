@@ -10,15 +10,12 @@ private tracker or owner account.
 3. Use only synthetic data in tests, examples, screenshots, and commits. Do
    not add personal, family, health, financial, account, credential, or
    production data.
-4. Run the relevant checks. Run all of these before requesting review for code
-   changes:
-
-   ```
-   pnpm lint
-   pnpm check-types
-   pnpm test:once
-   pnpm build
-   ```
+4. Follow the [verification and review policy](./AGENTS.md#verification-and-review).
+   Run focused checks for changed behavior before draft review. Required final
+   CI runs lint, type checks, tests and build; do not repeat that full batch
+   locally when CI supplies the same coverage. Record commands, results and
+   coverage gaps in the PR. Prose-only changes need diff and link checks, not
+   local application or database test runs.
 
 5. Update the public plan when implementation changes an adopted design.
 
