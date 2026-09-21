@@ -174,9 +174,7 @@ async function send(
   return response;
 }
 
-/** The read-only detail panel a row click, or its own kebab's "Review",
- * opens. There is no value-correction form here yet, so the available actions
- * only defer or remove an item from this queue. */
+/** The queue intentionally does not invent a correction write. */
 function AttentionDrawer({
   item,
   onOpenChange,
@@ -201,6 +199,12 @@ function AttentionDrawer({
         <div>
           <span className="text-gray-400">Why</span> {issueExplanation(item)}
         </div>
+        {item.state === "open" || item.state === "snoozed" ? (
+          <div>
+            <span className="text-gray-400">Resolution</span>{" "}
+            <Tag tone="warn">Resolution not yet supported</Tag>
+          </div>
+        ) : null}
         {item.document === null ? null : (
           <div>
             <span className="text-gray-400">Document</span>{" "}
@@ -445,16 +449,25 @@ export function AttentionTable({
         accessorFn: issueLabel,
         cell: ({ row }) => (
           <Detail
-            label={<span>{issueLabel(row.original)}</span>}
+            label={
+              <span className="block max-w-[22rem] truncate">
+                {issueLabel(row.original)}
+              </span>
+            }
             detail={issueExplanation(row.original)}
           />
         ),
       },
       {
-        id: "reason",
-        header: "Check",
-        accessorFn: (row) => row.detector,
-        cell: ({ row }) => <span>{row.original.detector}</span>,
+        id: "resolution",
+        header: "Resolution",
+        accessorFn: (row) => row.state,
+        cell: ({ row }) =>
+          row.original.state === "open" || row.original.state === "snoozed" ? (
+            <span className="whitespace-nowrap text-xs text-kith-text-muted">
+              Not yet supported
+            </span>
+          ) : null,
       },
       {
         id: "document",
@@ -570,7 +583,7 @@ export function AttentionTable({
 
   return (
     <div className="flex flex-col gap-2">
-      <PageHeader title="Needs attention" />
+      <PageHeader title="Needs Attention" />
       <div className="flex items-center gap-2">
         <button
           type="button"

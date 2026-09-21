@@ -4,6 +4,7 @@ import {
   archiveDate,
   label,
   shortDate,
+  tableAccountingMoney,
   tableDateTime,
   tableDecimal,
   tableInteger,
@@ -28,5 +29,10 @@ describe("table display formatting", () => {
     expect(tableDecimal("12345678901234567890.05")).toBe(
       "12,345,678,901,234,567,890.05",
     );
+  });
+
+  test("formats exact USD values as accounting money", () => {
+    expect(tableAccountingMoney("100000.22")).toBe("$ 100,000.22");
+    expect(tableAccountingMoney("-12.5")).toBe("($ 12.50)");
   });
 });

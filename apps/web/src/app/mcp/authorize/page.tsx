@@ -20,7 +20,7 @@ export const dynamic = "force-dynamic";
 
 function Loading() {
   return (
-    <AuthCard title="Open Brain">
+    <AuthCard title="Kith Mind">
       <p className="text-xs text-gray-600">Loading...</p>
     </AuthCard>
   );

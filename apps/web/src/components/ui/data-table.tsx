@@ -37,7 +37,12 @@ import { Check, Filter } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { buttonClass } from "@/components/ui/drawer";
-import { archiveDate, label, tableDecimal, tableInteger } from "@/lib/kith/format";
+import {
+  archiveDate,
+  label,
+  tableDecimal,
+  tableInteger,
+} from "@/lib/kith/format";
 import {
   columnChipOptions,
   matchesFilter,
@@ -64,6 +69,7 @@ declare module "@tanstack/react-table" {
     /** Never wraps: a date, a timestamp or a number, whose value would
      * otherwise break across two or three lines in a narrow column. */
     nowrap?: boolean;
+    align?: "left" | "right";
   }
 }
 
@@ -296,7 +302,8 @@ function loadColumnSizing(id: string | undefined): ColumnSizingState {
 /** Apply the app's table display conventions to primitive values while
  * leaving custom React cells untouched. */
 function displayCellValue(value: React.ReactNode): React.ReactNode {
-  if (typeof value === "number" && Number.isInteger(value)) return tableInteger(value);
+  if (typeof value === "number" && Number.isInteger(value))
+    return tableInteger(value);
   if (typeof value !== "string") return value;
   if (/^-?\d+$/.test(value)) return tableDecimal(value);
   if (/^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(value)) return archiveDate(value);
@@ -334,9 +341,10 @@ export function DataTable<T>({
   const [columnSizing, setColumnSizing] = useState<ColumnSizingState>(() =>
     loadColumnSizing(id),
   );
-  const [confirming, setConfirming] = useState<{ action: RowAction<T>; row: T } | null>(
-    null,
-  );
+  const [confirming, setConfirming] = useState<{
+    action: RowAction<T>;
+    row: T;
+  } | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmingBulk, setConfirmingBulk] = useState<{
     action: RowAction<T[]>;
@@ -358,7 +366,10 @@ export function DataTable<T>({
   useEffect(() => {
     if (id === undefined || typeof window === "undefined") return;
     try {
-      window.localStorage.setItem(WIDTHS_KEY_PREFIX + id, JSON.stringify(columnSizing));
+      window.localStorage.setItem(
+        WIDTHS_KEY_PREFIX + id,
+        JSON.stringify(columnSizing),
+      );
     } catch {
       // Private browsing, a full quota, or a disabled store. Widths just
       // don't persist this session.
@@ -369,8 +380,7 @@ export function DataTable<T>({
     data,
     columns: sizedColumns,
     defaultColumn: {
-      cell: ({ getValue }) =>
-        displayCellValue(getValue() as React.ReactNode),
+      cell: ({ getValue }) => displayCellValue(getValue() as React.ReactNode),
     },
     columnResizeMode: "onChange",
     enableColumnResizing: true,
@@ -505,7 +515,8 @@ export function DataTable<T>({
                     className="z-50 max-h-[70vh] min-w-56 overflow-y-auto rounded-control border border-kith-border-subtle bg-kith-surface px-2 py-1 text-sm shadow-[var(--kith-shadow-md)]"
                   >
                     {chipOptions.map(({ columnId, options }, sectionIndex) => {
-                      const header = table.getColumn(columnId)?.columnDef.header;
+                      const header =
+                        table.getColumn(columnId)?.columnDef.header;
                       const values = options.map((option) => option.value);
                       const hidden = unchecked[columnId] ?? [];
                       return (
@@ -514,7 +525,11 @@ export function DataTable<T>({
                             <DropdownMenu.Separator className="my-1 h-px bg-kith-border-subtle" />
                           ) : null}
                           <div className="flex items-center justify-between px-1 pt-1.5 pb-1 text-xs font-medium tracking-wide text-kith-text-muted uppercase">
-                            <span>{typeof header === "string" ? header : label(columnId)}</span>
+                            <span>
+                              {typeof header === "string"
+                                ? header
+                                : label(columnId)}
+                            </span>
                             <span className="normal-case">
                               <button
                                 type="button"
@@ -523,12 +538,17 @@ export function DataTable<T>({
                               >
                                 All
                               </button>
-                              <span aria-hidden className="mx-1 text-kith-text-muted">
+                              <span
+                                aria-hidden
+                                className="mx-1 text-kith-text-muted"
+                              >
                                 /
                               </span>
                               <button
                                 type="button"
-                                onClick={() => setUncheckedFor(columnId, values)}
+                                onClick={() =>
+                                  setUncheckedFor(columnId, values)
+                                }
                                 className="text-accent-700 hover:underline"
                               >
                                 None
@@ -544,7 +564,9 @@ export function DataTable<T>({
                                 setUncheckedFor(
                                   columnId,
                                   checked
-                                    ? hidden.filter((value) => value !== option.value)
+                                    ? hidden.filter(
+                                        (value) => value !== option.value,
+                                      )
                                     : [...hidden, option.value],
                                 )
                               }
@@ -556,7 +578,9 @@ export function DataTable<T>({
                               >
                                 <Check className="hidden size-3 group-data-[state=checked]:block" />
                               </span>
-                              <span className="flex-1">{label(option.value)}</span>
+                              <span className="flex-1">
+                                {label(option.value)}
+                              </span>
                               <span className="text-xs text-kith-text-muted tabular-nums">
                                 {option.count}
                               </span>
@@ -589,7 +613,8 @@ export function DataTable<T>({
                       onClick={() =>
                         action.danger
                           ? setConfirmingBulk({ action, rows: selectedRows })
-                          : (action.onSelect(selectedRows), setSelected(new Set()))
+                          : (action.onSelect(selectedRows),
+                            setSelected(new Set()))
                       }
                       className={
                         action.danger
@@ -628,7 +653,9 @@ export function DataTable<T>({
                         indeterminate={selectionState === "some"}
                         onChange={(event) => {
                           event.stopPropagation();
-                          setSelected((current) => toggleSelectAll(rowIdList, current));
+                          setSelected((current) =>
+                            toggleSelectAll(rowIdList, current),
+                          );
                         }}
                       />
                     </th>
@@ -640,7 +667,7 @@ export function DataTable<T>({
                         key={header.id}
                         scope="col"
                         style={{ width: header.getSize() }}
-                        className="relative h-row border-r border-kith-border bg-kith-surface-muted px-2 text-left align-middle font-medium text-kith-text-secondary last:border-r-0"
+                        className={`relative h-row border-r border-kith-border bg-kith-surface-muted px-2 align-middle font-medium text-kith-text-secondary last:border-r-0 ${header.column.columnDef.meta?.align === "right" ? "text-right" : "text-left"}`}
                       >
                         {header.isPlaceholder ? null : header.column.getCanSort() ? (
                           <button
@@ -653,18 +680,25 @@ export function DataTable<T>({
                                   ? "descending"
                                   : "none"
                             }
-                            className="flex items-center gap-1 hover:text-kith-text"
+                            className={`flex items-center gap-1 hover:text-kith-text ${header.column.columnDef.meta?.align === "right" ? "ml-auto justify-end" : ""}`}
                           >
                             {flexRender(
                               header.column.columnDef.header,
                               header.getContext(),
                             )}
                             <span aria-hidden className="text-gray-400">
-                              {sorted === "asc" ? "↑" : sorted === "desc" ? "↓" : ""}
+                              {sorted === "asc"
+                                ? "↑"
+                                : sorted === "desc"
+                                  ? "↓"
+                                  : ""}
                             </span>
                           </button>
                         ) : (
-                          flexRender(header.column.columnDef.header, header.getContext())
+                          flexRender(
+                            header.column.columnDef.header,
+                            header.getContext(),
+                          )
                         )}
                         {header.column.getCanResize() ? (
                           <div
@@ -725,17 +759,28 @@ export function DataTable<T>({
                   return (
                     <tr
                       key={row.id}
+                      aria-expanded={
+                        row.getCanExpand() ? row.getIsExpanded() : undefined
+                      }
                       tabIndex={focusable ? 0 : undefined}
                       onClick={focusable ? trigger : undefined}
                       onKeyDown={
                         focusable
                           ? (event) => {
-                              if (event.key !== "Enter" && event.key !== " ") return;
+                              if (event.key !== "Enter" && event.key !== " ")
+                                return;
                               if (isInteractiveTarget(event.target)) return;
                               event.preventDefault();
-                              if (shouldToggleSelectionOnKey(event.key, selectable)) {
+                              if (
+                                shouldToggleSelectionOnKey(
+                                  event.key,
+                                  selectable,
+                                )
+                              ) {
                                 anchorRef.current = rowIndex;
-                                setSelected((current) => toggleSelection(current, rowId));
+                                setSelected((current) =>
+                                  toggleSelection(current, rowId),
+                                );
                                 return;
                               }
                               trigger(event);
@@ -764,7 +809,10 @@ export function DataTable<T>({
                             checked={selected.has(rowId)}
                             onChange={(event) => {
                               event.stopPropagation();
-                              if (event.shiftKey && anchorRef.current !== null) {
+                              if (
+                                event.shiftKey &&
+                                anchorRef.current !== null
+                              ) {
                                 setSelected((current) =>
                                   applyRangeSelection(
                                     rowIdList,
@@ -775,7 +823,9 @@ export function DataTable<T>({
                                 );
                               } else {
                                 anchorRef.current = rowIndex;
-                                setSelected((current) => toggleSelection(current, rowId));
+                                setSelected((current) =>
+                                  toggleSelection(current, rowId),
+                                );
                               }
                             }}
                           />
@@ -784,71 +834,66 @@ export function DataTable<T>({
                       {row.getVisibleCells().map((cell, cellIndex) => {
                         const spansLabel =
                           parentLabel !== undefined && row.getCanExpand();
-                        if (spansLabel && cellIndex > 0 && cellIndex < labelSpan) {
+                        if (
+                          spansLabel &&
+                          cellIndex > 0 &&
+                          cellIndex < labelSpan
+                        ) {
                           return null;
                         }
                         return (
-                        <td
-                          key={cell.id}
-                          colSpan={spansLabel && cellIndex === 0 ? labelSpan : undefined}
-                          style={{ width: cell.column.getSize() }}
-                          className={`h-row px-2 align-middle ${
-                            cell.column.columnDef.meta?.nowrap === true
-                              ? "whitespace-nowrap"
-                              : ""
-                          }`}
-                        >
-                          {/* The expander for a `getSubRows` table: on the first
-                              column only, so the tree reads down one edge, and a
-                              child is indented rather than given a dead toggle. */}
-                          {cellIndex === 0 && getSubRows !== undefined ? (
-                            row.getCanExpand() ? (
-                              <button
-                                type="button"
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  onExpandChange?.(row.original, !row.getIsExpanded());
-                                  row.toggleExpanded();
-                                }}
-                                aria-expanded={row.getIsExpanded()}
-                                aria-label={row.getIsExpanded() ? "Collapse" : "Expand"}
-                                className="mr-1 text-gray-400 hover:text-gray-700"
-                              >
-                                {row.getIsExpanded() ? "▾" : "▸"}
-                              </button>
-                            ) : (
-                              <span aria-hidden className="mr-1 inline-block w-3" />
-                            )
-                          ) : null}
-                          {cell.getIsGrouped() ? (
-                            <button
-                              type="button"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                row.getToggleExpandedHandler()();
-                              }}
-                              aria-expanded={row.getIsExpanded()}
-                              className="flex items-center gap-1 font-medium"
-                            >
-                              <span aria-hidden>{row.getIsExpanded() ? "▾" : "▸"}</span>
-                              {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                              <span className="text-gray-400">({row.subRows.length})</span>
-                            </button>
-                          ) : spansLabel && cellIndex === 0 ? (
-                            parentLabel(row.original)
-                          ) : (groupBy !== undefined && cell.getIsAggregated()) ||
-                            cell.getIsPlaceholder() ? null : (
-                            // `getIsAggregated` is true for any row that has
-                            // sub-rows, whether or not the table is grouping, so a
-                            // `getSubRows` parent would render nothing at all if
-                            // this were not gated on `groupBy`. A grouped table
-                            // behaves exactly as it did.
-                            flexRender(
-                              cell.column.columnDef.cell,
-                              cell.getContext(),
-                            )
-                          )}
-                        </td>
+                          <td
+                            key={cell.id}
+                            colSpan={
+                              spansLabel && cellIndex === 0
+                                ? labelSpan
+                                : undefined
+                            }
+                            style={{ width: cell.column.getSize() }}
+                            className={`h-row px-2 align-middle ${
+                              cell.column.columnDef.meta?.align === "right"
+                                ? "text-right"
+                                : "text-left"
+                            } ${
+                              cell.column.columnDef.meta?.nowrap === true
+                                ? "whitespace-nowrap"
+                                : ""
+                            }`}
+                          >
+                            {cellIndex === 0 &&
+                            getSubRows !== undefined &&
+                            row.depth > 0 ? (
+                              <span
+                                aria-hidden
+                                className="mr-1 inline-block w-3"
+                              />
+                            ) : null}
+                            {cell.getIsGrouped() ? (
+                              <span className="flex items-center gap-1 font-medium">
+                                {flexRender(
+                                  cell.column.columnDef.cell,
+                                  cell.getContext(),
+                                )}
+                                <span className="text-gray-400">
+                                  ({row.subRows.length})
+                                </span>
+                              </span>
+                            ) : spansLabel && cellIndex === 0 ? (
+                              parentLabel(row.original)
+                            ) : (groupBy !== undefined &&
+                                cell.getIsAggregated()) ||
+                              cell.getIsPlaceholder() ? null : (
+                              // `getIsAggregated` is true for any row that has
+                              // sub-rows, whether or not the table is grouping, so a
+                              // `getSubRows` parent would render nothing at all if
+                              // this were not gated on `groupBy`. A grouped table
+                              // behaves exactly as it did.
+                              flexRender(
+                                cell.column.columnDef.cell,
+                                cell.getContext(),
+                              )
+                            )}
+                          </td>
                         );
                       })}
                       {actions.length > 0 ? (
@@ -875,19 +920,29 @@ export function DataTable<T>({
                                   {actions
                                     .filter(
                                       (action) =>
-                                        !(action.hidden?.(row.original) ?? false),
+                                        !(
+                                          action.hidden?.(row.original) ?? false
+                                        ),
                                     )
                                     .map((action) => (
                                       <DropdownMenu.Item
                                         key={action.label}
-                                        disabled={action.disabled?.(row.original) ?? false}
+                                        disabled={
+                                          action.disabled?.(row.original) ??
+                                          false
+                                        }
                                         onSelect={() =>
                                           action.danger
-                                            ? setConfirming({ action, row: row.original })
+                                            ? setConfirming({
+                                                action,
+                                                row: row.original,
+                                              })
                                             : action.onSelect(row.original)
                                         }
                                         className={`cursor-default px-2 py-1 outline-none data-[disabled]:text-gray-300 data-[highlighted]:bg-accent-50 ${
-                                          action.danger ? "text-kith-danger" : ""
+                                          action.danger
+                                            ? "text-kith-danger"
+                                            : ""
                                         }`}
                                       >
                                         {action.label}
@@ -924,7 +979,9 @@ export function DataTable<T>({
               This can&apos;t be undone.
             </AlertDialog.Description>
             <div className="mt-3 flex justify-end gap-2">
-              <AlertDialog.Cancel className={buttonClass}>Cancel</AlertDialog.Cancel>
+              <AlertDialog.Cancel className={buttonClass}>
+                Cancel
+              </AlertDialog.Cancel>
               <AlertDialog.Action
                 onClick={() => {
                   if (confirming) confirming.action.onSelect(confirming.row);
@@ -952,14 +1009,18 @@ export function DataTable<T>({
               {confirmingBulk?.action.label}?
             </AlertDialog.Title>
             <AlertDialog.Description className="mt-1 text-sm text-kith-text-secondary">
-              This can&apos;t be undone. Affects {confirmingBulk?.rows.length ?? 0}{" "}
-              item{confirmingBulk?.rows.length === 1 ? "" : "s"}.
+              This can&apos;t be undone. Affects{" "}
+              {confirmingBulk?.rows.length ?? 0} item
+              {confirmingBulk?.rows.length === 1 ? "" : "s"}.
             </AlertDialog.Description>
             <div className="mt-3 flex justify-end gap-2">
-              <AlertDialog.Cancel className={buttonClass}>Cancel</AlertDialog.Cancel>
+              <AlertDialog.Cancel className={buttonClass}>
+                Cancel
+              </AlertDialog.Cancel>
               <AlertDialog.Action
                 onClick={() => {
-                  if (confirmingBulk) confirmingBulk.action.onSelect(confirmingBulk.rows);
+                  if (confirmingBulk)
+                    confirmingBulk.action.onSelect(confirmingBulk.rows);
                   setConfirmingBulk(null);
                   setSelected(new Set());
                 }}
