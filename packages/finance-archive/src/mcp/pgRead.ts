@@ -1408,6 +1408,19 @@ async function listAccountInventory(
          SELECT p.as_of
            FROM positions p
           WHERE p.account_id = d.account_id
+            -- A parse-noted document remains parsed_ok = FALSE even when
+            -- it yielded some positions. That is source-level evidence that
+            -- the statement is incomplete, and it must hold its own date
+            -- back independently of how a person triages its review item.
+            -- In particular, a resolved or dismissed review records review
+            -- workflow, not that the parser subsequently read the omitted
+            -- holdings.
+            AND NOT EXISTS (
+              SELECT 1
+                FROM documents pd
+               WHERE pd.id = p.source_document_id
+                 AND pd.parsed_ok = FALSE
+            )
             AND NOT EXISTS (
               SELECT 1
                 FROM review_items r

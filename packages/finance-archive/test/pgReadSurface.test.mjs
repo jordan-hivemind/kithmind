@@ -2975,7 +2975,7 @@ test(
 );
 
 test(
-  "list_account_inventory does not advance the holdings snapshot from an incomplete latest statement (FIN-FRESHNESS-1)",
+  "list_account_inventory does not advance a partial statement after its review is closed (FIN-FRESHNESS-1)",
   { skip },
   async (t) => {
     const { owner, reader: r, seeded } = await fixture(t);
@@ -3003,12 +3003,20 @@ test(
         ["2026-04-30", "5", "USD", "market_price", latestDoc],
       ],
     });
+    // This is the durable state the importer writes for a parser that reached
+    // one holding but left another block unparsed: positions may exist, while
+    // the document is still not complete. The safety decision must come from
+    // `parsed_ok`, not from the mutable review workflow or account attribution.
+    await owner.query(
+      "UPDATE documents SET parsed_ok = FALSE WHERE id = $1",
+      [latestDoc],
+    );
     await owner.query(
       `INSERT INTO review_items
          (id, kind, account_id, source_document_id, raw_value, reason, status)
-       VALUES ('snapshot-review-latest', 'weak_instrument_match', $1, $2,
-               'unresolved holding', 'latest statement has unresolved holdings', 'open')`,
-      [accountId, latestDoc],
+       VALUES ('snapshot-review-latest', 'document_unparsed', NULL, $1,
+               'partial statement', 'synthetic parser left holdings unparsed', 'resolved')`,
+      [latestDoc],
     );
 
     let row = await inventory();
@@ -3018,10 +3026,24 @@ test(
       asOf: "2026-03-31",
       source: "positions",
     });
-    assert.equal(row.openReviewCount, 1);
+    assert.equal(row.openReviewCount, 0);
 
     await owner.query(
-      "UPDATE review_items SET status = 'resolved' WHERE id = 'snapshot-review-latest'",
+      "UPDATE review_items SET status = 'dismissed' WHERE id = 'snapshot-review-latest'",
+    );
+    row = await inventory();
+    assert.equal(
+      row.latestSnapshotAsOf,
+      "2026-03-31",
+      "dismissing the review cannot make an incomplete document a snapshot",
+    );
+
+    // A successful reparse is the only transition that makes the statement
+    // eligible. Its historical review may remain dismissed without changing
+    // that source-evidence fact.
+    await owner.query(
+      "UPDATE documents SET parsed_ok = TRUE WHERE id = $1",
+      [latestDoc],
     );
     row = await inventory();
     assert.equal(row.latestSnapshotAsOf, "2026-04-30");
