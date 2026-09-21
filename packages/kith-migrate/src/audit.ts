@@ -545,6 +545,18 @@ export async function auditCsvDirectory(
         // referencing column NULL is not checked, matching what a deferred
         // FK would accept at COMMIT in the real load.
         for (const fk of fksByTable.get(name) ?? []) {
+          const unmappedColumns = fk.localColumns.filter(
+            (column) => !table.columns.includes(column),
+          );
+          if (unmappedColumns.length > 0) {
+            skipped.push({
+              table: name,
+              constraint: fk.name,
+              kind: "foreign_key",
+              reason: `foreign key uses columns not present in the transform: ${unmappedColumns.join(", ")}`,
+            });
+            continue;
+          }
           if (!allTables.has(fk.foreignTable)) {
             skipped.push({
               table: name,

@@ -171,13 +171,39 @@ export function SourcesTable({
   const [failure, setFailure] = useState<string | null>(null);
   const [watchDraft, setWatchDraft] = useState<Draft | null>(null);
   const [editing, setEditing] = useState<Source | null>(null);
+  const [editingRoot, setEditingRoot] = useState<Root | null>(null);
   const [deleteRoot, setDeleteRoot] = useState<Root | null>(null);
+  const [disconnecting, setDisconnecting] = useState<Source | null>(null);
   const { data } = useQuery({
     queryKey: SOURCES_KEY,
     queryFn: async (): Promise<Page> =>
       request("/api/kith/sources", "GET") as Promise<Page>,
     initialData: initial,
   });
+  // Older workers omit the alias advertisement. Keep their existing watched
+  // roots usable, scoped to this connection rather than borrowing other roots.
+  const sourcesWithAliases = useMemo(
+    () =>
+      data.sources.map((source) => ({
+        ...source,
+        allowedRootAliases:
+          source.allowedRootAliases.length > 0
+            ? source.allowedRootAliases
+            : [
+                ...new Set(
+                  data.roots
+                    .filter(
+                      (root) =>
+                        root.sourceAccountId === source.id &&
+                        root.state !== "retired",
+                    )
+                    .map((root) => root.rootAlias)
+                    .filter((alias): alias is string => alias !== null),
+                ),
+              ],
+      })),
+    [data.sources, data.roots],
+  );
   const mutate = useMutation<
     void,
     Error,
@@ -243,6 +269,38 @@ export function SourcesTable({
         run: () =>
           request("/api/kith/source-roots", "DELETE", { sourceRootId: id }),
       }),
+    [mutate],
+  );
+  const editRoot = useCallback(
+    (root: Root, draft: Draft) => {
+      setEditingRoot(null);
+      mutate.mutate({
+        apply: (page) => page,
+        run: () =>
+          request("/api/kith/source-roots", "PATCH", {
+            sourceRootId: root.id,
+            rootAlias: draft.rootAlias,
+            relativePath: draft.relativePath,
+            area: draft.area,
+          }),
+      });
+    },
+    [mutate],
+  );
+  const disconnect = useCallback(
+    (source: Source) => {
+      setDisconnecting(null);
+      mutate.mutate({
+        apply: (page) => ({
+          ...page,
+          sources: page.sources.filter((item) => item.id !== source.id),
+          roots: page.roots.filter(
+            (root) => root.sourceAccountId !== source.id,
+          ),
+        }),
+        run: () => request(`/api/kith/source-accounts/${source.id}`, "DELETE"),
+      });
+    },
     [mutate],
   );
   const createWatch = useCallback(
@@ -400,6 +458,21 @@ export function SourcesTable({
         },
       },
       {
+        label: "Disconnect",
+        danger: true,
+        hidden: (row) => row.rowKind !== "connection",
+        onSelect: (row) =>
+          setDisconnecting(
+            data.sources.find((source) => source.id === row.id) ?? null,
+          ),
+      },
+      {
+        label: "Edit",
+        hidden: (row) => row.rowKind !== "location",
+        onSelect: (row) =>
+          setEditingRoot(data.roots.find((root) => root.id === row.id) ?? null),
+      },
+      {
         label: "Pause",
         hidden: (row) =>
           row.rowKind !== "location" || row.rootState !== "active",
@@ -421,15 +494,8 @@ export function SourcesTable({
     ],
     [data.roots, data.sources, updateConnection, updateRoot],
   );
-  const aliases = useMemo(
-    () => [
-      ...new Set(
-        data.roots
-          .map((root) => root.rootAlias)
-          .filter((alias): alias is string => alias !== null),
-      ),
-    ],
-    [data.roots],
+  const canWatch = sourcesWithAliases.some(
+    (source) => source.enabled && source.allowedRootAliases.length > 0,
   );
   return (
     <>
@@ -447,16 +513,16 @@ export function SourcesTable({
           <button
             type="button"
             className={primaryButtonClass}
-            disabled={data.sources.length === 0 || aliases.length === 0}
+            disabled={!canWatch}
             onClick={() => setWatchDraft(EMPTY_DRAFT)}
           >
             Watch a folder
           </button>
         }
       />
-      {aliases.length === 0 && data.sources.length > 0 ? (
+      {!canWatch && data.sources.length > 0 ? (
         <p className="mt-2 text-xs text-kith-text-muted">
-          An existing allowed root is needed before a folder can be watched.
+          Waiting for an enabled connection's worker to report allowed roots.
         </p>
       ) : null}
       {failure ? (
@@ -466,13 +532,21 @@ export function SourcesTable({
       ) : null}
       <WatchFolderDrawer
         draft={watchDraft}
-        sources={data.sources}
-        aliases={aliases}
+        sources={sourcesWithAliases}
         areas={areas}
         onChange={setWatchDraft}
         onSave={createWatch}
       />
+      <EditRootDrawer
+        key={editingRoot?.id ?? "closed"}
+        root={editingRoot}
+        sources={sourcesWithAliases}
+        areas={areas}
+        onClose={() => setEditingRoot(null)}
+        onSave={editRoot}
+      />
       <EditConnectionDrawer
+        key={editing?.id ?? "closed"}
         source={editing}
         onClose={() => setEditing(null)}
         onSave={(name) => {
@@ -513,6 +587,45 @@ export function SourcesTable({
           </AlertDialog.Content>
         </AlertDialog.Portal>
       </AlertDialog.Root>
+      <AlertDialog.Root
+        open={disconnecting !== null}
+        onOpenChange={(open) => {
+          if (!open) setDisconnecting(null);
+        }}
+      >
+        <AlertDialog.Portal>
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-kith-overlay" />
+          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
+            <AlertDialog.Title className="kith-section-title">
+              Disconnect this connection?
+            </AlertDialog.Title>
+            <AlertDialog.Description className="mt-1 text-sm text-kith-text-secondary">
+              This stops and retires{" "}
+              {disconnecting
+                ? data.roots.filter(
+                    (root) => root.sourceAccountId === disconnecting.id,
+                  ).length
+                : 0}{" "}
+              watched locations. Worker access grants remain saved but cannot
+              scan this disconnected connection. Already indexed documents,
+              records, and provenance remain available.
+            </AlertDialog.Description>
+            <div className="mt-3 flex justify-end gap-2">
+              <AlertDialog.Cancel className={buttonClass}>
+                Cancel
+              </AlertDialog.Cancel>
+              <AlertDialog.Action
+                className={primaryButtonClass}
+                onClick={() => {
+                  if (disconnecting) disconnect(disconnecting);
+                }}
+              >
+                Disconnect
+              </AlertDialog.Action>
+            </div>
+          </AlertDialog.Content>
+        </AlertDialog.Portal>
+      </AlertDialog.Root>
     </>
   );
 }
@@ -520,18 +633,21 @@ export function SourcesTable({
 function WatchFolderDrawer({
   draft,
   sources,
-  aliases,
   areas,
   onChange,
   onSave,
 }: {
   draft: Draft | null;
   sources: Source[];
-  aliases: string[];
   areas: readonly string[];
   onChange: (draft: Draft | null) => void;
   onSave: (draft: Draft) => void;
 }) {
+  const aliases =
+    draft === null
+      ? []
+      : (sources.find((source) => source.id === draft.sourceAccountId)
+          ?.allowedRootAliases ?? []);
   const valid =
     draft !== null &&
     draft.sourceAccountId !== "" &&
@@ -551,7 +667,11 @@ function WatchFolderDrawer({
               className={inputClass}
               value={draft.sourceAccountId}
               onChange={(event) =>
-                onChange({ ...draft, sourceAccountId: event.target.value })
+                onChange({
+                  ...draft,
+                  sourceAccountId: event.target.value,
+                  rootAlias: "",
+                })
               }
             >
               <option value="" />
@@ -633,6 +753,106 @@ function WatchFolderDrawer({
           </div>
         </div>
       )}
+    </Drawer>
+  );
+}
+
+function EditRootDrawer({
+  root,
+  sources,
+  areas,
+  onClose,
+  onSave,
+}: {
+  root: Root | null;
+  sources: Source[];
+  areas: readonly string[];
+  onClose: () => void;
+  onSave: (root: Root, draft: Draft) => void;
+}) {
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const value =
+    root && (!draft || draft.sourceAccountId !== root.sourceAccountId)
+      ? {
+          sourceAccountId: root.sourceAccountId,
+          rootAlias: root.rootAlias ?? "",
+          relativePath: root.relativePath ?? "",
+          area: root.area ?? "",
+        }
+      : draft;
+  const aliases = root
+    ? (sources.find((source) => source.id === root.sourceAccountId)
+        ?.allowedRootAliases ?? [])
+    : [];
+  return (
+    <Drawer
+      open={root !== null}
+      onOpenChange={(open) => {
+        if (!open) {
+          setDraft(null);
+          onClose();
+        }
+      }}
+      title="Edit watched location"
+    >
+      {root && value ? (
+        <div className="flex flex-col gap-3">
+          <Field label="Folder">
+            <select
+              className={inputClass}
+              value={value.rootAlias}
+              onChange={(event) =>
+                setDraft({ ...value, rootAlias: event.target.value })
+              }
+            >
+              <option value="">Choose an allowed root</option>
+              {aliases.map((alias) => (
+                <option key={alias} value={alias}>
+                  {alias}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Folder path">
+            <input
+              className={inputClass}
+              value={value.relativePath}
+              onChange={(event) =>
+                setDraft({ ...value, relativePath: event.target.value })
+              }
+            />
+          </Field>
+          <Field label="Organize as">
+            <select
+              className={inputClass}
+              value={value.area}
+              onChange={(event) =>
+                setDraft({ ...value, area: event.target.value })
+              }
+            >
+              <option value="" />
+              {areas.map((area) => (
+                <option key={area} value={area}>
+                  {area}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <div className="flex justify-end gap-2">
+            <button type="button" className={buttonClass} onClick={onClose}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className={primaryButtonClass}
+              disabled={!value.rootAlias || !value.relativePath || !value.area}
+              onClick={() => onSave(root, value)}
+            >
+              Save
+            </button>
+          </div>
+        </div>
+      ) : null}
     </Drawer>
   );
 }

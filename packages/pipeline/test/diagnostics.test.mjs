@@ -138,6 +138,7 @@ test("watch heartbeat is bounded, non-overlapping, and stops its request", async
       call: async (request, signal) => {
         calls += 1;
         assert.deepEqual(Object.keys(request).sort(), [
+          "allowedRootAliases",
           "connectorVersion",
           // ADM-10 review: always sent, and minted once per process.
           "heartbeatNonce",
@@ -148,6 +149,7 @@ test("watch heartbeat is bounded, non-overlapping, and stops its request", async
           "watcherId",
         ]);
         assert.match(request.heartbeatNonce, /^[0-9a-f]{32}$/);
+        assert.deepEqual(request.allowedRootAliases, ["fixture"]);
         assert.equal(request.operation, "diagnostics.heartbeat");
         signal.addEventListener("abort", () => {
           aborted = true;

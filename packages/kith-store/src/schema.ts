@@ -292,6 +292,14 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "coverage gap actions: stable condition identity and immutable resolution audit (UI-IA)",
     url: new URL("../migrations/037_coverage_gap_actions.sql", import.meta.url),
   },
+  {
+    version: 38,
+    name: "source account lifecycle and worker-reported allowed roots (UI-IA)",
+    url: new URL(
+      "../migrations/038_source_account_lifecycle.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
