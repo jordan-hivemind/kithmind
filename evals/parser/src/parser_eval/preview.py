@@ -119,7 +119,7 @@ def _requested_pages(windows: object) -> list[int]:
         ):
             raise _PreviewFailure("invalid_preview_request")
         for page in range(start, start + count):
-            if page in seen:
+            if page in seen or (pages and page <= pages[-1]):
                 raise _PreviewFailure("invalid_preview_request")
             seen.add(page)
             pages.append(page)
@@ -235,7 +235,7 @@ def _preview_pdf(
         "inspectedPageNumbers": pages,
         "units": units,
         "method": _method(
-            "pdfplumber_native_text_preview",
+            "pdf_native_text_v1",
             dependency_versions,
         ),
     }
@@ -341,7 +341,7 @@ def _preview_xlsx(data: bytes, windows: object, deadline: float) -> dict[str, An
         "sheetCount": len(sheets),
         "sheets": sheets,
         "method": _method(
-            "xlsx_workbook_metadata_preview",
+            "spreadsheet_manifest_v1",
             {"python": platform.python_version()},
         ),
     }

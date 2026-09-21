@@ -115,7 +115,7 @@ class PdfPreviewTests(unittest.TestCase):
         )
         self.assertEqual(result["units"][1]["text"], "")
         self.assertEqual(
-            result["method"]["name"], "pdfplumber_native_text_preview"
+            result["method"]["name"], "pdf_native_text_v1"
         )
         self.assertEqual(len(result["method"]["fingerprint"]), 64)
 
@@ -128,6 +128,10 @@ class PdfPreviewTests(unittest.TestCase):
             [
                 {"startPage": 1, "pageCount": 2},
                 {"startPage": 2, "pageCount": 1},
+            ],
+            [
+                {"startPage": 4, "pageCount": 1},
+                {"startPage": 1, "pageCount": 1},
             ],
             [{"startPage": 5, "pageCount": 1}],
             [{"startPage": True, "pageCount": 1}],
@@ -227,7 +231,7 @@ class XlsxPreviewTests(unittest.TestCase):
         )
         self.assertNotIn("PRIVATE-CELL-VALUE", json.dumps(result))
         self.assertEqual(
-            result["method"]["name"], "xlsx_workbook_metadata_preview"
+            result["method"]["name"], "spreadsheet_manifest_v1"
         )
 
     def test_xlsx_refuses_windows_malformed_xml_and_entities(self) -> None:
