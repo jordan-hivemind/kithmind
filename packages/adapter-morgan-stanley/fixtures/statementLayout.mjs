@@ -260,7 +260,7 @@ export function lotsWithoutTotalLines({ first = {}, second = {} } = {}) {
 /**
  * F1-61. The same equity security, printed across a page break: three lots at
  * the bottom of one page, the page footer, the next page's running header,
- * the identical table header reprinted, and then the rest of the lots and the
+ * the same table header reprinted, and then the rest of the lots and the
  * `Total` row that states the position. Returns the two pages' lines.
  */
 export function pageSplitEquityPages() {
@@ -315,6 +315,7 @@ export function pageSplitEquityPages() {
         yieldPct: "1.26",
       }),
       "        Next Dividend Payable 04/2026; Asset Class: Equities",
+      "        Page 2 of 2",
     ],
   ];
 }

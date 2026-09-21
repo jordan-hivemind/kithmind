@@ -466,19 +466,203 @@ test("page continuations without Total aggregate only after the block completes"
   const pages = pageSplitEquityPages().map((page) =>
     page.filter((line) => !/\bTotal\s+\d/.test(line)),
   );
-  pages[1].push("        Page 2 of 2");
-  const parsed = parseStatementLines(
-    pages.map((page) => page.join("\n")).join(`\n${PAGE_SEPARATOR}\n`),
-    kind,
+  // The reprint is semantically identical but its columns and rows shifted
+  // together. Each page must bind against its own header offsets.
+  pages[1] = pages[1].map((line) =>
+    /Security Description|02\/20\/26/.test(line) ? `   ${line}` : line,
   );
+  const text = pages
+    .map((page) => page.join("\n"))
+    .join(`\n${PAGE_SEPARATOR}\n`);
+  const parsed = parseStatementLines(text, kind);
   assert.equal(parsed.holdings.positions.length, 1);
   const [position] = parsed.holdings.positions;
   assert.equal(position.quantity, "15");
   assert.equal(position.marketValue, "4776");
   assert.equal(position.locators["marketValue.lot.1"].index, 1);
   assert.equal(position.locators["marketValue.lot.3"].index, 2);
+  for (const lot of [1, 2, 3]) {
+    const { binding } = position.locators[`marketValue.lot.${lot}`];
+    assert.equal(text.slice(binding.start, binding.end), binding.quote);
+  }
+  assert.deepEqual(parseStatementLines(text, kind), parsed);
   const firstOnly = parseStatementLines(pages[0].join("\n"), kind);
   assert.deepEqual(firstOnly.holdings.positions, []);
+});
+
+test("a printed Total continues across a shifted semantic header", () => {
+  const pages = pageSplitEquityPages();
+  pages[1] = pages[1].map((line) =>
+    /Security Description|02\/20\/26|\bTotal\s+15/.test(line)
+      ? `    ${line}`
+      : line,
+  );
+  const parsed = parseStatementLines(
+    pages.map((page) => page.join("\n")).join(`\n${PAGE_SEPARATOR}\n`),
+    kind,
+  );
+  assert.equal(parsed.holdings.positions.length, 1);
+  assert.equal(parsed.holdings.positions[0].instrument.symbol, "WNDF");
+  assert.equal(parsed.holdings.positions[0].marketValue, "4776");
+});
+
+test("an unnumbered cover can anchor a complete adjacent printed-page run", () => {
+  const pages = pageSplitEquityPages().map((page) =>
+    page.filter((line) => !/\bTotal\s+\d/.test(line)),
+  );
+  const cover = ["        CLIENT STATEMENT   For the Period March 1-31, 2026"];
+  pages[0] = pages[0].map((line) =>
+    line.replace(/Page 1 of 2/g, "Page 2 of 3"),
+  );
+  pages[1] = pages[1].map((line) =>
+    line.replace(/Page 2 of 2/g, "Page 3 of 3"),
+  );
+  const parsed = parseStatementLines(
+    [cover, ...pages]
+      .map((page) => page.join("\n"))
+      .join(`\n${PAGE_SEPARATOR}\n`),
+    kind,
+  );
+  assert.equal(parsed.holdings.positions.length, 1);
+  assert.equal(parsed.holdings.positions[0].marketValue, "4776");
+});
+
+test("page topology and semantic changes cannot complete an interrupted lot block", () => {
+  const cases = [
+    {
+      name: "missing cover",
+      mutate(pages) {
+        pages[0] = pages[0].map((line) =>
+          line.replace(/Page 1 of 2/g, "Page 2 of 3"),
+        );
+        pages[1] = pages[1].map((line) =>
+          line.replace(/Page 2 of 2/g, "Page 3 of 3"),
+        );
+      },
+    },
+    {
+      name: "missing middle page",
+      mutate(pages) {
+        pages[0] = pages[0].map((line) =>
+          line.replace(/Page 1 of 2/g, "Page 1 of 3"),
+        );
+        pages[1] = pages[1].map((line) =>
+          line.replace(/Page 2 of 2/g, "Page 3 of 3"),
+        );
+      },
+    },
+    {
+      name: "duplicate page number",
+      mutate(pages) {
+        pages[1] = pages[1].map((line) =>
+          line.replace(/Page 2 of 2/g, "Page 1 of 2"),
+        );
+      },
+    },
+    {
+      name: "reordered page number",
+      mutate(pages) {
+        pages[0] = pages[0].map((line) =>
+          line.replace(/Page 1 of 2/g, "Page 2 of 2"),
+        );
+        pages[1] = pages[1].map((line) =>
+          line.replace(/Page 2 of 2/g, "Page 1 of 2"),
+        );
+      },
+    },
+    {
+      name: "inconsistent total",
+      mutate(pages) {
+        pages[1] = pages[1].map((line) =>
+          line.replace(/Page 2 of 2/g, "Page 2 of 3"),
+        );
+      },
+    },
+    {
+      name: "missing successor footer",
+      mutate(pages) {
+        pages[1] = pages[1].filter((line) => !/Page 2 of 2/.test(line));
+      },
+    },
+    {
+      name: "conflicting successor declarations",
+      mutate(pages) {
+        pages[1].push("        Page 2 of 3");
+      },
+    },
+    {
+      name: "changed column semantics",
+      mutate(pages) {
+        pages[1] = pages[1].map((line) =>
+          line.replace("Market Value", "Value       "),
+        );
+      },
+    },
+  ];
+  for (const { name, mutate } of cases) {
+    const pages = pageSplitEquityPages().map((page) =>
+      page.filter((line) => !/\bTotal\s+\d/.test(line)),
+    );
+    mutate(pages);
+    const parsed = parseStatementLines(
+      pages.map((page) => page.join("\n")).join(`\n${PAGE_SEPARATOR}\n`),
+      kind,
+    );
+    assert.equal(
+      parsed.holdings.positions.some(
+        (position) =>
+          position.instrument?.symbol === "WNDF" ||
+          position.marketValue === "4776",
+      ),
+      false,
+      name,
+    );
+    assert.match(parsed.parseNote, /holdings block\(s\) left unparsed/, name);
+  }
+});
+
+test("an empty extracted page prevents a page-spanning lot completion", () => {
+  const pages = pageSplitEquityPages().map((page) =>
+    page.filter((line) => !/\bTotal\s+\d/.test(line)),
+  );
+  const parsed = parseStatementLines(
+    [pages[0].join("\n"), "", pages[1].join("\n")].join(
+      `\n${PAGE_SEPARATOR}\n`,
+    ),
+    kind,
+  );
+  assert.equal(
+    parsed.holdings.positions.some(
+      (position) =>
+        position.instrument?.symbol === "WNDF" ||
+        position.marketValue === "4776",
+    ),
+    false,
+  );
+  assert.match(parsed.parseNote, /holdings block\(s\) left unparsed/);
+});
+
+test("a printed Total after a page gap cannot complete the interrupted security", () => {
+  const pages = pageSplitEquityPages();
+  pages[0] = pages[0].map((line) =>
+    line.replace(/Page 1 of 2/g, "Page 1 of 3"),
+  );
+  pages[1] = pages[1].map((line) =>
+    line.replace(/Page 2 of 2/g, "Page 3 of 3"),
+  );
+  const parsed = parseStatementLines(
+    pages.map((page) => page.join("\n")).join(`\n${PAGE_SEPARATOR}\n`),
+    kind,
+  );
+  // The Total row can still state a value on its own page, but it cannot take
+  // the interrupted prefix's description or make the document complete.
+  assert.equal(
+    parsed.holdings.positions.some(
+      (position) => position.instrument?.symbol === "WNDF",
+    ),
+    false,
+  );
+  assert.match(parsed.parseNote, /holdings block\(s\) left unparsed/);
 });
 
 test("a continuation for another account cannot complete a lot block", () => {

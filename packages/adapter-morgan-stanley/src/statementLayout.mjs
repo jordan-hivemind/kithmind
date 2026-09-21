@@ -638,6 +638,76 @@ const TABLE_END = /^(TOTAL|Total Value|HOLDINGS|CASH FLOW|ACTIVITY|Page \d)/;
  * interrupted block across to that reprint instead of refusing it.
  */
 const PAGE_FOOTER = /^Page\s+\d+\s+of\s+\d+$/;
+
+/**
+ * The one consistent printed page declaration on each extracted page.
+ * Statements can have an unnumbered cover, and consolidated statements can
+ * restart numbering, so this deliberately does not require the document to
+ * begin at printed page 1. A spanning table only needs the stronger local
+ * fact that its two physical pages are adjacent and their printed numbers are
+ * adjacent under the same declared total.
+ */
+function printedPages(lines) {
+  const declarations = new Map();
+  for (const line of lines) {
+    const match = /^\s*Page\s+(\d+)\s+of\s+(\d+)\s*$/.exec(line.text);
+    if (match === null) continue;
+    const declaration = `${match[1]}/${match[2]}`;
+    const seen = declarations.get(line.page) ?? new Set();
+    seen.add(declaration);
+    declarations.set(line.page, seen);
+  }
+  return new Map(
+    [...declarations].map(([page, seen]) => {
+      if (seen.size !== 1) return [page, null];
+      const [declaration] = seen;
+      const [number, total] = declaration.split("/").map(Number);
+      return [page, { number, total }];
+    }),
+  );
+}
+
+function continuesOnAdjacentPrintedPage(carried, headerLine, printedByPage) {
+  if (headerLine.page !== carried.page + 1) return false;
+  const before = printedByPage.get(carried.page);
+  const after = printedByPage.get(headerLine.page);
+  return (
+    before !== null &&
+    before !== undefined &&
+    after !== null &&
+    after !== undefined &&
+    before.total === after.total &&
+    before.number + 1 === after.number &&
+    before.number < before.total &&
+    after.number <= after.total &&
+    printedPageSequenceIsAnchored(headerLine.page, printedByPage)
+  );
+}
+
+/** Trace a local printed-page run to positive evidence of its beginning. A
+ * `Page 1` can begin an account-local run anywhere. An unnumbered cover is
+ * also supported when the later printed number agrees with the extracted
+ * physical page index. A missing cover cannot make physical page 1's
+ * `Page 2` look complete. */
+function printedPageSequenceIsAnchored(page, printedByPage) {
+  let physicalPage = page;
+  let declaration = printedByPage.get(physicalPage);
+  if (declaration === null || declaration === undefined) return false;
+  while (declaration.number > 1) {
+    const previous = printedByPage.get(physicalPage - 1);
+    if (
+      previous === null ||
+      previous === undefined ||
+      previous.total !== declaration.total ||
+      previous.number + 1 !== declaration.number
+    ) {
+      return declaration.number === physicalPage;
+    }
+    physicalPage -= 1;
+    declaration = previous;
+  }
+  return declaration.number === 1;
+}
 /**
  * F1-61. The sub-header a table reprints above a section's own totals rows
  * ("Percentage of Holdings", then the value columns again). Everything from
@@ -706,6 +776,13 @@ function resolveValueColumn(columns) {
     if (column.name !== "reportedValue") return [column];
     return pricesInNav ? [{ ...column, name: "marketValue" }] : [];
   });
+}
+
+/** Offsets may shift when a table header is reprinted on the next page. The
+ * ordered field/label pairs are its semantic identity; offsets remain local
+ * to each page and are used only to bind that page's rows. */
+function holdingsHeaderSignature(columns) {
+  return JSON.stringify(columns.map(({ name, text }) => [name, text]));
 }
 
 /** "CUSIP 00000WNF1" on a bond's detail line. */
@@ -1083,10 +1160,11 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
     else positions.push(position);
   };
   // F1-61. A security block a page footer interrupted, waiting for the same
-  // table to be reprinted on the next page. Flushed as it always was the
+  // table schema to be reprinted on the next page. Flushed as it always was the
   // moment anything other than that reprint turns up, so a block that is
   // never continued is still read exactly as before.
   let carried = null;
+  const printedByPage = printedPages(lines);
   const flushCarried = () => {
     if (carried === null) return;
     emit(carried.block, carried.columns, carried.context);
@@ -1118,17 +1196,18 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
       textMeta,
     );
 
-    const headerText = lines[i].text;
+    const headerSignature = holdingsHeaderSignature(columns);
     let block = [];
     let description = null;
-    // F1-61. This table reprints the header the page footer above cut a
+    // F1-61. This table reprints the semantic header the page footer above cut a
     // security off under, for the same account: the rows below continue that
     // security's block rather than starting a new one. Anything else flushes
     // the carried block first, unchanged.
     if (
       carried !== null &&
-      carried.headerText === headerText &&
-      carried.context.accountKey === accountKey
+      carried.headerSignature === headerSignature &&
+      carried.context.accountKey === accountKey &&
+      continuesOnAdjacentPrintedPage(carried, lines[i], printedByPage)
     ) {
       block = carried.block;
       description = carried.description;
@@ -1214,9 +1293,12 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
           ...context,
           section,
           description,
-          allowLotAggregation: finalPageFooter,
+          allowLotAggregation:
+            finalPageFooter &&
+            printedPageSequenceIsAnchored(lines[i].page, printedByPage),
         },
-        headerText,
+        headerSignature,
+        page: lines[i].page,
       };
     } else {
       flush();
