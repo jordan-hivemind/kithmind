@@ -107,7 +107,7 @@ test(
         [[...PG_TABLES]],
       );
       assert.equal(Number(tables.rows[0].n), PG_TABLES.length);
-      assert.equal(PG_TABLES.length, 20);
+      assert.equal(PG_TABLES.length, 22);
 
       // Running it again is a no-op: one row per migration applied, no extra
       // row, revision bump, or error.
@@ -118,6 +118,120 @@ test(
         "SELECT count(*)::text AS n FROM schema_version",
       );
       assert.equal(Number(versions.rows[0].n), PG_MIGRATIONS.length);
+    });
+  },
+);
+
+test(
+  "position scope history is immutable, source-owned, generation-bound, and forgotten with its document",
+  { skip },
+  async () => {
+    await withArchive(async (client) => {
+      const accountId = await seedAccount(client);
+      const otherAccountId = await seedAccount(client, "EUR");
+      await client.query(
+        `INSERT INTO documents
+           (id, institution_id, account_id, doc_type, doc_date, file_path,
+            sha256, retained_sha256, retained_byte_length, media_type,
+            capture_id, parsed_ok)
+         VALUES ('scope-doc', 'inst-1', $1, 'statement', DATE '2026-03-31',
+                 '/raw/scope-doc', $2, $2, 10, 'application/pdf',
+                 'scope-capture', FALSE),
+                ('other-doc', 'inst-1', $1, 'statement', DATE '2026-03-31',
+                 '/raw/other-doc', $3, $3, 10, 'application/pdf',
+                 'other-capture', FALSE)`,
+        [accountId, "a".repeat(64), "b".repeat(64)],
+      );
+      await client.query(
+        `INSERT INTO holding_projection_generations
+           (id, document_id, generation_number, generation_kind,
+            retained_sha256, projection_digest, created_at, activated_at)
+         VALUES ('other-generation', 'other-doc', 1, 'baseline', $1, $2,
+                 now(), now())`,
+        ["b".repeat(64), "c".repeat(64)],
+      );
+
+      await assert.rejects(
+        client.query(
+          `INSERT INTO position_scope_observations
+             (id, source_document_id, holding_projection_generation_id,
+              retained_sha256, account_id, as_of, proof_version, status,
+              emitted_position_count, gap_codes, evidence, created_at)
+           VALUES ('wrong-generation', 'scope-doc', 'other-generation', $1,
+                   $2, DATE '2026-03-31', 'position_scope_v1', 'complete',
+                   1, '{}', '{"tables":[]}', now())`,
+          ["a".repeat(64), accountId],
+        ),
+        /foreign key/i,
+      );
+
+      await client.query(
+        `INSERT INTO position_scope_observations
+           (id, source_document_id, retained_sha256, account_id, as_of,
+            proof_version, status, emitted_position_count, gap_codes,
+            zero_basis, evidence, created_at)
+         VALUES ('scope-1', 'scope-doc', $1, $2, DATE '2026-03-31',
+                 'position_scope_v1', 'complete', 1, '{}', NULL,
+                 '{"tables":[]}', now())`,
+        ["a".repeat(64), accountId],
+      );
+      await client.query(
+        `INSERT INTO position_scope_memberships
+           (source_document_id, scope_id, position_row_hash, account_id,
+            as_of, quantity, price, market_value, cost_basis, unrealized,
+            currency, valuation_basis, valuation_note, source_locator)
+         VALUES ('scope-doc', 'scope-1', $1, $2, DATE '2026-03-31',
+                 1, 2, 2, 1, 1, 'USD', 'market_price', 'synthetic',
+                 '{"row":{"source":"synthetic","index":1}}')`,
+        ["d".repeat(64), accountId],
+      );
+
+      await assert.rejects(
+        client.query(
+          "UPDATE position_scope_observations SET status = 'partial' WHERE id = 'scope-1'",
+        ),
+        /immutable/i,
+      );
+      await assert.rejects(
+        client.query(
+          "UPDATE position_scope_memberships SET account_id = $1 WHERE scope_id = 'scope-1'",
+          [otherAccountId],
+        ),
+        /immutable/i,
+      );
+      await assert.rejects(
+        client.query(
+          `INSERT INTO position_scope_memberships
+             (source_document_id, scope_id, position_row_hash, account_id,
+              as_of, currency, source_locator)
+           VALUES ('scope-doc', 'scope-1', $1, $2, DATE '2026-03-31',
+                   'EUR', '{}')`,
+          ["e".repeat(64), otherAccountId],
+        ),
+        /foreign key/i,
+      );
+
+      await client.query("DELETE FROM documents WHERE id = 'scope-doc'");
+      assert.equal(
+        Number(
+          (
+            await client.query(
+              "SELECT count(*)::text AS n FROM position_scope_observations",
+            )
+          ).rows[0].n,
+        ),
+        0,
+      );
+      assert.equal(
+        Number(
+          (
+            await client.query(
+              "SELECT count(*)::text AS n FROM position_scope_memberships",
+            )
+          ).rows[0].n,
+        ),
+        0,
+      );
     });
   },
 );
@@ -169,12 +283,7 @@ test(
     await withArchive(async (client) => {
       const accountId = await seedAccount(client);
       const before = Number((await oneRevision(client)).revision);
-      const values = [
-        "alias-revision",
-        accountId,
-        "inst-1",
-        "111-222222-333",
-      ];
+      const values = ["alias-revision", accountId, "inst-1", "111-222222-333"];
 
       await client.query(
         `INSERT INTO account_aliases
@@ -188,7 +297,9 @@ test(
         [values[0]],
       );
       assert.equal((await oneRevision(client)).revision, String(before + 2));
-      await client.query("DELETE FROM account_aliases WHERE id = $1", [values[0]]);
+      await client.query("DELETE FROM account_aliases WHERE id = $1", [
+        values[0],
+      ]);
       assert.equal((await oneRevision(client)).revision, String(before + 3));
 
       await client.query("BEGIN");

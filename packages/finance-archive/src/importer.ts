@@ -34,6 +34,8 @@
 
 import { randomUUID } from "node:crypto";
 
+import type { PositionScopeEvidence, PositionScopeGapCode } from "./adapter.js";
+
 import { multiplyDecimal } from "./decimal.js";
 import {
   assertCandidateHashesOwnedByDocument,
@@ -245,6 +247,18 @@ export type ImportLiability = {
   sourceLocator: string;
 };
 
+/** One adapter-proved source position projection for an exact account/date. */
+export type ImportPositionScope = {
+  accountId: string;
+  asOf: string;
+  proofVersion: "position_scope_v1";
+  status: "complete" | "partial";
+  emittedPositionCount: number;
+  gapCodes: readonly PositionScopeGapCode[];
+  zeroBasis?: "source_stated_none";
+  evidence: PositionScopeEvidence;
+};
+
 /**
  * One acquired file (a raw statement, or one page of a paginated pull) and
  * the rows parsed from it. Rows are attributed to `documents` by content
@@ -321,6 +335,8 @@ export type ImportDocument = {
   positions?: readonly ImportPosition[];
   balances?: readonly ImportBalance[];
   liabilities?: readonly ImportLiability[];
+  /** Optional positive source observations; absence preserves legacy gates. */
+  positionScopes?: readonly ImportPositionScope[];
 };
 
 /**
@@ -465,6 +481,16 @@ const VALUATION_BASES = new Set([
   "last_round",
   "cost",
   "reported_nav",
+]);
+/** Mirrors adapter.ts's closed gap union and migration 15's CHECK. */
+const POSITION_SCOPE_GAP_CODES = new Set<PositionScopeGapCode>([
+  "unresolved_lots",
+  "missing_security_start",
+  "unsupported_table_header",
+  "unsupported_value_column",
+  "page_sequence_gap",
+  "unbounded_account_scope",
+  "unproven_empty",
 ]);
 
 type ReviewCandidate = {
@@ -1823,6 +1849,255 @@ export async function importBatch(
     };
   }
 
+  type PreparedPositionScopeMember = {
+    hash: string;
+    accountId: string;
+    asOf: string;
+    instrumentId: string | null;
+    quantity: string | null;
+    price: string | null;
+    marketValue: string | null;
+    costBasis: string | null;
+    unrealized: string | null;
+    currency: string;
+    valuationBasis: string | null;
+    valuationNote: string | null;
+    sourceLocator: string;
+  };
+
+  function positionScopeMember(
+    prepared: PreparedHolding,
+  ): PreparedPositionScopeMember {
+    return {
+      hash: prepared.hash,
+      accountId: String(prepared.values[1]),
+      asOf: String(prepared.values[2]),
+      instrumentId: (prepared.values[3] as string | null) ?? null,
+      quantity: (prepared.values[4] as string | null) ?? null,
+      price: (prepared.values[5] as string | null) ?? null,
+      marketValue: (prepared.values[6] as string | null) ?? null,
+      costBasis: (prepared.values[7] as string | null) ?? null,
+      unrealized: (prepared.values[8] as string | null) ?? null,
+      currency: String(prepared.values[9]),
+      valuationBasis: (prepared.values[10] as string | null) ?? null,
+      valuationNote: (prepared.values[11] as string | null) ?? null,
+      sourceLocator: String(prepared.values[13]),
+    };
+  }
+
+  /**
+   * Persist immutable source coverage without claiming ownership of current
+   * rows. A foreign-owned global hash can be a member, but the read predicate
+   * later compares every stored semantic field and the complete account/date
+   * set before using it. A replay of the same proof is a no-op; a changed
+   * payload under the same proof version is refused.
+   */
+  async function persistPositionScopes(
+    document: ImportDocument,
+    documentId: string,
+    generationId: string | null,
+    preparedPositions: readonly PreparedHolding[],
+  ): Promise<void> {
+    if ((document.positionScopes?.length ?? 0) === 0) return;
+    if (
+      document.retainedSha256 === null ||
+      document.retainedSha256 === undefined
+    ) {
+      openReview(document.accountId, documentId, null, {
+        kind: "position_scope_unretained",
+        rawValue: "position_scope_v1",
+        reason:
+          "position scope proof was not stored because the source document has no retained SHA-256 binding",
+      });
+      return;
+    }
+
+    const seen = new Set<string>();
+    for (const scope of document.positionScopes ?? []) {
+      const key = `${scope.accountId}\u0000${scope.asOf}\u0000${scope.proofVersion}`;
+      const gapCodes = [...new Set(scope.gapCodes)].sort();
+      const members = preparedPositions
+        .map(positionScopeMember)
+        .filter(
+          (member) =>
+            member.accountId === scope.accountId && member.asOf === scope.asOf,
+        );
+      const distinctHashes = new Set(members.map((member) => member.hash));
+      const structural =
+        ISO_DATE.test(scope.asOf) &&
+        Number.isSafeInteger(scope.emittedPositionCount) &&
+        scope.emittedPositionCount >= 0 &&
+        scope.gapCodes.every((code) => POSITION_SCOPE_GAP_CODES.has(code)) &&
+        gapCodes.length === scope.gapCodes.length &&
+        ((scope.status === "complete" && gapCodes.length === 0) ||
+          (scope.status === "partial" && gapCodes.length > 0)) &&
+        (scope.status === "complete" && scope.emittedPositionCount === 0
+          ? scope.zeroBasis === "source_stated_none"
+          : scope.zeroBasis === undefined) &&
+        members.length === scope.emittedPositionCount &&
+        distinctHashes.size === members.length &&
+        !seen.has(key);
+      if (!structural) {
+        openReview(scope.accountId, documentId, null, {
+          kind: "position_scope_mismatch",
+          rawValue: `${scope.asOf}:${scope.proofVersion}`,
+          reason:
+            "position scope proof was not stored because its account/date emitted count, gap state, zero basis, or distinct prepared membership did not match the mapped source positions",
+        });
+        continue;
+      }
+      seen.add(key);
+
+      const existing = await client.query<{
+        id: string;
+        payload_matches: boolean;
+      }>(
+        `SELECT id,
+                retained_sha256 = $6
+                AND status = $7
+                AND emitted_position_count = $8
+                AND gap_codes = $9::text[]
+                AND zero_basis IS NOT DISTINCT FROM $10
+                AND evidence = $11::jsonb AS payload_matches
+           FROM position_scope_observations
+          WHERE source_document_id = $1
+            AND holding_projection_generation_id IS NOT DISTINCT FROM $2
+            AND account_id = $3 AND as_of = $4::date AND proof_version = $5`,
+        [
+          documentId,
+          generationId,
+          scope.accountId,
+          scope.asOf,
+          scope.proofVersion,
+          document.retainedSha256,
+          scope.status,
+          scope.emittedPositionCount,
+          gapCodes,
+          scope.zeroBasis ?? null,
+          JSON.stringify(scope.evidence),
+        ],
+      );
+      let scopeId = existing.rows[0]?.id;
+      if (scopeId === undefined) {
+        scopeId = randomUUID();
+        await client.query(
+          `INSERT INTO position_scope_observations
+             (id, source_document_id, holding_projection_generation_id,
+              retained_sha256, account_id, as_of, proof_version, status,
+              emitted_position_count, gap_codes, zero_basis, evidence, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6::date, $7, $8, $9,
+                   $10::text[], $11, $12::jsonb, $13)`,
+          [
+            scopeId,
+            documentId,
+            generationId,
+            document.retainedSha256,
+            scope.accountId,
+            scope.asOf,
+            scope.proofVersion,
+            scope.status,
+            scope.emittedPositionCount,
+            gapCodes,
+            scope.zeroBasis ?? null,
+            JSON.stringify(scope.evidence),
+            startedAt,
+          ],
+        );
+        await insertRows(
+          client,
+          "position_scope_memberships",
+          [
+            "source_document_id",
+            "scope_id",
+            "position_row_hash",
+            "account_id",
+            "as_of",
+            "instrument_id",
+            "quantity",
+            "price",
+            "market_value",
+            "cost_basis",
+            "unrealized",
+            "currency",
+            "valuation_basis",
+            "valuation_note",
+            "source_locator",
+          ],
+          members.map((member) => [
+            documentId,
+            scopeId,
+            member.hash,
+            member.accountId,
+            member.asOf,
+            member.instrumentId,
+            member.quantity,
+            member.price,
+            member.marketValue,
+            member.costBasis,
+            member.unrealized,
+            member.currency,
+            member.valuationBasis,
+            member.valuationNote,
+            member.sourceLocator,
+          ]),
+        );
+        continue;
+      }
+      if (existing.rows[0]?.payload_matches !== true) {
+        throw new Error(
+          "position scope replay changed an immutable proof payload",
+        );
+      }
+      const storedMembers = await client.query<{
+        position_row_hash: string;
+        account_id: string;
+        as_of: string;
+        instrument_id: string | null;
+        quantity: string | null;
+        price: string | null;
+        market_value: string | null;
+        cost_basis: string | null;
+        unrealized: string | null;
+        currency: string;
+        valuation_basis: string | null;
+        valuation_note: string | null;
+        source_locator: string;
+      }>(
+        `SELECT position_row_hash, account_id, as_of::text AS as_of,
+                instrument_id, quantity::text AS quantity, price::text AS price,
+                market_value::text AS market_value,
+                cost_basis::text AS cost_basis, unrealized::text AS unrealized,
+                currency::text AS currency, valuation_basis, valuation_note,
+                source_locator
+           FROM position_scope_memberships WHERE scope_id = $1
+          ORDER BY position_row_hash`,
+        [scopeId],
+      );
+      const expected = [...members]
+        .sort((left, right) => left.hash.localeCompare(right.hash))
+        .map((member) => ({
+          position_row_hash: member.hash,
+          account_id: member.accountId,
+          as_of: member.asOf,
+          instrument_id: member.instrumentId,
+          quantity: member.quantity,
+          price: member.price,
+          market_value: member.marketValue,
+          cost_basis: member.costBasis,
+          unrealized: member.unrealized,
+          currency: member.currency,
+          valuation_basis: member.valuationBasis,
+          valuation_note: member.valuationNote,
+          source_locator: member.sourceLocator,
+        }));
+      if (JSON.stringify(storedMembers.rows) !== JSON.stringify(expected)) {
+        throw new Error(
+          "position scope replay changed immutable source memberships",
+        );
+      }
+    }
+  }
+
   function prepareBalance(
     balance: ImportBalance,
     accountId: string,
@@ -2219,6 +2494,7 @@ export async function importBatch(
   async function processHoldings(
     document: ImportDocument,
     documentId: string,
+    generationId: string | null = null,
   ): Promise<{ anySuccess: boolean; projectionSafe: boolean }> {
     let anySuccess = false;
 
@@ -2301,6 +2577,12 @@ export async function importBatch(
             "old rows and evidence were preserved, no reparsed holdings were published, " +
             "and the document remains partial pending a reviewed replacement",
         });
+        await persistPositionScopes(
+          document,
+          documentId,
+          generationId,
+          preparedPositions,
+        );
         return { anySuccess: false, projectionSafe: false };
       }
     }
@@ -2340,6 +2622,13 @@ export async function importBatch(
     ) {
       anySuccess = true;
     }
+
+    await persistPositionScopes(
+      document,
+      documentId,
+      generationId,
+      preparedPositions,
+    );
 
     return { anySuccess, projectionSafe: true };
   }
@@ -2421,6 +2710,11 @@ export async function importBatch(
         // this archive already has.
         rowsDeduplicated += document.rows.length;
         await processHoldings(document, existing.id);
+        // Scope validation can open a bounded mismatch/unretained review on
+        // this already-parsed path. Flush it against this document before
+        // moving to the next one; pending reviews must never bleed across
+        // document attribution.
+        await flushReviews(existing.id);
         // F1-76 phase 3. Instrument-match decisions are re-derived on every
         // reparse (resolution happens in adapterImport.ts, before this skip),
         // and this is the path a whole-archive reparse of already-imported
@@ -2677,6 +2971,19 @@ export async function importBatch(
               "authoritative replay did not exactly restate this document's active reviewed holding projection; current holdings and history were preserved and the document remains partial",
           });
         }
+        const scopePositions: PreparedHolding[] = [];
+        for (const position of document.positions ?? []) {
+          const accountId = position.accountId ?? document.accountId;
+          if (accountId === null) continue;
+          const ready = preparePosition(position, accountId, documentId);
+          if (ready !== null) scopePositions.push(ready);
+        }
+        await persistPositionScopes(
+          document,
+          documentId,
+          versionedGenerationId,
+          scopePositions,
+        );
       } else {
         const holdings = await processHoldings(document, documentId);
         if (holdings.anySuccess) anySuccess = true;

@@ -1090,6 +1090,109 @@ CREATE TRIGGER holding_projection_memberships_immutable
   FOR EACH ROW EXECUTE FUNCTION reject_holding_projection_history_update();
 `;
 
+// Positive source coverage is separate from the mutable current position
+// mirror. One observation records what one retained document proved for one
+// account/date; its memberships name the exact semantic position hashes that
+// parser emitted and retain that document's own evidence locator. A member is
+// intentionally not a foreign key to positions: another document may own the
+// globally deduplicated current row, and removing or replacing that row must
+// make the read predicate fail closed rather than delete source history.
+//
+// A versioned document binds an observation to the projection generation it
+// was replayed against. A later reviewed replacement therefore retires the
+// proof from reads without mutating it. Unversioned documents use the partial
+// unique index below and retain the conservative one-proof-version rule.
+const POSITION_SCOPE_OBSERVATIONS = `
+CREATE TABLE position_scope_observations (
+  id TEXT PRIMARY KEY,
+  source_document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  holding_projection_generation_id TEXT,
+  retained_sha256 TEXT NOT NULL CHECK (retained_sha256 ~ '^[0-9a-f]{64}$'),
+  account_id TEXT NOT NULL REFERENCES accounts(id),
+  as_of DATE NOT NULL,
+  proof_version TEXT NOT NULL CHECK (proof_version = 'position_scope_v1'),
+  status TEXT NOT NULL CHECK (status IN ('complete', 'partial')),
+  emitted_position_count BIGINT NOT NULL CHECK (emitted_position_count >= 0),
+  gap_codes TEXT[] NOT NULL,
+  zero_basis TEXT CHECK (zero_basis IS NULL OR zero_basis = 'source_stated_none'),
+  evidence JSONB NOT NULL CHECK (jsonb_typeof(evidence) = 'object'),
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (source_document_id, id),
+  UNIQUE (source_document_id, id, account_id, as_of),
+  FOREIGN KEY (source_document_id, holding_projection_generation_id)
+    REFERENCES holding_projection_generations(document_id, id),
+  CHECK (gap_codes <@ ARRAY[
+    'unresolved_lots',
+    'missing_security_start',
+    'unsupported_table_header',
+    'unsupported_value_column',
+    'page_sequence_gap',
+    'unbounded_account_scope',
+    'unproven_empty'
+  ]::TEXT[]),
+  CHECK (
+    (status = 'complete' AND cardinality(gap_codes) = 0)
+    OR (status = 'partial' AND cardinality(gap_codes) > 0)
+  ),
+  CHECK (
+    (status = 'complete' AND emitted_position_count = 0
+      AND zero_basis = 'source_stated_none')
+    OR (status = 'complete' AND emitted_position_count > 0
+      AND zero_basis IS NULL)
+    OR (status = 'partial' AND zero_basis IS NULL)
+  )
+);
+
+CREATE UNIQUE INDEX position_scope_observations_unversioned_key
+  ON position_scope_observations
+    (source_document_id, account_id, as_of, proof_version)
+  WHERE holding_projection_generation_id IS NULL;
+
+CREATE UNIQUE INDEX position_scope_observations_versioned_key
+  ON position_scope_observations
+    (source_document_id, holding_projection_generation_id,
+     account_id, as_of, proof_version)
+  WHERE holding_projection_generation_id IS NOT NULL;
+
+CREATE TABLE position_scope_memberships (
+  source_document_id TEXT NOT NULL,
+  scope_id TEXT NOT NULL,
+  position_row_hash TEXT NOT NULL CHECK (position_row_hash ~ '^[0-9a-f]{64}$'),
+  account_id TEXT NOT NULL REFERENCES accounts(id),
+  as_of DATE NOT NULL,
+  instrument_id TEXT REFERENCES instruments(id),
+  quantity finance_numeric,
+  price finance_numeric,
+  market_value finance_numeric,
+  cost_basis finance_numeric,
+  unrealized finance_numeric,
+  currency currency_code NOT NULL,
+  valuation_basis TEXT CHECK (valuation_basis IS NULL
+    OR valuation_basis IN ('market_price', 'last_round', 'cost', 'reported_nav')),
+  valuation_note TEXT,
+  source_locator TEXT NOT NULL,
+  PRIMARY KEY (scope_id, position_row_hash),
+  FOREIGN KEY (source_document_id, scope_id, account_id, as_of)
+    REFERENCES position_scope_observations
+      (source_document_id, id, account_id, as_of)
+    ON DELETE CASCADE
+);
+
+CREATE TRIGGER position_scope_observations_immutable
+  BEFORE UPDATE ON position_scope_observations
+  FOR EACH ROW EXECUTE FUNCTION reject_holding_projection_history_update();
+CREATE TRIGGER position_scope_memberships_immutable
+  BEFORE UPDATE ON position_scope_memberships
+  FOR EACH ROW EXECUTE FUNCTION reject_holding_projection_history_update();
+
+CREATE TRIGGER finance_read_revision_bump
+  BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON position_scope_observations
+  FOR EACH STATEMENT EXECUTE FUNCTION bump_finance_read_revision();
+CREATE TRIGGER finance_read_revision_bump
+  BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON position_scope_memberships
+  FOR EACH STATEMENT EXECUTE FUNCTION bump_finance_read_revision();
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -1162,6 +1265,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     name: "immutable holding projection generations and current document pointer",
     sql: HOLDING_PROJECTION_GENERATIONS,
   },
+  {
+    version: 15,
+    name: "account-scoped position coverage observations and exact memberships",
+    sql: POSITION_SCOPE_OBSERVATIONS,
+  },
 ]);
 
 /** The version an archive reaches once every migration has been applied. */
@@ -1190,6 +1298,8 @@ export const PG_TABLES: readonly string[] = Object.freeze([
   "holding_projection_generations",
   "holding_projection_assertions",
   "holding_projection_generation_memberships",
+  "position_scope_observations",
+  "position_scope_memberships",
 ]);
 
 /**

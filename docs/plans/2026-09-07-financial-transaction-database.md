@@ -488,7 +488,7 @@ then grants the existing finance reader `SELECT` on those three tables without
 rotating its password. Historical position, balance and liability evidence is
 verified through the reader credential before any correction is activated.
 The adapter contract can additionally return optional positive position-scope
-observations for later persistence. A scope names the exact document-local
+observations. A scope names the exact document-local
 account and statement date, emitted position count, closed parser-gap codes and
 retained-text evidence for each table header and end. Complete status requires
 a positively bounded account section, every observed table accounted for and
@@ -496,15 +496,39 @@ an anchored continuous printed-page run. A complete zero-position scope also
 requires the statement's own explicit assertion that the account holds none;
 no rows and no rejected blocks are never enough. Consolidated tables before an
 account marker produce no account scope. Older adapters and documents omit the
-optional field and keep the conservative document-wide behavior above. Until
-the account-scope persistence migration and reader integration land, these
-adapter observations do not relax `documents.parsed_ok` or any read gate.
-Adding or tightening this metadata must preserve the adapter's emitted
+optional field and keep the conservative document-wide behavior above. The
+absence of a valid positive observation does not relax `documents.parsed_ok`
+or any read gate. Adding or tightening this metadata must preserve the adapter's emitted
 holdings unless a separate parser defect and its intended correction are
 demonstrated. Regression fixtures cover printed page declarations at both the
 bottom of the preceding physical page and the top of the following page, and
 assert the same semantic holdings output rather than relying only on passing
 fixture counts.
+
+Migration 15 persists those observations in immutable
+`position_scope_observations` and `position_scope_memberships`. Each
+observation binds the retained SHA-256, account, date, proof version, status,
+count, closed gaps, zero basis and source evidence. Each membership retains the
+source's own locator plus every stored position semantic field. It deliberately
+does not own or rehome the canonical position row. A second retained source may
+vouch for a globally deduplicated row only when its full semantics match.
+Versioned observations bind the active holding-projection generation;
+unversioned observations become ineligible when a generation is activated.
+Deleting a source document cascades its proof, while direct updates to either
+proof table are refused.
+
+Inventory, direct snapshots and holdings aggregates accept a scope only when
+it is complete, its retained SHA and generation are current, every membership
+still has a full-semantic canonical match, and the membership set equals the
+entire current account/date snapshot. A subset, extra row, semantic drift,
+partial scope or stale generation therefore fails closed. A complete zero-row
+scope is selectable only with `source_stated_none`. An exact scope can replace
+that source document's generic `document_unparsed` finding for the proved
+account/date. Account-specific findings such as ambiguous values and balance
+conflicts, null-account document findings, and failed or pending position
+reconciliations remain blocking. Legacy documents with no scope keep the
+document-wide rule, and one unsafe contributor still withholds a mixed-source
+date.
 
 Coverage is reported at the same granularity as the record contract requires,
 so the later Kith Mind adapter wraps this surface rather than re-deriving it.

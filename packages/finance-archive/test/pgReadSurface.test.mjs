@@ -1190,6 +1190,362 @@ test(
 );
 
 test(
+  "exact account scopes admit only their full semantic snapshot and preserve ordinary review gates",
+  { skip },
+  async (t) => {
+    const { owner, reader: r } = await fixture(t);
+    const source = await institution(owner, "account-scope-proof", {
+      accounts: 2,
+    });
+    const [completeAccount, partialAccount] = source.accountIds;
+    const asOf = "2026-07-31";
+    const canonicalDoc = await document(
+      owner,
+      source.id,
+      completeAccount,
+      asOf,
+    );
+    const consolidatedDoc = await document(owner, source.id, null, asOf);
+    await makeDocumentCitable(owner, canonicalDoc);
+    await makeDocumentCitable(owner, consolidatedDoc);
+    await owner.query(
+      `INSERT INTO instruments (id, symbol, name)
+       VALUES ('scope-complete-instrument', 'SCP1', 'Synthetic Complete Fund'),
+              ('scope-partial-instrument', 'SCP2', 'Synthetic Partial Fund')`,
+    );
+    await owner.query("UPDATE documents SET parsed_ok = FALSE WHERE id = $1", [
+      consolidatedDoc,
+    ]);
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, instrument_id, quantity, price, market_value, cost_basis,
+          unrealized, currency, valuation_basis, valuation_note,
+          source_document_id, source_locator, row_hash)
+       VALUES ('scope-complete-position', $1, $3::date,
+               'scope-complete-instrument', 2, 50, 100, 80,
+               20, 'USD', 'market_price', 'Synthetic stated mark', $2,
+               $7, $4),
+              ('scope-partial-position', $5, $3::date,
+               'scope-partial-instrument', 1, 60, 60, 50,
+               10, 'USD', 'market_price', 'Synthetic stated mark', $2,
+               $8, $6)`,
+      [
+        completeAccount,
+        canonicalDoc,
+        asOf,
+        "a".repeat(64),
+        partialAccount,
+        "b".repeat(64),
+        structuredBindings({
+          quantity: "2",
+          price: "50",
+          marketValue: "100",
+          costBasis: "80",
+          unrealized: "20",
+        }),
+        structuredBindings({
+          quantity: "1",
+          price: "60",
+          marketValue: "60",
+          costBasis: "50",
+          unrealized: "10",
+        }),
+      ],
+    );
+    const retained = (
+      await one(owner, "SELECT retained_sha256 FROM documents WHERE id = $1", [
+        consolidatedDoc,
+      ])
+    ).retained_sha256;
+    await owner.query(
+      `INSERT INTO position_scope_observations
+         (id, source_document_id, retained_sha256, account_id, as_of,
+          proof_version, status, emitted_position_count, gap_codes,
+          evidence, created_at)
+       VALUES ('scope-complete', $1, $2, $3, $5::date,
+               'position_scope_v1', 'complete', 1, '{}',
+               '{"tables":[{"headers":[{"source":"synthetic","index":1}],"end":{"source":"synthetic","index":2}}],"scopeEnd":{"source":"synthetic","index":3}}',
+               now()),
+              ('scope-partial', $1, $2, $4, $5::date,
+               'position_scope_v1', 'partial', 1,
+               ARRAY['unresolved_lots'],
+               '{"tables":[{"headers":[{"source":"synthetic","index":4}]}]}',
+               now())`,
+      [consolidatedDoc, retained, completeAccount, partialAccount, asOf],
+    );
+    await owner.query(
+      `INSERT INTO position_scope_memberships
+         (source_document_id, scope_id, position_row_hash, account_id, as_of,
+          instrument_id, quantity, price, market_value, cost_basis, unrealized,
+          currency, valuation_basis, valuation_note, source_locator)
+       VALUES ($1, 'scope-complete', $4, $2, $6::date,
+               'scope-complete-instrument', 2, 50, 100,
+               80, 20, 'USD', 'market_price', 'Synthetic stated mark',
+               '{"row":{"source":"consolidated","index":11}}'),
+              ($1, 'scope-partial', $5, $3, $6::date,
+               'scope-partial-instrument', 1, 60, 60,
+               50, 10, 'USD', 'market_price', 'Synthetic stated mark',
+               '{"row":{"source":"consolidated","index":12}}')`,
+      [
+        consolidatedDoc,
+        completeAccount,
+        partialAccount,
+        "a".repeat(64),
+        "b".repeat(64),
+        asOf,
+      ],
+    );
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES ('scope-generic-unparsed', 'document_unparsed', NULL, $1,
+               'partial consolidated source', 'another account has gaps',
+               'open')`,
+      [consolidatedDoc],
+    );
+
+    const snapshot = async (accountId) =>
+      serve(r, {
+        operation: "get_holdings_snapshot",
+        accountId,
+        snapshot: { mode: "exact", asOf },
+      });
+    const aggregate = async (accountId) =>
+      serve(r, {
+        operation: "aggregate_money",
+        metric: "market_value",
+        groupBy: "currency",
+        accountId,
+        from: asOf,
+        toExclusive: "2026-08-01",
+      });
+
+    let complete = await snapshot(completeAccount);
+    assert.equal(complete.summary.status, "partial");
+    assert.equal(complete.summary.positionCount, 1);
+    assert.equal(
+      complete.summary.currencies[0].marketValue.amount.decimal,
+      "100",
+    );
+    assert.equal(complete.coverage.reasons.includes("failed_import"), false);
+    let completeAggregate = await aggregate(completeAccount);
+    assert.equal(completeAggregate.items[0].total.decimal, "100");
+    assert.equal(
+      completeAggregate.coverage.reasons.includes("failed_import"),
+      false,
+    );
+
+    const partial = await snapshot(partialAccount);
+    assert.equal(partial.summary.status, "unavailable");
+    assert.equal(partial.summary.reason, "incomplete_source");
+    assert.ok(partial.coverage.reasons.includes("failed_import"));
+    assert.deepEqual((await aggregate(partialAccount)).items, []);
+
+    const inventory = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 100,
+    });
+    const completeInventory = inventory.items.find(
+      (item) => item.account.accountId === completeAccount,
+    );
+    const partialInventory = inventory.items.find(
+      (item) => item.account.accountId === partialAccount,
+    );
+    assert.equal(completeInventory.latestSnapshotAsOf, asOf);
+    assert.equal(completeInventory.currentValue.value.decimal, "100");
+    assert.equal(partialInventory.latestSnapshotAsOf, undefined);
+
+    // Price is intentionally absent from positionHash. Changing it proves
+    // the read gate compares the full stored semantics rather than trusting
+    // the hash alone.
+    await owner.query(
+      "UPDATE positions SET price = 51 WHERE id = 'scope-complete-position'",
+    );
+    complete = await snapshot(completeAccount);
+    assert.equal(complete.summary.status, "unavailable");
+    assert.equal(complete.summary.reason, "incomplete_source");
+    await owner.query(
+      "UPDATE positions SET price = 50 WHERE id = 'scope-complete-position'",
+    );
+
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, instrument_id, quantity, price, market_value, cost_basis,
+          unrealized, currency, valuation_basis, source_document_id,
+          source_locator, row_hash)
+       VALUES ('scope-unwitnessed-position', $1, $2::date,
+               'scope-complete-instrument', 1, 5, 5, 4, 1,
+               'USD', 'market_price', $3,
+               '{"row":{"source":"canonical","index":99}}', $4)`,
+      [completeAccount, asOf, canonicalDoc, "c".repeat(64)],
+    );
+    complete = await snapshot(completeAccount);
+    assert.equal(complete.summary.status, "unavailable");
+    assert.equal(complete.summary.reason, "incomplete_source");
+    await owner.query(
+      "DELETE FROM positions WHERE id = 'scope-unwitnessed-position'",
+    );
+
+    // A non-parser review remains blocking even though the source membership
+    // proof itself is exact. Null account attribution applies to both account
+    // sections in the consolidated document.
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES ('scope-null-review', 'ambiguous_market_value', NULL, $1,
+               'synthetic ambiguity', 'requires review', 'open')`,
+      [consolidatedDoc],
+    );
+    complete = await snapshot(completeAccount);
+    assert.equal(complete.summary.status, "unavailable");
+    assert.equal(complete.summary.reason, "incomplete_source");
+    completeAggregate = await aggregate(completeAccount);
+    assert.deepEqual(completeAggregate.items, []);
+
+    await owner.query(
+      "UPDATE review_items SET status = 'resolved' WHERE id = 'scope-null-review'",
+    );
+    complete = await snapshot(completeAccount);
+    assert.equal(complete.summary.status, "partial");
+
+    // An unversioned proof becomes stale as soon as this document acquires an
+    // active reviewed projection. A proof bound to that exact generation is
+    // accepted, then becomes stale when the active generation advances.
+    await owner.query(
+      `INSERT INTO holding_projection_generations
+         (id, document_id, generation_number, generation_kind,
+          retained_sha256, projection_digest, created_at, activated_at)
+       VALUES ('scope-generation-1', $1, 1, 'baseline', $2, $3,
+               now(), now())`,
+      [consolidatedDoc, retained, "d".repeat(64)],
+    );
+    await owner.query(
+      `UPDATE documents
+          SET active_holding_projection_generation_id = 'scope-generation-1'
+        WHERE id = $1`,
+      [consolidatedDoc],
+    );
+    complete = await snapshot(completeAccount);
+    assert.equal(complete.summary.status, "unavailable");
+
+    await owner.query(
+      `INSERT INTO position_scope_observations
+         (id, source_document_id, holding_projection_generation_id,
+          retained_sha256, account_id, as_of, proof_version, status,
+          emitted_position_count, gap_codes, evidence, created_at)
+       VALUES ('scope-complete-versioned', $1, 'scope-generation-1', $2, $3,
+               $4::date, 'position_scope_v1', 'complete', 1, '{}',
+               '{"tables":[{"headers":[{"source":"synthetic","index":20}],"end":{"source":"synthetic","index":21}}],"scopeEnd":{"source":"synthetic","index":22}}',
+               now())`,
+      [consolidatedDoc, retained, completeAccount, asOf],
+    );
+    await owner.query(
+      `INSERT INTO position_scope_memberships
+         (source_document_id, scope_id, position_row_hash, account_id, as_of,
+          instrument_id, quantity, price, market_value, cost_basis, unrealized, currency,
+          valuation_basis, valuation_note, source_locator)
+       VALUES ($1, 'scope-complete-versioned', $4, $2, $3::date,
+               'scope-complete-instrument', 2, 50,
+               100, 80, 20, 'USD', 'market_price', 'Synthetic stated mark',
+               '{"row":{"source":"consolidated","index":20}}')`,
+      [consolidatedDoc, completeAccount, asOf, "a".repeat(64)],
+    );
+    complete = await snapshot(completeAccount);
+    assert.equal(complete.summary.status, "partial");
+
+    await owner.query(
+      `INSERT INTO holding_projection_generations
+         (id, document_id, generation_number, generation_kind,
+          retained_sha256, projection_digest, created_at, activated_at)
+       VALUES ('scope-generation-2', $1, 2, 'baseline', $2, $3,
+               now(), now())`,
+      [consolidatedDoc, retained, "e".repeat(64)],
+    );
+    await owner.query(
+      `UPDATE documents
+          SET active_holding_projection_generation_id = 'scope-generation-2'
+        WHERE id = $1`,
+      [consolidatedDoc],
+    );
+    complete = await snapshot(completeAccount);
+    assert.equal(complete.summary.status, "unavailable");
+    assert.equal(complete.summary.reason, "incomplete_source");
+  },
+);
+
+test(
+  "an exact source-stated zero scope selects a complete empty snapshot",
+  { skip },
+  async (t) => {
+    const { owner, reader: r } = await fixture(t);
+    const source = await institution(owner, "exact-zero-scope");
+    const accountId = source.accountIds[0];
+    const asOf = "2026-08-31";
+    const doc = await document(owner, source.id, accountId, asOf);
+    await makeDocumentCitable(owner, doc);
+    await owner.query("UPDATE documents SET parsed_ok = FALSE WHERE id = $1", [
+      doc,
+    ]);
+    const retained = (
+      await one(owner, "SELECT retained_sha256 FROM documents WHERE id = $1", [
+        doc,
+      ])
+    ).retained_sha256;
+    await owner.query(
+      `INSERT INTO position_scope_observations
+         (id, source_document_id, retained_sha256, account_id, as_of,
+          proof_version, status, emitted_position_count, gap_codes,
+          zero_basis, evidence, created_at)
+       VALUES ('scope-exact-zero', $1, $2, $3, $4::date,
+               'position_scope_v1', 'complete', 0, '{}',
+               'source_stated_none',
+               '{"tables":[],"explicitNone":{"source":"synthetic","index":1},"scopeEnd":{"source":"synthetic","index":2}}',
+               now())`,
+      [doc, retained, accountId, asOf],
+    );
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES ('scope-zero-unparsed', 'document_unparsed', $1, $2,
+               'no position rows', 'source explicitly states none', 'open')`,
+      [accountId, doc],
+    );
+
+    const snapshot = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId,
+      snapshot: { mode: "exact", asOf },
+    });
+    assert.deepEqual(snapshot.selectedSnapshot, { status: "found", asOf });
+    assert.deepEqual(snapshot.items, []);
+    assert.deepEqual(snapshot.summary, {
+      status: "complete",
+      positionCount: 0,
+      resolvedInstrumentCount: 0,
+      institutionSymbolInstrumentCount: 0,
+      unresolvedInstrumentCount: 0,
+      quantityCoverage: {
+        availablePositionCount: 0,
+        missingPositionCount: 0,
+      },
+      currencies: [],
+    });
+    assert.equal(snapshot.completeness, "partial");
+
+    const aggregate = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      accountId,
+      from: asOf,
+      toExclusive: "2026-09-01",
+    });
+    assert.deepEqual(aggregate.items, []);
+    assert.equal(aggregate.coverage.reasons.includes("failed_import"), false);
+  },
+);
+
+test(
   "holdings value defects are withheld consistently from inventory and aggregates and disclosed on raw snapshots",
   { skip },
   async (t) => {
