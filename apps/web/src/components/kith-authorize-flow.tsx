@@ -61,7 +61,7 @@ export function KithAuthorizeFlow({
   const request = readAuthorizeRequest(searchParams);
   if (!request) {
     return (
-      <AuthCard title="Open Brain">
+      <AuthCard title="Kith Mind">
         <p role="alert" className="text-xs text-red-700">
           Missing OAuth parameters. Please start the authorization flow from
           your MCP client.
@@ -92,7 +92,7 @@ export function KithAuthorizeFlow({
 
   if (spaces === null) {
     return (
-      <AuthCard title="Open Brain">
+      <AuthCard title="Kith Mind">
         <p className="mb-3 text-xs text-gray-600">
           {mode === "signIn"
             ? "Sign in to authorize this MCP client."
@@ -134,7 +134,10 @@ export function KithAuthorizeFlow({
           }}
         >
           <div className="flex flex-col gap-1">
-            <label htmlFor="email" className="text-xs font-medium text-gray-700">
+            <label
+              htmlFor="email"
+              className="text-xs font-medium text-gray-700"
+            >
               Email
             </label>
             <input
@@ -147,7 +150,10 @@ export function KithAuthorizeFlow({
             />
           </div>
           <div className="flex flex-col gap-1">
-            <label htmlFor="password" className="text-xs font-medium text-gray-700">
+            <label
+              htmlFor="password"
+              className="text-xs font-medium text-gray-700"
+            >
               Password
             </label>
             <input
@@ -199,7 +205,7 @@ export function KithAuthorizeFlow({
   }
 
   return (
-    <AuthCard title="Open Brain">
+    <AuthCard title="Kith Mind">
       <p className="text-xs text-gray-700">
         Choose what this MCP client can access. After approval, you will return
         to <strong>{request.redirectDestination}</strong>.

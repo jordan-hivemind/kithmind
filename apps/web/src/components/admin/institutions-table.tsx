@@ -17,17 +17,13 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { type ColumnDef } from "@tanstack/react-table";
+import { Info } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import { InstitutionAccountDrawer } from "@/components/admin/institution-account-drawer";
 import { DataTable, Detail, Tag } from "@/components/ui/data-table";
 import type { InstitutionsPageData } from "@/lib/kith/admin-data";
-import {
-  archiveDate,
-  label,
-  tableInteger,
-  tableMoney,
-} from "@/lib/kith/format";
+import { archiveDate, label, tableMoney } from "@/lib/kith/format";
 import type { InstitutionRow } from "@/lib/kith/institutions";
 
 const TONE: Record<InstitutionRow["status"], "neutral" | "accent" | "warn"> = {
@@ -46,12 +42,6 @@ const EMPTY: Record<InstitutionsPageData["state"], string> = {
 /** The one place the partial-read tooltip's wording lives. */
 export const TRUNCATED_DETAIL =
   "The archive holds more accounts than this read followed. Rows below are a prefix, not the whole inventory.";
-
-function number(value: number | null) {
-  return value === null ? null : (
-    <span className="tabular-nums">{tableInteger(value)}</span>
-  );
-}
 
 function date(value: string | null) {
   return (
@@ -105,7 +95,7 @@ export function InstitutionsTable({
         accessorKey: "accountLast4",
         header: "Last 4",
         size: 80,
-        meta: { nowrap: true },
+        meta: { nowrap: true, align: "right" },
         cell: ({ row }) =>
           row.original.accountLast4 !== null ? (
             <span className="tabular-nums">
@@ -132,12 +122,7 @@ export function InstitutionsTable({
         accessorKey: "currentValue",
         header: "Current value",
         size: 170,
-        meta: { nowrap: true },
-        // A figure older than the inactivity threshold carries its date in the
-        // cell, not only in the tooltip: a 2019 balance on an account whose
-        // statements are still arriving reads as today's money otherwise, and
-        // nobody hovers a number that looks current. Muted for the same
-        // reason, on the row's own inactive status or on the figure's age.
+        meta: { nowrap: true, align: "right" },
         cell: ({ row }) =>
           row.original.currentValue === null ||
           row.original.currentValueCurrency === null ? (
@@ -159,11 +144,6 @@ export function InstitutionsTable({
                       row.original.currentValueCurrency,
                     )}
                   </span>
-                  {row.original.currentValueStale ? (
-                    <span className="ml-1.5 tabular-nums">
-                      {archiveDate(row.original.currentValueAsOf)}
-                    </span>
-                  ) : null}
                 </span>
               }
               detail={`as of ${archiveDate(row.original.currentValueAsOf)}`}
@@ -171,35 +151,43 @@ export function InstitutionsTable({
           ),
       },
       {
-        id: "statements",
-        accessorKey: "statements",
-        size: 90,
-        header: "Statements",
-        meta: { nowrap: true },
-        cell: ({ row }) => number(row.original.statements),
-      },
-      {
-        id: "records",
-        accessorKey: "records",
-        size: 90,
-        header: "Records",
-        meta: { nowrap: true },
-        cell: ({ row }) => number(row.original.records),
+        id: "valueInfo",
+        header: "Value info",
+        size: 76,
+        meta: { nowrap: true, align: "right" },
+        cell: ({ row }) => (
+          <button
+            type="button"
+            aria-label={`Show value information for ${row.original.name}`}
+            title={
+              row.original.currentValueAsOf
+                ? `As of ${archiveDate(row.original.currentValueAsOf)}`
+                : "Value information"
+            }
+            className="ml-auto inline-flex rounded-control p-1 text-kith-text-muted hover:bg-accent-50 hover:text-kith-action focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent-600"
+            onClick={(event) => {
+              event.stopPropagation();
+              if (row.original.archive !== null) setEditing(row.original);
+            }}
+          >
+            <Info className="size-4" aria-hidden="true" />
+          </button>
+        ),
       },
       {
         id: "activityFrom",
         accessorKey: "activityFrom",
         size: 110,
-        header: "Activity from",
-        meta: { nowrap: true },
+        header: "First record",
+        meta: { nowrap: true, align: "right" },
         cell: ({ row }) => date(row.original.activityFrom),
       },
       {
         id: "activityTo",
         accessorKey: "activityTo",
         size: 110,
-        header: "Activity to",
-        meta: { nowrap: true },
+        header: "Latest record",
+        meta: { nowrap: true, align: "right" },
         cell: ({ row }) => date(row.original.activityTo),
       },
       {
@@ -207,16 +195,8 @@ export function InstitutionsTable({
         accessorKey: "latestSnapshotAsOf",
         size: 125,
         header: "Latest snapshot",
-        meta: { nowrap: true },
+        meta: { nowrap: true, align: "right" },
         cell: ({ row }) => date(row.original.latestSnapshotAsOf),
-      },
-      {
-        id: "openReviews",
-        accessorKey: "openReviews",
-        size: 105,
-        header: "Open reviews",
-        meta: { nowrap: true },
-        cell: ({ row }) => number(row.original.openReviews),
       },
       {
         id: "status",
@@ -290,7 +270,10 @@ export function InstitutionsTable({
             : EMPTY[data.state]
         }
       />
-      <InstitutionAccountDrawer row={editing} onClose={() => setEditing(null)} />
+      <InstitutionAccountDrawer
+        row={editing}
+        onClose={() => setEditing(null)}
+      />
     </div>
   );
 }

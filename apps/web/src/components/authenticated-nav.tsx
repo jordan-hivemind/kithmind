@@ -4,9 +4,9 @@
 // the sign-out control taken as a prop (`kith-sign-out.tsx` owns what signing
 // out does).
 //
-// `canAdmin` comes from the `(authenticated)` layout's `loadAdminAccess`, the
-// same owner-or-editor check the admin layout gates on. Hiding the link is
-// presentation only: the admin layout still refuses a reader on its own.
+// Authorization is intentionally not represented in the primary navigation.
+// Admin routes retain their own owner-or-editor gate when reached through an
+// in-context drilldown or a Settings link.
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
@@ -16,17 +16,10 @@ import { Button } from "@/components/ui/controls";
 type NavLink = { href: string; label: string; section: string };
 
 const LINKS: readonly NavLink[] = [
-  { href: "/", label: "Dashboard", section: "/" },
-  { href: "/browse", label: "Browse", section: "/browse" },
-  { href: "/spaces", label: "Spaces", section: "/spaces" },
+  { href: "/", label: "Home", section: "/" },
+  { href: "/browse", label: "Thoughts & Facts", section: "/browse" },
   { href: "/settings", label: "Settings", section: "/settings" },
 ];
-
-const ADMIN: NavLink = {
-  href: "/admin/sources",
-  label: "Admin",
-  section: "/admin",
-};
 
 function isActive(pathname: string, section: string): boolean {
   return section === "/" ? pathname === "/" : pathname.startsWith(section);
@@ -35,14 +28,14 @@ function isActive(pathname: string, section: string): boolean {
 export function AuthenticatedNav({
   onSignOut,
   pending = false,
-  canAdmin = false,
 }: {
   onSignOut: () => void;
   pending?: boolean;
+  // Kept for callers during the navigation transition. Route authorization is
+  // still enforced by each protected route.
   canAdmin?: boolean;
 }) {
   const pathname = usePathname();
-  const links = canAdmin ? [...LINKS, ADMIN] : LINKS;
 
   return (
     <header className="border-b border-kith-border-subtle bg-kith-surface shadow-[var(--kith-shadow-xs)]">
@@ -57,7 +50,7 @@ export function AuthenticatedNav({
           Kith Mind
         </Link>
         <ul className="flex h-full items-stretch gap-4">
-          {links.map((link) => {
+          {LINKS.map((link) => {
             const active = isActive(pathname, link.section);
             return (
               <li key={link.href} className="flex">

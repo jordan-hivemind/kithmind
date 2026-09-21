@@ -25,7 +25,7 @@ export default async function BrowsePage({
   searchParams: Promise<SearchParams>;
 }) {
   const params = await searchParams;
-  const view = one(params.view) === "thoughts" ? "thoughts" : "facts";
+  const view = one(params.view) === "facts" ? "facts" : "thoughts";
   const includeHistorical = one(params.historical) === "1";
   const type = one(params.type);
 

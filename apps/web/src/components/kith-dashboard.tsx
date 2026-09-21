@@ -1,340 +1,102 @@
-"use client";
+import type { admin } from "@repo/kith-store";
+import Link from "next/link";
 
-// The dashboard. `app/(authenticated)/page.tsx` loads `stats` and `recent`
-// from one read-only transaction; `useServerData` keeps them current by
-// refreshing that render whenever a thought or fact changes in one of the
-// caller's spaces. This replaced a ten-second poll of `/api/status/dashboard`.
-//
-// Quick Capture posts to `POST /api/kith/thoughts/capture`
-// (`lib/kith/capture.ts`), the same model-backed admission gate the MCP
-// `capture_thought` tool runs.
-//
-// Editing and deleting a recent thought are `useOptimisticMutation` against
-// this same `["dashboard"]` cache: `apply` patches `recent` at once, a
-// failure rolls it back and shows a toast, and either way the mutation
-// settling -- and the live change feed, once the write lands -- resyncs from
-// the server render.
-
-import { type memory } from "@repo/kith-store";
-import { type ColumnDef } from "@tanstack/react-table";
-import { useCallback, useMemo, useState } from "react";
-
-import { KithQuickCapture } from "@/components/kith-quick-capture";
-import {
-  type ThoughtDraft,
-  ThoughtDrawer,
-} from "@/components/kith-thought-drawer";
 import { PageHeader } from "@/components/ui/controls";
-import {
-  DataTable,
-  Detail,
-  type RowAction,
-  Tag,
-} from "@/components/ui/data-table";
-import {
-  type CaptureResponse,
-  captureThought,
-} from "@/lib/kith/capture-client";
-import { label, shortDate } from "@/lib/kith/format";
-import { isPendingId, mutateJson, pendingId } from "@/lib/kith/optimistic";
-import {
-  useOptimisticMutation,
-  useServerData,
-} from "@/lib/kith/use-server-data";
+import { tableInteger } from "@/lib/kith/format";
 
-type DashboardStats = {
-  totalFacts: number;
-  totalThoughts: number;
-  byType: Array<{ type: string; count: number }>;
-};
+type Area = admin.AreaCoverageRow;
 
-type DashboardThought = {
-  id: string;
-  content: string;
-  createdAt: number;
-  metadata: {
-    type: string;
-    topics: readonly string[];
-    people: readonly string[];
-    actionItems: readonly string[];
-    summary: string;
-  };
-};
+const DATA_TYPES: readonly {
+  area: string;
+  label: string;
+  href?: string;
+}[] = [
+  {
+    area: "brokerage",
+    label: "Investment Accounts",
+    href: "/admin/institutions",
+  },
+  {
+    area: "outside investments",
+    label: "Private Investments",
+    href: "/admin/investments",
+  },
+  { area: "banking and cards", label: "Banking & Cards" },
+  { area: "taxes", label: "Taxes" },
+  { area: "medical", label: "Medical" },
+  { area: "vehicles", label: "Vehicles" },
+  { area: "home and projects", label: "Home & Projects" },
+  { area: "notes and facts", label: "Thoughts & Facts", href: "/browse" },
+];
 
-type DashboardData = {
-  stats: DashboardStats;
-  recent: readonly DashboardThought[];
-};
-
-type Row = {
-  id: string;
-  pending: boolean;
-  content: string;
-  type: string;
-  topics: string;
-  people: string;
-  actionItems: string;
-  createdAt: number;
-};
-
-type EditVars = {
-  id: string;
-  content: string;
-  type: memory.ThoughtType;
-  topics: string[];
-  people: string[];
-};
-
-type CaptureVars = { id: string; content: string; createdAt: number };
-
-const LIVE_TABLES = ["thoughts", "facts"] as const;
-const DASHBOARD_KEY = ["dashboard"];
-
-function Stat({ value, name }: { value: number; name: string }) {
-  return (
-    <div className="kith-tile min-w-28 px-4 py-3">
-      <div className="text-lg leading-6 font-semibold tabular-nums">
-        {value}
-      </div>
-      <div className="text-sm text-kith-text-secondary">{name}</div>
-    </div>
-  );
+function count(value: number) {
+  return <span className="tabular-nums">{tableInteger(value)}</span>;
 }
 
-export function KithDashboard({ stats, recent }: DashboardData) {
-  const serverData = useMemo(() => ({ stats, recent }), [stats, recent]);
-  const data = useServerData<DashboardData>(
-    DASHBOARD_KEY,
-    serverData,
-    LIVE_TABLES,
-  );
-  const [editing, setEditing] = useState<{
-    id: string;
-    draft: ThoughtDraft;
-  } | null>(null);
-
-  const edit = useOptimisticMutation<DashboardData, EditVars>({
-    queryKey: DASHBOARD_KEY,
-    mutationFn: (vars) =>
-      mutateJson(`/api/kith/thoughts/${vars.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({
-          content: vars.content,
-          type: vars.type,
-          topics: vars.topics,
-          people: vars.people,
-        }),
-      }),
-    apply: (current, vars) => ({
-      ...current,
-      recent: current.recent.map((thought) =>
-        thought.id === vars.id
-          ? {
-              ...thought,
-              content: vars.content,
-              metadata: {
-                ...thought.metadata,
-                type: vars.type,
-                topics: vars.topics,
-                people: vars.people,
-              },
-            }
-          : thought,
-      ),
-    }),
-  });
-
-  const remove = useOptimisticMutation<DashboardData, string>({
-    queryKey: DASHBOARD_KEY,
-    mutationFn: (id) =>
-      mutateJson(`/api/kith/thoughts/${id}`, { method: "DELETE" }),
-    apply: (current, id) => ({
-      ...current,
-      recent: current.recent.filter((thought) => thought.id !== id),
-    }),
-  });
-
-  const capture = useOptimisticMutation<DashboardData, CaptureVars>({
-    queryKey: DASHBOARD_KEY,
-    mutationFn: async ({ content }) => {
-      const result = await captureThought(content);
-      if (result.disposition !== "stored") {
-        throw new Error(
-          result.operationSummary ??
-            "This was not stored. Try one coherent durable narrative, or use a structured fact.",
-        );
-      }
-      return result;
-    },
-    apply: (current, values) => ({
-      ...current,
-      stats: {
-        ...current.stats,
-        totalThoughts: current.stats.totalThoughts + 1,
-      },
-      recent: [
-        {
-          id: values.id,
-          content: values.content,
-          createdAt: values.createdAt,
-          metadata: {
-            type: "pending",
-            topics: [],
-            people: [],
-            actionItems: [],
-            summary: values.content,
-          },
-        },
-        ...current.recent,
-      ],
-    }),
-  });
-
-  const rows = useMemo<Row[]>(
-    () =>
-      data.recent.map((thought) => ({
-        id: thought.id,
-        pending: isPendingId(thought.id),
-        content: thought.content,
-        type: label(thought.metadata.type),
-        topics: thought.metadata.topics.join(", "),
-        people: thought.metadata.people.join(", "),
-        actionItems: thought.metadata.actionItems.join("\n"),
-        createdAt: thought.createdAt,
-      })),
-    [data.recent],
-  );
-
-  const columns = useMemo<ColumnDef<Row, unknown>[]>(
-    () => [
-      {
-        id: "content",
-        accessorKey: "content",
-        header: "Thought",
-        cell: ({ row }) => (
-          <span className="line-clamp-1 max-w-2xl">
-            <Detail
-              label={row.original.content}
-              detail={[row.original.content, row.original.actionItems]
-                .filter(Boolean)
-                .join("\n\n")}
-            />
-          </span>
-        ),
-      },
-      {
-        id: "type",
-        accessorKey: "type",
-        header: "Type",
-        cell: ({ row }) => (
-          <Tag>{row.original.pending ? "Saving" : row.original.type}</Tag>
-        ),
-      },
-      { id: "topics", accessorKey: "topics", header: "Topics" },
-      { id: "people", accessorKey: "people", header: "People" },
-      {
-        id: "createdAt",
-        accessorKey: "createdAt",
-        header: "Created",
-        meta: { nowrap: true },
-        cell: ({ row }) => (
-          <span className="text-gray-600 tabular-nums">
-            {shortDate(row.original.createdAt)}
-          </span>
-        ),
-      },
-    ],
-    [],
-  );
-
-  // Shared by the kebab's Edit item and clicking the row.
-  const openEdit = useCallback(
-    (row: Row) => {
-      if (row.pending) return;
-      const thought = data.recent.find((item) => item.id === row.id);
-      if (!thought) return;
-      setEditing({
-        id: row.id,
-        draft: {
-          content: thought.content,
-          type: thought.metadata.type as memory.ThoughtType,
-          topics: thought.metadata.topics.join(", "),
-          people: thought.metadata.people.join(", "),
-        },
-      });
-    },
-    [data.recent],
-  );
-
-  const actions = useMemo<RowAction<Row>[]>(
-    () => [
-      { label: "Edit", hidden: (row) => row.pending, onSelect: openEdit },
-      {
-        label: "Delete",
-        danger: true,
-        hidden: (row) => row.pending,
-        onSelect: (row) => void remove.mutateAsync(row.id),
-      },
-      {
-        label: "Copy id",
-        hidden: (row) => row.pending,
-        onSelect: (row) => void navigator.clipboard.writeText(row.id),
-      },
-    ],
-    [openEdit, remove],
-  );
+/**
+ * Home deliberately stays a small fixed inventory. Coverage gaps are not
+ * shown as attention counts until they lead to the actionable queue required
+ * by the information-architecture plan.
+ */
+export function KithDashboard({
+  initial,
+}: {
+  initial: { areas: Area[]; truncated: boolean };
+}) {
+  const areas = new Map(initial.areas.map((area) => [area.area, area]));
 
   return (
-    <div>
-      <PageHeader title="Dashboard">
-        <KithQuickCapture
-          onCapture={async (content): Promise<CaptureResponse> =>
-            (await capture.mutateAsync({
-              id: pendingId(),
-              content,
-              createdAt: Date.now(),
-            })) as CaptureResponse
-          }
-        />
-      </PageHeader>
-      <div className="mb-4 flex flex-wrap gap-2">
-        <Stat value={data.stats.totalFacts} name="facts" />
-        <Stat value={data.stats.totalThoughts} name="thoughts" />
-        {data.stats.byType.slice(0, 3).map((entry) => (
-          <Stat key={entry.type} value={entry.count} name={label(entry.type)} />
-        ))}
-      </div>
-      <section className="kith-tile mt-6 overflow-hidden">
-        <div className="kith-tile-header px-4 py-2">
-          <h2 className="kith-section-title">Recent thoughts</h2>
-        </div>
-        <div className="p-4">
-          <DataTable
-            id="dashboard-recent-thoughts"
-            data={rows}
-            columns={columns}
-            filterColumns={["type"]}
-            initialSorting={[{ id: "createdAt", desc: true }]}
-            actions={actions}
-            onRowClick={openEdit}
-            searchPlaceholder="Search thoughts"
-            empty="No thoughts"
-          />
-        </div>
+    <div className="max-w-[960px]">
+      <PageHeader title="Your Data" />
+      <section className="kith-tile overflow-hidden" aria-label="Your Data">
+        <table className="w-full text-[13.5px]">
+          <thead className="border-b border-kith-border-subtle bg-kith-surface-subtle text-left text-kith-text-secondary">
+            <tr>
+              <th scope="col" className="px-4 py-2 font-medium">
+                Data type
+              </th>
+              <th scope="col" className="px-4 py-2 text-right font-medium">
+                Documents
+              </th>
+              <th scope="col" className="px-4 py-2 text-right font-medium">
+                Records
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {DATA_TYPES.map((dataType) => {
+              const area = areas.get(dataType.area);
+              return (
+                <tr
+                  key={dataType.area}
+                  className="border-b border-kith-border-subtle last:border-b-0"
+                >
+                  <th scope="row" className="px-4 py-2 text-left font-medium">
+                    {dataType.href ? (
+                      <Link
+                        href={dataType.href}
+                        className="text-accent-700 hover:text-accent-800 focus-visible:outline-2 focus-visible:outline-accent-600"
+                      >
+                        {dataType.label}
+                      </Link>
+                    ) : (
+                      <span className="text-kith-text-secondary">
+                        {dataType.label}
+                      </span>
+                    )}
+                  </th>
+                  <td className="px-4 py-2 text-right">
+                    {count(area?.documents ?? 0)}
+                  </td>
+                  <td className="px-4 py-2 text-right">
+                    {count(area?.records ?? 0)}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </section>
-
-      {editing === null ? null : (
-        <ThoughtDrawer
-          open
-          onOpenChange={(open) => {
-            if (!open) setEditing(null);
-          }}
-          initial={editing.draft}
-          onSave={async (values) => {
-            await edit.mutateAsync({ id: editing.id, ...values });
-          }}
-        />
-      )}
     </div>
   );
 }

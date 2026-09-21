@@ -21,7 +21,10 @@
 // the follow-up.
 
 import { embeddings, memory } from "@repo/kith-store";
-import { getAuthorizedReadSpaceIds, type IdentityCtx } from "@repo/kith-store/identity";
+import {
+  getAuthorizedReadSpaceIds,
+  type IdentityCtx,
+} from "@repo/kith-store/identity";
 
 import { loadAuthenticatedPage } from "@/lib/kith/page-session";
 
@@ -37,7 +40,9 @@ const THOUGHT_TYPES = [
 ] as const;
 export type ThoughtType = (typeof THOUGHT_TYPES)[number];
 
-export function asThoughtType(value: string | undefined): ThoughtType | undefined {
+export function asThoughtType(
+  value: string | undefined,
+): ThoughtType | undefined {
   return THOUGHT_TYPES.includes(value as ThoughtType)
     ? (value as ThoughtType)
     : undefined;
@@ -52,33 +57,45 @@ export type BrowseArgs = {
 };
 
 export type BrowseData =
-  | { view: "facts"; facts: memory.HydratedFact[] }
-  | { view: "thoughts"; thoughts: readonly memory.Thought[] };
+  | {
+      view: "facts";
+      facts: memory.HydratedFact[];
+      stats: memory.SpaceStats;
+    }
+  | {
+      view: "thoughts";
+      thoughts: readonly memory.Thought[];
+      stats: memory.SpaceStats;
+    };
 
 export async function loadBrowse(
   cookieHeader: string | null,
   args: BrowseArgs,
 ): Promise<BrowseData | null> {
-  return await loadAuthenticatedPage(cookieHeader, async ({ ctx, principal }) => {
-    const spaceIds = await getAuthorizedReadSpaceIds(ctx, principal);
-    if (args.view === "facts") {
-      const facts = await memory.listFacts(ctx, spaceIds, {
-        limit: LIST_LIMIT,
-        includeHistorical: args.includeHistorical,
-      });
-      return { view: "facts", facts };
-    }
+  return await loadAuthenticatedPage(
+    cookieHeader,
+    async ({ ctx, principal }) => {
+      const spaceIds = await getAuthorizedReadSpaceIds(ctx, principal);
+      const stats = await memory.computeSpaceStats(ctx, spaceIds);
+      if (args.view === "facts") {
+        const facts = await memory.listFacts(ctx, spaceIds, {
+          limit: LIST_LIMIT,
+          includeHistorical: args.includeHistorical,
+        });
+        return { view: "facts", facts, stats };
+      }
 
-    const type = asThoughtType(args.type);
-    const thoughts = await memory.listBySpaces(
-      ctx,
-      spaceIds,
-      LIST_LIMIT,
-      args.includeHistorical,
-      type === undefined ? undefined : { type },
-    );
-    return { view: "thoughts", thoughts };
-  });
+      const type = asThoughtType(args.type);
+      const thoughts = await memory.listBySpaces(
+        ctx,
+        spaceIds,
+        LIST_LIMIT,
+        args.includeHistorical,
+        type === undefined ? undefined : { type },
+      );
+      return { view: "thoughts", thoughts, stats };
+    },
+  );
 }
 
 export type ThoughtSearchResult = {
@@ -106,10 +123,15 @@ export async function searchThoughtsScoped(
   args: ThoughtSearchArgs,
 ): Promise<ThoughtSearchResult> {
   const type = asThoughtType(args.type);
-  const found = await embeddings.searchThoughtsHybrid(ctx, spaceIds, args.query, {
-    limit: LIST_LIMIT,
-    includeHistorical: args.includeHistorical,
-    ...(type === undefined ? {} : { type }),
-  });
+  const found = await embeddings.searchThoughtsHybrid(
+    ctx,
+    spaceIds,
+    args.query,
+    {
+      limit: LIST_LIMIT,
+      includeHistorical: args.includeHistorical,
+      ...(type === undefined ? {} : { type }),
+    },
+  );
   return { thoughts: found.results, vectorStatus: found.vectorStatus };
 }

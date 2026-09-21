@@ -13,8 +13,10 @@
 // API keys are not in the change feed (migration 024 says why), so a key made
 // on another device shows up on the next visit rather than live.
 
+import * as AlertDialog from "@radix-ui/react-alert-dialog";
 import { useQueryClient } from "@tanstack/react-query";
 import type { ColumnDef } from "@tanstack/react-table";
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { WorkerHeartbeatStatus } from "@/components/kith-worker-heartbeat-status";
@@ -44,7 +46,7 @@ import {
 } from "@/components/ui/data-table";
 import { useToast } from "@/components/ui/toast";
 import { sourceAccountGrantsForCapabilities } from "@/lib/api-key-scopes";
-import { PLUGIN_COMMANDS, PROMPTS } from "@/lib/kith/connect-guide";
+import { AI_CONNECTION_HELP, mcpEndpoint } from "@/lib/kith/connect-guide";
 import { shortDate, tableInteger } from "@/lib/kith/format";
 import {
   isPendingId,
@@ -102,37 +104,85 @@ export function KithSettings({ initial }: { initial: SettingsData }) {
   return (
     <div>
       <PageHeader title="Settings" />
-      {data.googleAuth.enabled && (
-        <AccountSection linked={data.googleAuth.linked} />
-      )}
-      <DestinationSection data={data} writableSpaces={writableSpaces} />
-      <ApiKeysSection data={data} />
-      <SourceAccountsSection
-        sourceAccounts={data.sourceAccounts}
-        spaces={writableSpaces}
+      <AccountSection
+        enabled={data.googleAuth.enabled}
+        linked={data.googleAuth.linked}
       />
+      <DestinationSection data={data} writableSpaces={writableSpaces} />
+      <ConnectionsSection />
+      <ApiKeysSection data={data} />
       <ConnectSection />
+      <SharingSection />
+      <OperationsSection />
     </div>
   );
 }
 
-function AccountSection({ linked }: { linked: boolean }) {
+function AccountSection({
+  enabled,
+  linked,
+}: {
+  enabled: boolean;
+  linked: boolean;
+}) {
   return (
     <Section id="account" title="Account">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <p className="text-sm font-medium text-kith-text">Google sign-in</p>
-          <p className="mt-1 text-xs text-kith-text-muted">
-            {linked
-              ? "Google sign-in is connected to this Kith account."
-              : "Connect a Google account after signing in with your password."}
-          </p>
+      {enabled ? (
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="text-sm font-medium text-kith-text">Google sign-in</p>
+            <p className="mt-1 text-xs text-kith-text-muted">
+              {linked
+                ? "Google sign-in is connected to this Kith account."
+                : "Connect a Google account after signing in with your password."}
+            </p>
+          </div>
+          {!linked && (
+            <a href="/api/auth/google?action=link" className={buttonClass()}>
+              Connect Google
+            </a>
+          )}
         </div>
-        {!linked && (
-          <a href="/api/auth/google?action=link" className={buttonClass()}>
-            Connect Google
-          </a>
-        )}
+      ) : (
+        <p className="text-sm text-kith-text-secondary">Password sign-in</p>
+      )}
+    </Section>
+  );
+}
+
+function SettingsLink({ href, label }: { href: string; label: string }) {
+  return (
+    <Link
+      href={href}
+      className="text-sm font-medium text-accent-700 hover:text-accent-800"
+    >
+      {label}
+    </Link>
+  );
+}
+
+function ConnectionsSection() {
+  return (
+    <Section id="connections" title="Connections & Sources">
+      <SettingsLink href="/admin/sources" label="Data Sources" />
+    </Section>
+  );
+}
+
+function SharingSection() {
+  return (
+    <Section id="sharing" title="Sharing & Access">
+      <SettingsLink href="/spaces" label="Spaces" />
+    </Section>
+  );
+}
+
+function OperationsSection() {
+  return (
+    <Section id="operations" title="System & Operations">
+      <div className="flex flex-wrap gap-4">
+        <SettingsLink href="/admin/attention" label="Needs Attention" />
+        <SettingsLink href="/admin/health" label="System Health" />
       </div>
     </Section>
   );
@@ -162,9 +212,11 @@ function DestinationSection({
       settings: { ...current.settings, defaultWriteSpaceId: spaceId },
     }),
   });
+  // A revoked default still needs an explicit reset before captures can resume.
+  if (writableSpaces.length <= 1 && !unavailable) return null;
 
   return (
-    <Section id="destination" title="Default write destination">
+    <Section id="destination" title="Where new items are saved">
       <div className="flex flex-wrap items-end gap-3">
         <Field label="Destination" htmlFor="default-write-space">
           <select
@@ -186,6 +238,9 @@ function DestinationSection({
             ))}
           </select>
         </Field>
+        <p className="text-xs text-kith-text-muted">
+          New captures use this space unless another is selected.
+        </p>
         {unavailable && (
           <div role="alert" className="flex items-center gap-2">
             <Tag tone="warn">no longer writable</Tag>
@@ -216,6 +271,7 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
   const [creating, setCreating] = useState(false);
   const [newRawKey, setNewRawKey] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [revokeTarget, setRevokeTarget] = useState<ApiKeyRow | null>(null);
 
   const spaceNames = useMemo(
     () => new Map(data.spaces.map((space) => [space.spaceId, space.name])),
@@ -305,11 +361,11 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
 
   const columns = useMemo<ColumnDef<ApiKeyRow, unknown>[]>(
     () => [
-      { id: "name", accessorKey: "name", header: "Name" },
+      { id: "name", accessorKey: "name", header: "Purpose" },
       {
         id: "keyPrefix",
         accessorKey: "keyPrefix",
-        header: "Key",
+        header: "Key prefix",
         cell: ({ row }) => (
           <code className="font-mono text-data text-gray-700">
             {isPendingId(row.original.id)
@@ -333,7 +389,7 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
       {
         id: "spaces",
         accessorFn: (row) => row.spaceIds.length,
-        header: "Spaces",
+        header: "Data access",
         meta: { nowrap: true },
         cell: ({ row }) => (
           <Detail
@@ -346,6 +402,17 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
               .map((id) => spaceNames.get(id) ?? id)
               .join(", ")}
           />
+        ),
+      },
+      {
+        id: "status",
+        accessorFn: (row) =>
+          row.lastUsedAt === null ? "Never used" : "Active",
+        header: "Status",
+        cell: ({ row }) => (
+          <Tag tone={row.original.lastUsedAt === null ? "neutral" : "accent"}>
+            {row.original.lastUsedAt === null ? "Never used" : "Active"}
+          </Tag>
         ),
       },
       {
@@ -391,17 +458,17 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
       {
         label: "Revoke",
         danger: true,
-        onSelect: (key) => revoke.mutate(key.id),
+        onSelect: (key) => setRevokeTarget(key),
         disabled: (key) => isPendingId(key.id),
       },
     ],
-    [revoke],
+    [],
   );
 
   return (
     <Section
       id="api-keys"
-      title="API keys"
+      title="AI Access"
       actions={
         <Button variant="primary" onClick={() => setCreating((open) => !open)}>
           {creating ? "Close" : "New key"}
@@ -465,6 +532,38 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
           {loadingMore ? "Loading..." : "Load more"}
         </Button>
       )}
+      <AlertDialog.Root
+        open={revokeTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setRevokeTarget(null);
+        }}
+      >
+        <AlertDialog.Portal>
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-kith-overlay" />
+          <AlertDialog.Content className="fixed top-1/2 left-1/2 z-50 w-full max-w-sm -translate-x-1/2 -translate-y-1/2 rounded-panel border border-kith-border-subtle bg-kith-surface p-5 shadow-[var(--kith-shadow-lg)]">
+            <AlertDialog.Title className="kith-section-title">
+              Revoke this API key?
+            </AlertDialog.Title>
+            <AlertDialog.Description className="mt-1 text-sm text-kith-text-secondary">
+              Clients using this key will immediately stop working.
+            </AlertDialog.Description>
+            <div className="mt-3 flex justify-end gap-2">
+              <AlertDialog.Cancel className={buttonClass()}>
+                Cancel
+              </AlertDialog.Cancel>
+              <AlertDialog.Action
+                className={buttonClass("primary")}
+                onClick={() => {
+                  if (revokeTarget) revoke.mutate(revokeTarget.id);
+                  setRevokeTarget(null);
+                }}
+              >
+                Revoke key
+              </AlertDialog.Action>
+            </div>
+          </AlertDialog.Content>
+        </AlertDialog.Portal>
+      </AlertDialog.Root>
     </Section>
   );
 }
@@ -627,6 +726,9 @@ const EMPTY_DRAFT: SourceDraft = {
   freshnessMinutes: "1440",
 };
 
+// Connection management moved to Data Sources. Kept private while API-key
+// creation still shares its source-account types above.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function SourceAccountsSection({
   sourceAccounts,
   spaces,
@@ -958,22 +1060,9 @@ function ConnectSection() {
       {
         id: "mcp-url",
         name: "MCP URL",
-        value: origin ? `${origin}/api/mcp` : "",
-        detail:
-          "Claude Desktop, Cowork and Cursor: add a custom MCP server with this URL",
+        value: origin ? mcpEndpoint(origin) : "",
+        detail: AI_CONNECTION_HELP,
       },
-      ...PLUGIN_COMMANDS.map((command) => ({
-        id: command.name,
-        name: command.name,
-        value: command.value,
-        detail: "",
-      })),
-      ...PROMPTS.map((prompt) => ({
-        id: prompt.title,
-        name: `Prompt: ${prompt.title}`,
-        value: prompt.prompt,
-        detail: prompt.description,
-      })),
     ],
     [origin],
   );
@@ -1015,13 +1104,13 @@ function ConnectSection() {
   );
 
   return (
-    <Section id="connect" title="Connect">
+    <Section id="connect" title="AI Connections">
       <DataTable
         id="settings-connect"
         data={rows}
         columns={columns}
         actions={actions}
-        searchPlaceholder="Search"
+        showSearch={false}
         empty="Nothing to connect"
       />
     </Section>

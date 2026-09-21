@@ -51,9 +51,32 @@ export function tableDecimal(value: string): string {
 
 /** Whole units in the amount's own currency; no figure is converted. */
 export function tableMoney(amount: number, currency: string): string {
-  return new Intl.NumberFormat("en-US", {
+  const formatter = new Intl.NumberFormat("en-US", {
     style: "currency",
     currency,
-    maximumFractionDigits: 0,
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  const symbol =
+    formatter.formatToParts(amount).find((part) => part.type === "currency")
+      ?.value ?? currency;
+  const numeric = new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
   }).format(amount);
+  return `${symbol} ${numeric}`;
+}
+
+/** Exact-decimal accounting money for authoritative values from the store. */
+export function tableAccountingMoney(value: string, currency = "USD"): string {
+  const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(value);
+  if (match === null) return value;
+  const [, sign, whole, fraction = ""] = match;
+  const cents = `${fraction}00`.slice(0, 2);
+  const formatted = tableDecimal(`${whole}.${cents}`);
+  const symbol =
+    new Intl.NumberFormat("en-US", { style: "currency", currency })
+      .formatToParts(0)
+      .find((part) => part.type === "currency")?.value ?? currency;
+  return sign === "-" ? `(${symbol} ${formatted})` : `${symbol} ${formatted}`;
 }

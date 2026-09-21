@@ -29,6 +29,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { type ColumnDef } from "@tanstack/react-table";
+import { Check } from "lucide-react";
 import { useCallback, useMemo, useRef, useState } from "react";
 
 import {
@@ -47,7 +48,11 @@ import {
   Tag,
 } from "@/components/ui/data-table";
 import { buttonClass, primaryButtonClass } from "@/components/ui/drawer";
-import { archiveDate, tableDecimal, tableInteger } from "@/lib/kith/format";
+import {
+  archiveDate,
+  tableAccountingMoney,
+  tableDecimal,
+} from "@/lib/kith/format";
 import { entryPatchFields } from "@/lib/kith/investment-entry-patch";
 import {
   type ImportPreview,
@@ -84,7 +89,19 @@ const STATUS_TONE: Record<string, "neutral" | "accent" | "warn"> = {
 
 function Money({ value }: { value: string }) {
   return (
-    <span className="tabular-nums text-gray-900">{tableDecimal(value)}</span>
+    <span className="tabular-nums text-gray-900">
+      {tableAccountingMoney(value)}
+    </span>
+  );
+}
+
+function Amount({ value, currency }: { value: string; currency: string }) {
+  return (
+    <span className="tabular-nums text-gray-900">
+      {currency === "USD"
+        ? tableAccountingMoney(value)
+        : `${tableDecimal(value)} ${currency}`}
+    </span>
   );
 }
 
@@ -414,7 +431,7 @@ export function InvestmentsTable({
           row.original.kind === "investment" ? (
             <Detail label={row.original.name} detail={row.original.notes} />
           ) : (
-            <span className="tabular-nums text-gray-500">
+            <span className="block text-right tabular-nums text-gray-500">
               {archiveDate(row.original.entryDate)}
             </span>
           ),
@@ -434,26 +451,22 @@ export function InvestmentsTable({
           ),
       },
       {
-        id: "signedOn",
-        accessorFn: (row) =>
-          row.kind === "investment" ? (row.signedOn ?? "") : row.amount,
-        header: "Signed",
-        meta: { nowrap: true },
+        id: "amount",
+        accessorFn: (row) => (row.kind === "investment" ? "" : row.amount),
+        header: "Amount",
+        meta: { nowrap: true, align: "right" },
         cell: ({ row }) =>
-          row.original.kind === "investment" ? (
-            <span className="tabular-nums text-gray-600">
-              {archiveDate(row.original.signedOn)}
-            </span>
-          ) : (
-            <span className="tabular-nums">
-              {tableDecimal(row.original.amount)} {row.original.currency}
-            </span>
+          row.original.kind === "investment" ? null : (
+            <Amount
+              value={row.original.amount}
+              currency={row.original.currency}
+            />
           ),
       },
       {
         id: "committed",
         header: "Committed",
-        meta: { nowrap: true },
+        meta: { nowrap: true, align: "right" },
         accessorFn: (row) =>
           row.kind === "investment" ? row.totals.usd.committed : "",
         cell: ({ row }) =>
@@ -475,7 +488,7 @@ export function InvestmentsTable({
       {
         id: "sent",
         header: "Sent",
-        meta: { nowrap: true },
+        meta: { nowrap: true, align: "right" },
         accessorFn: (row) =>
           row.kind === "investment" ? row.totals.usd.sent : "",
         cell: ({ row }) =>
@@ -493,7 +506,7 @@ export function InvestmentsTable({
       {
         id: "outstanding",
         header: "Outstanding",
-        meta: { nowrap: true },
+        meta: { nowrap: true, align: "right" },
         accessorFn: (row) =>
           row.kind === "investment" ? row.totals.usd.outstanding : "",
         cell: ({ row }) => {
@@ -522,7 +535,7 @@ export function InvestmentsTable({
       {
         id: "received",
         header: "Received",
-        meta: { nowrap: true },
+        meta: { nowrap: true, align: "right" },
         accessorFn: (row) =>
           row.kind === "investment" ? row.totals.usd.received : "",
         cell: ({ row }) =>
@@ -532,30 +545,33 @@ export function InvestmentsTable({
       },
       {
         id: "documents",
-        header: "Docs",
-        meta: { nowrap: true },
+        header: "Documents",
+        meta: { nowrap: true, align: "right" },
         accessorFn: (row) =>
           row.kind === "investment"
             ? row.documentCount
             : (row.documentId ?? ""),
         cell: ({ row }) =>
           row.original.kind === "investment" ? (
-            <Detail
-              label={
-                <span className="tabular-nums">
-                  {tableInteger(row.original.documentCount)}
-                </span>
-              }
-              detail={
-                row.original.unlinkedDocumentCount === 0
-                  ? null
-                  : `${tableInteger(row.original.unlinkedDocumentCount)} unlinked`
-              }
-            />
+            row.original.documentCount > 0 ? (
+              <span
+                role="img"
+                aria-label="Has documents"
+                title="Has documents"
+                className="ml-auto inline-flex text-emerald-600"
+              >
+                <Check className="size-4" aria-hidden="true" />
+              </span>
+            ) : null
           ) : row.original.documentId === null ? null : (
-            <Tag tone="accent" title={row.original.documentId}>
-              linked
-            </Tag>
+            <span
+              role="img"
+              aria-label="Has documents"
+              title="Has documents"
+              className="ml-auto inline-flex text-emerald-600"
+            >
+              <Check className="size-4" aria-hidden="true" />
+            </span>
           ),
       },
       {

@@ -31,7 +31,15 @@ import {
   signUp,
 } from "@repo/kith-store/identity";
 import pg from "pg";
-import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  test,
+  vi,
+} from "vitest";
 
 import { setKithPool } from "@/lib/kith/pool";
 
@@ -55,7 +63,12 @@ const PASSWORD = "a strong enough password";
 const secret = randomBytes(32).toString("hex");
 
 type Fixture = {
-  userA: { userId: string; cookie: string; spaceId: string; sharedSpaceId: string };
+  userA: {
+    userId: string;
+    cookie: string;
+    spaceId: string;
+    sharedSpaceId: string;
+  };
   userB: { userId: string; cookie: string; spaceId: string };
   /** A `reader` member of userA's shared space, for the ADM-2 admin loaders. */
   readerC: { userId: string; cookie: string; spaceId: string };
@@ -68,7 +81,9 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
   let fixture: Fixture;
   let transactionLog: string[] = [];
 
-  async function onAdmin<T>(work: (admin: pg.Client) => Promise<T>): Promise<T> {
+  async function onAdmin<T>(
+    work: (admin: pg.Client) => Promise<T>,
+  ): Promise<T> {
     const admin = new pg.Client({ connectionString: adminUrl });
     await admin.connect();
     try {
@@ -78,7 +93,9 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
     }
   }
 
-  function inTransaction<T>(work: (ctx: IdentityCtx) => Promise<T>): Promise<T> {
+  function inTransaction<T>(
+    work: (ctx: IdentityCtx) => Promise<T>,
+  ): Promise<T> {
     return withKithTransaction(pool, (client) => work(identityCtx(client)));
   }
 
@@ -86,14 +103,19 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
   function recordingPool(inner: pg.Pool): pg.Pool {
     return new Proxy(inner, {
       get(target, property, receiver) {
-        if (property !== "connect") return Reflect.get(target, property, receiver);
+        if (property !== "connect")
+          return Reflect.get(target, property, receiver);
         return async () => {
           const client = await target.connect();
           const query = client.query.bind(client);
           return new Proxy(client, {
             get(clientTarget, clientProperty, clientReceiver) {
               if (clientProperty !== "query") {
-                return Reflect.get(clientTarget, clientProperty, clientReceiver);
+                return Reflect.get(
+                  clientTarget,
+                  clientProperty,
+                  clientReceiver,
+                );
               }
               return (...args: unknown[]) => {
                 const text = args[0];
@@ -163,7 +185,10 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
     const userA = await signedInUser();
     const userB = await signedInUser();
     const shared = await inTransaction((ctx) =>
-      createSharedSpace(ctx, { userId: userA.userId, name: "A's shared space" }),
+      createSharedSpace(ctx, {
+        userId: userA.userId,
+        name: "A's shared space",
+      }),
     );
 
     await inTransaction(async (ctx) => {
@@ -242,7 +267,9 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
     expect(
       data!.recent.some((thought) => thought.content.includes("userB")),
     ).toBe(false);
-    expect(transactionLog).toEqual(["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"]);
+    expect(transactionLog).toEqual([
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    ]);
   });
 
   test("loadBrowse: facts and thoughts are both scoped to the caller's space", async () => {
@@ -255,17 +282,22 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
     expect(facts).not.toBeNull();
     if (facts?.view !== "facts") throw new Error("expected facts view");
     expect(facts.facts.map((fact) => fact.subject.name)).toEqual(["Alex"]);
+    expect(facts.stats).toMatchObject({ totalFacts: 1, totalThoughts: 1 });
 
     resetLog();
     const thoughts = await loadBrowse(fixture.userA.cookie, {
       view: "thoughts",
       includeHistorical: false,
     });
-    if (thoughts?.view !== "thoughts") throw new Error("expected thoughts view");
+    if (thoughts?.view !== "thoughts")
+      throw new Error("expected thoughts view");
+    expect(thoughts.stats).toMatchObject({ totalFacts: 1, totalThoughts: 1 });
     expect(thoughts.thoughts.map((t) => t.content)).toEqual([
       "userA's personal thought, only visible to userA.",
     ]);
-    expect(transactionLog).toEqual(["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"]);
+    expect(transactionLog).toEqual([
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    ]);
   });
 
   test("loadBrowse denies an unauthenticated request", async () => {
@@ -300,7 +332,9 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
     // No injected `embedQuery`, so the vector leg never runs -- see
     // `lib/kith/browse.ts`'s module comment.
     expect(body.vectorStatus).toBe("unavailable");
-    expect(transactionLog).toEqual(["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"]);
+    expect(transactionLog).toEqual([
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    ]);
   });
 
   test("loadSettings lists only the caller's own spaces and source accounts, in one transaction", async () => {
@@ -313,7 +347,9 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
     expect(spaceIds).toContain(fixture.userA.sharedSpaceId);
     expect(spaceIds).not.toContain(fixture.userB.spaceId);
     expect(data!.apiKeys.page).toEqual([]);
-    expect(transactionLog).toEqual(["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"]);
+    expect(transactionLog).toEqual([
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    ]);
   });
 
   test("loadSettings denies an unauthenticated request", async () => {
@@ -334,7 +370,9 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
     );
     expect(data!.selected?.space.spaceId).toBe(fixture.userA.sharedSpaceId);
     expect(data!.selected?.viewer.role).toBe("owner");
-    expect(transactionLog).toEqual(["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"]);
+    expect(transactionLog).toEqual([
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    ]);
   });
 
   test("loadFamilyOverview never returns another user's space detail", async () => {
@@ -402,9 +440,9 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
     expect(memoryArea!.records).toBe(2);
     expect(memoryArea!.status).toBe("covered");
     expect(
-      data!.areas.filter((area) => area.area !== "notes and facts").every(
-        (area) => area.status === "empty",
-      ),
+      data!.areas
+        .filter((area) => area.area !== "notes and facts")
+        .every((area) => area.status === "empty"),
     ).toBe(true);
     expect(transactionLog).toEqual([
       "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
@@ -424,9 +462,8 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
   });
 
   test("a reader-role member administers nothing, so every admin loader is empty", async () => {
-    const { loadCoverage, loadHealth, loadInstitutions } = await import(
-      "./admin-data"
-    );
+    const { loadCoverage, loadHealth, loadInstitutions } =
+      await import("./admin-data");
     const health = await loadHealth(fixture.readerC.cookie);
     expect(
       health!.checks.find((check) => check.id === "documents_watcher")!.status,
@@ -451,9 +488,8 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
   });
 
   test("the admin loaders deny an unauthenticated request", async () => {
-    const { loadCoverage, loadHealth, loadInstitutions } = await import(
-      "./admin-data"
-    );
+    const { loadCoverage, loadHealth, loadInstitutions } =
+      await import("./admin-data");
     expect(await loadHealth(null)).toBeNull();
     expect(await loadInstitutions(null)).toBeNull();
     expect(await loadCoverage(null)).toBeNull();
@@ -504,9 +540,7 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
 
   /** Binds the mocked archive to `spaceId`, and counts every read of it. */
   function archiveOn(spaceId: string) {
-    const read = vi.fn(async () =>
-      Promise.resolve(inventoryResponse(spaceId)),
-    );
+    const read = vi.fn(async () => Promise.resolve(inventoryResponse(spaceId)));
     financeMock.resolve.mockReturnValue({ spaceId, read });
     return read;
   }
@@ -533,9 +567,8 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
     // userB owns their own personal space, so they administer one and reach
     // the archive gate; they are not a member of the space the archive holds.
     const read = archiveOn(fixture.userA.sharedSpaceId);
-    const { loadCoverage, loadHealth, loadInstitutions } = await import(
-      "./admin-data"
-    );
+    const { loadCoverage, loadHealth, loadInstitutions } =
+      await import("./admin-data");
     const institutions = await loadInstitutions(fixture.userB.cookie);
     expect(institutions!.institutions).toEqual([]);
     expect(institutions!.state).toBe("not_configured");
