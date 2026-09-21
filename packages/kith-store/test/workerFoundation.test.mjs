@@ -738,6 +738,54 @@ test(
         ),
         /triage preview source ownership mismatch/,
       );
+
+      const forgetEpoch = await provenance.beginSourceItemForget(f.client, {
+        spaceId: f.spaceId,
+        sourceItemId,
+        forgottenAt: new Date(NOW + 2),
+        forgottenBy: f.userId,
+      });
+      assert.equal(
+        (
+          await f.client.query(
+            `SELECT count(*)::int AS count FROM kith.source_triage_previews
+              WHERE source_item_id = $1`,
+            [sourceItemId],
+          )
+        ).rows[0].count,
+        0,
+      );
+      assert.equal(
+        await provenance.beginSourceItemForget(f.client, {
+          spaceId: f.spaceId,
+          sourceItemId,
+          forgottenAt: new Date(NOW + 3),
+          forgottenBy: f.userId,
+        }),
+        forgetEpoch,
+      );
+      await assert.rejects(
+        f.client.query(
+          `INSERT INTO kith.source_triage_previews
+             (id,space_id,source_account_id,source_item_id,
+              observed_content_hash,observed_byte_length,observed_media_type,
+              observed_observation_epoch,preview_fingerprint,preview_method,
+              source_format,source_unit_count,inspected_original_units,
+              provisional_metadata,confidence)
+           VALUES ($1,$2,$3,$4,$5,10,'application/pdf',1,$6,
+                   'pdf_native_text_v1','pdf',1,'[1]'::jsonb,
+                   '{"title":"forgotten"}'::jsonb,0.5)`,
+          [
+            newKithId(),
+            f.spaceId,
+            f.sourceAccountId,
+            sourceItemId,
+            HASH_A,
+            "f".repeat(64),
+          ],
+        ),
+        /triage preview source ownership mismatch/,
+      );
     } finally {
       await pool.end();
     }

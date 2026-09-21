@@ -70,11 +70,13 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'triage preview payload is immutable';
   END IF;
-  IF TG_OP = 'INSERT' AND NOT EXISTS (
-    SELECT 1 FROM kith.source_items i WHERE i.id = NEW.source_item_id
+  IF TG_OP = 'INSERT' THEN
+    PERFORM 1 FROM kith.source_items i WHERE i.id = NEW.source_item_id
       AND i.space_id = NEW.space_id AND i.source_account_id = NEW.source_account_id
-  ) THEN
-    RAISE EXCEPTION 'triage preview source ownership mismatch';
+      AND i.lifecycle = 'available' FOR KEY SHARE;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'triage preview source ownership mismatch';
+    END IF;
   END IF;
   IF NEW.source_revision_id IS NOT NULL AND NOT EXISTS (
     SELECT 1 FROM kith.source_revisions r WHERE r.id = NEW.source_revision_id

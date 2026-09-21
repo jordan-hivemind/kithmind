@@ -1530,7 +1530,24 @@ export async function beginSourceItemForget(
   client: ClientBase,
   input: { spaceId: string; sourceItemId: string; forgottenAt: Date; forgottenBy: string },
 ): Promise<number> {
+  // Serialize preview insertion with forgetting. The preview trigger takes a
+  // key-share lock while it verifies an available item, so this row lock makes
+  // either the preview commit before the deletion below or observe the new
+  // non-available lifecycle and fail.
+  await client.query(
+    `SELECT id FROM kith.source_items
+      WHERE id = $1 AND space_id = $2 FOR UPDATE`,
+    [input.sourceItemId, input.spaceId],
+  );
   const item = await requireSourceItem(client, input.sourceItemId, input.spaceId);
+  // Provisional metadata can contain a title and date. Erase it at the first
+  // forget boundary, before archive deletion completes, and repeat the delete
+  // on idempotent calls so an interrupted older attempt cannot retain it.
+  await client.query(
+    `DELETE FROM kith.source_triage_previews
+      WHERE source_item_id = $1 AND space_id = $2`,
+    [item.id, input.spaceId],
+  );
   if (item.lifecycle === "forgotten" || item.lifecycle === "forgetting") {
     return item.desiredProcessingEpoch;
   }
