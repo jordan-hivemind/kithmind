@@ -2182,8 +2182,12 @@ test(
       join(tmpdir(), "kith-finance-correction-candidate-raw-"),
     );
     t.after(() => rmSync(rawDir, { recursive: true, force: true }));
-    const { fixturesDir, adapterModulePath, sessionModulePath } =
-      writeReparseAdapterFixtures(t);
+    const {
+      fixturesDir,
+      adapterModulePath,
+      changedHoldingsAdapterModulePath,
+      sessionModulePath,
+    } = writeReparseAdapterFixtures(t);
     const selectionPath = reparseSelection(fixturesDir);
     makeRunner({
       adapterModulePath,
@@ -2256,6 +2260,34 @@ test(
         await count(client, table),
         before[table],
         `${table} is unchanged by the dry run`,
+      );
+    }
+
+    const changedOutput = makeHoldingCorrectionCandidateRunner({
+      adapterModulePath: changedHoldingsAdapterModulePath,
+      schema,
+      rawDir,
+      documentId: document.id,
+      retainedSha256: document.retained_sha256,
+    })();
+    const changedManifest = JSON.parse(changedOutput);
+    assert.deepEqual(changedManifest.tables.positions, {
+      oldRows: 4,
+      candidateRows: 4,
+      unchanged: 3,
+      changed: 1,
+      added: 0,
+      removed: 0,
+    });
+    assert.notEqual(
+      changedManifest.oldProjectionDigest,
+      changedManifest.candidateProjectionDigest,
+    );
+    for (const table of tables) {
+      assert.equal(
+        await count(client, table),
+        before[table],
+        `${table} is unchanged by a correction candidate`,
       );
     }
 
