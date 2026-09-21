@@ -59,8 +59,7 @@ export type CoverageGapInput = {
   detectedAt: number;
 };
 export type CoverageGapAcknowledgement =
-  | "mark_unavailable"
-  | "mark_not_expected";
+  "mark_unavailable" | "mark_not_expected";
 export type CoverageGapListItem = {
   id: string;
   spaceId: string;
@@ -171,7 +170,7 @@ function gapIdentity(
 }
 
 function conditionKey(identity: string): string {
-  return `v1:${createHash("sha256").update(identity).digest("hex")}`;
+  return createHash("md5").update(identity).digest("hex");
 }
 export async function upsertCoverageWindow(
   ctx: Ctx,
