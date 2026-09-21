@@ -954,7 +954,7 @@ test(
 );
 
 test(
-  "cited multi-currency snapshot totals and field evidence are exact",
+  "cited multi-currency snapshot and grouped aggregate totals stay exact per currency",
   { skip },
   async (t) => {
     const { owner, reader: r, seeded } = await fixture(t);
@@ -1021,6 +1021,535 @@ test(
       aggregate.items.find((item) => item.currency === "USD").total.decimal,
       "200",
     );
+    assert.equal(
+      aggregate.items.find((item) => item.currency === "EUR").total.decimal,
+      "150",
+    );
+  },
+);
+
+test(
+  "zero-row partial sources and consolidated attribution agree across inventory, snapshot, and aggregate reads",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const accountId = seeded.settled.accountIds[0];
+    const priorDoc = await document(
+      owner,
+      seeded.settled.id,
+      accountId,
+      "2026-03-31",
+    );
+    const contributingDoc = await document(
+      owner,
+      seeded.settled.id,
+      accountId,
+      "2026-04-30",
+    );
+    const partialDoc = await document(
+      owner,
+      seeded.settled.id,
+      accountId,
+      "2026-04-30",
+    );
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, quantity, market_value, cost_basis, currency,
+          valuation_basis, source_document_id)
+       VALUES ('eligibility-prior', $1, DATE '2026-03-31', '1', '100', '90',
+               'USD', 'market_price', $2),
+              ('eligibility-latest', $1, DATE '2026-04-30', '1', '105', '95',
+               'USD', 'market_price', $3)`,
+      [accountId, priorDoc, contributingDoc],
+    );
+    await owner.query("UPDATE documents SET parsed_ok = FALSE WHERE id = $1", [
+      partialDoc,
+    ]);
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES ('eligibility-resolved', 'document_unparsed', $1, $2,
+               'synthetic partial', 'a row was not parsed', 'resolved')`,
+      [accountId, partialDoc],
+    );
+
+    const inventory = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 100,
+    });
+    const inventoryRow = inventory.items.find(
+      (item) => item.account.accountId === accountId,
+    );
+    assert.equal(inventoryRow.latestSnapshotAsOf, "2026-03-31");
+    assert.equal(inventoryRow.currentValue.value.decimal, "100");
+
+    let snapshot = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId,
+      snapshot: { mode: "latest" },
+    });
+    assert.deepEqual(snapshot.selectedSnapshot, {
+      status: "found",
+      asOf: "2026-04-30",
+    });
+    assert.equal(snapshot.items.length, 1);
+    assert.deepEqual(snapshot.summary, {
+      status: "unavailable",
+      reason: "incomplete_source",
+      positionCount: 1,
+      currencies: [],
+    });
+    assert.equal(snapshot.completeness, "partial");
+    assert.ok(snapshot.coverage.reasons.includes("failed_import"));
+
+    let aggregate = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      accountId,
+    });
+    assert.deepEqual(aggregate.items, []);
+    assert.ok(aggregate.coverage.reasons.includes("failed_import"));
+
+    // The same durable partial state can come from a consolidated statement:
+    // the document has no account, and a closed review supplies attribution.
+    await owner.query("UPDATE documents SET parsed_ok = TRUE WHERE id = $1", [
+      partialDoc,
+    ]);
+    const consolidated = await document(
+      owner,
+      seeded.settled.id,
+      accountId,
+      "2026-05-31",
+    );
+    await owner.query(
+      "UPDATE documents SET account_id = NULL, parsed_ok = FALSE WHERE id = $1",
+      [consolidated],
+    );
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES ('eligibility-consolidated', 'document_unparsed', $1, $2,
+               'synthetic consolidated partial', 'a section was not parsed',
+               'dismissed')`,
+      [accountId, consolidated],
+    );
+
+    snapshot = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId,
+      snapshot: { mode: "latest" },
+    });
+    assert.deepEqual(snapshot.selectedSnapshot, {
+      status: "found",
+      asOf: "2026-05-31",
+    });
+    assert.deepEqual(snapshot.items, []);
+    assert.deepEqual(snapshot.summary, {
+      status: "unavailable",
+      reason: "incomplete_source",
+      positionCount: 0,
+      currencies: [],
+    });
+    assert.equal(snapshot.completeness, "partial");
+    assert.ok(snapshot.coverage.reasons.includes("failed_import"));
+
+    aggregate = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      accountId,
+    });
+    assert.deepEqual(aggregate.items, []);
+    assert.ok(aggregate.coverage.reasons.includes("failed_import"));
+
+    // An open account-linked review independently blocks a consolidated
+    // document even after its document-level parser flag is clear.
+    await owner.query("UPDATE documents SET parsed_ok = TRUE WHERE id = $1", [
+      consolidated,
+    ]);
+    await owner.query(
+      "UPDATE review_items SET status = 'open' WHERE id = 'eligibility-consolidated'",
+    );
+    snapshot = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId,
+      snapshot: { mode: "latest" },
+    });
+    assert.equal(snapshot.selectedSnapshot.asOf, "2026-05-31");
+    assert.equal(snapshot.summary.reason, "incomplete_source");
+    assert.ok(snapshot.coverage.reasons.includes("failed_import"));
+  },
+);
+
+test(
+  "holdings value defects are withheld consistently from inventory and aggregates and disclosed on raw snapshots",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const accountId = seeded.settled.accountIds[0];
+    const doc = await document(
+      owner,
+      seeded.settled.id,
+      accountId,
+      "2026-06-30",
+    );
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, quantity, market_value, cost_basis, currency,
+          valuation_basis, source_document_id)
+       VALUES ('value-defect-a', $1, DATE '2026-06-30', '1', '60', '50',
+               'USD', 'market_price', $2),
+              ('value-defect-b', $1, DATE '2026-06-30', '1', NULL, '40',
+               'USD', 'market_price', $2)`,
+      [accountId, doc],
+    );
+
+    const inventory = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 100,
+    });
+    const inventoryRow = inventory.items.find(
+      (item) => item.account.accountId === accountId,
+    );
+    assert.equal(inventoryRow.latestSnapshotAsOf, undefined);
+    assert.equal(inventoryRow.currentValue, undefined);
+
+    let snapshot = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId,
+      snapshot: { mode: "exact", asOf: "2026-06-30" },
+    });
+    assert.equal(snapshot.items.length, 2);
+    assert.equal(snapshot.summary.status, "partial");
+    assert.ok(snapshot.coverage.reasons.includes("missing_value"));
+
+    let aggregate = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      accountId,
+      from: "2026-06-01",
+      toExclusive: "2026-07-01",
+    });
+    assert.deepEqual(aggregate.items, []);
+    assert.ok(aggregate.coverage.reasons.includes("missing_value"));
+
+    await owner.query(
+      `UPDATE positions
+          SET market_value = '40', currency = 'EUR'
+        WHERE id = 'value-defect-b'`,
+    );
+    snapshot = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId,
+      snapshot: { mode: "exact", asOf: "2026-06-30" },
+    });
+    assert.equal(snapshot.items.length, 2);
+    assert.deepEqual(
+      new Set(snapshot.summary.currencies.map((item) => item.currency)),
+      new Set(["USD", "EUR"]),
+    );
+    assert.equal(
+      snapshot.coverage.reasons.includes("unsupported_value"),
+      false,
+      "separate currency summaries do not require an FX conversion",
+    );
+
+    aggregate = await serve(r, {
+      operation: "aggregate_money",
+      metric: "cost_basis",
+      groupBy: "currency",
+      accountId,
+      from: "2026-06-01",
+      toExclusive: "2026-07-01",
+    });
+    assert.deepEqual(
+      new Map(
+        aggregate.items.map((item) => [item.currency, item.total.decimal]),
+      ),
+      new Map([
+        ["EUR", "40"],
+        ["USD", "50"],
+      ]),
+    );
+
+    await owner.query(
+      `UPDATE positions
+          SET currency = 'USD', valuation_basis = 'cost'
+        WHERE id = 'value-defect-b'`,
+    );
+    aggregate = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      accountId,
+    });
+    assert.deepEqual(aggregate.items, []);
+    assert.ok(aggregate.coverage.reasons.includes("unsupported_value"));
+
+    aggregate = await serve(r, {
+      operation: "aggregate_money",
+      metric: "cost_basis",
+      groupBy: "currency",
+      accountId,
+    });
+    assert.equal(aggregate.items[0].total.decimal, "90");
+  },
+);
+
+test(
+  "account-currency aggregates withhold an unsafe account without hiding safe accounts",
+  { skip },
+  async (t) => {
+    const { owner, reader: r } = await fixture(t);
+    const source = await institution(owner, "account-group-safety", {
+      accounts: 2,
+    });
+    const [unsafeAccount, safeAccount] = source.accountIds;
+    const partialDoc = await document(
+      owner,
+      source.id,
+      unsafeAccount,
+      "2026-09-30",
+    );
+    const safeDoc = await document(owner, source.id, safeAccount, "2026-09-30");
+    await owner.query("UPDATE documents SET parsed_ok = FALSE WHERE id = $1", [
+      partialDoc,
+    ]);
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, quantity, market_value, cost_basis, currency,
+          valuation_basis, source_document_id)
+       VALUES ('account-group-safe-position', $1, DATE '2026-09-30', '1',
+               '125', '100', 'USD', 'market_price', $2)`,
+      [safeAccount, safeDoc],
+    );
+
+    const response = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "account_currency",
+      sourceId: source.id,
+    });
+    assert.deepEqual(
+      response.items.map((item) => ({
+        accountId: item.accountId,
+        currency: item.currency,
+        total: item.total.decimal,
+      })),
+      [{ accountId: safeAccount, currency: "USD", total: "125" }],
+    );
+    assert.ok(response.coverage.reasons.includes("failed_import"));
+  },
+);
+
+test(
+  "a requested aggregate currency is judged only by rows in that currency",
+  { skip },
+  async (t) => {
+    const { owner, reader: r } = await fixture(t);
+    const source = await institution(owner, "selected-currency-safety");
+    const accountId = source.accountIds[0];
+    const doc = await document(owner, source.id, accountId, "2026-10-31");
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, quantity, market_value, cost_basis, currency,
+          valuation_basis, source_document_id)
+       VALUES ('selected-currency-usd', $1, DATE '2026-10-31', '1', '80',
+               '70', 'USD', 'market_price', $2),
+              ('selected-currency-eur', $1, DATE '2026-10-31', '1', NULL,
+               '40', 'EUR', 'market_price', $2)`,
+      [accountId, doc],
+    );
+
+    let response = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      sourceId: source.id,
+      currency: "USD",
+    });
+    assert.equal(response.items.length, 1);
+    assert.equal(response.items[0].currency, "USD");
+    assert.equal(response.items[0].total.decimal, "80");
+    assert.equal(response.coverage.reasons.includes("missing_value"), false);
+    assert.equal(
+      response.coverage.reasons.includes("unsupported_value"),
+      false,
+    );
+
+    response = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      sourceId: source.id,
+      currency: "EUR",
+    });
+    assert.deepEqual(response.items, []);
+    assert.ok(response.coverage.reasons.includes("missing_value"));
+  },
+);
+
+test(
+  "reviews on superseded documents do not make the retained holdings source partial",
+  { skip },
+  async (t) => {
+    const { owner, reader: r } = await fixture(t);
+    const source = await institution(owner, "superseded-review-safety");
+    const accountId = source.accountIds[0];
+    const supersededDoc = await document(
+      owner,
+      source.id,
+      accountId,
+      "2026-11-30",
+    );
+    const retainedDoc = await document(
+      owner,
+      source.id,
+      accountId,
+      "2026-11-30",
+    );
+    await owner.query("UPDATE documents SET superseded_by = $2 WHERE id = $1", [
+      supersededDoc,
+      retainedDoc,
+    ]);
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES ('superseded-source-review', 'ambiguous_amount', $1, $2,
+               'synthetic stale review', 'the source was replaced', 'open')`,
+      [accountId, supersededDoc],
+    );
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, quantity, market_value, cost_basis, currency,
+          valuation_basis, source_document_id)
+       VALUES ('superseded-review-position', $1, DATE '2026-11-30', '1',
+               '140', '120', 'USD', 'market_price', $2)`,
+      [accountId, retainedDoc],
+    );
+
+    const snapshot = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId,
+      snapshot: { mode: "exact", asOf: "2026-11-30" },
+    });
+    assert.notEqual(snapshot.summary.status, "unavailable");
+    assert.equal(snapshot.coverage.reasons.includes("failed_import"), false);
+
+    const inventory = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 100,
+    });
+    const inventoryRow = inventory.items.find(
+      (item) => item.account.accountId === accountId,
+    );
+    assert.equal(inventoryRow.openReviewCount, 0);
+    assert.equal(inventoryRow.latestSnapshotAsOf, "2026-11-30");
+  },
+);
+
+test(
+  "another account's passing position period cannot prove snapshot coverage",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const requestedAccount = seeded.settled.accountIds[0];
+    const otherAccount = "acct_river_oak_other";
+    await owner.query(
+      `INSERT INTO accounts (id, institution_id, acct_last4, base_currency)
+       VALUES ($1, $2, '1999', 'USD')`,
+      [otherAccount, seeded.settled.id],
+    );
+    await owner.query(
+      `INSERT INTO instruments (id, symbol, name)
+       VALUES ('coverage-other-instrument', 'COI', 'Other Account Instrument')`,
+    );
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, quantity, market_value, cost_basis, currency,
+          valuation_basis)
+       VALUES ('coverage-requested-position', $1, DATE '2026-07-31', '1',
+               '100', '90', 'USD', 'market_price')`,
+      [requestedAccount],
+    );
+    await owner.query(
+      `INSERT INTO position_reconciliations
+         (id, account_id, instrument_id, period_start, period_end, status)
+       VALUES ('coverage-other-pass', $1, 'coverage-other-instrument',
+               DATE '2026-07-31', DATE '2026-07-31', 'pass')`,
+      [otherAccount],
+    );
+
+    const snapshot = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId: requestedAccount,
+      snapshot: { mode: "exact", asOf: "2026-07-31" },
+    });
+    assert.deepEqual(snapshot.selectedSnapshot, {
+      status: "found",
+      asOf: "2026-07-31",
+    });
+    assert.equal(snapshot.coverage.status, "unknown");
+    assert.ok(snapshot.coverage.reasons.includes("source_gap"));
+  },
+);
+
+test(
+  "an unverified position reconciliation blocks every holdings value surface",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const accountId = seeded.settled.accountIds[0];
+    await owner.query(
+      `INSERT INTO instruments (id, symbol, name)
+       VALUES ('eligibility-gate-instrument', 'EGI', 'Eligibility Gate')`,
+    );
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, instrument_id, quantity, market_value,
+          cost_basis, currency, valuation_basis)
+       VALUES ('eligibility-gated-position', $1, DATE '2026-08-31',
+               'eligibility-gate-instrument', '1', '110', '100', 'USD',
+               'market_price')`,
+      [accountId],
+    );
+    await owner.query(
+      `INSERT INTO position_reconciliations
+         (id, account_id, instrument_id, period_start, period_end, status)
+       VALUES ('eligibility-gate', $1, 'eligibility-gate-instrument',
+               DATE '2026-07-31', DATE '2026-08-31', 'unverified')`,
+      [accountId],
+    );
+
+    const inventory = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 100,
+    });
+    const inventoryRow = inventory.items.find(
+      (item) => item.account.accountId === accountId,
+    );
+    assert.equal(inventoryRow.latestSnapshotAsOf, undefined);
+    assert.equal(inventoryRow.currentValue, undefined);
+
+    const snapshot = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId,
+      snapshot: { mode: "latest" },
+    });
+    assert.equal(snapshot.selectedSnapshot.asOf, "2026-08-31");
+    assert.equal(snapshot.summary.reason, "incomplete_source");
+    assert.ok(snapshot.coverage.reasons.includes("pending_import"));
+
+    const aggregate = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      accountId,
+    });
+    assert.deepEqual(aggregate.items, []);
+    assert.ok(aggregate.coverage.reasons.includes("pending_import"));
   },
 );
 
@@ -2045,11 +2574,7 @@ async function importLotOnlyAggregatePosition(t) {
   await client.query(
     `INSERT INTO accounts (id, institution_id, acct_last4, base_currency)
      VALUES ($1, $2, $3, 'USD')`,
-    [
-      ADAPTER.accounts[0].id,
-      ADAPTER.institution.id,
-      ADAPTER.accounts[0].last4,
-    ],
+    [ADAPTER.accounts[0].id, ADAPTER.institution.id, ADAPTER.accounts[0].last4],
   );
 
   const quotes = ["$10.25", "19.75"];
@@ -2226,7 +2751,10 @@ test(
       trusted,
       "synthetic-finance-cursor-secret-at-least-32-bytes",
     );
-    const client = new Client({ name: "aggregate-finance-client", version: "1" });
+    const client = new Client({
+      name: "aggregate-finance-client",
+      version: "1",
+    });
     const [clientTransport, serverTransport] =
       InMemoryTransport.createLinkedPair();
     try {
@@ -3006,30 +3534,17 @@ test(
     await moneyRows(owner, accountId, {
       positions: [
         ["2026-03-31", "100", "USD", "market_price", priorDoc],
-        [
-          "2026-04-30",
-          "5",
-          "USD",
-          "market_price",
-          latestCompleteDoc,
-        ],
-        [
-          "2026-04-30",
-          "7",
-          "USD",
-          "market_price",
-          latestPartialDoc,
-        ],
+        ["2026-04-30", "5", "USD", "market_price", latestCompleteDoc],
+        ["2026-04-30", "7", "USD", "market_price", latestPartialDoc],
       ],
     });
     // This is the durable state the importer writes when one of multiple
     // sources for an account/date is only partially parsed. The complete
     // source must not let that fragmentary date advance. The safety decision
     // comes from `parsed_ok`, not mutable review workflow or attribution.
-    await owner.query(
-      "UPDATE documents SET parsed_ok = FALSE WHERE id = $1",
-      [latestPartialDoc],
-    );
+    await owner.query("UPDATE documents SET parsed_ok = FALSE WHERE id = $1", [
+      latestPartialDoc,
+    ]);
     await owner.query(
       `INSERT INTO review_items
          (id, kind, account_id, source_document_id, raw_value, reason, status)
@@ -3060,10 +3575,9 @@ test(
     // A successful reparse is the only transition that makes the statement
     // eligible. Its historical review may remain dismissed without changing
     // that source-evidence fact.
-    await owner.query(
-      "UPDATE documents SET parsed_ok = TRUE WHERE id = $1",
-      [latestPartialDoc],
-    );
+    await owner.query("UPDATE documents SET parsed_ok = TRUE WHERE id = $1", [
+      latestPartialDoc,
+    ]);
     row = await inventory();
     assert.equal(row.latestSnapshotAsOf, "2026-04-30");
     assert.deepEqual(row.currentValue, {

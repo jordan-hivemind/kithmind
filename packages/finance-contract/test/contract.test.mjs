@@ -486,6 +486,28 @@ describe("response truth and evidence", () => {
     rejects("invalid_response", () => parseExchange(exchange));
   });
 
+  it("keeps raw snapshot rows inspectable when source incompleteness makes every monetary summary unsafe", () => {
+    const exchange = clone(syntheticFinanceReadExchanges[7]);
+    exchange.response.summary = {
+      status: "unavailable",
+      reason: "incomplete_source",
+      positionCount: 1,
+      currencies: [],
+    };
+    exchange.response.coverage = {
+      status: "partial",
+      reasons: ["failed_import"],
+    };
+    exchange.response.completeness = "partial";
+    assert.equal(
+      parseExchange(exchange).response.summary.reason,
+      "incomplete_source",
+    );
+
+    exchange.response.completeness = "complete";
+    rejects("invalid_response", () => parseExchange(exchange));
+  });
+
   it("retains evidence for precision overflow issues", () => {
     const exchange = clone(syntheticFinanceReadExchanges[0]);
     exchange.response.items = [];
@@ -741,7 +763,10 @@ describe("list_account_inventory (ADM-2)", () => {
       ["2026-08-31"],
       ["2025-12-31"],
       ["2026-07-32"],
-      Array.from({ length: 13 }, (_, i) => `2026-07-${String(31 - i).padStart(2, "0")}`),
+      Array.from(
+        { length: 13 },
+        (_, i) => `2026-07-${String(31 - i).padStart(2, "0")}`,
+      ),
     ]) {
       const exchange = inventory();
       exchange.response.items[0].balanceDates = dates;

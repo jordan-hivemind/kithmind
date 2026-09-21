@@ -285,9 +285,7 @@ export type FinanceSnapshotFieldDisclosure = {
  * instrument, and no identifier is invented for one.
  */
 export type FinanceSnapshotInstrumentStatus =
-  | "resolved"
-  | "institution_symbol"
-  | "ambiguous";
+  "resolved" | "institution_symbol" | "ambiguous";
 
 export type FinanceSnapshotInstrument =
   | {
@@ -380,7 +378,7 @@ export type FinanceHoldingsSnapshotSummary =
     }
   | {
       status: "unavailable";
-      reason: "position_limit" | "evidence_bytes_limit";
+      reason: "position_limit" | "evidence_bytes_limit" | "incomplete_source";
       positionCount: number;
       currencies: [];
     };
@@ -2266,7 +2264,7 @@ function snapshotSummary(value: unknown): FinanceHoldingsSnapshotSummary {
     ) as [];
     const reason = oneOf(
       input.reason,
-      ["position_limit", "evidence_bytes_limit"] as const,
+      ["position_limit", "evidence_bytes_limit", "incomplete_source"] as const,
       "invalid_response",
     );
     if (
@@ -2513,9 +2511,7 @@ function coverageRecord(value: unknown): FinanceCoverageRecord {
  * outside the activity the same row claims. A row with a snapshot but no
  * activity range is refused for the same reason.
  */
-function accountInventoryRecord(
-  value: unknown,
-): FinanceAccountInventoryRecord {
+function accountInventoryRecord(value: unknown): FinanceAccountInventoryRecord {
   const input = object(value, "invalid_response");
   exact(
     input,
@@ -2935,7 +2931,9 @@ export function parseFinanceReadResponseShape(
         ? undefined
         : summary.reason === "position_limit"
           ? "snapshot_summary_limit"
-          : "snapshot_summary_evidence_limit";
+          : summary.reason === "evidence_bytes_limit"
+            ? "snapshot_summary_evidence_limit"
+            : undefined;
     if (
       (selectedSnapshot.status === "not_found" &&
         (parsedItems.length !== 0 || summary.positionCount !== 0)) ||

@@ -1219,6 +1219,156 @@ type AccountInventoryRow = AccountDescriptorRow & {
   latest_balance_holds_securities: boolean | null;
 };
 
+type HoldingsDateAssessment = {
+  partial_source: boolean;
+  open_review: boolean;
+  failed_reconciliation: boolean;
+  pending_reconciliation: boolean;
+  position_count: string;
+  missing_market_value: string;
+  missing_cost_basis: string;
+  non_market_value: string;
+  currency_count: string;
+};
+
+/**
+ * The durable facts that can disqualify one account/date from being called a
+ * complete holdings snapshot. Keep these predicates in one place: inventory,
+ * direct snapshot reads and holdings aggregates must not disagree about the
+ * same stored state.
+ *
+ * A document can belong to an account directly, through a contributed
+ * position, or through review attribution. The last form matters for
+ * consolidated statements whose document-level account_id is null. Review
+ * status deliberately does not affect partial-source attribution: resolving
+ * a review does not make a parser produce rows it previously omitted.
+ */
+function holdingsDatePredicates(account: string, asOf: string) {
+  return {
+    partialSource: `EXISTS (
+      SELECT 1 FROM documents pd
+       WHERE pd.parsed_ok = FALSE
+         AND pd.superseded_by IS NULL
+         AND (
+           (pd.account_id = ${account} AND pd.doc_date = ${asOf})
+           OR EXISTS (
+             SELECT 1 FROM positions partial_p
+              WHERE partial_p.source_document_id = pd.id
+                AND partial_p.account_id = ${account}
+                AND partial_p.as_of = ${asOf}
+           )
+           OR (pd.doc_date = ${asOf} AND EXISTS (
+             SELECT 1 FROM review_items partial_r
+              WHERE partial_r.source_document_id = pd.id
+                AND partial_r.account_id = ${account}
+           ))
+         )
+    )`,
+    openReview: `EXISTS (
+      SELECT 1 FROM review_items open_r
+      LEFT JOIN documents open_d ON open_d.id = open_r.source_document_id
+       WHERE open_r.account_id = ${account}
+         AND open_r.status = 'open'
+         AND open_d.superseded_by IS NULL
+         AND (
+           open_d.doc_date = ${asOf}
+           OR EXISTS (
+             SELECT 1 FROM positions open_p
+              WHERE open_p.source_document_id = open_r.source_document_id
+                AND open_p.account_id = ${account}
+                AND open_p.as_of = ${asOf}
+           )
+         )
+    )`,
+    failedReconciliation: `EXISTS (
+      SELECT 1 FROM position_reconciliations failed_pr
+       WHERE failed_pr.account_id = ${account}
+         AND failed_pr.period_end = ${asOf}
+         AND failed_pr.status = 'fail'
+    )`,
+    pendingReconciliation: `EXISTS (
+      SELECT 1 FROM position_reconciliations pending_pr
+       WHERE pending_pr.account_id = ${account}
+         AND pending_pr.period_end = ${asOf}
+         AND pending_pr.status = 'unverified'
+    )`,
+  };
+}
+
+async function assessHoldingsDate(
+  client: pg.ClientBase,
+  accountId: string,
+  asOf: string,
+): Promise<HoldingsDateAssessment> {
+  const predicates = holdingsDatePredicates("$1", "$2::date");
+  const result = await client.query<HoldingsDateAssessment>(
+    `SELECT ${predicates.partialSource} AS partial_source,
+            ${predicates.openReview} AS open_review,
+            ${predicates.failedReconciliation} AS failed_reconciliation,
+            ${predicates.pendingReconciliation} AS pending_reconciliation,
+            count(p.*)::text AS position_count,
+            count(*) FILTER (WHERE p.market_value IS NULL)::text
+              AS missing_market_value,
+            count(*) FILTER (WHERE p.cost_basis IS NULL)::text
+              AS missing_cost_basis,
+            count(*) FILTER (
+              WHERE p.valuation_basis IS DISTINCT FROM 'market_price'
+            )::text AS non_market_value,
+            count(DISTINCT p.currency)::text AS currency_count
+       FROM positions p
+      WHERE p.account_id = $1 AND p.as_of = $2::date`,
+    [accountId, asOf],
+  );
+  return result.rows[0]!;
+}
+
+function foldHoldingsSourceAssessment(
+  scope: ReadScope,
+  assessment: HoldingsDateAssessment,
+): boolean {
+  let safe = true;
+  if (
+    assessment.partial_source ||
+    assessment.open_review ||
+    assessment.failed_reconciliation
+  ) {
+    scope.withheld.add("failed_import");
+    safe = false;
+  }
+  if (assessment.pending_reconciliation) {
+    scope.withheld.add("pending_import");
+    safe = false;
+  }
+  return safe;
+}
+
+function foldHoldingsDateAssessment(
+  scope: ReadScope,
+  assessment: HoldingsDateAssessment,
+  requiredValue: "market_value" | "cost_basis" | "both",
+): boolean {
+  let safe = foldHoldingsSourceAssessment(scope, assessment);
+  const missing =
+    requiredValue === "market_value"
+      ? Number(assessment.missing_market_value)
+      : requiredValue === "cost_basis"
+        ? Number(assessment.missing_cost_basis)
+        : Number(assessment.missing_market_value) +
+          Number(assessment.missing_cost_basis);
+  if (missing > 0) {
+    scope.withheld.add("missing_value");
+    safe = false;
+  }
+  if (
+    requiredValue !== "cost_basis" &&
+    Number(assessment.non_market_value) > 0
+  ) {
+    scope.withheld.add("unsupported_value");
+    safe = false;
+  }
+  return safe;
+}
+
 function statedValue(
   rawAmount: string | null,
   rawCurrency: string | null,
@@ -1337,6 +1487,7 @@ async function listAccountInventory(
   options: FinanceReadOptions,
 ): Promise<FinanceReadResponse> {
   const cursorKey = readCursorKey(scope, request, options);
+  const eligibility = holdingsDatePredicates("d.account_id", "p.as_of");
   const result = await client.query<AccountInventoryRow>(
     `${ACCOUNT_DESCRIPTOR_CTES}
      SELECT d.*,
@@ -1359,7 +1510,15 @@ async function listAccountInventory(
             hs.as_of::text AS latest_snapshot_as_of,
             (SELECT count(*) FROM review_items r
               WHERE r.account_id = d.account_id
-                AND r.status = 'open')::text AS open_review_count,
+                AND r.status = 'open'
+                AND (
+                  r.source_document_id IS NULL
+                  OR EXISTS (
+                    SELECT 1 FROM documents review_d
+                     WHERE review_d.id = r.source_document_id
+                       AND review_d.superseded_by IS NULL
+                  )
+                ))::text AS open_review_count,
             lb.as_of::text AS balance_as_of,
             lb.total_value::text AS balance_value,
             lb.currency::text AS balance_currency,
@@ -1408,38 +1567,16 @@ async function listAccountInventory(
          SELECT p.as_of
            FROM positions p
           WHERE p.account_id = d.account_id
-            -- A parse-noted document remains parsed_ok = FALSE even when
-            -- it yielded some positions. If any source contributing to the
-            -- account/date is incomplete, the whole date is fragmentary and
-            -- must stay back independently of review-item triage.
-            -- In particular, a resolved or dismissed review records review
-            -- workflow, not that the parser subsequently read the omitted
-            -- holdings.
-            AND NOT EXISTS (
-              SELECT 1
-                FROM positions partial_p
-                JOIN documents pd ON pd.id = partial_p.source_document_id
-               WHERE partial_p.account_id = p.account_id
-                 AND partial_p.as_of = p.as_of
-                 AND pd.parsed_ok = FALSE
-            )
-            AND NOT EXISTS (
-              SELECT 1
-                FROM review_items r
-                JOIN documents rd ON rd.id = r.source_document_id
-               WHERE r.account_id = d.account_id
-                 AND r.status = 'open'
-                 AND rd.account_id = d.account_id
-                 AND rd.doc_date = p.as_of
-            )
-            AND NOT EXISTS (
-              SELECT 1
-                FROM position_reconciliations pr
-               WHERE pr.account_id = d.account_id
-                 AND pr.period_end = p.as_of
-                 AND pr.status <> 'pass'
-            )
+            AND NOT ${eligibility.partialSource}
+            AND NOT ${eligibility.openReview}
+            AND NOT ${eligibility.failedReconciliation}
+            AND NOT ${eligibility.pendingReconciliation}
           GROUP BY p.as_of
+          HAVING count(*) FILTER (WHERE p.market_value IS NULL) = 0
+             AND count(DISTINCT p.currency) = 1
+             AND count(*) FILTER (
+                   WHERE p.valuation_basis IS DISTINCT FROM 'market_price'
+                 ) = 0
           ORDER BY p.as_of DESC
           LIMIT 1
        ) hs ON true
@@ -1555,6 +1692,9 @@ async function listTransactions(
   );
   await foldScopeCoverage(client, scope, {
     ...(request.sourceId === undefined ? {} : { sourceId: request.sourceId }),
+    ...(request.accountId === undefined
+      ? {}
+      : { accountId: request.accountId }),
     ...(request.from === undefined ? {} : { from: request.from }),
     ...(request.toExclusive === undefined
       ? {}
@@ -1607,6 +1747,9 @@ async function listHoldings(
   );
   await foldScopeCoverage(client, scope, {
     ...(request.sourceId === undefined ? {} : { sourceId: request.sourceId }),
+    ...(request.accountId === undefined
+      ? {}
+      : { accountId: request.accountId }),
     ...(request.asOf === undefined
       ? {}
       : { toExclusive: addDays(request.asOf, 1) }),
@@ -1850,6 +1993,62 @@ function summaryMetric(
   }
 }
 
+/**
+ * Selects the date the archive knows the caller asked about, including a date
+ * represented only by failure evidence. Without the latter, a zero-position
+ * partial statement disappears and `latest` silently falls back to an older
+ * complete snapshot (or `not_found`).
+ */
+async function selectKnownHoldingsDate(
+  client: pg.ClientBase,
+  accountId: string,
+  selector: FinanceHoldingsSnapshotSelector,
+): Promise<string | null> {
+  const result = await client.query<{ as_of: string | null }>(
+    `WITH candidate_dates AS (
+       SELECT p.as_of
+         FROM positions p
+        WHERE p.account_id = $1
+       UNION
+       SELECT d.doc_date AS as_of
+         FROM documents d
+        WHERE d.doc_date IS NOT NULL
+          AND d.superseded_by IS NULL
+          AND (
+            d.account_id = $1
+            OR EXISTS (
+              SELECT 1 FROM review_items attributed_r
+               WHERE attributed_r.source_document_id = d.id
+                 AND attributed_r.account_id = $1
+            )
+          )
+          AND (
+            d.parsed_ok = FALSE
+            OR EXISTS (
+              SELECT 1 FROM review_items open_r
+               WHERE open_r.source_document_id = d.id
+                 AND open_r.account_id = $1
+                 AND open_r.status = 'open'
+            )
+          )
+       UNION
+       SELECT pr.period_end AS as_of
+         FROM position_reconciliations pr
+        WHERE pr.account_id = $1 AND pr.status <> 'pass'
+     )
+     SELECT max(as_of)::text AS as_of
+       FROM candidate_dates
+      WHERE ($2::date IS NULL OR as_of = $2::date)
+        AND ($3::date IS NULL OR as_of <= $3::date)`,
+    [
+      accountId,
+      selector.mode === "exact" ? selector.asOf : null,
+      selector.mode === "latest" ? (selector.onOrBefore ?? null) : null,
+    ],
+  );
+  return result.rows[0]!.as_of;
+}
+
 async function getHoldingsSnapshot(
   client: pg.ClientBase,
   scope: ReadScope,
@@ -1866,23 +2065,15 @@ async function getHoldingsSnapshot(
     throw new FinanceContractError("not_authorized");
   const account = accountDescriptorOf(accountRow, scope);
 
-  const selected = await client.query<{ as_of: string | null }>(
-    `SELECT max(as_of)::text AS as_of FROM positions
-      WHERE account_id = $1
-        AND ($2::date IS NULL OR as_of = $2::date)
-        AND ($3::date IS NULL OR as_of <= $3::date)`,
-    [
-      request.accountId,
-      request.snapshot.mode === "exact" ? request.snapshot.asOf : null,
-      request.snapshot.mode === "latest"
-        ? (request.snapshot.onOrBefore ?? null)
-        : null,
-    ],
+  const asOf = await selectKnownHoldingsDate(
+    client,
+    request.accountId,
+    request.snapshot,
   );
-  const asOf = selected.rows[0]!.as_of;
   if (asOf === null) {
     await foldScopeCoverage(client, scope, {
       sourceId: account.sourceId,
+      accountId: request.accountId,
       ...(request.snapshot.mode === "exact"
         ? {
             from: request.snapshot.asOf,
@@ -1915,8 +2106,18 @@ async function getHoldingsSnapshot(
     };
   }
 
+  const dateAssessment = await assessHoldingsDate(
+    client,
+    request.accountId,
+    asOf,
+  );
+  const sourceIsUsable = foldHoldingsSourceAssessment(scope, dateAssessment);
+  foldHoldingsDateAssessment(scope, dateAssessment, "both");
+  const monetarySummarySourceIsUsable =
+    sourceIsUsable && Number(dateAssessment.non_market_value) === 0;
   await foldScopeCoverage(client, scope, {
     sourceId: account.sourceId,
+    accountId: request.accountId,
     from: asOf,
     toExclusive: addDays(asOf, 1),
     kinds: ["holding", "balance"],
@@ -2019,6 +2220,13 @@ async function getHoldingsSnapshot(
     summary = {
       status: "unavailable",
       reason: positionLimitExceeded ? "position_limit" : "evidence_bytes_limit",
+      positionCount,
+      currencies: [],
+    };
+  } else if (!monetarySummarySourceIsUsable) {
+    summary = {
+      status: "unavailable",
+      reason: "incomplete_source",
       positionCount,
       currencies: [],
     };
@@ -2173,6 +2381,11 @@ async function getHoldingsSnapshot(
     const availableQuantityCount = allItems.filter(
       (item) => item.quantity !== undefined,
     ).length;
+    // The contract derives this status from the position fields below. Source
+    // and account/date eligibility is carried by envelope coverage instead;
+    // changing this status alone would produce an invalid response. The
+    // assessment above still makes the response itself partial and names the
+    // reason while preserving explicitly requested raw rows.
     const fullyUsable =
       resolvedInstrumentCount + institutionSymbolInstrumentCount ===
         allItems.length &&
@@ -2256,6 +2469,9 @@ async function listBalances(
   );
   await foldScopeCoverage(client, scope, {
     ...(request.sourceId === undefined ? {} : { sourceId: request.sourceId }),
+    ...(request.accountId === undefined
+      ? {}
+      : { accountId: request.accountId }),
     ...(request.from === undefined ? {} : { from: request.from }),
     ...(request.toExclusive === undefined
       ? {}
@@ -2279,6 +2495,141 @@ type AggregateRow = {
   ids: string[];
 };
 
+type HoldingsAggregateEligibility = {
+  globalUnsafe: boolean;
+  unsafeAccountIds: string[];
+  unsafeGroupKeys: string[];
+};
+
+function aggregateGroupKey(
+  groupsByAccount: boolean,
+  accountId: string,
+  currency: string,
+): string {
+  return `${groupsByAccount ? accountId : ""}\u001f${currency}`;
+}
+
+async function holdingsAggregateEligibility(
+  client: pg.ClientBase,
+  scope: ReadScope,
+  request: AggregateMoneyRequest,
+  groupsByAccount: boolean,
+): Promise<HoldingsAggregateEligibility> {
+  const selected = await client.query<{ account_id: string; as_of: string }>(
+    `WITH candidate_dates(account_id, as_of) AS (
+       SELECT p.account_id, p.as_of
+         FROM positions p
+       UNION
+       SELECT d.account_id, d.doc_date
+         FROM documents d
+        WHERE d.account_id IS NOT NULL
+          AND d.doc_date IS NOT NULL
+          AND d.superseded_by IS NULL
+          AND (
+            d.parsed_ok = FALSE
+            OR EXISTS (
+              SELECT 1 FROM review_items open_r
+               WHERE open_r.source_document_id = d.id
+                 AND open_r.account_id = d.account_id
+                 AND open_r.status = 'open'
+            )
+          )
+       UNION
+       SELECT attributed_r.account_id, d.doc_date
+         FROM review_items attributed_r
+         JOIN documents d ON d.id = attributed_r.source_document_id
+        WHERE attributed_r.account_id IS NOT NULL
+          AND d.doc_date IS NOT NULL
+          AND d.superseded_by IS NULL
+          AND (d.parsed_ok = FALSE OR attributed_r.status = 'open')
+       UNION
+       SELECT pr.account_id, pr.period_end
+         FROM position_reconciliations pr
+        WHERE pr.status <> 'pass'
+     ), scoped AS (
+       SELECT c.account_id, c.as_of
+         FROM candidate_dates c
+         JOIN accounts a ON a.id = c.account_id
+        WHERE ($1::text IS NULL OR a.institution_id = $1)
+          AND ($2::text IS NULL OR c.account_id = $2)
+          AND ($3::date IS NULL OR c.as_of >= $3::date)
+          AND ($4::date IS NULL OR c.as_of < $4::date)
+     )
+     SELECT account_id, max(as_of)::text AS as_of
+       FROM scoped
+      GROUP BY account_id
+      ORDER BY account_id`,
+    [
+      request.sourceId ?? null,
+      request.accountId ?? null,
+      request.from ?? null,
+      request.toExclusive ?? null,
+    ],
+  );
+  let globalUnsafe = false;
+  const unsafeAccountIds = new Set<string>();
+  const unsafeGroupKeys = new Set<string>();
+  for (const selectedDate of selected.rows) {
+    const assessment = await assessHoldingsDate(
+      client,
+      selectedDate.account_id,
+      selectedDate.as_of,
+    );
+    // A partial source or failed gate can have omitted an entire row, whose
+    // currency is consequently unknowable. Currency-only grouping cannot
+    // publish any group, since that omitted row could belong to any of them.
+    // Account-currency grouping can still publish other accounts, because an
+    // omitted row from this account cannot contribute to theirs.
+    if (!foldHoldingsSourceAssessment(scope, assessment)) {
+      if (groupsByAccount) unsafeAccountIds.add(selectedDate.account_id);
+      else globalUnsafe = true;
+      continue;
+    }
+    const byCurrency = await client.query<{
+      currency: string;
+      missing_value: string;
+      non_market_value: string;
+    }>(
+      `SELECT p.currency::text,
+              count(*) FILTER (
+                WHERE p.${request.metric === "market_value" ? "market_value" : "cost_basis"} IS NULL
+              )::text AS missing_value,
+              count(*) FILTER (
+                WHERE p.valuation_basis IS DISTINCT FROM 'market_price'
+              )::text AS non_market_value
+         FROM positions p
+        WHERE p.account_id = $1 AND p.as_of = $2::date
+        GROUP BY p.currency`,
+      [selectedDate.account_id, selectedDate.as_of],
+    );
+    for (const currency of byCurrency.rows) {
+      if (
+        request.currency !== undefined &&
+        currency.currency !== request.currency
+      )
+        continue;
+      const missing = Number(currency.missing_value) > 0;
+      const unsupportedMarketValue =
+        request.metric === "market_value" &&
+        Number(currency.non_market_value) > 0;
+      if (!missing && !unsupportedMarketValue) continue;
+      scope.withheld.add(missing ? "missing_value" : "unsupported_value");
+      unsafeGroupKeys.add(
+        aggregateGroupKey(
+          groupsByAccount,
+          selectedDate.account_id,
+          currency.currency,
+        ),
+      );
+    }
+  }
+  return {
+    globalUnsafe,
+    unsafeAccountIds: [...unsafeAccountIds],
+    unsafeGroupKeys: [...unsafeGroupKeys],
+  };
+}
+
 /**
  * The SQL behind each metric. Every one of them groups by currency, which is
  * how "a total never crosses currencies" is made structural rather than
@@ -2295,6 +2646,8 @@ function aggregateSql(
   groupsByAccount: boolean,
   afterCurrency: string | null,
   afterAccountId: string | null,
+  unsafeGroupKeys: readonly string[],
+  unsafeAccountIds: readonly string[],
 ): { sql: string; values: unknown[] } {
   const account = groupsByAccount
     ? ", a.id AS account_id"
@@ -2327,13 +2680,18 @@ function aggregateSql(
             SELECT * FROM grouped
              WHERE ($6::text IS NULL OR
                     (currency, coalesce(account_id, '')) > ($6, $7::text))
+               AND (coalesce(account_id, '') || chr(31) || currency)
+                     <> ALL($8::text[])
+               AND (account_id IS NULL OR account_id <> ALL($9::text[]))
              ORDER BY currency, coalesce(account_id, '')
-             LIMIT $8`,
+             LIMIT $10`,
       values: [
         ...shared,
         request.currency ?? null,
         afterCurrency,
         afterAccountId,
+        unsafeGroupKeys,
+        unsafeAccountIds,
       ],
     };
   }
@@ -2375,13 +2733,18 @@ function aggregateSql(
           SELECT * FROM grouped
            WHERE ($6::text IS NULL OR
                   (currency, coalesce(account_id, '')) > ($6, $7::text))
+             AND (coalesce(account_id, '') || chr(31) || currency)
+                   <> ALL($8::text[])
+             AND (account_id IS NULL OR account_id <> ALL($9::text[]))
            ORDER BY currency, coalesce(account_id, '')
-           LIMIT $8`,
+           LIMIT $10`,
     values: [
       ...shared,
       request.currency ?? null,
       afterCurrency,
       afterAccountId,
+      unsafeGroupKeys,
+      unsafeAccountIds,
     ],
   };
 }
@@ -2401,16 +2764,27 @@ async function aggregateMoney(
       typeof cursorKey[1] !== "string")
   )
     throw new FinanceContractError("invalid_request");
+  const holdingsAggregate =
+    request.metric === "market_value" || request.metric === "cost_basis";
+  const aggregateEligibility = holdingsAggregate
+    ? await holdingsAggregateEligibility(
+        client,
+        scope,
+        request,
+        groupsByAccount,
+      )
+    : { globalUnsafe: false, unsafeAccountIds: [], unsafeGroupKeys: [] };
   const { sql, values } = aggregateSql(
     request,
     groupsByAccount,
     cursorKey?.[0] ?? null,
     cursorKey?.[1] ?? null,
+    aggregateEligibility.unsafeGroupKeys,
+    aggregateEligibility.unsafeAccountIds,
   );
-  const result = await client.query<AggregateRow>(sql, [
-    ...values,
-    request.limit + 1,
-  ]);
+  const result = aggregateEligibility.globalUnsafe
+    ? { rows: [] as AggregateRow[] }
+    : await client.query<AggregateRow>(sql, [...values, request.limit + 1]);
   const rows = result.rows.slice(0, request.limit);
   const truncated = result.rows.length > request.limit;
 
@@ -2451,6 +2825,9 @@ async function aggregateMoney(
 
   await foldScopeCoverage(client, scope, {
     ...(request.sourceId === undefined ? {} : { sourceId: request.sourceId }),
+    ...(request.accountId === undefined
+      ? {}
+      : { accountId: request.accountId }),
     ...(request.from === undefined ? {} : { from: request.from }),
     ...(request.toExclusive === undefined
       ? {}
@@ -2723,6 +3100,7 @@ function uncovered(
 /** What a coverage question is asked about, from any operation. */
 type CoverageFilters = {
   sourceId?: string;
+  accountId?: string;
   from?: string;
   toExclusive?: string;
   kinds: FinanceRecordKind[];
@@ -2767,31 +3145,50 @@ async function coverageRecords(
 
   const sources = await client.query<SourceRow>(
     `SELECT i.id AS source_id,
-            (SELECT count(*)::text FROM accounts a WHERE a.institution_id = i.id) AS accounts,
+            (SELECT count(*)::text FROM accounts a WHERE a.institution_id = i.id
+              AND ($3::text IS NULL OR a.id = $3)) AS accounts,
             (SELECT count(*)::text FROM transactions t JOIN accounts a ON a.id = t.account_id
-              WHERE a.institution_id = i.id) AS transactions,
+              WHERE a.institution_id = i.id
+                AND ($3::text IS NULL OR a.id = $3)) AS transactions,
             (SELECT count(*)::text FROM positions p JOIN accounts a ON a.id = p.account_id
-              WHERE a.institution_id = i.id) AS positions,
+              WHERE a.institution_id = i.id
+                AND ($3::text IS NULL OR a.id = $3)) AS positions,
             (SELECT count(*)::text FROM balances b JOIN accounts a ON a.id = b.account_id
-              WHERE a.institution_id = i.id) AS balances,
-            (SELECT count(*)::text FROM documents d WHERE d.institution_id = i.id) AS documents,
+              WHERE a.institution_id = i.id
+                AND ($3::text IS NULL OR a.id = $3)) AS balances,
+            (SELECT count(*)::text FROM documents d
+              WHERE d.institution_id = i.id
+                AND ($3::text IS NULL OR d.account_id = $3 OR EXISTS (
+                  SELECT 1 FROM review_items dri
+                   WHERE dri.source_document_id = d.id AND dri.account_id = $3
+                ))) AS documents,
             (SELECT min(t.process_date)::text FROM transactions t JOIN accounts a ON a.id = t.account_id
-              WHERE a.institution_id = i.id) AS txn_min,
+              WHERE a.institution_id = i.id
+                AND ($3::text IS NULL OR a.id = $3)) AS txn_min,
             (SELECT max(t.process_date)::text FROM transactions t JOIN accounts a ON a.id = t.account_id
-              WHERE a.institution_id = i.id) AS txn_max,
+              WHERE a.institution_id = i.id
+                AND ($3::text IS NULL OR a.id = $3)) AS txn_max,
             (SELECT min(p.as_of)::text FROM positions p JOIN accounts a ON a.id = p.account_id
-              WHERE a.institution_id = i.id) AS pos_min,
+              WHERE a.institution_id = i.id
+                AND ($3::text IS NULL OR a.id = $3)) AS pos_min,
             (SELECT max(p.as_of)::text FROM positions p JOIN accounts a ON a.id = p.account_id
-              WHERE a.institution_id = i.id) AS pos_max,
+              WHERE a.institution_id = i.id
+                AND ($3::text IS NULL OR a.id = $3)) AS pos_max,
             (SELECT min(b.as_of)::text FROM balances b JOIN accounts a ON a.id = b.account_id
-              WHERE a.institution_id = i.id) AS bal_min,
+              WHERE a.institution_id = i.id
+                AND ($3::text IS NULL OR a.id = $3)) AS bal_min,
             (SELECT max(b.as_of)::text FROM balances b JOIN accounts a ON a.id = b.account_id
-              WHERE a.institution_id = i.id) AS bal_max
+              WHERE a.institution_id = i.id
+                AND ($3::text IS NULL OR a.id = $3)) AS bal_max
        FROM institutions i
       WHERE ($1::text IS NULL OR i.id = $1)
+        AND ($3::text IS NULL OR EXISTS (
+          SELECT 1 FROM accounts requested_a
+           WHERE requested_a.id = $3 AND requested_a.institution_id = i.id
+        ))
       ORDER BY i.id
       LIMIT $2`,
-    [request.sourceId ?? null, MAX_SUPPORT_ROWS],
+    [request.sourceId ?? null, MAX_SUPPORT_ROWS, request.accountId ?? null],
   );
 
   const cashPeriods = await client.query<PeriodRow>(
@@ -2800,9 +3197,10 @@ async function coverageRecords(
        JOIN accounts a ON a.id = r.account_id
        JOIN institutions i ON i.id = a.institution_id
       WHERE ($1::text IS NULL OR i.id = $1)
+        AND ($3::text IS NULL OR a.id = $3)
       ORDER BY i.id, r.period_start
       LIMIT $2`,
-    [request.sourceId ?? null, MAX_SUPPORT_ROWS],
+    [request.sourceId ?? null, MAX_SUPPORT_ROWS, request.accountId ?? null],
   );
 
   const positionPeriods = await client.query<PeriodRow>(
@@ -2811,9 +3209,10 @@ async function coverageRecords(
        JOIN accounts a ON a.id = pr.account_id
        JOIN institutions i ON i.id = a.institution_id
       WHERE ($1::text IS NULL OR i.id = $1)
+        AND ($3::text IS NULL OR a.id = $3)
       ORDER BY i.id, pr.period_start
       LIMIT $2`,
-    [request.sourceId ?? null, MAX_SUPPORT_ROWS],
+    [request.sourceId ?? null, MAX_SUPPORT_ROWS, request.accountId ?? null],
   );
 
   const reviews = await client.query<ReviewRow>(
@@ -2827,10 +3226,12 @@ async function coverageRecords(
        JOIN institutions i ON i.id = a.institution_id
        LEFT JOIN documents d ON d.id = ri.source_document_id
       WHERE ri.status = 'open'
+        AND (d.id IS NULL OR d.superseded_by IS NULL)
         AND ($1::text IS NULL OR i.id = $1)
+        AND ($3::text IS NULL OR ri.account_id = $3)
       GROUP BY i.id
       LIMIT $2`,
-    [request.sourceId ?? null, MAX_SUPPORT_ROWS],
+    [request.sourceId ?? null, MAX_SUPPORT_ROWS, request.accountId ?? null],
   );
   const reviewBySource = new Map(
     reviews.rows.map((row) => [row.source_id, row]),
