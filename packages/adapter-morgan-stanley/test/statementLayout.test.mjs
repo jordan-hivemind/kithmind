@@ -506,6 +506,32 @@ test("a printed Total continues across a shifted semantic header", () => {
   assert.equal(parsed.holdings.positions[0].marketValue, "4776");
 });
 
+test("leading and trailing printed-page furniture preserve identical holdings", () => {
+  const footerBottom = pageSplitEquityPages();
+  const headerTop = footerBottom.map((page) => [...page]);
+  headerTop[0] = headerTop[0].slice(0, -1);
+  headerTop[1] = [headerTop[1].at(-1), ...headerTop[1].slice(0, -1)];
+  const parse = (pages) =>
+    parseStatementLines(
+      pages.map((page) => page.join("\n")).join(`\n${PAGE_SEPARATOR}\n`),
+      kind,
+    );
+  const bottom = parse(footerBottom);
+  const top = parse(headerTop);
+  const withoutEvidence = ({ locators: _locators, ...position }) => position;
+  assert.deepEqual(
+    top.holdings.positions.map(withoutEvidence),
+    bottom.holdings.positions.map(withoutEvidence),
+  );
+  assert.equal(top.holdings.positions.length, 1);
+  assert.equal(top.holdings.positions[0].marketValue, "4776");
+  for (const parsed of [bottom, top]) {
+    assert.equal(parsed.holdings.positionScopes.length, 1);
+    assert.equal(parsed.holdings.positionScopes[0].status, "complete");
+    assert.deepEqual(parsed.holdings.positionScopes[0].gapCodes, []);
+  }
+});
+
 test("an unnumbered cover can anchor a complete adjacent printed-page run", () => {
   const pages = pageSplitEquityPages().map((page) =>
     page.filter((line) => !/\bTotal\s+\d/.test(line)),
@@ -1145,7 +1171,12 @@ test("unsupported account tables remain partial even beside a recognized table",
   const malformed = (line) =>
     line.replace("Security Description", "Security Name       ");
   const unsupportedTail = equityBlockLines().slice(1).map(malformed);
-  const firstPage = [originalFirstPage, ...unsupportedTail].join("\n");
+  const firstPage = [
+    originalFirstPage,
+    "        TOTAL",
+    "        SYNTHETIC PRIVATE ASSETS",
+    ...unsupportedTail,
+  ].join("\n");
   const secondPage = originalSecondPage.split("\n").map(malformed).join("\n");
   const parsed = parseStatementLines(
     `${firstPage}\n${PAGE_SEPARATOR}\n${secondPage}`,
@@ -1172,6 +1203,27 @@ test("unsupported account tables remain partial even beside a recognized table",
         gapCodes: ["unproven_empty", "unsupported_table_header"],
       },
     ],
+  );
+});
+
+test("a security name containing header words is not an unsupported table", () => {
+  const text = STATEMENT_LAYOUT_TEXT.replace(
+    "WIDGET NEUTRAL FUND (WNDF)",
+    "Security Value Fund (SQVF)",
+  );
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 2);
+  assert.equal(
+    parsed.holdings.positions.some(
+      (position) => position.instrument?.symbol === "SQVF",
+    ),
+    true,
+  );
+  assert.equal(
+    parsed.holdings.positionScopes.some((scope) =>
+      scope.gapCodes.includes("unsupported_table_header"),
+    ),
+    false,
   );
 });
 

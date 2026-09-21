@@ -656,9 +656,14 @@ const REALIZED_TABLE = /\bAcquired\b.*\bSold\b.*\bProceeds\b/;
 const HOLDINGS_HEADER = /^\s*Security Description\b/;
 /** A table that is visibly security-shaped but whose description label is not
  * one this parser supports. It is still an observed account-scoped gap and
- * must not disappear merely because `headerColumns` cannot bind it. */
+ * must not disappear merely because `headerColumns` cannot bind it. Requiring
+ * a column-sized gap keeps a security name containing words such as
+ * "Quantity" or "Value" from becoming a header. */
 const POSSIBLE_HOLDINGS_HEADER =
-  /^\s*Security\b.*\b(?:Trade Date|Quantity|Face Value|Contracts|Market Value|NAV|Value)\b/;
+  /^\s*Security\b.*?\s{2,}(?:Trade Date|Quantity|Face Value|Contracts|Market Value|NAV|Value)\b/;
+function observedHoldingsHeader(text) {
+  return HOLDINGS_HEADER.test(text) || POSSIBLE_HOLDINGS_HEADER.test(text);
+}
 /** A security's aggregate row, printed under its per-lot rows. */
 const TOTAL_ROW = /^Total\b/;
 /** Ends a holdings table. */
@@ -1283,6 +1288,97 @@ function accountBoundaryAfter(lines, afterIndex, accountKey, kind, textMeta) {
   return null;
 }
 
+/**
+ * Observe a holdings-shaped table the row parser does not support without
+ * putting that table into the row parser's control flow. This separation is
+ * deliberate: completeness metadata may become more conservative, but it
+ * must not change which holdings the established parser emits.
+ */
+function unsupportedHoldingsTableObservations({
+  lines,
+  kind,
+  accountKeys,
+  markerLines,
+  textMeta,
+  printedByPage,
+  populatedPages,
+}) {
+  const tables = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (
+      HOLDINGS_HEADER.test(lines[i].text) ||
+      !POSSIBLE_HOLDINGS_HEADER.test(lines[i].text) ||
+      REALIZED_TABLE.test(lines[i].text)
+    ) {
+      continue;
+    }
+    const columns = headerColumns(lines[i].text);
+    if (
+      columns.length < 2 ||
+      columns.some((column) => column.name === "description")
+    ) {
+      continue;
+    }
+    const marker = markerLines[i];
+    const hasExplicitSection = lines
+      .slice(Math.max(0, i - 6, marker === null ? 0 : marker + 1), i)
+      .filter((line) => line.page === lines[i].page)
+      .some(({ text }) => explicitHoldingsSection(text) !== null);
+    if (!hasExplicitSection) continue;
+
+    let terminalIndex = null;
+    for (let j = i + 1; j < lines.length; j += 1) {
+      if (
+        TABLE_END.test(lines[j].text.trim()) ||
+        observedHoldingsHeader(lines[j].text) ||
+        BARE_ACCOUNT_LINE.test(lines[j].text)
+      ) {
+        terminalIndex = j;
+        break;
+      }
+    }
+    const finalEvidence = finalPageEvidence(
+      lines,
+      kind,
+      textMeta,
+      printedByPage,
+      populatedPages,
+    );
+    const evidenceEnd =
+      terminalIndex !== null
+        ? {
+            lineIndex: terminalIndex,
+            locator: lineSpanLocator(
+              lines[terminalIndex],
+              kind,
+              "unsupported holdings table end",
+              textMeta,
+            ),
+          }
+        : finalEvidence !== null && finalEvidence.lineIndex > i
+          ? finalEvidence
+          : null;
+    tables.push({
+      accountKey: accountKeys[i],
+      accountLocator: accountSpanLocator(lines, markerLines, i, kind, textMeta),
+      headers: [
+        lineSpanLocator(
+          lines[i],
+          kind,
+          "unsupported holdings table header",
+          textMeta,
+        ),
+      ],
+      end: evidenceEnd?.locator ?? null,
+      gapCodes: new Set(["unsupported_table_header"]),
+      emittedPositionCount: 0,
+      firstLineIndex: i,
+      lastLineIndex: evidenceEnd?.lineIndex ?? i,
+    });
+  }
+  return tables;
+}
+
 function positionScopesFromTables({
   lines,
   kind,
@@ -1465,7 +1561,11 @@ function parseHoldings(
   // with the carried block, so a continuation cannot look like two complete
   // tables and a missing successor cannot look complete at all.
   let carried = null;
-  const flushCarried = (nextAccountKey = null, nextMarker = null) => {
+  const flushCarried = (
+    nextAccountKey = null,
+    nextMarker = null,
+    nextHeaderIndex = null,
+  ) => {
     if (carried === null) return;
     if (nextMarker !== null && nextAccountKey !== carried.context.accountKey) {
       carried.table.end = lineSpanLocator(
@@ -1474,6 +1574,26 @@ function parseHoldings(
         "holdings table account boundary",
         textMeta,
       );
+    } else if (nextHeaderIndex !== null) {
+      // A different recognized table header closes a complete preceding
+      // security block even when a leading page declaration caused the old
+      // row parser to carry it until seeing this header. This affects proof
+      // bounds only; `emit` below is the same established row path.
+      const independentlyComplete =
+        positionFromBlock(carried.block, carried.columns, {
+          ...carried.context,
+          allowLotAggregation: false,
+        }).position !== null;
+      if (independentlyComplete) {
+        carried.table.end = lineSpanLocator(
+          lines[nextHeaderIndex],
+          kind,
+          "next holdings table boundary",
+          textMeta,
+        );
+      } else {
+        carried.table.gapCodes.add("page_sequence_gap");
+      }
     } else if (
       carried.finalPageFooter &&
       !lines.some(
@@ -1500,7 +1620,7 @@ function parseHoldings(
   };
 
   for (let i = 0; i < lines.length; i += 1) {
-    if (!POSSIBLE_HOLDINGS_HEADER.test(lines[i].text)) continue;
+    if (!HOLDINGS_HEADER.test(lines[i].text)) continue;
     if (REALIZED_TABLE.test(lines[i].text)) continue;
     const marker = markerLines[i];
     const accountKey = accountKeys[i];
@@ -1512,62 +1632,7 @@ function parseHoldings(
       textMeta,
     );
     const columns = resolveValueColumn(headerColumns(lines[i].text));
-    if (!columns.some((column) => column.name === "description")) {
-      flushCarried(accountKey, marker);
-      let terminalIndex = null;
-      for (let j = i + 1; j < lines.length; j += 1) {
-        if (
-          TABLE_END.test(lines[j].text.trim()) ||
-          POSSIBLE_HOLDINGS_HEADER.test(lines[j].text)
-        ) {
-          terminalIndex = j;
-          break;
-        }
-      }
-      const finalEvidence = finalPageEvidence(
-        lines,
-        kind,
-        textMeta,
-        printedByPage,
-        populatedPages,
-      );
-      const terminalIsFinalFooter =
-        terminalIndex !== null &&
-        PAGE_FOOTER.test(lines[terminalIndex].text.trim()) &&
-        finalEvidence !== null &&
-        terminalIndex === finalEvidence.lineIndex;
-      tables.push({
-        accountKey,
-        accountLocator,
-        headers: [
-          lineSpanLocator(
-            lines[i],
-            kind,
-            "unsupported holdings table header",
-            textMeta,
-          ),
-        ],
-        end:
-          terminalIndex !== null &&
-          (!PAGE_FOOTER.test(lines[terminalIndex].text.trim()) ||
-            terminalIsFinalFooter)
-            ? lineSpanLocator(
-                lines[terminalIndex],
-                kind,
-                "unsupported holdings table end",
-                textMeta,
-              )
-            : terminalIndex === null &&
-                finalEvidence !== null &&
-                finalEvidence.lineIndex > i
-              ? finalEvidence.locator
-              : null,
-        gapCodes: new Set(["unsupported_table_header"]),
-        emittedPositionCount: 0,
-        lastLineIndex: terminalIndex ?? i,
-      });
-      continue;
-    }
+    if (!columns.some((column) => column.name === "description")) continue;
     const sectionLines = lines
       .slice(Math.max(0, i - 6, marker === null ? 0 : marker + 1), i)
       .filter((line) => line.page === lines[i].page);
@@ -1608,7 +1673,7 @@ function parseHoldings(
       table.lastLineIndex = i;
       carried = null;
     } else {
-      flushCarried(accountKey, marker);
+      flushCarried(accountKey, marker, i);
       table = {
         accountKey,
         accountLocator,
@@ -1618,6 +1683,7 @@ function parseHoldings(
         end: null,
         gapCodes: new Set(),
         emittedPositionCount: 0,
+        firstLineIndex: i,
         lastLineIndex: i,
       };
       tables.push(table);
@@ -1643,7 +1709,7 @@ function parseHoldings(
     for (let j = i + 1; j < lines.length; j += 1) {
       const text = lines[j].text;
       const trimmed = text.trim();
-      if (TABLE_END.test(trimmed) || POSSIBLE_HOLDINGS_HEADER.test(text)) {
+      if (TABLE_END.test(trimmed) || HOLDINGS_HEADER.test(text)) {
         terminalIndex = j;
         interruptedByPageFooter = PAGE_FOOTER.test(trimmed);
         const footer = /^Page\s+(\d+)\s+of\s+(\d+)$/.exec(trimmed);
@@ -1697,13 +1763,16 @@ function parseHoldings(
           allowLotAggregation:
             finalPageFooter &&
             printedPageSequenceIsAnchored(
-              lines[terminalIndex].page,
+              lines[i].page,
               printedByPage,
               populatedPages,
             ),
         },
         headerSignature,
-        page: lines[terminalIndex].page,
+        // Parsing topology is based on the last content row's physical page.
+        // The next printed `Page N` line is leading furniture on the next
+        // physical page in retained extraction, not the page that was cut.
+        page: lines[i].page,
         footerPage: lines[terminalIndex].page,
         footerIndex: terminalIndex,
         finalPageFooter,
@@ -1736,6 +1805,18 @@ function parseHoldings(
     }
   }
   flushCarried();
+  tables.push(
+    ...unsupportedHoldingsTableObservations({
+      lines,
+      kind,
+      accountKeys,
+      markerLines,
+      textMeta,
+      printedByPage,
+      populatedPages,
+    }),
+  );
+  tables.sort((left, right) => left.firstLineIndex - right.firstLineIndex);
   const positionScopes = positionScopesFromTables({
     lines,
     kind,

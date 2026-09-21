@@ -480,6 +480,12 @@ account marker produce no account scope. Older adapters and documents omit the
 optional field and keep the conservative document-wide behavior above. Until
 the account-scope persistence migration and reader integration land, these
 adapter observations do not relax `documents.parsed_ok` or any read gate.
+Adding or tightening this metadata must preserve the adapter's emitted
+holdings unless a separate parser defect and its intended correction are
+demonstrated. Regression fixtures cover printed page declarations at both the
+bottom of the preceding physical page and the top of the following page, and
+assert the same semantic holdings output rather than relying only on passing
+fixture counts.
 
 Coverage is reported at the same granularity as the record contract requires,
 so the later Kith Mind adapter wraps this surface rather than re-deriving it.
