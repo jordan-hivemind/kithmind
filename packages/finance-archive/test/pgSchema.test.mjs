@@ -181,6 +181,28 @@ test(
         /check constraint/i,
       );
 
+      for (const [id, evidence] of [
+        ["empty-positive-table", '{"tables":[{}],"scopeEnd":{}}'],
+        [
+          "unbounded-positive-table",
+          '{"tables":[{"headers":[{}]}],"scopeEnd":{}}',
+        ],
+      ]) {
+        await assert.rejects(
+          client.query(
+            `INSERT INTO position_scope_observations
+               (id, source_document_id, retained_sha256, account_id, as_of,
+                proof_version, status, emitted_position_count, gap_codes,
+                evidence, created_at)
+             VALUES ($1, 'scope-doc', $2, $3, DATE '2026-03-31',
+                     'position_scope_v1', 'complete', 1, '{}', $4::jsonb,
+                     now())`,
+            [id, "a".repeat(64), accountId, evidence],
+          ),
+          /check constraint/i,
+        );
+      }
+
       await client.query(
         `INSERT INTO position_scope_observations
            (id, source_document_id, retained_sha256, account_id, as_of,

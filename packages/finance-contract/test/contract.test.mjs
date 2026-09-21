@@ -712,14 +712,26 @@ describe("list_account_inventory (ADM-2)", () => {
     rejects("invalid_response", () => parseExchange(exchange));
   });
 
-  it("refuses a snapshot outside the activity the same row reports", () => {
+  it("accepts a later exact-zero observation outside older row activity", () => {
     const exchange = inventory();
     exchange.response.items[0].latestSnapshotAsOf = "2026-09-30";
-    rejects("invalid_response", () => parseExchange(exchange));
+    assert.equal(
+      parseExchange(exchange).response.items[0].latestSnapshotAsOf,
+      "2026-09-30",
+    );
+  });
 
+  it("accepts an exact zero snapshot date without an activity range", () => {
     const unranged = inventory();
     unranged.response.items[1].latestSnapshotAsOf = "2026-07-31";
-    rejects("invalid_response", () => parseExchange(unranged));
+    const parsed = parseExchange(unranged);
+    assert.equal(parsed.response.items[1].latestSnapshotAsOf, "2026-07-31");
+    assert.equal(parsed.response.items[1].activityFrom, undefined);
+
+    const recordsWithoutRange = inventory();
+    recordsWithoutRange.response.items[1].recordCount = 1;
+    recordsWithoutRange.response.items[1].latestSnapshotAsOf = "2026-07-31";
+    rejects("invalid_response", () => parseExchange(recordsWithoutRange));
   });
 
   it("refuses a negative count", () => {

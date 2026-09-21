@@ -517,6 +517,13 @@ unversioned observations become ineligible when a generation is activated.
 Deleting a source document cascades its proof, while direct updates to either
 proof table are refused.
 
+Production uses `NO_DEFAULT_SELECT` for the existing finance reader. Migration
+15 rollout therefore grants that role `SELECT` on
+`position_scope_observations` and `position_scope_memberships` after applying
+the migration as the archive owner. It does not recreate the role or rotate
+its password. The read surface is verified through the existing reader
+credential before release.
+
 Inventory, direct snapshots and holdings aggregates accept a scope only when
 it is complete, its retained SHA and generation are current, every membership
 still has a full-semantic canonical match, and the membership set equals the
@@ -525,7 +532,7 @@ partial scope or stale generation therefore fails closed. A complete zero-row
 scope is selectable only with `source_stated_none`. An exact scope can replace
 that source document's generic `document_unparsed` finding for the proved
 account/date. Account-specific findings such as ambiguous values and balance
-conflicts, null-account document findings, and failed or pending position
+conflicts, null-account non-parser findings, and failed or pending position
 reconciliations remain blocking. Legacy documents with no scope keep the
 document-wide rule, and one unsafe contributor still withholds a mixed-source
 date.

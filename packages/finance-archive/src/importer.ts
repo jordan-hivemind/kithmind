@@ -864,6 +864,32 @@ export async function importBatch(
     reviewItemsUpdated += reopened.rowCount ?? 0;
   }
 
+  const POSITION_SCOPE_MISMATCH_RESOLUTION_PREFIX =
+    "resolved on reimport: every declared position scope validated and persisted exactly";
+
+  async function reopenSystemResolvedPositionScopeMismatch(
+    documentId: string,
+    accountId: string,
+    rawValue: string,
+  ): Promise<void> {
+    const reopened = await client.query(
+      `UPDATE review_items SET status = 'open'
+        WHERE source_document_id = $1
+          AND kind = 'position_scope_mismatch'
+          AND account_id = $2
+          AND raw_value = $3
+          AND status = 'resolved'
+          AND resolution_note LIKE $4`,
+      [
+        documentId,
+        accountId,
+        rawValue,
+        `${POSITION_SCOPE_MISMATCH_RESOLUTION_PREFIX} (import_runs.id=%`,
+      ],
+    );
+    reviewItemsUpdated += reopened.rowCount ?? 0;
+  }
+
   /** One `weak_instrument_match` sighting, not yet written: the descriptor
    * (`rawValue`), the matched instrument and institution it names, and the
    * `reason` the first sighting of this triple would open with. */
@@ -1912,9 +1938,14 @@ export async function importBatch(
       return;
     }
 
-    const seen = new Set<string>();
+    const scopeOutcomes = new Map<
+      string,
+      { accountId: string; reviewValue: string; valid: boolean }
+    >();
     for (const scope of document.positionScopes ?? []) {
       const key = `${scope.accountId}\u0000${scope.asOf}\u0000${scope.proofVersion}`;
+      const reviewValue = `${scope.accountId}:${scope.asOf}:${scope.proofVersion}`;
+      const duplicateDeclaration = scopeOutcomes.has(key);
       const gapCodes = [...new Set(scope.gapCodes)].sort();
       const members = preparedPositions
         .map(positionScopeMember)
@@ -1946,18 +1977,26 @@ export async function importBatch(
         members.length === scope.emittedPositionCount &&
         distinctHashes.size === members.length &&
         completeEvidence &&
-        !seen.has(key);
+        !duplicateDeclaration;
+      scopeOutcomes.set(key, {
+        accountId: scope.accountId,
+        reviewValue,
+        valid: structural,
+      });
       if (!structural) {
+        await reopenSystemResolvedPositionScopeMismatch(
+          documentId,
+          scope.accountId,
+          reviewValue,
+        );
         openReview(scope.accountId, documentId, null, {
           kind: "position_scope_mismatch",
-          rawValue: `${scope.asOf}:${scope.proofVersion}`,
+          rawValue: reviewValue,
           reason:
             "position scope proof was not stored because its account/date emitted count, gap state, positive boundary evidence, zero basis, or distinct prepared membership did not match the mapped source positions",
         });
         continue;
       }
-      seen.add(key);
-
       const existing = await client.query<{
         id: string;
         payload_matches: boolean;
@@ -2105,6 +2144,33 @@ export async function importBatch(
           "position scope replay changed immutable source memberships",
         );
       }
+    }
+
+    // This importer owns this review kind. It closes each exact account/date
+    // key only after that declaration validated and either persisted or
+    // matched immutable history. An invalid declaration for another account,
+    // a key omitted by a later parser, a manually resolved item, and a
+    // dismissed item are all left untouched.
+    for (const outcome of scopeOutcomes.values()) {
+      if (!outcome.valid) continue;
+      const resolved = await client.query(
+        `UPDATE review_items
+            SET status = 'resolved', resolved_at = $2,
+                resolution_note = $3
+          WHERE source_document_id = $1
+            AND kind = 'position_scope_mismatch'
+            AND status = 'open'
+            AND account_id = $4
+            AND raw_value = $5`,
+        [
+          documentId,
+          now.toISOString(),
+          `${POSITION_SCOPE_MISMATCH_RESOLUTION_PREFIX} (import_runs.id=${importRunId})`,
+          outcome.accountId,
+          outcome.reviewValue,
+        ],
+      );
+      reviewItemsResolved += resolved.rowCount ?? 0;
     }
   }
 

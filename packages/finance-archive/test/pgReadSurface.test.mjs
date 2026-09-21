@@ -1320,7 +1320,28 @@ test(
         toExclusive: "2026-08-01",
       });
 
+    // A failed proof attempt remains a real read gate until a later import
+    // validates and persists that exact scope. The importer owns this review
+    // lifecycle; the reader merely honors its open/resolved state.
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES ('scope-mismatch-review', 'position_scope_mismatch', $1, $2,
+               $3, 'synthetic invalid scope', 'open')`,
+      [completeAccount, consolidatedDoc, `${asOf}:position_scope_v1`],
+    );
     let complete = await snapshot(completeAccount);
+    assert.equal(complete.summary.status, "unavailable");
+    assert.equal(complete.summary.reason, "incomplete_source");
+    await owner.query(
+      `UPDATE review_items
+          SET status = 'resolved', resolved_at = now(),
+              resolution_note =
+                'resolved on reimport: every declared position scope validated and persisted exactly (import_runs.id=synthetic)'
+        WHERE id = 'scope-mismatch-review'`,
+    );
+
+    complete = await snapshot(completeAccount);
     assert.equal(complete.summary.status, "partial");
     assert.equal(complete.summary.positionCount, 1);
     assert.equal(
@@ -1510,6 +1531,15 @@ test(
                'no position rows', 'source explicitly states none', 'open')`,
       [accountId, doc],
     );
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, quantity, market_value, currency,
+          valuation_basis, source_document_id, source_locator, row_hash)
+       VALUES ('scope-zero-older-position', $1, DATE '2026-07-31', 1, 25,
+               'USD', 'market_price', $2,
+               '{"row":{"source":"synthetic","index":7}}', $3)`,
+      [accountId, doc, "f".repeat(64)],
+    );
 
     const snapshot = await serve(r, {
       operation: "get_holdings_snapshot",
@@ -1531,6 +1561,18 @@ test(
       currencies: [],
     });
     assert.equal(snapshot.completeness, "partial");
+
+    const inventory = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 100,
+    });
+    const inventoryRow = inventory.items.find(
+      (item) => item.account.accountId === accountId,
+    );
+    assert.equal(inventoryRow.latestSnapshotAsOf, asOf);
+    assert.equal(inventoryRow.currentValue, undefined);
+    assert.equal(inventoryRow.activityFrom, "2026-07-31");
+    assert.equal(inventoryRow.activityTo, "2026-07-31");
 
     const aggregate = await serve(r, {
       operation: "aggregate_money",

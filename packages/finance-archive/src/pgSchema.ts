@@ -1103,6 +1103,32 @@ CREATE TRIGGER holding_projection_memberships_immutable
 // proof from reads without mutating it. Unversioned documents use the partial
 // unique index below and retain the conservative one-proof-version rule.
 const POSITION_SCOPE_OBSERVATIONS = `
+CREATE FUNCTION position_scope_has_complete_tables(value JSONB)
+RETURNS BOOLEAN
+LANGUAGE SQL
+IMMUTABLE
+STRICT
+AS $$
+  SELECT CASE
+    WHEN jsonb_typeof(value->'tables') = 'array' THEN
+      jsonb_array_length(value->'tables') > 0
+      AND NOT EXISTS (
+        SELECT 1
+          FROM jsonb_array_elements(value->'tables') AS table_entry
+         WHERE jsonb_typeof(table_entry) <> 'object'
+            OR CASE
+                 WHEN jsonb_typeof(table_entry->'headers') = 'array'
+                 THEN jsonb_array_length(table_entry->'headers') = 0
+                 ELSE TRUE
+               END
+            OR jsonb_typeof(table_entry->'end') IS DISTINCT FROM 'object'
+      )
+    ELSE FALSE
+  END
+$$;
+
+REVOKE ALL ON FUNCTION position_scope_has_complete_tables(JSONB) FROM PUBLIC;
+
 CREATE TABLE position_scope_observations (
   id TEXT PRIMARY KEY,
   source_document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
@@ -1153,7 +1179,7 @@ CREATE TABLE position_scope_observations (
           AND jsonb_typeof(evidence->'explicitNone')
             IS NOT DISTINCT FROM 'object')
         OR (emitted_position_count > 0
-          AND jsonb_array_length(evidence->'tables') > 0)
+          AND position_scope_has_complete_tables(evidence))
       )
     )
   )

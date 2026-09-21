@@ -1743,7 +1743,10 @@ async function listAccountInventory(
           AND coalesce(reconciliation.failed, FALSE) = FALSE
           AND coalesce(reconciliation.pending, FALSE) = FALSE
           AND p.missing = 0
-          AND p.currency_count = 1
+          AND (
+            p.currency_count = 1
+            OR (p.currency_count = 0 AND p.value IS NULL)
+          )
           AND p.not_marked = 0
         ORDER BY p.account_id, p.as_of DESC
      ),
@@ -1842,7 +1845,7 @@ async function listAccountInventory(
       ...(ranged
         ? { activityFrom: row.activity_from!, activityTo: row.activity_to! }
         : {}),
-      ...(ranged && row.latest_snapshot_as_of !== null
+      ...(row.latest_snapshot_as_of !== null
         ? { latestSnapshotAsOf: row.latest_snapshot_as_of }
         : {}),
       // FIN-FRESHNESS-1: the dates of balance rows that exist, never a

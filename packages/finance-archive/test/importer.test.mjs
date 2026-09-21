@@ -920,6 +920,28 @@ test(
     const mismatchSha = "93".padEnd(64, "0");
     const unprovedZeroSha = "95".padEnd(64, "0");
     const zeroSha = "94".padEnd(64, "0");
+    const bothPositions = [
+      position(),
+      position({
+        accountId: OTHER_ACCOUNT.id,
+        sourceLocator: "holdings:other:1",
+      }),
+    ];
+    const otherScope = (overrides = {}) =>
+      positionScope({
+        accountId: OTHER_ACCOUNT.id,
+        evidence: {
+          account: { source: "synthetic_statement", index: 20 },
+          tables: [
+            {
+              headers: [{ source: "synthetic_statement", index: 21 }],
+              end: { source: "synthetic_statement", index: 23 },
+            },
+          ],
+          scopeEnd: { source: "synthetic_statement", index: 24 },
+        },
+        ...overrides,
+      });
 
     const mismatch = await importBatch(
       client,
@@ -927,22 +949,187 @@ test(
         source: "synthetic-scope",
         documents: [
           retainedHoldingDocument(mismatchSha, {
-            positions: [position()],
-            positionScopes: [positionScope({ emittedPositionCount: 2 })],
+            positions: bothPositions,
+            positionScopes: [
+              positionScope(),
+              otherScope({ emittedPositionCount: 2 }),
+            ],
           }),
         ],
       },
       NOW,
     );
     assert.equal(mismatch.reviewItemsOpened, 1);
+    let mismatchReview = await one(
+      client,
+      `SELECT kind, account_id, raw_value, status
+         FROM review_items WHERE kind = 'position_scope_mismatch'`,
+    );
+    assert.deepEqual(mismatchReview, {
+      kind: "position_scope_mismatch",
+      account_id: OTHER_ACCOUNT.id,
+      raw_value: `${OTHER_ACCOUNT.id}:2026-03-31:position_scope_v1`,
+      status: "open",
+    });
+
+    // Replaying only the already-valid account cannot clear or hide the
+    // omitted account's mismatch on the same document/date/proof version.
+    const omittedOther = await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(mismatchSha, {
+            positions: bothPositions,
+            positionScopes: [positionScope()],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(omittedOther.reviewItemsResolved, 0);
     assert.equal(
       (
         await one(
           client,
-          "SELECT kind FROM review_items WHERE kind = 'position_scope_mismatch'",
+          `SELECT status FROM review_items
+            WHERE kind = 'position_scope_mismatch'`,
         )
-      ).kind,
-      "position_scope_mismatch",
+      ).status,
+      "open",
+    );
+
+    const corrected = await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(mismatchSha, {
+            positions: bothPositions,
+            positionScopes: [positionScope(), otherScope()],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(corrected.reviewItemsResolved, 1);
+    mismatchReview = await one(
+      client,
+      `SELECT status, resolution_note
+         FROM review_items WHERE kind = 'position_scope_mismatch'`,
+    );
+    assert.equal(mismatchReview.status, "resolved");
+    assert.match(
+      mismatchReview.resolution_note,
+      /^resolved on reimport: every declared position scope validated and persisted exactly /,
+    );
+    assert.equal(await count(client, "position_scope_observations"), 2);
+
+    const regressed = await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(mismatchSha, {
+            positions: bothPositions,
+            positionScopes: [
+              positionScope(),
+              otherScope({ emittedPositionCount: 2 }),
+            ],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(regressed.reviewItemsOpened, 0);
+    assert.equal(regressed.reviewItemsUpdated, 1);
+    mismatchReview = await one(
+      client,
+      `SELECT status, resolved_at IS NOT NULL AS was_resolved,
+              resolution_note LIKE
+                'resolved on reimport: every declared position scope validated and persisted exactly%'
+                AS has_system_resolution
+         FROM review_items WHERE kind = 'position_scope_mismatch'`,
+    );
+    assert.deepEqual(mismatchReview, {
+      status: "open",
+      was_resolved: true,
+      has_system_resolution: true,
+    });
+    assert.equal(
+      await count(
+        client,
+        "review_items",
+        "WHERE kind = 'position_scope_mismatch'",
+      ),
+      1,
+    );
+
+    await client.query(
+      `UPDATE review_items
+          SET status = 'dismissed', resolved_at = now(),
+              resolution_note = 'reviewer accepted the synthetic discrepancy'
+        WHERE kind = 'position_scope_mismatch'`,
+    );
+    const dismissedReplay = await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(mismatchSha, {
+            positions: bothPositions,
+            positionScopes: [
+              positionScope(),
+              otherScope({ emittedPositionCount: 2 }),
+            ],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(dismissedReplay.reviewItemsOpened, 0);
+    assert.equal(dismissedReplay.reviewItemsUpdated, 0);
+    assert.equal(
+      (
+        await one(
+          client,
+          `SELECT status FROM review_items
+            WHERE kind = 'position_scope_mismatch'`,
+        )
+      ).status,
+      "dismissed",
+    );
+
+    await client.query(
+      `UPDATE review_items
+          SET status = 'resolved', resolution_note = 'manual resolution'
+        WHERE kind = 'position_scope_mismatch'`,
+    );
+    const manuallyResolvedReplay = await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(mismatchSha, {
+            positions: bothPositions,
+            positionScopes: [
+              positionScope(),
+              otherScope({ emittedPositionCount: 2 }),
+            ],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(manuallyResolvedReplay.reviewItemsOpened, 0);
+    assert.equal(manuallyResolvedReplay.reviewItemsUpdated, 0);
+    assert.deepEqual(
+      await one(
+        client,
+        `SELECT status, resolution_note FROM review_items
+          WHERE kind = 'position_scope_mismatch'`,
+      ),
+      { status: "resolved", resolution_note: "manual resolution" },
     );
 
     const unprovedZero = await importBatch(
@@ -965,7 +1152,7 @@ test(
       NOW,
     );
     assert.equal(unprovedZero.reviewItemsOpened, 1);
-    assert.equal(await count(client, "position_scope_observations"), 0);
+    assert.equal(await count(client, "position_scope_observations"), 2);
 
     await importBatch(
       client,
@@ -1009,7 +1196,22 @@ test(
       zero_basis: "source_stated_none",
       parsed_ok: false,
     });
-    assert.equal(await count(client, "position_scope_memberships"), 0);
+    assert.equal(
+      Number(
+        (
+          await one(
+            client,
+            `SELECT count(*)::text AS n
+               FROM position_scope_memberships m
+               JOIN position_scope_observations o ON o.id = m.scope_id
+               JOIN documents d ON d.id = o.source_document_id
+              WHERE d.sha256 = $1`,
+            [zeroSha],
+          )
+        ).n,
+      ),
+      0,
+    );
   },
 );
 
