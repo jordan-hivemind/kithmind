@@ -90,11 +90,11 @@ export function DocumentViewer({
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-40 bg-kith-overlay" />
         <Dialog.Content className="fixed inset-x-4 top-4 bottom-4 z-50 flex max-w-none flex-col overflow-hidden rounded-panel border border-kith-border-subtle bg-kith-surface shadow-[var(--kith-shadow-lg)] sm:inset-x-8 lg:inset-x-16">
-          <div className="flex min-h-12 items-center justify-between gap-3 border-b border-kith-border-subtle px-4">
-            <Dialog.Title className="min-w-0 truncate kith-section-title">
+          <div className="flex min-h-12 flex-wrap items-center gap-3 border-b border-kith-border-subtle px-4 py-2 sm:flex-nowrap">
+            <Dialog.Title className="basis-full truncate kith-section-title sm:min-w-0 sm:flex-1 sm:basis-auto">
               {title}
             </Dialog.Title>
-            <div className="flex shrink-0 items-center gap-2">
+            <div className="ml-auto flex shrink-0 flex-wrap justify-end gap-2">
               {canViewOriginal && canViewText ? (
                 <div className="flex items-center gap-1">
                   <button
@@ -154,7 +154,6 @@ export function DocumentViewer({
                 src={viewerUrl}
                 title={title}
                 className="h-full w-full rounded-control border border-kith-border-subtle bg-kith-surface"
-                sandbox=""
               />
             ) : canViewText ? (
               <div className="h-full overflow-y-auto rounded-control border border-kith-border-subtle bg-kith-surface p-5 text-[15px] leading-6 text-kith-text">
