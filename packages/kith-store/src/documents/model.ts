@@ -926,6 +926,48 @@ export async function getDocument(
   };
 }
 
+/**
+ * Bridges the stable source-item identity used by corrections and review work
+ * to its current active Brain document representations. A parsed source may
+ * contain more than one document, so this returns a bounded collection rather
+ * than silently choosing one.
+ */
+export async function getDocumentsForSourceItem(
+  client: ClientBase,
+  spaceIds: readonly string[],
+  sourceItemId: string,
+  ceiling: SensitivityLevel = "restricted",
+): Promise<{ sourceItemId: string; documents: GetDocumentResult[] }> {
+  validateSpaces(spaceIds);
+  if (spaceIds.length === 0) return { sourceItemId, documents: [] };
+  const ids = (
+    await client.query<{ id: string }>(
+      `SELECT d.id FROM kith.source_items i
+         JOIN kith.documents d
+           ON d.space_id = i.space_id
+          AND d.source_item_id = i.id
+          AND d.processing_generation_id = i.active_generation_id
+          AND d.publication_state = 'active'
+        WHERE i.id = $1 AND i.space_id = ANY($2::kith.kith_id[])
+          AND i.lifecycle = 'available'
+        ORDER BY d.document_key, d.id LIMIT 65`,
+      [sourceItemId, spaceIds],
+    )
+  ).rows;
+  if (ids.length > 64) {
+    throw new Error("Source item exceeds the supported document bound");
+  }
+  const resolved = await Promise.all(
+    ids.map((row) => getDocument(client, spaceIds, row.id, false, ceiling)),
+  );
+  return {
+    sourceItemId,
+    documents: resolved.filter(
+      (document): document is GetDocumentResult => document !== null,
+    ),
+  };
+}
+
 type MetadataBudget = { remaining: number; overflow: boolean };
 
 function numberValue(value: unknown): number {

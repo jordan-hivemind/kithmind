@@ -12,6 +12,8 @@ export const KITH_HELP_TOPICS = [
   "memory",
   "accounts",
   "corrections",
+  "documents",
+  "finance_reviews",
   "coverage",
 ] as const;
 
@@ -20,7 +22,7 @@ export type KithHelpTopic = (typeof KITH_HELP_TOPICS)[number];
 const HELP: Record<KithHelpTopic, string> = {
   start: `Kith Mind stores facts, narrative thoughts, indexed documents, investments and exact records.
 
-Use get_kith_capabilities first when a task may write or ingest. Use get_kith_help only for the domain you need. Available topics: recall_capture, capabilities, investments, entries, document_links, entities, attention, memory, accounts, corrections, coverage.
+Use get_kith_capabilities first when a task may write or ingest. Use get_kith_help only for the domain you need. Available topics: recall_capture, capabilities, investments, entries, document_links, entities, attention, memory, accounts, corrections, documents, finance_reviews, coverage.
 
 Use list_spaces before choosing a space. Authentication, credential capabilities, current membership, space grants, source-account grants and sensitivity ceilings are enforced on every call. A userId is an author, not the owner of a shared-space row. Never infer that similarly named IDs are interchangeable.`,
 
@@ -78,7 +80,17 @@ Example money correction: {"spaceId":"<spaceId>","sourceItemId":"<sourceItemId>"
 
 Supported currencies are AUD, CAD, CHF, CNY, EUR, GBP, HKD, INR, JPY, KRW, MXN, NZD, SEK, SGD and USD. Decimal unitCode uses the store's supported UCUM subset: %, 1, /min, 10*3/uL, 10*6/uL, Cel, K, L, U/L, [IU]/L, [degF], [ft_i], [in_i], [lb_av], [mi_i], [mi_i]/h, [oz_av], cm, d, g, g/dL, h, kg, km, km/h, m, m/s, m[IU]/L, mL, mg, mg/dL, min, mm, mm[Hg], mmol/L, ng/mL, pg/mL, s, ug, ug/dL and umol/L.`,
 
-  coverage: `This release manages investments, investment entries, persisted supporting-document decisions, entity aliases, attention actions and mutes, facts, thoughts, finance account display overrides, and extracted-value corrections. It does not expose space membership, credential creation/revocation, source-root changes, re-extraction, arbitrary database access, trades, transfers, or writes to the separate financial archive.
+  documents: `Use list_document_schemas to inspect the current active kinds and typed fields before changing classification. get_document accepts exactly one documentId or sourceItemId. A documentId reads one parsed Brain representation; a sourceItemId bridges to every current active representation for the stable item.
+
+manage_document_extraction set_classification stores the owner's kind on the source item and schedules extraction. The override survives re-extraction and the model cannot replace it. clear_classification restores automatic classification and also schedules extraction. reprocess accepts at most 100 explicit sourceItemIds and includes current ready items that have never been extracted.
+
+Scheduling results are queued, already_queued, followup_queued, already_followup_queued, not_ready or not_found_or_forbidden. A follow-up means a job was already running and another was queued to observe the owner's newer change. None of these means extraction finished. Call get_document_extraction_status with the same sourceItemIds until each item is extracted or reports a failed, not_ready or unavailable reason. The status includes current Brain documentIds, the latest extraction, the latest job and open correction reasons. Re-extraction automatically resolves an open extraction review when its gate failure no longer occurs; owner value corrections remain and are reapplied.`,
+
+  finance_reviews: `Financial archive review items are the Institutions Open Reviews queue. They are separate from Kith extraction corrections and attention items. Use list_finance_reviews, then get_finance_review when the list evidence is not enough. A finance reviewItemId and archive account or instrument IDs are not Kith sourceItemIds, documentIds, account override IDs, entities or investments.
+
+Act from the recorded evidence. confirm_instrument_match is supported only when that evidence identifies the target instrument. map_account_key records an api_key or statement_number alias for future account identification; it does not mean historical transactions or positions were repaired. acknowledge_safeguard records that the supported safeguard review was handled. dismiss requires a note. Unsupported actions stay open and report their next action rather than being forced into one of these operations. The agent may complete an evidence-supported repair without asking the owner to repeat the decision.`,
+
+  coverage: `This release manages investments, investment entries, persisted supporting-document decisions, entity aliases, attention actions and mutes, facts, thoughts, finance account display overrides, supported finance review actions, extracted-value corrections, document classification and selected re-extraction. It does not expose space membership, credential creation/revocation, source-root changes, arbitrary database access, trades or transfers.
 
 Document search and exact-record answers remain bounded by reported source coverage. A missing match does not prove an event did not happen. Follow cursors and report truncation, coverage reasons, stale state and exclusions. Entity and attention reads are paginated. Supporting-link reads use the store's bounded candidate limit and currently return no cursor.`,
 };

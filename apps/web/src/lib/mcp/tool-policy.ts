@@ -60,6 +60,8 @@ export const MCP_TOOL_ANNOTATIONS = {
   [MCP_TOOL_NAMES.queryRecords]: readOnly,
   [MCP_TOOL_NAMES.searchDocuments]: readOnly,
   [MCP_TOOL_NAMES.getDocument]: readOnly,
+  [MCP_TOOL_NAMES.listDocumentSchemas]: readOnly,
+  [MCP_TOOL_NAMES.getDocumentExtractionStatus]: readOnly,
   [MCP_TOOL_NAMES.listSources]: readOnly,
   [MCP_TOOL_NAMES.listInventory]: readOnly,
   [MCP_TOOL_NAMES.listReviewQueue]: readOnly,
@@ -88,6 +90,10 @@ export const MCP_TOOL_ANNOTATIONS = {
   [MCP_TOOL_NAMES.manageMemory]: destructiveWrite,
   [MCP_TOOL_NAMES.manageAccountDisplayOverride]: managedWrite,
   [MCP_TOOL_NAMES.correctExtractedValue]: managedWrite,
+  [MCP_TOOL_NAMES.manageDocumentExtraction]: managedWrite,
+  [MCP_TOOL_NAMES.listFinanceReviews]: readOnly,
+  [MCP_TOOL_NAMES.getFinanceReview]: readOnly,
+  [MCP_TOOL_NAMES.manageFinanceReview]: managedWrite,
 } as const satisfies Record<McpToolName, McpToolAnnotations>;
 
 export const MCP_MEMORY_TOOL_NAMES = [

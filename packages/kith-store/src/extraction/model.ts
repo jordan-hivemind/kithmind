@@ -48,6 +48,7 @@ import type {
 } from "../admin/model.js";
 import {
   schedule,
+  TerminalDeferredWorkError,
   type DeferredCtx,
   type DeferredWorkRow,
   type ScheduleResult,
@@ -165,6 +166,71 @@ export async function scheduleDocumentExtraction(
     },
     dedupeKey: extractionDedupeKey(input.sourceItemId),
   });
+}
+
+export type DocumentExtractionScheduleState =
+  | "queued"
+  | "already_queued"
+  | "followup_queued"
+  | "already_followup_queued";
+
+export type DocumentExtractionScheduleResult = ScheduleResult & {
+  state: DocumentExtractionScheduleState;
+};
+
+function extractionFollowUpKey(sourceItemId: string, runningJobId: string): string {
+  return `${extractionDedupeKey(sourceItemId)}:after:${runningJobId}`;
+}
+
+/** Schedules owner-requested work without letting a running job absorb a
+ * classification or correction made after it began reading. */
+export async function scheduleDocumentExtractionRepair(
+  ctx: DeferredCtx,
+  input: {
+    spaceId: string;
+    sourceItemId: string;
+    processingGenerationId: string;
+  },
+): Promise<DocumentExtractionScheduleResult> {
+  const pending = await ctx.client.query<{
+    id: string;
+    state: "queued" | "running";
+  }>(
+    `SELECT id, state FROM kith.deferred_work
+      WHERE kind = 'document_extraction' AND space_id = $1
+        AND payload->>'sourceItemId' = $2
+        AND state IN ('queued', 'running')
+      ORDER BY CASE state WHEN 'queued' THEN 0 ELSE 1 END, updated_at DESC, id
+      FOR UPDATE`,
+    [input.spaceId, input.sourceItemId],
+  );
+  const queued = pending.rows.find((row) => row.state === "queued");
+  if (queued) {
+    // A queued job may name an older generation. Claim cannot pass this row
+    // lock, so refresh it before reporting that existing work is sufficient.
+    await ctx.client.query(
+      `UPDATE kith.deferred_work
+          SET payload = $2::jsonb, updated_at = transaction_timestamp()
+        WHERE id = $1 AND state = 'queued'`,
+      [queued.id, JSON.stringify(input)],
+    );
+    return { id: queued.id, deduped: true, state: "already_queued" };
+  }
+  const running = pending.rows.find((row) => row.state === "running");
+  if (running) {
+    const result = await schedule(ctx, {
+      kind: "document_extraction",
+      spaceId: input.spaceId,
+      payload: input,
+      dedupeKey: extractionFollowUpKey(input.sourceItemId, running.id),
+    });
+    return {
+      ...result,
+      state: result.deduped ? "already_followup_queued" : "followup_queued",
+    };
+  }
+  const result = await scheduleDocumentExtraction(ctx, input);
+  return { ...result, state: result.deduped ? "already_queued" : "queued" };
 }
 
 /**
@@ -437,6 +503,8 @@ type Loaded = {
   pagesWithText: number;
   allWithText: LoadedPage[];
   types: LoadedType[];
+  /** A durable owner decision that the model may not replace. */
+  ownerKind: string | null;
   /** The kind the last extraction of this document settled on, when there was
    * one. Only used to pick the model before the reply names a kind. */
   priorKind: string | null;
@@ -451,7 +519,7 @@ async function loadDocument(
   const item = (
     await client.query<Record<string, unknown>>(
       `SELECT i.space_id, i.source_account_id, i.lifecycle,
-              i.active_generation_id, s.created_by
+              i.active_generation_id, i.owner_document_kind, s.created_by
          FROM kith.source_items i JOIN kith.spaces s ON s.id = i.space_id
         WHERE i.id = $1 LIMIT 1`,
       [sourceItemId],
@@ -506,7 +574,7 @@ async function loadDocument(
   // invitation to cite it. Numbering is by position in the shown list, so
   // leaving one out shifts nothing: there is no hole to shift over.
   const withText = all.filter((page) => page.text.trim().length > 0);
-  const priorKind =
+  const extractedKind =
     (
       await client.query<{ kind: string }>(
         `SELECT kind FROM kith.document_extractions
@@ -515,6 +583,10 @@ async function loadDocument(
       )
     ).rows[0]?.kind ?? null;
   const types = await loadTypes(client, spaceId, now);
+  const ownerKind = typeof item.owner_document_kind === "string"
+    ? item.owner_document_kind
+    : null;
+  const priorKind = ownerKind ?? extractedKind;
   const priorBounds = priorKind
     ? types.find((type) => type.kind === priorKind)
     : undefined;
@@ -541,6 +613,7 @@ async function loadDocument(
      * measured against. Leaving out a blank page loses nothing. */
     pagesWithText: withText.length,
     types,
+    ownerKind,
     priorKind,
     /** Every page with words on it, kept so a wider bound can be applied
      * after the reply names a kind without reading the document again. */
@@ -668,7 +741,10 @@ async function loadTypes(
  * facts, and lengthening the prompt buys precision the gate already provides.
  */
 export function buildRequest(loaded: Loaded): ExtractionRequest {
-  const catalog = loaded.types
+  const requestTypes = loaded.ownerKind
+    ? loaded.types.filter((type) => type.kind === loaded.ownerKind)
+    : loaded.types;
+  const catalog = requestTypes
     .map((type) => {
       const fields = type.fields
         .map(
@@ -703,8 +779,11 @@ export function buildRequest(loaded: Loaded): ExtractionRequest {
   // Every field name of every active kind, deduplicated. The schema's enum and
   // the prompt's catalog are two statements of one contract.
   const fields = [
-    ...new Set(loaded.types.flatMap((type) => type.fields.map((f) => f.name))),
+    ...new Set(requestTypes.flatMap((type) => type.fields.map((f) => f.name))),
   ];
+  const classificationRule = loaded.ownerKind
+    ? `\nThe owner classified this document as ${loaded.ownerKind}. Return that exact kind. Do not choose another kind or other.\n`
+    : "";
   const prompt = `Read this document and report what it says. Do not infer, calculate, or convert anything.
 
 Each page is shown as numbered lines, like "7| Subtotal    10.00". Cite the lines a value comes from by their numbers. Do not copy text back.
@@ -721,7 +800,7 @@ Reply with JSON only, in exactly this shape:
     "page": <page number>,
     "lines": [<line number>]}]}
 
-Rules:
+Rules:${classificationRule}
 - Every statement names a field in "field". Never leave it out, never rename it, and never use the field name as a key of its own.
 - "lines" holds one to three line numbers from the page named in "page". Cite the line that prints the value. You may also cite the line that prints its label, even if it is far away; they do not need to be next to each other.
 - Only use fields listed under the kind you chose. Omit a field the document does not state: leave it out entirely rather than returning an empty string, a null or a blank.
@@ -762,7 +841,7 @@ ${catalog}
 Document:
 ${truncated}${body}
 `;
-  return { prompt, kinds: loaded.types.map((type) => type.kind), fields };
+  return { prompt, kinds: requestTypes.map((type) => type.kind), fields };
 }
 
 // ---------------------------------------------------------------------------
@@ -2442,8 +2521,17 @@ export async function runDocumentExtractionJob(
   // A document that is forgotten, unavailable, still parsing or replaced since
   // the job was queued is not an error: the activation that replaces it queues
   // its own job.
-  if (!first || first.types.length === 0) return null;
+  if (!first) return null;
+  if (
+    first.ownerKind !== null &&
+    !first.types.some((type) => type.kind === first.ownerKind)
+  ) {
+    throw new TerminalDeferredWorkError("owner_classification_schema_inactive");
+  }
+  if (first.types.length === 0) return null;
   let loaded: Loaded = first;
+  const enforceOwnerKind = (reading: ModelReading): ModelReading =>
+    loaded.ownerKind === null ? reading : { ...reading, kind: loaded.ownerKind };
 
   // Which model reads this document.
   //
@@ -2471,8 +2559,10 @@ export async function runDocumentExtractionJob(
   let refusedModel: string | null = null;
   let reading: ModelReading;
   try {
-    reading = await model.read(
-      knownOverride ? { ...request, model: knownOverride } : request,
+    reading = enforceOwnerKind(
+      await model.read(
+        knownOverride ? { ...request, model: knownOverride } : request,
+      ),
     );
   } catch (error) {
     // Only an override can be fallen back from. A default that fails is the
@@ -2480,7 +2570,7 @@ export async function runDocumentExtractionJob(
     if (!knownOverride) throw error;
     refusedModel = knownOverride;
     used = model.name;
-    reading = await model.read(request);
+    reading = enforceOwnerKind(await model.read(request));
   }
   const chosen = loaded.types.find((type) => type.kind === reading.kind);
   const wanted = chosen?.model ?? null;
@@ -2498,8 +2588,8 @@ export async function runDocumentExtractionJob(
   if (refusedModel === null && (widerRequest || (wanted && wanted !== used))) {
     const next = widerRequest ?? request;
     try {
-      reading = await model.read(
-        wanted ? { ...next, model: wanted } : next,
+      reading = enforceOwnerKind(
+        await model.read(wanted ? { ...next, model: wanted } : next),
       );
       if (wanted) used = wanted;
     } catch {
@@ -2516,7 +2606,8 @@ export async function runDocumentExtractionJob(
     const current = await loadDocument(client, spaceId, sourceItemId, now);
     if (
       !current ||
-      current.processingGenerationId !== loaded.processingGenerationId
+      current.processingGenerationId !== loaded.processingGenerationId ||
+      current.ownerKind !== loaded.ownerKind
     ) {
       return null;
     }

@@ -32,6 +32,7 @@
 
 import { admin, documents, embeddings, memory, records } from "@repo/kith-store";
 import type { EmbedQuery } from "@repo/kith-store/embeddings";
+import * as extraction from "@repo/kith-store/extraction";
 import {
   getAuthorizedReadSpaceIds,
   type IdentityCtx,
@@ -287,7 +288,17 @@ export type McpReads = {
   queryRecords(query: unknown): Promise<unknown>;
   searchDocuments(args: SearchDocumentsArgs): Promise<unknown>;
   getDocument(
-    args: ReadSpaces & { documentId: string; includeHistorical?: boolean },
+    args: ReadSpaces &
+      (
+        | { documentId: string; sourceItemId?: never; includeHistorical?: boolean }
+        | { documentId?: never; sourceItemId: string; includeHistorical?: never }
+      ),
+  ): Promise<unknown>;
+  listDocumentSchemas(
+    args: ReadSpaces & { cursor?: string; limit?: number },
+  ): Promise<unknown>;
+  getDocumentExtractionStatus(
+    args: ReadSpaces & { sourceItemIds: string[] },
   ): Promise<unknown>;
   /**
    * The sources, and the authorized set they were read under.
@@ -752,16 +763,41 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
         );
       });
     },
-    async getDocument({ spaceIds, documentId, includeHistorical }) {
-      return await read(async ({ ctx, principal, spaces }) =>
-        documents.getDocument(
+    async getDocument(args) {
+      return await read(async ({ ctx, principal, spaces }) => {
+        const authorized = await spaces(args.spaceIds);
+        return args.sourceItemId === undefined
+          ? await documents.getDocument(
+              ctx.client,
+              authorized,
+              args.documentId,
+              args.includeHistorical,
+              principalMaxSensitivity(principal),
+            )
+          : await documents.getDocumentsForSourceItem(
+              ctx.client,
+              authorized,
+              args.sourceItemId,
+              principalMaxSensitivity(principal),
+            );
+      });
+    },
+    async listDocumentSchemas({ spaceIds, cursor, limit }) {
+      return await read(async ({ ctx, spaces }) =>
+        extraction.listDocumentSchemas(ctx.client, await spaces(spaceIds), {
+          ...(cursor === undefined ? {} : { cursor }),
+          ...(limit === undefined ? {} : { limit }),
+        }),
+      );
+    },
+    async getDocumentExtractionStatus({ spaceIds, sourceItemIds }) {
+      return await read(async ({ ctx, spaces }) => ({
+        items: await extraction.getDocumentExtractionStatuses(
           ctx.client,
           await spaces(spaceIds),
-          documentId,
-          includeHistorical,
-          principalMaxSensitivity(principal),
+          sourceItemIds,
         ),
-      );
+      }));
     },
     async listSources({ spaceIds, sourceAccountId, limit }) {
       // The authorized set comes back with the sources so the tool's finance
