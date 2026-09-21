@@ -15,14 +15,8 @@ and is absent from public clones.
    `<topic>` when no task ID exists), deleted after merge.
 3. Do not add real personal, family, health, financial, account, credential,
    or production data to the repository. Use synthetic fixtures.
-4. Run the relevant checks. Before requesting review for a code change, run:
-
-   ```
-   pnpm lint
-   pnpm check-types
-   pnpm test:once
-   pnpm build
-   ```
+4. Follow [Verification and review](#verification-and-review). Run focused
+   checks before draft review and use final CI as the authoritative release gate.
 
 5. Open a pull request that explains the behavior change and the checks run.
    Update a public plan when the implementation changes an adopted design.
@@ -40,7 +34,8 @@ For every state change (`blocked`, `review`, or `done`), update the tracker
 with a next action that stands on its own, the verification command, and the PR
 URL where applicable. Never delete tracker rows. A task is done only after its
 PR is merged, required checks are green, and the plan's acceptance line is
-satisfied. Run all four verification commands before marking a task `review`.
+satisfied. Before marking a task `review`, record focused verification and any
+pending final CI checks under the policy below.
 Add tracker rows for discovered work with a `source` note identifying the task
 that surfaced it.
 
@@ -61,7 +56,7 @@ cleanup. Every agent reads this section before starting.
 | Only the orchestrator merges, migrates and deploys | A merge does not deploy. Migrations are positions in a list and the schema runner rejects gaps, so they go in series through one agent. |
 | Side lanes stay out of | `packages/kith-store/migrations`, `packages/pipeline`, `packages/worker-protocol`, `packages/kith-store/src/workers`, `packages/kith-store/src/identity`, `apps/web/src/lib/mcp`, auth and MCP routes, `docs/private`. Need a change there? Say so in your PR and stop. |
 | Shared UI components have one owner at a time | `apps/web/src/components/ui/*` is shared by every screen. Only one open PR may change it. Keep changes backward compatible. |
-| Finish cleanly | Run the four checks. Remove containers and your own scratch files. Tell the owner the PR is ready. The orchestrator removes your worktree and branch at merge. |
+| Finish cleanly | Record verification under the policy below. Remove containers and your own scratch files. Tell the owner the PR is ready. The orchestrator removes your worktree and branch at merge. |
 | Do not read the owner's data | No document text, database values or files under the watched folders. Counts, enums and booleans only. Use synthetic fixtures. |
 
 ### Waiting costs tokens
@@ -79,6 +74,56 @@ Every model turn re-reads the whole conversation. An agent that checks
 To get a side-lane PR shipped, the owner tells the orchestrator "ship PR <n>".
 
 UI work follows [`docs/ui-style.md`](docs/ui-style.md).
+
+## Verification and review
+
+This policy supersedes generic instructions in older plans to run all four
+commands before every review. Plan-specific acceptance tests still apply.
+The purpose is to find defects early and ship verified changes, without
+repeating unchanged work at each handoff.
+
+| Stage or change | Required evidence |
+| --- | --- |
+| Development and draft review | Run the focused tests for changed behavior and affected consumers. Share the diff for review promptly; do not wait for a full repository build to begin review. State what remains unverified. |
+| Final code release | Required CI must pass for the final merge candidate. CI runs `pnpm lint`, `pnpm check-types`, `pnpm test:once`, and `pnpm build`; its results satisfy those checks without another local full run. Run local checks for coverage or environments CI does not exercise. |
+| Prose-only documentation | Check the diff, links and consistency of instructions. No local application build or database suite is needed. Required CI remains binding until the workflow itself changes. Executable examples, generated inputs and configuration changes need their relevant checks. |
+| Review correction | Test the changed behavior and plausible regressions. Review the delta and verify earlier findings are resolved. Reopen unchanged areas only when the fix changes their assumptions. |
+| Deployment or data repair | Verify the changed live behavior and the owner's acceptance condition. A green build, successful reparse or healthy endpoint alone does not prove the requested data or UI outcome. |
+
+Record the tested commit, commands, results, database requirements and material
+coverage gaps in the PR. Reuse author or CI evidence when the relevant source,
+dependencies, configuration and test environment are unchanged. A prose-only
+commit does not invalidate code evidence; a rebase requires checking what
+changed in the base and rerunning checks affected by it. Required final-head
+CI and branch protection must still pass. Never relabel earlier evidence as
+having run against a later commit.
+
+Use one accountable release owner. For code requiring independent review, use
+one reviewer per risk area; prose-only edits do not need a new review lane.
+Authors own focused verification; reviewers inspect behavior and test adequacy;
+the orchestrator checks evidence and release acceptance. Do not have every role
+repeat the same suite or commission another full review of unchanged code.
+Collect related findings into a coherent repair before the final check batch.
+Retain independent review for financial correctness, security and schema
+changes, including the second-model security requirement below.
+
+Choose tests by failure risk, not by how many commands can be run. Before an
+expensive final batch, exercise parser boundaries, complete/partial/zero data,
+replay and recovery transitions, or realistic query cardinality as applicable.
+Performance regressions should distinguish the broken implementation from the
+fix under the supported runtime budget, without fragile tiny timing thresholds.
+Use synthetic fixtures; owner-authorized production diagnostics remain private.
+A skipped database test is not passing database evidence. Separate integration
+suites are not duplicates merely because they use the same database.
+
+Broaden verification when changes cross shared contracts, dependencies, build
+configuration or security boundaries, or when failures reveal wider impact.
+Otherwise stop testing once relevant checks and acceptance pass. Do not add
+unrelated cleanup, a new framework or another approval gate to a release fix.
+Keep release blockers separate from follow-up improvements, give each active
+lane a concrete next action, and reuse valid operational checkpoints rather
+than restarting long jobs because of a handoff. If a gate fails, identify the
+violated invariant before repeating the operation or weakening the gate.
 
 ## Cross-workstream coordination
 
