@@ -74,13 +74,13 @@ function storedPosition(id, instrumentId, locator, overrides = {}) {
   };
 }
 
-function balance(totalValue, cash, locator) {
+function balance(totalValue, cash, locator, currency = "USD") {
   return {
     asOf: "2025-03-31",
     totalValueText: totalValue,
     totalValueNote: null,
     cash,
-    currency: "USD",
+    currency,
     periodStartValue: null,
     periodEndValue: null,
     sourceLocator: locator,
@@ -214,6 +214,80 @@ test("a second distinct balance for one account and date is not publishable cand
     "adapter_has_no_holding_completeness_attestation",
     "candidate_row_rejected",
   ]);
+});
+
+test("unknown three-letter money currencies mirror importer review semantics without leaking values", () => {
+  const unknownCurrency = "ZZZ";
+  const manifest = buildHoldingCorrectionCandidateManifest({
+    documentId: "doc-unknown-currency",
+    retainedSha256: SHA,
+    stored: emptyTables,
+    candidate: candidate({
+      positions: [
+        {
+          asOf: "2025-03-31",
+          instrumentId: "inst-a",
+          quantity: null,
+          price: null,
+          marketValueText: "100",
+          marketValueNote: null,
+          costBasis: null,
+          unrealized: null,
+          currency: unknownCurrency,
+          valuationBasis: "cost",
+          valuationNote: null,
+          sourceLocator: "page:1:position:1",
+        },
+      ],
+      balances: [
+        balance("100", null, "page:1:balance:1", unknownCurrency),
+      ],
+      liabilities: [
+        {
+          accountId: "acct-1",
+          kind: "loan",
+          displayName: "Synthetic liability",
+          balanceText: "100",
+          balanceNote: null,
+          currency: unknownCurrency,
+          rate: null,
+          asOf: "2025-03-31",
+          collateralNote: null,
+          sourceLocator: "page:1:liability:1",
+        },
+      ],
+    }),
+  });
+
+  assert.equal(manifest.tables.positions.candidateRows, 1);
+  assert.equal(manifest.tables.balances.candidateRows, 1);
+  assert.equal(manifest.tables.liabilities.candidateRows, 1);
+  assert.equal(manifest.completeness.state, "partial");
+  assert.equal(manifest.completeness.issueCount, 3);
+  assert.deepEqual(manifest.completeness.reasons, [
+    "adapter_has_no_holding_completeness_attestation",
+    "adapter_mapping_review_required",
+  ]);
+  assert.doesNotMatch(JSON.stringify(manifest), /ZZZ|Synthetic liability/);
+
+  assert.throws(
+    () =>
+      buildHoldingCorrectionCandidateManifest({
+        documentId: "doc-invalid-currency",
+        retainedSha256: SHA,
+        stored: emptyTables,
+        candidate: candidate({
+          balances: [
+            balance(null, null, "page:1:balance:1", "PRIVATE_CURRENCY"),
+          ],
+        }),
+      }),
+    (error) => {
+      assert.match(error.message, /invalid currency code/);
+      assert.doesNotMatch(error.message, /PRIVATE_CURRENCY/);
+      return true;
+    },
+  );
 });
 
 test("ambiguous remaining locators and retained-byte mismatches fail closed", () => {

@@ -6,7 +6,7 @@ import type {
   ImportLiability,
   ImportPosition,
 } from "./importer.js";
-import { currencyExponent, toMinorUnits } from "./money.js";
+import { toMinorUnits } from "./money.js";
 import { toNumericText } from "./pgNumeric.js";
 import {
   balanceHash,
@@ -17,6 +17,7 @@ import type { ArchiveClient } from "./pgStore.js";
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+const CURRENCY_CODE = /^[A-Z]{3}$/;
 const VALUATION_BASES = new Set([
   "market_price",
   "last_round",
@@ -211,6 +212,12 @@ function validDate(value: string): boolean {
   return ISO_DATE.test(value);
 }
 
+function assertCurrencyCode(value: string, table: HoldingProjectionTable): void {
+  if (!CURRENCY_CODE.test(value)) {
+    fail(`${table} candidate has an invalid currency code`);
+  }
+}
+
 function preparePosition(
   row: ImportPosition,
   document: ImportDocument,
@@ -218,7 +225,7 @@ function preparePosition(
 ): CandidateHoldingRow | null {
   const account = accountId(row.accountId, document.accountId, "positions")!;
   if (!validDate(row.asOf)) return null;
-  currencyExponent(row.currency);
+  assertCurrencyCode(row.currency, "positions");
   const quantity = candidateNumeric(row.quantity, issue);
   const price = candidateNumeric(row.price, issue);
   const marketValue = candidateMoney(
@@ -274,7 +281,7 @@ function prepareBalance(
 ): CandidateHoldingRow | null {
   const account = accountId(row.accountId, document.accountId, "balances")!;
   if (!validDate(row.asOf)) return null;
-  currencyExponent(row.currency);
+  assertCurrencyCode(row.currency, "balances");
   const totalValue = candidateMoney(
     row.totalValueText,
     row.totalValueNote,
@@ -319,7 +326,7 @@ function prepareLiability(
 ): CandidateHoldingRow | null {
   const account = accountId(row.accountId, document.accountId, "liabilities");
   if (!validDate(row.asOf)) return null;
-  currencyExponent(row.currency);
+  assertCurrencyCode(row.currency, "liabilities");
   const balance = candidateMoney(
     row.balanceText,
     row.balanceNote,
