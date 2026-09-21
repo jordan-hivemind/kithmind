@@ -30,6 +30,11 @@ import {
   primaryButtonClass,
 } from "@/components/ui/drawer";
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
   amountSchema,
   amountSchemaFor,
   isoDateSchema,
@@ -301,43 +306,57 @@ export function EntryDrawer({
         <ul className="flex flex-col gap-0.5">
           {visible.slice(0, 6).map((suggestion) => (
             <li key={suggestion.documentId}>
-              <button
-                type="button"
-                aria-pressed={draft.documentId === suggestion.documentId}
-                title={suggestion.reasons.join(", ")}
-                onClick={() =>
-                  setDraft({
-                    ...draft,
-                    documentId:
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-pressed={draft.documentId === suggestion.documentId}
+                    onClick={() =>
+                      setDraft({
+                        ...draft,
+                        documentId:
+                          draft.documentId === suggestion.documentId
+                            ? null
+                            : suggestion.documentId,
+                      })
+                    }
+                    className={`w-full truncate rounded-tag border px-1.5 py-0.5 text-left text-meta ${
                       draft.documentId === suggestion.documentId
-                        ? null
-                        : suggestion.documentId,
-                  })
-                }
-                className={`w-full truncate rounded-tag border px-1.5 py-0.5 text-left text-meta ${
-                  draft.documentId === suggestion.documentId
-                    ? "border-accent-600 bg-accent-50 text-accent-700"
-                    : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"
-                }`}
-              >
-                {suggestion.title}
-                <span className="ml-1 text-gray-400">
-                  {suggestion.reasons.join(" ")}
-                </span>
-              </button>
+                        ? "border-accent-600 bg-accent-50 text-accent-700"
+                        : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"
+                    }`}
+                  >
+                    {suggestion.title}
+                    <span className="ml-1 text-gray-400">
+                      {suggestion.reasons.join(" ")}
+                    </span>
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {suggestion.reasons.join(", ") || suggestion.title}
+                </TooltipContent>
+              </Tooltip>
             </li>
           ))}
         </ul>
 
         <div className="flex items-center gap-2 pt-1">
-          <button
-            type="button"
-            disabled
-            title="Drop files in the watched Investing folder"
-            className={buttonClass}
-          >
-            Upload
-          </button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span
+                tabIndex={0}
+                aria-label="Upload unavailable"
+                className="inline-flex rounded-control outline-none focus-visible:ring-2 focus-visible:ring-kith-action"
+              >
+                <button type="button" disabled className={buttonClass}>
+                  Upload
+                </button>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>
+              Drop files in the watched Investing folder
+            </TooltipContent>
+          </Tooltip>
           <span className="flex-1" />
           <button
             type="button"

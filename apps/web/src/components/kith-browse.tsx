@@ -33,7 +33,12 @@ import {
 import { KithQuickCapture } from "@/components/kith-quick-capture";
 import { KithThoughtSearch } from "@/components/kith-thought-search";
 import { inputClass, PageHeader } from "@/components/ui/controls";
-import { DataTable, type RowAction, Tag } from "@/components/ui/data-table";
+import {
+  DataTable,
+  Detail,
+  type RowAction,
+  Tag,
+} from "@/components/ui/data-table";
 import type { BrowseData, BrowseView } from "@/lib/kith/browse";
 import {
   type CaptureResponse,
@@ -221,14 +226,18 @@ function FactsTable({
         size: 420,
         minSize: 240,
         cell: ({ row }) => (
-          <span
-            title={row.original.statement}
-            className={`block truncate ${
-              row.original.status === "current" ? "" : "text-gray-500"
-            }`}
-          >
-            {row.original.statement}
-          </span>
+          <Detail
+            label={
+              <span
+                className={`block truncate ${
+                  row.original.status === "current" ? "" : "text-gray-500"
+                }`}
+              >
+                {row.original.statement}
+              </span>
+            }
+            detail={row.original.statement}
+          />
         ),
       },
       {

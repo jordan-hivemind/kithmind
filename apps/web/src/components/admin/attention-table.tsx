@@ -32,6 +32,11 @@ import {
   Tag,
 } from "@/components/ui/data-table";
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import {
   type DocumentReference,
   DocumentViewer,
 } from "@/components/ui/document-viewer";
@@ -602,11 +607,10 @@ export function AttentionTable({
           }
           const document = item.item.document;
           if (document === null) return null;
-          return (
+          return document.uri === null ? (
             <button
               type="button"
               data-row-click-ignore
-              title={document.uri ?? undefined}
               onClick={(event) => {
                 event.stopPropagation();
                 setDocument(document);
@@ -615,6 +619,23 @@ export function AttentionTable({
             >
               {document.title ?? document.sourceItemId}
             </button>
+          ) : (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  data-row-click-ignore
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setDocument(document);
+                  }}
+                  className="block w-full truncate text-left text-accent-700 underline-offset-2 hover:underline"
+                >
+                  {document.title ?? document.sourceItemId}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>{document.uri}</TooltipContent>
+            </Tooltip>
           );
         },
       },

@@ -21,7 +21,6 @@
 // `entity` and `datetime` are not offered an Edit action at all (see the
 // browse table's kebab), so this component never has to render one.
 
-import * as Tooltip from "@radix-ui/react-tooltip";
 import { type memory } from "@repo/kith-store";
 import { useEffect, useState } from "react";
 
@@ -32,6 +31,12 @@ import {
   inputClass,
   primaryButtonClass,
 } from "@/components/ui/drawer";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 export type EditableFactValue = Extract<
   memory.FactValue,
@@ -50,9 +55,21 @@ export type FactDraft = {
   validFrom: string;
 };
 
-const CHANGE_KIND_OPTIONS: { value: FactChangeKind; label: string; detail: string }[] = [
-  { value: "changed", label: "Changed", detail: "The old value was true once and stays in history" },
-  { value: "corrected", label: "Was wrong", detail: "The old value was never true and is withheld, even from history" },
+const CHANGE_KIND_OPTIONS: {
+  value: FactChangeKind;
+  label: string;
+  detail: string;
+}[] = [
+  {
+    value: "changed",
+    label: "Changed",
+    detail: "The old value was true once and stays in history",
+  },
+  {
+    value: "corrected",
+    label: "Was wrong",
+    detail: "The old value was never true and is withheld, even from history",
+  },
 ];
 
 /** Square segmented control, matching the browse page's own `Segment`
@@ -66,11 +83,11 @@ function ChangeKindControl({
   onChange: (value: FactChangeKind) => void;
 }) {
   return (
-    <Tooltip.Provider delayDuration={200}>
+    <TooltipProvider delayDuration={0} skipDelayDuration={0}>
       <div className="flex rounded-tag border border-gray-300 text-xs">
         {CHANGE_KIND_OPTIONS.map((option) => (
-          <Tooltip.Root key={option.value}>
-            <Tooltip.Trigger asChild>
+          <Tooltip key={option.value}>
+            <TooltipTrigger asChild>
               <button
                 type="button"
                 aria-pressed={value === option.value}
@@ -83,19 +100,14 @@ function ChangeKindControl({
               >
                 {option.label}
               </button>
-            </Tooltip.Trigger>
-            <Tooltip.Portal>
-              <Tooltip.Content
-                sideOffset={4}
-                className="z-50 max-w-xs rounded-control border border-kith-border-subtle bg-kith-surface px-3 py-2 text-sm text-kith-text-secondary shadow-[var(--kith-shadow-md)]"
-              >
-                {option.detail}
-              </Tooltip.Content>
-            </Tooltip.Portal>
-          </Tooltip.Root>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-xs">
+              {option.detail}
+            </TooltipContent>
+          </Tooltip>
         ))}
       </div>
-    </Tooltip.Provider>
+    </TooltipProvider>
   );
 }
 
@@ -127,7 +139,9 @@ export function FactDrawer({
       changeKind: draft.changeKind,
       ...(draft.validFrom === ""
         ? {}
-        : { validFrom: new Date(`${draft.validFrom}T00:00:00.000Z`).getTime() }),
+        : {
+            validFrom: new Date(`${draft.validFrom}T00:00:00.000Z`).getTime(),
+          }),
     });
     onOpenChange(false);
   };
@@ -229,7 +243,9 @@ export function FactDrawer({
             type="date"
             className={inputClass}
             value={draft.validFrom}
-            onChange={(event) => setDraft({ ...draft, validFrom: event.target.value })}
+            onChange={(event) =>
+              setDraft({ ...draft, validFrom: event.target.value })
+            }
           />
         </Field>
         <div className="flex items-center justify-end gap-2 pt-1">

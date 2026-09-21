@@ -17,7 +17,7 @@
 import type { ColumnDef } from "@tanstack/react-table";
 import { useMemo, useState } from "react";
 
-import { DataTable } from "@/components/ui/data-table";
+import { DataTable, Detail } from "@/components/ui/data-table";
 import {
   buttonClass,
   Drawer,
@@ -25,6 +25,11 @@ import {
   inputClass,
   primaryButtonClass,
 } from "@/components/ui/drawer";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   archiveDate,
   label,
@@ -328,13 +333,15 @@ export function ImportDrawer({
             ))}
 
             {preview.skipped.map((row) => (
-              <p
+              <Detail
                 key={`${row.line}:${row.reason}`}
-                className="truncate rounded-tag border border-gray-200 px-1.5 py-0.5 text-meta text-gray-500"
-                title={row.raw}
-              >
-                {row.line} · {row.reason}
-              </p>
+                label={
+                  <span className="block truncate rounded-tag border border-gray-200 px-1.5 py-0.5 text-meta text-gray-500">
+                    {row.line} · {row.reason}
+                  </span>
+                }
+                detail={row.raw}
+              />
             ))}
 
             <ul className="flex max-h-64 flex-col gap-0.5 overflow-y-auto">
@@ -350,28 +357,34 @@ export function ImportDrawer({
                     {row.investmentName}
                     {row.occurrence > 1 ? ` (${row.occurrence})` : ""}
                   </span>
-                  <span
-                    className="tabular-nums"
-                    title={
-                      row.notes.length === 0 ? undefined : row.notes.join("; ")
-                    }
-                  >
-                    {tableDecimal(row.amount)} {row.currency}
-                    {/* Converted at this row's own rate, shown at cents. The
+                  <Detail
+                    label={
+                      <span className="tabular-nums">
+                        {tableDecimal(row.amount)} {row.currency}
+                        {/* Converted at this row's own rate, shown at cents. The
                         reconciliation adds the unrounded values, the way the
                         store does. */}
-                    {row.currency === "USD"
-                      ? ""
-                      : ` → ${tableDecimal(roundToScale(row.usdAmount, 2).value)}`}
-                  </span>
-                  <button
-                    type="button"
-                    title={row.why}
-                    onClick={() => flip(index)}
-                    className="rounded-tag border border-gray-200 bg-gray-50 px-1.5 py-0.5 hover:border-gray-300"
-                  >
-                    {label(row.entryType)}
-                  </button>
+                        {row.currency === "USD"
+                          ? ""
+                          : ` → ${tableDecimal(roundToScale(row.usdAmount, 2).value)}`}
+                      </span>
+                    }
+                    detail={row.notes.join("; ")}
+                  />
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={() => flip(index)}
+                        className="rounded-tag border border-gray-200 bg-gray-50 px-1.5 py-0.5 hover:border-gray-300"
+                      >
+                        {label(row.entryType)}
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      {row.why || label(row.entryType)}
+                    </TooltipContent>
+                  </Tooltip>
                 </li>
               ))}
             </ul>
