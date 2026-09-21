@@ -1299,6 +1299,158 @@ test(
 );
 
 test(
+  "account-currency aggregates withhold an unsafe account without hiding safe accounts",
+  { skip },
+  async (t) => {
+    const { owner, reader: r } = await fixture(t);
+    const source = await institution(owner, "account-group-safety", {
+      accounts: 2,
+    });
+    const [unsafeAccount, safeAccount] = source.accountIds;
+    const partialDoc = await document(
+      owner,
+      source.id,
+      unsafeAccount,
+      "2026-09-30",
+    );
+    const safeDoc = await document(owner, source.id, safeAccount, "2026-09-30");
+    await owner.query("UPDATE documents SET parsed_ok = FALSE WHERE id = $1", [
+      partialDoc,
+    ]);
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, quantity, market_value, cost_basis, currency,
+          valuation_basis, source_document_id)
+       VALUES ('account-group-safe-position', $1, DATE '2026-09-30', '1',
+               '125', '100', 'USD', 'market_price', $2)`,
+      [safeAccount, safeDoc],
+    );
+
+    const response = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "account_currency",
+      sourceId: source.id,
+    });
+    assert.deepEqual(
+      response.items.map((item) => ({
+        accountId: item.accountId,
+        currency: item.currency,
+        total: item.total.decimal,
+      })),
+      [{ accountId: safeAccount, currency: "USD", total: "125" }],
+    );
+    assert.ok(response.coverage.reasons.includes("failed_import"));
+  },
+);
+
+test(
+  "a requested aggregate currency is judged only by rows in that currency",
+  { skip },
+  async (t) => {
+    const { owner, reader: r } = await fixture(t);
+    const source = await institution(owner, "selected-currency-safety");
+    const accountId = source.accountIds[0];
+    const doc = await document(owner, source.id, accountId, "2026-10-31");
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, quantity, market_value, cost_basis, currency,
+          valuation_basis, source_document_id)
+       VALUES ('selected-currency-usd', $1, DATE '2026-10-31', '1', '80',
+               '70', 'USD', 'market_price', $2),
+              ('selected-currency-eur', $1, DATE '2026-10-31', '1', NULL,
+               '40', 'EUR', 'market_price', $2)`,
+      [accountId, doc],
+    );
+
+    let response = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      sourceId: source.id,
+      currency: "USD",
+    });
+    assert.equal(response.items.length, 1);
+    assert.equal(response.items[0].currency, "USD");
+    assert.equal(response.items[0].total.decimal, "80");
+    assert.equal(response.coverage.reasons.includes("missing_value"), false);
+    assert.equal(
+      response.coverage.reasons.includes("unsupported_value"),
+      false,
+    );
+
+    response = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      sourceId: source.id,
+      currency: "EUR",
+    });
+    assert.deepEqual(response.items, []);
+    assert.ok(response.coverage.reasons.includes("missing_value"));
+  },
+);
+
+test(
+  "reviews on superseded documents do not make the retained holdings source partial",
+  { skip },
+  async (t) => {
+    const { owner, reader: r } = await fixture(t);
+    const source = await institution(owner, "superseded-review-safety");
+    const accountId = source.accountIds[0];
+    const supersededDoc = await document(
+      owner,
+      source.id,
+      accountId,
+      "2026-11-30",
+    );
+    const retainedDoc = await document(
+      owner,
+      source.id,
+      accountId,
+      "2026-11-30",
+    );
+    await owner.query("UPDATE documents SET superseded_by = $2 WHERE id = $1", [
+      supersededDoc,
+      retainedDoc,
+    ]);
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES ('superseded-source-review', 'ambiguous_amount', $1, $2,
+               'synthetic stale review', 'the source was replaced', 'open')`,
+      [accountId, supersededDoc],
+    );
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, quantity, market_value, cost_basis, currency,
+          valuation_basis, source_document_id)
+       VALUES ('superseded-review-position', $1, DATE '2026-11-30', '1',
+               '140', '120', 'USD', 'market_price', $2)`,
+      [accountId, retainedDoc],
+    );
+
+    const snapshot = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId,
+      snapshot: { mode: "exact", asOf: "2026-11-30" },
+    });
+    assert.notEqual(snapshot.summary.status, "unavailable");
+    assert.equal(snapshot.coverage.reasons.includes("failed_import"), false);
+
+    const inventory = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 100,
+    });
+    const inventoryRow = inventory.items.find(
+      (item) => item.account.accountId === accountId,
+    );
+    assert.equal(inventoryRow.openReviewCount, 0);
+    assert.equal(inventoryRow.latestSnapshotAsOf, "2026-11-30");
+  },
+);
+
+test(
   "another account's passing position period cannot prove snapshot coverage",
   { skip },
   async (t) => {

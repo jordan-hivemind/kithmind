@@ -1269,6 +1269,7 @@ function holdingsDatePredicates(account: string, asOf: string) {
       LEFT JOIN documents open_d ON open_d.id = open_r.source_document_id
        WHERE open_r.account_id = ${account}
          AND open_r.status = 'open'
+         AND open_d.superseded_by IS NULL
          AND (
            open_d.doc_date = ${asOf}
            OR EXISTS (
@@ -1509,7 +1510,15 @@ async function listAccountInventory(
             hs.as_of::text AS latest_snapshot_as_of,
             (SELECT count(*) FROM review_items r
               WHERE r.account_id = d.account_id
-                AND r.status = 'open')::text AS open_review_count,
+                AND r.status = 'open'
+                AND (
+                  r.source_document_id IS NULL
+                  OR EXISTS (
+                    SELECT 1 FROM documents review_d
+                     WHERE review_d.id = r.source_document_id
+                       AND review_d.superseded_by IS NULL
+                  )
+                ))::text AS open_review_count,
             lb.as_of::text AS balance_as_of,
             lb.total_value::text AS balance_value,
             lb.currency::text AS balance_currency,
@@ -2488,6 +2497,7 @@ type AggregateRow = {
 
 type HoldingsAggregateEligibility = {
   globalUnsafe: boolean;
+  unsafeAccountIds: string[];
   unsafeGroupKeys: string[];
 };
 
@@ -2557,6 +2567,7 @@ async function holdingsAggregateEligibility(
     ],
   );
   let globalUnsafe = false;
+  const unsafeAccountIds = new Set<string>();
   const unsafeGroupKeys = new Set<string>();
   for (const selectedDate of selected.rows) {
     const assessment = await assessHoldingsDate(
@@ -2565,10 +2576,13 @@ async function holdingsAggregateEligibility(
       selectedDate.as_of,
     );
     // A partial source or failed gate can have omitted an entire row, whose
-    // currency is consequently unknowable. No currency group is safe to
-    // publish from that selected account/date.
+    // currency is consequently unknowable. Currency-only grouping cannot
+    // publish any group, since that omitted row could belong to any of them.
+    // Account-currency grouping can still publish other accounts, because an
+    // omitted row from this account cannot contribute to theirs.
     if (!foldHoldingsSourceAssessment(scope, assessment)) {
-      globalUnsafe = true;
+      if (groupsByAccount) unsafeAccountIds.add(selectedDate.account_id);
+      else globalUnsafe = true;
       continue;
     }
     const byCurrency = await client.query<{
@@ -2589,6 +2603,11 @@ async function holdingsAggregateEligibility(
       [selectedDate.account_id, selectedDate.as_of],
     );
     for (const currency of byCurrency.rows) {
+      if (
+        request.currency !== undefined &&
+        currency.currency !== request.currency
+      )
+        continue;
       const missing = Number(currency.missing_value) > 0;
       const unsupportedMarketValue =
         request.metric === "market_value" &&
@@ -2604,7 +2623,11 @@ async function holdingsAggregateEligibility(
       );
     }
   }
-  return { globalUnsafe, unsafeGroupKeys: [...unsafeGroupKeys] };
+  return {
+    globalUnsafe,
+    unsafeAccountIds: [...unsafeAccountIds],
+    unsafeGroupKeys: [...unsafeGroupKeys],
+  };
 }
 
 /**
@@ -2624,6 +2647,7 @@ function aggregateSql(
   afterCurrency: string | null,
   afterAccountId: string | null,
   unsafeGroupKeys: readonly string[],
+  unsafeAccountIds: readonly string[],
 ): { sql: string; values: unknown[] } {
   const account = groupsByAccount
     ? ", a.id AS account_id"
@@ -2658,14 +2682,16 @@ function aggregateSql(
                     (currency, coalesce(account_id, '')) > ($6, $7::text))
                AND (coalesce(account_id, '') || chr(31) || currency)
                      <> ALL($8::text[])
+               AND (account_id IS NULL OR account_id <> ALL($9::text[]))
              ORDER BY currency, coalesce(account_id, '')
-             LIMIT $9`,
+             LIMIT $10`,
       values: [
         ...shared,
         request.currency ?? null,
         afterCurrency,
         afterAccountId,
         unsafeGroupKeys,
+        unsafeAccountIds,
       ],
     };
   }
@@ -2709,14 +2735,16 @@ function aggregateSql(
                   (currency, coalesce(account_id, '')) > ($6, $7::text))
              AND (coalesce(account_id, '') || chr(31) || currency)
                    <> ALL($8::text[])
+             AND (account_id IS NULL OR account_id <> ALL($9::text[]))
            ORDER BY currency, coalesce(account_id, '')
-           LIMIT $9`,
+           LIMIT $10`,
     values: [
       ...shared,
       request.currency ?? null,
       afterCurrency,
       afterAccountId,
       unsafeGroupKeys,
+      unsafeAccountIds,
     ],
   };
 }
@@ -2745,13 +2773,14 @@ async function aggregateMoney(
         request,
         groupsByAccount,
       )
-    : { globalUnsafe: false, unsafeGroupKeys: [] };
+    : { globalUnsafe: false, unsafeAccountIds: [], unsafeGroupKeys: [] };
   const { sql, values } = aggregateSql(
     request,
     groupsByAccount,
     cursorKey?.[0] ?? null,
     cursorKey?.[1] ?? null,
     aggregateEligibility.unsafeGroupKeys,
+    aggregateEligibility.unsafeAccountIds,
   );
   const result = aggregateEligibility.globalUnsafe
     ? { rows: [] as AggregateRow[] }
@@ -3197,6 +3226,7 @@ async function coverageRecords(
        JOIN institutions i ON i.id = a.institution_id
        LEFT JOIN documents d ON d.id = ri.source_document_id
       WHERE ri.status = 'open'
+        AND (d.id IS NULL OR d.superseded_by IS NULL)
         AND ($1::text IS NULL OR i.id = $1)
         AND ($3::text IS NULL OR ri.account_id = $3)
       GROUP BY i.id
