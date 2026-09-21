@@ -13,8 +13,14 @@
 // This component fetches nothing and imports nothing from Convex. The space list
 // arrives as a prop, already authorized by whoever loaded it.
 
-import * as Tooltip from "@radix-ui/react-tooltip";
 import { useEffect } from "react";
+
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 export type KeyCapability = "read" | "write" | "ingest";
 
@@ -74,11 +80,11 @@ export function SensitivityControl({
   onChange: (value: SensitivityChoice) => void;
 }) {
   return (
-    <Tooltip.Provider delayDuration={200}>
+    <TooltipProvider delayDuration={0} skipDelayDuration={0}>
       <div className="flex rounded-tag border border-gray-300 text-xs">
         {SENSITIVITY_OPTIONS.map((option) => (
-          <Tooltip.Root key={option.value}>
-            <Tooltip.Trigger asChild>
+          <Tooltip key={option.value}>
+            <TooltipTrigger asChild>
               <button
                 type="button"
                 aria-pressed={value === option.value}
@@ -91,19 +97,14 @@ export function SensitivityControl({
               >
                 {option.label}
               </button>
-            </Tooltip.Trigger>
-            <Tooltip.Portal>
-              <Tooltip.Content
-                sideOffset={4}
-                className="z-50 max-w-xs rounded-control border border-kith-border-subtle bg-kith-surface px-3 py-2 text-sm text-kith-text-secondary shadow-[var(--kith-shadow-md)]"
-              >
-                {option.detail}
-              </Tooltip.Content>
-            </Tooltip.Portal>
-          </Tooltip.Root>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-xs">
+              {option.detail}
+            </TooltipContent>
+          </Tooltip>
         ))}
       </div>
-    </Tooltip.Provider>
+    </TooltipProvider>
   );
 }
 
@@ -225,7 +226,6 @@ export function SpaceGrantChoices({
         />
       </div>
       <p className="mt-3 text-xs text-kith-text-secondary">
-
         Access follows your current membership. Removing access to a space also
         removes this client’s access. Narrative memory capture needs both read
         and write access to check existing memories.

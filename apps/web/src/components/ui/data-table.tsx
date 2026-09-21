@@ -17,7 +17,6 @@
 
 import * as AlertDialog from "@radix-ui/react-alert-dialog";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import * as Tooltip from "@radix-ui/react-tooltip";
 import {
   type ColumnDef,
   type ColumnSizingState,
@@ -37,6 +36,12 @@ import { Check, Filter } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { buttonClass } from "@/components/ui/drawer";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   archiveDate,
   label,
@@ -202,13 +207,30 @@ export function Tag({
     typeof children === "string" && /^[a-z]+(?:_[a-z]+)*$/.test(children)
       ? label(children)
       : children;
-  return (
+  const tag = (
     <span
-      title={title}
       className={`inline-flex items-center rounded-tag border px-1.5 py-0.5 text-xs leading-none ${tones[tone]}`}
     >
       {displayChildren}
     </span>
+  );
+  const detail = title?.trim();
+  if (detail === undefined || detail === "") return tag;
+  return (
+    <TooltipProvider delayDuration={0} skipDelayDuration={0}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span
+            tabIndex={0}
+            onKeyDown={(event) => event.stopPropagation()}
+            className="inline-flex rounded-tag outline-none focus-visible:ring-2 focus-visible:ring-kith-action"
+          >
+            {tag}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>{detail}</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 
@@ -222,21 +244,18 @@ export function Detail({
 }) {
   if (detail === null || detail === "") return <>{label}</>;
   return (
-    <Tooltip.Root>
-      <Tooltip.Trigger asChild>
-        <span className="cursor-default underline decoration-kith-border-subtle decoration-dotted underline-offset-2">
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          tabIndex={0}
+          onKeyDown={(event) => event.stopPropagation()}
+          className="cursor-default underline decoration-kith-border-subtle decoration-dotted underline-offset-2 outline-none focus-visible:ring-2 focus-visible:ring-kith-action"
+        >
           {label}
         </span>
-      </Tooltip.Trigger>
-      <Tooltip.Portal>
-        <Tooltip.Content
-          sideOffset={4}
-          className="z-50 max-w-sm rounded-control border border-kith-border-subtle bg-kith-surface px-3 py-2 text-sm text-kith-text-secondary shadow-[var(--kith-shadow-md)]"
-        >
-          {detail}
-        </Tooltip.Content>
-      </Tooltip.Portal>
-    </Tooltip.Root>
+      </TooltipTrigger>
+      <TooltipContent>{detail}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -480,7 +499,7 @@ export function DataTable<T>({
   const extraColumns = (actions.length > 0 ? 1 : 0) + (selectable ? 1 : 0);
 
   return (
-    <Tooltip.Provider delayDuration={200}>
+    <TooltipProvider delayDuration={0} skipDelayDuration={0}>
       <div className="flex flex-col gap-2">
         {showSearch || chipOptions.length > 0 || selectable || toolbar ? (
           <div className="flex flex-wrap items-center gap-2">
@@ -1032,6 +1051,6 @@ export function DataTable<T>({
           </AlertDialog.Content>
         </AlertDialog.Portal>
       </AlertDialog.Root>
-    </Tooltip.Provider>
+    </TooltipProvider>
   );
 }

@@ -557,7 +557,6 @@ export function InvestmentsTable({
               <span
                 role="img"
                 aria-label="Has documents"
-                title="Has documents"
                 className="ml-auto inline-flex text-emerald-600"
               >
                 <Check className="size-4" aria-hidden="true" />
@@ -567,7 +566,6 @@ export function InvestmentsTable({
             <span
               role="img"
               aria-label="Has documents"
-              title="Has documents"
               className="ml-auto inline-flex text-emerald-600"
             >
               <Check className="size-4" aria-hidden="true" />

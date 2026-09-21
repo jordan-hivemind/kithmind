@@ -21,7 +21,13 @@ import { Info } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import { InstitutionAccountDrawer } from "@/components/admin/institution-account-drawer";
+import { valueInformationDetail } from "@/components/admin/institutions-value-info";
 import { DataTable, Detail, Tag } from "@/components/ui/data-table";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import type { InstitutionsPageData } from "@/lib/kith/admin-data";
 import { archiveDate, label, tableMoney } from "@/lib/kith/format";
 import type { InstitutionRow } from "@/lib/kith/institutions";
@@ -88,7 +94,7 @@ export function InstitutionsTable({
         id: "name",
         accessorKey: "name",
         header: "Account",
-        size: 250,
+        size: 180,
       },
       {
         id: "accountLast4",
@@ -121,7 +127,7 @@ export function InstitutionsTable({
         id: "currentValue",
         accessorKey: "currentValue",
         header: "Current value",
-        size: 170,
+        size: 132,
         meta: { nowrap: true, align: "right" },
         cell: ({ row }) =>
           row.original.currentValue === null ||
@@ -152,27 +158,31 @@ export function InstitutionsTable({
       },
       {
         id: "valueInfo",
-        header: "Value info",
-        size: 76,
+        header: () => <span className="sr-only">Value information</span>,
+        size: 40,
         meta: { nowrap: true, align: "right" },
-        cell: ({ row }) => (
-          <button
-            type="button"
-            aria-label={`Show value information for ${row.original.name}`}
-            title={
-              row.original.currentValueAsOf
-                ? `As of ${archiveDate(row.original.currentValueAsOf)}`
-                : "Value information"
-            }
-            className="ml-auto inline-flex rounded-control p-1 text-kith-text-muted hover:bg-accent-50 hover:text-kith-action focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent-600"
-            onClick={(event) => {
-              event.stopPropagation();
-              if (row.original.archive !== null) setEditing(row.original);
-            }}
-          >
-            <Info className="size-4" aria-hidden="true" />
-          </button>
-        ),
+        cell: ({ row }) => {
+          const detail = valueInformationDetail(row.original);
+          if (detail === null || row.original.archive === null) return null;
+          return (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={`Show value information for ${row.original.name}`}
+                  className="ml-auto inline-flex rounded-control p-1 text-kith-text-muted hover:bg-accent-50 hover:text-kith-action focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent-600"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    if (row.original.archive !== null) setEditing(row.original);
+                  }}
+                >
+                  <Info className="size-4" aria-hidden="true" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>{detail}</TooltipContent>
+            </Tooltip>
+          );
+        },
       },
       {
         id: "activityFrom",
