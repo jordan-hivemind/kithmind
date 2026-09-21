@@ -3,6 +3,8 @@ export const MCP_TOOL_NAMES = {
   queryRecords: "query_records",
   searchDocuments: "search_documents",
   getDocument: "get_document",
+  listDocumentSchemas: "list_document_schemas",
+  getDocumentExtractionStatus: "get_document_extraction_status",
   listSources: "list_sources",
   listInventory: "list_inventory",
   listReviewQueue: "list_review_queue",
@@ -31,6 +33,10 @@ export const MCP_TOOL_NAMES = {
   manageMemory: "manage_memory",
   manageAccountDisplayOverride: "manage_account_display_override",
   correctExtractedValue: "correct_extracted_value",
+  manageDocumentExtraction: "manage_document_extraction",
+  listFinanceReviews: "list_finance_reviews",
+  getFinanceReview: "get_finance_review",
+  manageFinanceReview: "manage_finance_review",
 } as const;
 
 export const MCP_TOOL_NAME_LIST = Object.values(MCP_TOOL_NAMES);

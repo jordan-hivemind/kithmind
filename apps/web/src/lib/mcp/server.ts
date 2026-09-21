@@ -30,6 +30,7 @@ import {
   readFinanceArchive,
   resolveFinanceArchive,
 } from "./finance";
+import { postgresFinanceReviews } from "./finance-reviews";
 import {
   KITH_HELP_TOPICS,
   kithHelp,
@@ -145,6 +146,9 @@ const CLIENT_SAFE_TOOL_ERRORS: ReadonlySet<string> = new Set([
   "This item is dismissed; undo it before snoozing",
   "correction_target_is_a_list_field",
   "Provide exactly one of seedId or aroundMs",
+  "Provide exactly one of documentId or sourceItemId",
+  "includeHistorical is only valid with documentId",
+  "Document schema not found",
 ]);
 
 const CLIENT_SAFE_IDENTITY_ERROR_CODES: ReadonlySet<string> = new Set([
@@ -527,6 +531,7 @@ export function createMcpServer(
   const reads: McpReads = postgresReads(credential.withPrincipal);
   const writes: McpWrites = postgresWrites(credential.withPrincipal);
   const management = postgresManagement(credential.withPrincipal);
+  const financeReviews = postgresFinanceReviews(credential.withPrincipal);
 
   /**
    * The space set the finance provider is authorized against. Read on every call
@@ -663,23 +668,72 @@ export function createMcpServer(
   );
   const getDocumentTool = registerTool(
     MCP_TOOL_NAMES.getDocument,
-    "Read an indexed document and its retained evidence. Historical revisions require includeHistorical; forgotten and unauthorized documents are unavailable. Original files may require desktop access even when evidence is retained.",
+    "Read indexed evidence by one Brain documentId, or bridge a stable sourceItemId to all of its current active Brain documents. Give exactly one ID. Historical revisions apply only to documentId. Forgotten and unauthorized documents are unavailable.",
     {
-      documentId: spaceIdSchema,
+      documentId: spaceIdSchema.optional(),
+      sourceItemId: spaceIdSchema.optional(),
       spaceIds: readSpacesSchema,
       includeHistorical: z.boolean().optional(),
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.getDocument],
-    async ({ documentId, spaceIds, ...args }) => {
-      const result = await reads.getDocument({
-        ...args,
-        documentId,
-        spaceIds,
-      });
+    async ({ documentId, sourceItemId, spaceIds, includeHistorical }) => {
+      if ((documentId === undefined) === (sourceItemId === undefined)) {
+        throw new Error("Provide exactly one of documentId or sourceItemId");
+      }
+      if (sourceItemId !== undefined && includeHistorical !== undefined) {
+        throw new Error("includeHistorical is only valid with documentId");
+      }
+      const result = await reads.getDocument(
+        documentId !== undefined
+          ? { documentId, spaceIds, includeHistorical }
+          : { sourceItemId: sourceItemId!, spaceIds },
+      );
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result) }],
       };
     },
+  );
+  const listDocumentSchemasTool = registerTool(
+    MCP_TOOL_NAMES.listDocumentSchemas,
+    "List the current active extraction schemas and typed fields available in authorized spaces. Use a returned kind with manage_document_extraction set_classification.",
+    {
+      spaceIds: readSpacesSchema,
+      cursor: z.string().min(1).max(4096).optional(),
+      limit: z.number().int().min(1).max(50).optional(),
+    },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listDocumentSchemas],
+    async ({ spaceIds, ...args }) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            await reads.listDocumentSchemas({ ...args, spaceIds }),
+          ),
+        },
+      ],
+    }),
+  );
+  const getDocumentExtractionStatusTool = registerTool(
+    MCP_TOOL_NAMES.getDocumentExtractionStatus,
+    "Read extraction, queue and unresolved-review status for a bounded explicit set of stable sourceItemIds. A queued or running result is not a completed repair.",
+    {
+      sourceItemIds: z.array(spaceIdSchema).min(1).max(100),
+      spaceIds: readSpacesSchema,
+    },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.getDocumentExtractionStatus],
+    async ({ sourceItemIds, spaceIds }) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            await reads.getDocumentExtractionStatus({
+              sourceItemIds,
+              spaceIds,
+            }),
+          ),
+        },
+      ],
+    }),
   );
   const ingestUrlTool = registerTool(
     MCP_TOOL_NAMES.ingestUrl,
@@ -2126,11 +2180,140 @@ export function createMcpServer(
     }),
   );
 
+  const manageDocumentExtractionTool = registerTool(
+    MCP_TOOL_NAMES.manageDocumentExtraction,
+    "Persist or clear an owner's document classification and schedule re-extraction, or reprocess a bounded explicit batch of current ready source items. Results report queued, running-follow-up, already queued, not ready, or unavailable scheduling states; they never claim queued work is finished.",
+    {
+      request: z.discriminatedUnion("action", [
+        z.object({
+          action: z.literal("set_classification"),
+          spaceId: spaceIdSchema,
+          sourceItemId: spaceIdSchema,
+          kind: z.string().trim().min(1).max(100),
+        }),
+        z.object({
+          action: z.literal("clear_classification"),
+          spaceId: spaceIdSchema,
+          sourceItemId: spaceIdSchema,
+        }),
+        z.object({
+          action: z.literal("reprocess"),
+          spaceId: spaceIdSchema,
+          sourceItemIds: z.array(spaceIdSchema).min(1).max(100),
+        }),
+      ]),
+    },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.manageDocumentExtraction],
+    async ({ request }) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            await management.manageDocumentExtraction(request),
+          ),
+        },
+      ],
+    }),
+  );
+
+  const listFinanceReviewsTool = registerTool(
+    MCP_TOOL_NAMES.listFinanceReviews,
+    "List the financial archive review queue with evidence and supported next actions. Status defaults to open. These reviewItemIds and archive account or instrument IDs are separate from Kith sourceItemIds, documentIds, entityIds and investmentIds.",
+    {
+      accountId: z.string().trim().min(1).max(200).optional(),
+      kind: z
+        .union([
+          z.string().trim().min(1).max(100),
+          z.array(z.string().trim().min(1).max(100)).min(1).max(20),
+        ])
+        .optional(),
+      status: z
+        .union([
+          z.enum(["open", "resolved", "dismissed"]),
+          z
+            .array(z.enum(["open", "resolved", "dismissed"]))
+            .min(1)
+            .max(3),
+        ])
+        .optional(),
+      limit: z.number().int().min(1).max(100).optional(),
+      cursor: z.string().min(1).max(4096).optional(),
+    },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listFinanceReviews],
+    async (args) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(await financeReviews.listReviews(args)),
+        },
+      ],
+    }),
+  );
+
+  const getFinanceReviewTool = registerTool(
+    MCP_TOOL_NAMES.getFinanceReview,
+    "Read one financial archive review item, including its evidence and supported next action, by reviewItemId.",
+    { reviewId: z.string().trim().min(1).max(200) },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.getFinanceReview],
+    async (args) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(await financeReviews.getReview(args)),
+        },
+      ],
+    }),
+  );
+
+  const manageFinanceReviewTool = registerTool(
+    MCP_TOOL_NAMES.manageFinanceReview,
+    "Resolve one supported financial archive review action from its evidence, or dismiss it with a required note. Confirm an instrument match only when the review evidence supports it. Mapping an account alias affects future identification and does not claim historical rows were repaired.",
+    {
+      request: z.discriminatedUnion("kind", [
+        z.object({
+          kind: z.literal("confirm_instrument_match"),
+          reviewItemId: z.string().trim().min(1).max(200),
+          matchedInstrumentId: z.string().trim().min(1).max(200),
+          note: z.string().trim().min(1).max(2_000).optional(),
+        }),
+        z.object({
+          kind: z.literal("map_account_key"),
+          reviewItemId: z.string().trim().min(1).max(200),
+          targetAccountId: z.string().trim().min(1).max(200),
+          aliasKind: z.enum(["api_key", "statement_number"]),
+          note: z.string().trim().min(1).max(2_000).optional(),
+        }),
+        z.object({
+          kind: z.literal("acknowledge_safeguard"),
+          reviewItemId: z.string().trim().min(1).max(200),
+          note: z.string().trim().min(1).max(2_000).optional(),
+        }),
+        z.object({
+          kind: z.literal("dismiss"),
+          reviewItemId: z.string().trim().min(1).max(200),
+          note: z.string().trim().min(1).max(2_000),
+        }),
+      ]),
+    },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.manageFinanceReview],
+    async ({ request }) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(await financeReviews.manageReview(request)),
+        },
+      ],
+    }),
+  );
+
   const registeredTools = {
     [MCP_TOOL_NAMES.ingestUrl]: ingestUrlTool,
     [MCP_TOOL_NAMES.queryRecords]: queryRecordsTool,
     [MCP_TOOL_NAMES.searchDocuments]: searchDocumentsTool,
     [MCP_TOOL_NAMES.getDocument]: getDocumentTool,
+    [MCP_TOOL_NAMES.listDocumentSchemas]: listDocumentSchemasTool,
+    [MCP_TOOL_NAMES.getDocumentExtractionStatus]:
+      getDocumentExtractionStatusTool,
     [MCP_TOOL_NAMES.listSources]: listSourcesTool,
     [MCP_TOOL_NAMES.listInventory]: listInventoryTool,
     [MCP_TOOL_NAMES.listReviewQueue]: listReviewQueueTool,
@@ -2162,6 +2345,10 @@ export function createMcpServer(
     [MCP_TOOL_NAMES.manageAccountDisplayOverride]:
       manageAccountDisplayOverrideTool,
     [MCP_TOOL_NAMES.correctExtractedValue]: correctExtractedValueTool,
+    [MCP_TOOL_NAMES.manageDocumentExtraction]: manageDocumentExtractionTool,
+    [MCP_TOOL_NAMES.listFinanceReviews]: listFinanceReviewsTool,
+    [MCP_TOOL_NAMES.getFinanceReview]: getFinanceReviewTool,
+    [MCP_TOOL_NAMES.manageFinanceReview]: manageFinanceReviewTool,
   } satisfies Record<McpToolName, { disable: () => void }>;
   const enabledToolNames = new Set(resolveEnabledMcpToolNames());
   for (const name of MCP_TOOL_NAME_LIST) {

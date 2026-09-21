@@ -215,6 +215,26 @@ export {
   type PersistedAcquisition,
 } from "./adapterImport.js";
 export {
+  actOnFinanceReviewItem,
+  FinanceReviewActionError,
+  FINANCE_REVIEW_STATUSES,
+  getFinanceReviewItem,
+  listFinanceReviewItems,
+  type FinanceReviewAccountCandidate,
+  type FinanceReviewAction,
+  type FinanceReviewActionOutcome,
+  type FinanceReviewCanonicalRow,
+  type FinanceReviewDocument,
+  type FinanceReviewEvidence,
+  type FinanceReviewGuidance,
+  type FinanceReviewInstrumentCandidate,
+  type FinanceReviewItem,
+  type FinanceReviewItemDetail,
+  type FinanceReviewStatus,
+  type ListFinanceReviewItemsInput,
+  type ListFinanceReviewItemsResult,
+} from "./reviewManagement.js";
+export {
   ARCHIVE_LAYOUT_VERSION,
   ARCHIVE_SEGMENT,
   assertArchiveSegment,
