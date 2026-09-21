@@ -801,6 +801,7 @@ Reply with JSON only, in exactly this shape:
     "lines": [<line number>]}]}
 
 Rules:${classificationRule}
+- Choose a kind from what the document itself does, not its title, folder, or general topic. A document that merely relates to an investment is not an investment agreement unless it creates or acquires an investment commitment, security, or ownership interest.
 - Every statement names a field in "field". Never leave it out, never rename it, and never use the field name as a key of its own.
 - "lines" holds one to three line numbers from the page named in "page". Cite the line that prints the value. You may also cite the line that prints its label, even if it is far away; they do not need to be next to each other.
 - Only use fields listed under the kind you chose. Omit a field the document does not state: leave it out entirely rather than returning an empty string, a null or a blank.
@@ -2342,16 +2343,18 @@ async function store(
     sourceItemId: loaded.sourceItemId,
   });
 
-  // A human fix outlives this replace. The observations above are the model's
-  // newest reading of every field, including fields the owner has already
-  // corrected, so without this line a re-extraction silently reverts a
-  // correction on the exact-arithmetic side -- `latest_observation` and
-  // `sum_money` back to the model's number -- while `get_document` goes on
-  // showing the owner's. Re-applied inside the same transaction as the
+  // A human fix outlives this replace when its field belongs to the current
+  // kind. The observations above are the model's newest reading of every such
+  // field, so without this line a re-extraction silently reverts a correction
+  // on the exact-arithmetic side -- `latest_observation` and `sum_money` back
+  // to the model's number -- while `get_document` goes on showing the owner's.
+  // A correction from a former kind stays in history without recreating an
+  // out-of-schema observation. Re-applied inside the same transaction as the
   // replace, so no reader ever sees the reverted state.
   await reapplyCorrections(client, {
     spaceId: loaded.spaceId,
     sourceItemId: loaded.sourceItemId,
+    declaredFields: new Set(type?.fields.map((field) => field.name) ?? []),
   });
 
   // Corrections. A field a human already fixed does not get a new open item:

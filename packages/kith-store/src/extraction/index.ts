@@ -1,6 +1,7 @@
 // ADM-5a: typed extraction. See `model.ts` for the module overview.
 
 export * from "./seed.js";
+export * from "./classificationUpgrade.js";
 export * from "./lines.js";
 export * from "./diagnose.js";
 export * from "./gate.js";

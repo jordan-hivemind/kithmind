@@ -656,18 +656,27 @@ export async function supersedeOpenCorrections(
 }
 
 /**
- * Re-applies every resolved correction for one document to the observations
- * that were just written.
+ * Re-applies every resolved correction whose field belongs to this run's
+ * document kind to the observations that were just written.
  *
  * The extraction writer replaces its observations wholesale on every run, so
  * without this a re-extraction quietly undoes the owner's fix on the exact
  * side while `get_document` goes on showing it: `latest_observation` would say
  * 15.50 and the document read 16.50, from the same transaction, about the same
- * field. Called at the end of the replace, inside it.
+ * field. A correction from a former kind stays as history and becomes current
+ * again if a compatible kind is restored. Called at the end of the replace,
+ * inside it.
  */
 export async function reapplyCorrections(
   client: ClientBase,
-  input: { spaceId: string; sourceItemId: string },
+  input: {
+    spaceId: string;
+    sourceItemId: string;
+    /** Fields declared by the kind this extraction selected. A correction
+     * from an earlier classification stays in history but cannot recreate an
+     * observation the current kind has no place for. */
+    declaredFields: ReadonlySet<string>;
+  },
 ): Promise<number> {
   let applied = 0;
   for (const [fieldName, correctedValue] of await resolvedCorrections(
@@ -675,6 +684,8 @@ export async function reapplyCorrections(
     input.spaceId,
     input.sourceItemId,
   )) {
+    const field = fieldName.split(":", 1)[0]!;
+    if (!input.declaredFields.has(field)) continue;
     const wrote = await writeThrough(client, {
       ...input,
       fieldName,

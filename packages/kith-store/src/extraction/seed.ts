@@ -90,9 +90,9 @@ export const STARTER_DOCUMENT_TYPES: readonly SeedDocumentType[] = [
     sensitivity: "sensitive",
     area: "finance",
     description:
-      "A subscription agreement, SAFE, or convertible note for an investment.",
+      "A transaction instrument that commits capital or acquires stock, units, a SAFE, a note, an LP or LLC membership interest, or another security.",
     guidance:
-      "An agreement to invest in a company. Read the parties, the date it was signed, the amount committed, and the instrument terms if they are stated.",
+      "Classify by operative legal effect, not title. Use when it creates an investment commitment or acquires equity, debt, or another security. LLC or partnership membership agreements count when they convey units or economic ownership. Dues or fees for access, services, association, community, or renewal do not count without a security or ownership interest. Read stated parties and terms.",
     fields: [
       required(org("company")),
       text("investor_as_written"),
