@@ -163,7 +163,15 @@ Stage large text/record/chunk batches under a generation ID within platform limi
 
 Cloud-side monitoring detects missing worker heartbeats and stale sources while the worker is off. Alerts are actionable and deduplicated: authentication expired, archive disconnected, queue stuck, coverage gap, budget paused, recovery failed. `brain doctor` checks configuration, identity, permissions, source reachability, worker heartbeat, generation/index compatibility and stale windows. It does not merely accept any HTTP 200 as proof of access to the configured corpus.
 
-Before bulk ingestion, implement encrypted backups and test a restore into an isolated deployment. Include records, identities, memberships, provenance/text, processing versions, config and archived bytes or independently restorable references. Restore credentials through a separate secure procedure, disable workers until identities/source mappings are verified, and check counts/hashes plus sampled answers/citations. Define recovery point/time objectives from measured restore results. Adapt the existing upstream ai-brain exporter while preserving attribution and reviewing its contracts, rather than starting another generic exporter. Export schema-versioned JSON and an evidence manifest; Markdown is an optional readable projection, not the authoritative backup.
+Owner storage policy, confirmed 2026-09-21: Dropbox is sufficient for files and
+Neon is sufficient for Postgres. Separate file backups, restic snapshots,
+redundant encrypted copies, database dumps and backup restore drills are not
+ingestion prerequisites for this deployment. This supersedes the earlier
+requirement to build a separate backup system before bulk ingestion. Preserve
+provider identity, source hashes, evidence and authorization without creating
+another backup copy. If an original becomes unavailable, report that honestly.
+Do not restart or expand separate backup infrastructure without a new explicit
+owner request. Existing copies must not be deleted merely to remove the gate.
 
 ## 6. Sources and capture
 
