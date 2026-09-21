@@ -14,11 +14,13 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { Worker } from "node:worker_threads";
 
 import {
   CAPTURE_MANIFEST_VERSION,
@@ -31,6 +33,7 @@ import {
   writeCaptureManifest,
   writeRawDocument,
 } from "../dist/index.js";
+import { readCaptureManifestById } from "../dist/captures.js";
 
 // Synthetic space id (F1-28): not a real space, just what exercises the
 // shared-root prefix this suite writes and reads through.
@@ -46,6 +49,86 @@ const OPAQUE_POLICY = {
 };
 const DOCUMENT_BYTES = new TextEncoder().encode("synthetic captured document bytes");
 const DOCUMENT_SHA256 = sha256HexOf(DOCUMENT_BYTES);
+const CAPTURE_MODULE_URL = new URL("../dist/index.js", import.meta.url).href;
+
+const WRITE_WORKER_SOURCE = `
+  import { parentPort, workerData } from "node:worker_threads";
+
+  const { writeCaptureManifest } = await import(workerData.moduleUrl);
+  parentPort.postMessage({ type: "ready" });
+  await new Promise((resolve) => parentPort.once("message", resolve));
+  try {
+    const result = writeCaptureManifest(workerData.root, workerData.manifest);
+    parentPort.postMessage({ type: "result", ok: true, result });
+  } catch (error) {
+    parentPort.postMessage({
+      type: "result",
+      ok: false,
+      error: { name: error.name, message: error.message },
+    });
+  }
+`;
+
+/** Start real filesystem writers in parallel, after every worker has loaded
+ * the built module. This exercises the no-clobber publication race rather
+ * than serializing calls through this test's event loop. */
+async function writeConcurrently(root, manifests) {
+  const workers = manifests.map(
+    (candidate) =>
+      new Worker(WRITE_WORKER_SOURCE, {
+        eval: true,
+        type: "module",
+        workerData: { moduleUrl: CAPTURE_MODULE_URL, root, manifest: candidate },
+      }),
+  );
+  const ready = workers.map(
+    (worker) =>
+      new Promise((resolve, reject) => {
+        worker.once("message", resolve);
+        worker.once("error", reject);
+      }),
+  );
+  const readyMessages = await Promise.all(ready);
+  assert.ok(readyMessages.every((message) => message.type === "ready"));
+
+  const results = workers.map(
+    (worker) =>
+      new Promise((resolve, reject) => {
+        worker.once("message", resolve);
+        worker.once("error", reject);
+      }),
+  );
+  const exits = workers.map(
+    (worker) =>
+      new Promise((resolve, reject) => {
+        worker.once("exit", (code) =>
+          code === 0 ? resolve() : reject(new Error(`capture writer worker exited ${code}`)),
+        );
+      }),
+  );
+  for (const worker of workers) worker.postMessage("write");
+  const messages = await Promise.all(results);
+  await Promise.all(exits);
+  return messages;
+}
+
+function captureIndexPath(root, captureId) {
+  return join(root, "captures", ".by-id", captureId);
+}
+
+function assertIndependentCopies(root, written) {
+  const indexPath = captureIndexPath(root, readCaptureManifest(written.path).captureId);
+  assert.deepEqual(readFileSync(indexPath), readFileSync(written.path));
+  const indexStat = statSync(indexPath);
+  const canonicalStat = statSync(written.path);
+  assert.notDeepEqual(
+    [indexStat.dev, indexStat.ino],
+    [canonicalStat.dev, canonicalStat.ino],
+    "index and canonical manifests must not share a filesystem object",
+  );
+  assert.equal(indexStat.nlink, 1);
+  assert.equal(canonicalStat.nlink, 1);
+}
 
 /** A throwaway raw-tree root with the one document every fixture manifest
  * cites already written, removed when the test ends -- the fully resolved
@@ -103,6 +186,62 @@ test("writeCaptureManifest writes once and reports a repeat of the same capture 
   assert.equal(second.status, "already_exists");
   assert.equal(second.path, first.path);
   assert.equal(second.manifestSha256, first.manifestSha256);
+  assert.deepEqual(readCaptureManifestById(root, m.captureId), {
+    manifest: m,
+    path: first.path,
+    manifestSha256: first.manifestSha256,
+  });
+  assertIndependentCopies(root, first);
+});
+
+test("concurrent identical retries elect one writer and preserve independent verified copies", async (t) => {
+  const root = rawTreeRoot(t);
+  const m = manifest({ captureId: "capture-concurrent-same" });
+  const attempts = await writeConcurrently(root, Array.from({ length: 6 }, () => m));
+
+  assert.ok(attempts.every((attempt) => attempt.type === "result" && attempt.ok));
+  assert.deepEqual(
+    attempts.map((attempt) => attempt.result.status).sort(),
+    ["already_exists", "already_exists", "already_exists", "already_exists", "already_exists", "written"],
+  );
+  const written = attempts[0].result;
+  assert.deepEqual(readCaptureManifest(written.path), m);
+  assert.deepEqual(readCaptureManifestById(root, m.captureId).manifest, m);
+  assertIndependentCopies(root, written);
+});
+
+test("concurrent conflicting claims leave exactly one authoritative capture", async (t) => {
+  const root = rawTreeRoot(t);
+  const contenders = [
+    manifest({ captureId: "capture-concurrent-conflict" }),
+    manifest({
+      captureId: "capture-concurrent-conflict",
+      sourceId: "inst_synthetic_b",
+      capturedAt: "2025-09-01T00:00:00.000Z",
+      docType: "trade_confirmation",
+    }),
+  ];
+  const attempts = await writeConcurrently(root, contenders);
+  const successes = attempts.filter((attempt) => attempt.ok);
+  const conflicts = attempts.filter((attempt) => !attempt.ok);
+
+  assert.equal(successes.length, 1);
+  assert.equal(successes[0].result.status, "written");
+  assert.equal(conflicts.length, 1);
+  assert.equal(conflicts[0].error.name, "CaptureConflictError");
+
+  const winner = readCaptureManifestById(root, "capture-concurrent-conflict");
+  const winningCandidate = contenders.find(
+    (candidate) => candidate.sourceId === winner.manifest.sourceId,
+  );
+  assert.ok(winningCandidate);
+  assert.deepEqual(winner.manifest, winningCandidate);
+  assert.deepEqual(readCaptureManifest(winner.path), winner.manifest);
+  assertIndependentCopies(root, winner);
+  const canonicalFiles = readdirSync(join(root, "captures"), { recursive: true }).filter((entry) =>
+    entry.endsWith(".json"),
+  );
+  assert.equal(canonicalFiles.length, 1);
 });
 
 test("two different capture ids for byte-identical document content each keep their own manifest", (t) => {
@@ -222,6 +361,11 @@ test("readCaptureManifest rejects a capture edited in place: the file name state
     (error) => error instanceof CaptureIntegrityError && error.reason === "manifest_hash",
     "modified provenance must never be read back as fact",
   );
+  assert.throws(
+    () => readCaptureManifestById(root, "capture-a"),
+    (error) => error instanceof CaptureIntegrityError && error.reason === "manifest_hash",
+    "the id reader must verify the canonical manifest too",
+  );
 });
 
 test("F1-71: a capture may record the provider's own document id, and a capture written before that field existed still reads", (t) => {
@@ -300,6 +444,10 @@ test("readCaptureManifest rejects a capture whose retained object is gone or alt
     () => readCaptureManifest(dangling.path),
     (error) => error instanceof CaptureIntegrityError && error.reason === "missing_document",
   );
+  assert.throws(
+    () => readCaptureManifestById(root, "capture-dangling"),
+    (error) => error instanceof CaptureIntegrityError && error.reason === "missing_document",
+  );
 
   const written = writeCaptureManifest(root, manifest());
   const documentPath = join(
@@ -312,6 +460,10 @@ test("readCaptureManifest rejects a capture whose retained object is gone or alt
   writeFileSync(documentPath, "different bytes than the capture vouches for");
   assert.throws(
     () => readCaptureManifest(written.path),
+    (error) => error instanceof CaptureIntegrityError && error.reason === "document_hash",
+  );
+  assert.throws(
+    () => readCaptureManifestById(root, "capture-a"),
     (error) => error instanceof CaptureIntegrityError && error.reason === "document_hash",
   );
 });
