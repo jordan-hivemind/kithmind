@@ -437,6 +437,32 @@ Every response carries the dataset revision and an explicit completeness state.
 A partial or truncated result is never labeled complete. Zero rows with unknown
 coverage means no indexed match, not proof that no event occurred.
 
+Holdings reads apply one conservative account-and-date eligibility rule. A
+date is incomplete when a current contributing or account-attributed document
+has `parsed_ok = false`, an open review is linked to that account and date, or
+the position reconciliation ending on that date failed or remains unverified.
+Review attribution covers consolidated documents whose document-level account
+is null. Closing a review does not clear a parser failure because review state
+does not replace rows the parser omitted.
+
+The three holdings views use that rule according to what each operation can
+truthfully express. Inventory may retain the previous eligible snapshot date.
+An explicitly requested snapshot keeps its raw position rows and selected date,
+but its monetary summary is `unavailable` with reason `incomplete_source`.
+`aggregate_money` withholds a currency group if a known contributor in that
+group lacks the requested value. It withholds the whole holdings aggregate when
+source incompleteness means an omitted row's currency is unknowable. Market
+value aggregation also refuses rows not marked at market price; cost basis
+aggregation does not impose that market-value rule. Separate currency groups
+remain valid because the operation never performs an FX conversion. Coverage
+queries used by an account-scoped operation are scoped to that account, so a
+passing period on another account cannot vouch for it.
+
+This rule is intentionally bounded by stored evidence. The current schema does
+not encode a positive, complete, zero-position observation for every
+account/date, and this read rule does not claim that it does. Parser replay and
+source-projection replacement are separate importer concerns.
+
 Coverage is reported at the same granularity as the record contract requires,
 so the later Kith Mind adapter wraps this surface rather than re-deriving it.
 

@@ -1321,10 +1321,9 @@ async function assessHoldingsDate(
   return result.rows[0]!;
 }
 
-function foldHoldingsDateAssessment(
+function foldHoldingsSourceAssessment(
   scope: ReadScope,
   assessment: HoldingsDateAssessment,
-  requiredValue: "market_value" | "cost_basis" | "both",
 ): boolean {
   let safe = true;
   if (
@@ -1339,6 +1338,15 @@ function foldHoldingsDateAssessment(
     scope.withheld.add("pending_import");
     safe = false;
   }
+  return safe;
+}
+
+function foldHoldingsDateAssessment(
+  scope: ReadScope,
+  assessment: HoldingsDateAssessment,
+  requiredValue: "market_value" | "cost_basis" | "both",
+): boolean {
+  let safe = foldHoldingsSourceAssessment(scope, assessment);
   const missing =
     requiredValue === "market_value"
       ? Number(assessment.missing_market_value)
@@ -1351,8 +1359,8 @@ function foldHoldingsDateAssessment(
     safe = false;
   }
   if (
-    Number(assessment.non_market_value) > 0 ||
-    Number(assessment.currency_count) > 1
+    requiredValue !== "cost_basis" &&
+    Number(assessment.non_market_value) > 0
   ) {
     scope.withheld.add("unsupported_value");
     safe = false;
@@ -2094,7 +2102,10 @@ async function getHoldingsSnapshot(
     request.accountId,
     asOf,
   );
+  const sourceIsUsable = foldHoldingsSourceAssessment(scope, dateAssessment);
   foldHoldingsDateAssessment(scope, dateAssessment, "both");
+  const monetarySummarySourceIsUsable =
+    sourceIsUsable && Number(dateAssessment.non_market_value) === 0;
   await foldScopeCoverage(client, scope, {
     sourceId: account.sourceId,
     accountId: request.accountId,
@@ -2200,6 +2211,13 @@ async function getHoldingsSnapshot(
     summary = {
       status: "unavailable",
       reason: positionLimitExceeded ? "position_limit" : "evidence_bytes_limit",
+      positionCount,
+      currencies: [],
+    };
+  } else if (!monetarySummarySourceIsUsable) {
+    summary = {
+      status: "unavailable",
+      reason: "incomplete_source",
       positionCount,
       currencies: [],
     };
@@ -2468,11 +2486,25 @@ type AggregateRow = {
   ids: string[];
 };
 
-async function holdingsAggregateIsUsable(
+type HoldingsAggregateEligibility = {
+  globalUnsafe: boolean;
+  unsafeGroupKeys: string[];
+};
+
+function aggregateGroupKey(
+  groupsByAccount: boolean,
+  accountId: string,
+  currency: string,
+): string {
+  return `${groupsByAccount ? accountId : ""}\u001f${currency}`;
+}
+
+async function holdingsAggregateEligibility(
   client: pg.ClientBase,
   scope: ReadScope,
   request: AggregateMoneyRequest,
-): Promise<boolean> {
+  groupsByAccount: boolean,
+): Promise<HoldingsAggregateEligibility> {
   const selected = await client.query<{ account_id: string; as_of: string }>(
     `WITH candidate_dates(account_id, as_of) AS (
        SELECT p.account_id, p.as_of
@@ -2524,23 +2556,55 @@ async function holdingsAggregateIsUsable(
       request.toExclusive ?? null,
     ],
   );
-  let usable = true;
+  let globalUnsafe = false;
+  const unsafeGroupKeys = new Set<string>();
   for (const selectedDate of selected.rows) {
     const assessment = await assessHoldingsDate(
       client,
       selectedDate.account_id,
       selectedDate.as_of,
     );
-    if (
-      !foldHoldingsDateAssessment(
-        scope,
-        assessment,
-        request.metric === "market_value" ? "market_value" : "cost_basis",
-      )
-    )
-      usable = false;
+    // A partial source or failed gate can have omitted an entire row, whose
+    // currency is consequently unknowable. No currency group is safe to
+    // publish from that selected account/date.
+    if (!foldHoldingsSourceAssessment(scope, assessment)) {
+      globalUnsafe = true;
+      continue;
+    }
+    const byCurrency = await client.query<{
+      currency: string;
+      missing_value: string;
+      non_market_value: string;
+    }>(
+      `SELECT p.currency::text,
+              count(*) FILTER (
+                WHERE p.${request.metric === "market_value" ? "market_value" : "cost_basis"} IS NULL
+              )::text AS missing_value,
+              count(*) FILTER (
+                WHERE p.valuation_basis IS DISTINCT FROM 'market_price'
+              )::text AS non_market_value
+         FROM positions p
+        WHERE p.account_id = $1 AND p.as_of = $2::date
+        GROUP BY p.currency`,
+      [selectedDate.account_id, selectedDate.as_of],
+    );
+    for (const currency of byCurrency.rows) {
+      const missing = Number(currency.missing_value) > 0;
+      const unsupportedMarketValue =
+        request.metric === "market_value" &&
+        Number(currency.non_market_value) > 0;
+      if (!missing && !unsupportedMarketValue) continue;
+      scope.withheld.add(missing ? "missing_value" : "unsupported_value");
+      unsafeGroupKeys.add(
+        aggregateGroupKey(
+          groupsByAccount,
+          selectedDate.account_id,
+          currency.currency,
+        ),
+      );
+    }
   }
-  return usable;
+  return { globalUnsafe, unsafeGroupKeys: [...unsafeGroupKeys] };
 }
 
 /**
@@ -2559,6 +2623,7 @@ function aggregateSql(
   groupsByAccount: boolean,
   afterCurrency: string | null,
   afterAccountId: string | null,
+  unsafeGroupKeys: readonly string[],
 ): { sql: string; values: unknown[] } {
   const account = groupsByAccount
     ? ", a.id AS account_id"
@@ -2591,13 +2656,16 @@ function aggregateSql(
             SELECT * FROM grouped
              WHERE ($6::text IS NULL OR
                     (currency, coalesce(account_id, '')) > ($6, $7::text))
+               AND (coalesce(account_id, '') || chr(31) || currency)
+                     <> ALL($8::text[])
              ORDER BY currency, coalesce(account_id, '')
-             LIMIT $8`,
+             LIMIT $9`,
       values: [
         ...shared,
         request.currency ?? null,
         afterCurrency,
         afterAccountId,
+        unsafeGroupKeys,
       ],
     };
   }
@@ -2639,13 +2707,16 @@ function aggregateSql(
           SELECT * FROM grouped
            WHERE ($6::text IS NULL OR
                   (currency, coalesce(account_id, '')) > ($6, $7::text))
+             AND (coalesce(account_id, '') || chr(31) || currency)
+                   <> ALL($8::text[])
            ORDER BY currency, coalesce(account_id, '')
-           LIMIT $8`,
+           LIMIT $9`,
     values: [
       ...shared,
       request.currency ?? null,
       afterCurrency,
       afterAccountId,
+      unsafeGroupKeys,
     ],
   };
 }
@@ -2667,18 +2738,24 @@ async function aggregateMoney(
     throw new FinanceContractError("invalid_request");
   const holdingsAggregate =
     request.metric === "market_value" || request.metric === "cost_basis";
-  const aggregateUsable = holdingsAggregate
-    ? await holdingsAggregateIsUsable(client, scope, request)
-    : true;
+  const aggregateEligibility = holdingsAggregate
+    ? await holdingsAggregateEligibility(
+        client,
+        scope,
+        request,
+        groupsByAccount,
+      )
+    : { globalUnsafe: false, unsafeGroupKeys: [] };
   const { sql, values } = aggregateSql(
     request,
     groupsByAccount,
     cursorKey?.[0] ?? null,
     cursorKey?.[1] ?? null,
+    aggregateEligibility.unsafeGroupKeys,
   );
-  const result = aggregateUsable
-    ? await client.query<AggregateRow>(sql, [...values, request.limit + 1])
-    : { rows: [] as AggregateRow[] };
+  const result = aggregateEligibility.globalUnsafe
+    ? { rows: [] as AggregateRow[] }
+    : await client.query<AggregateRow>(sql, [...values, request.limit + 1]);
   const rows = result.rows.slice(0, request.limit);
   const truncated = result.rows.length > request.limit;
 
