@@ -1408,6 +1408,21 @@ async function listAccountInventory(
          SELECT p.as_of
            FROM positions p
           WHERE p.account_id = d.account_id
+            -- A parse-noted document remains parsed_ok = FALSE even when
+            -- it yielded some positions. If any source contributing to the
+            -- account/date is incomplete, the whole date is fragmentary and
+            -- must stay back independently of review-item triage.
+            -- In particular, a resolved or dismissed review records review
+            -- workflow, not that the parser subsequently read the omitted
+            -- holdings.
+            AND NOT EXISTS (
+              SELECT 1
+                FROM positions partial_p
+                JOIN documents pd ON pd.id = partial_p.source_document_id
+               WHERE partial_p.account_id = p.account_id
+                 AND partial_p.as_of = p.as_of
+                 AND pd.parsed_ok = FALSE
+            )
             AND NOT EXISTS (
               SELECT 1
                 FROM review_items r

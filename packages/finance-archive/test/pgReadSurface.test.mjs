@@ -2975,7 +2975,7 @@ test(
 );
 
 test(
-  "list_account_inventory does not advance the holdings snapshot from an incomplete latest statement (FIN-FRESHNESS-1)",
+  "list_account_inventory rejects a mixed-source date until every source parses completely (FIN-FRESHNESS-1)",
   { skip },
   async (t) => {
     const { owner, reader: r, seeded } = await fixture(t);
@@ -2986,7 +2986,13 @@ test(
       accountId,
       "2026-03-31",
     );
-    const latestDoc = await document(
+    const latestCompleteDoc = await document(
+      owner,
+      seeded.settled.id,
+      accountId,
+      "2026-04-30",
+    );
+    const latestPartialDoc = await document(
       owner,
       seeded.settled.id,
       accountId,
@@ -3000,15 +3006,36 @@ test(
     await moneyRows(owner, accountId, {
       positions: [
         ["2026-03-31", "100", "USD", "market_price", priorDoc],
-        ["2026-04-30", "5", "USD", "market_price", latestDoc],
+        [
+          "2026-04-30",
+          "5",
+          "USD",
+          "market_price",
+          latestCompleteDoc,
+        ],
+        [
+          "2026-04-30",
+          "7",
+          "USD",
+          "market_price",
+          latestPartialDoc,
+        ],
       ],
     });
+    // This is the durable state the importer writes when one of multiple
+    // sources for an account/date is only partially parsed. The complete
+    // source must not let that fragmentary date advance. The safety decision
+    // comes from `parsed_ok`, not mutable review workflow or attribution.
+    await owner.query(
+      "UPDATE documents SET parsed_ok = FALSE WHERE id = $1",
+      [latestPartialDoc],
+    );
     await owner.query(
       `INSERT INTO review_items
          (id, kind, account_id, source_document_id, raw_value, reason, status)
-       VALUES ('snapshot-review-latest', 'weak_instrument_match', $1, $2,
-               'unresolved holding', 'latest statement has unresolved holdings', 'open')`,
-      [accountId, latestDoc],
+       VALUES ('snapshot-review-latest', 'document_unparsed', NULL, $1,
+               'partial statement', 'synthetic parser left holdings unparsed', 'resolved')`,
+      [latestPartialDoc],
     );
 
     let row = await inventory();
@@ -3018,15 +3045,29 @@ test(
       asOf: "2026-03-31",
       source: "positions",
     });
-    assert.equal(row.openReviewCount, 1);
+    assert.equal(row.openReviewCount, 0);
 
     await owner.query(
-      "UPDATE review_items SET status = 'resolved' WHERE id = 'snapshot-review-latest'",
+      "UPDATE review_items SET status = 'dismissed' WHERE id = 'snapshot-review-latest'",
+    );
+    row = await inventory();
+    assert.equal(
+      row.latestSnapshotAsOf,
+      "2026-03-31",
+      "dismissing the review cannot make an incomplete document a snapshot",
+    );
+
+    // A successful reparse is the only transition that makes the statement
+    // eligible. Its historical review may remain dismissed without changing
+    // that source-evidence fact.
+    await owner.query(
+      "UPDATE documents SET parsed_ok = TRUE WHERE id = $1",
+      [latestPartialDoc],
     );
     row = await inventory();
     assert.equal(row.latestSnapshotAsOf, "2026-04-30");
     assert.deepEqual(row.currentValue, {
-      value: { decimal: "5", currency: "USD" },
+      value: { decimal: "12", currency: "USD" },
       asOf: "2026-04-30",
       source: "positions",
     });
