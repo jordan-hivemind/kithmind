@@ -516,8 +516,10 @@ The parser reads these security-block shapes:
   block is carried only when the extracted pages are physically adjacent,
   their printed page numbers are adjacent under one declared total, that
   printed-page run has a positive `Page 1` or physical-page anchor, and the
-  account and semantic columns agree. An explicit change between documented
-  asset-class table titles prevents joining even when the columns match.
+  account and semantic columns agree. An explicit change of asset-class
+  table title prevents joining even when the columns match, including titles
+  the parser has not encountered before. Unidentified successor rows cannot
+  become anonymous holdings when their prefix or continuation proof is missing.
   This accepts an unnumbered cover page
   but refuses missing, repeated, reordered, inconsistently numbered or
   semantically changed continuations. A block without that proof is flushed

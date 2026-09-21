@@ -662,6 +662,13 @@ function printedPages(lines) {
       if (seen.size !== 1) return [page, null];
       const [declaration] = seen;
       const [number, total] = declaration.split("/").map(Number);
+      if (
+        !Number.isSafeInteger(number) ||
+        !Number.isSafeInteger(total) ||
+        number < 1 ||
+        total < number
+      )
+        return [page, null];
       return [page, { number, total }];
     }),
   );
@@ -800,23 +807,19 @@ function holdingsHeaderSignature(columns) {
   return JSON.stringify(columns.map(({ name, text }) => [name, text]));
 }
 
-// Explicit table titles documented by the statement layout. A repeated
-// column schema does not make a different asset-class table a continuation.
-// Generic running headings (including HOLDINGS) are not section boundaries.
-const HOLDINGS_SECTION_TITLES = new Set([
-  "CASH, BANK DEPOSIT PROGRAM AND MONEY MARKET FUNDS",
-  "STOCKS",
-  "COMMON STOCKS",
-  "MUTUAL FUNDS",
-  "GOVERNMENT SECURITIES",
-  "CORPORATE FIXED INCOME",
-  "USD SAVINGS DEPOSITS",
-  "OPTIONS",
-]);
-
+// Table titles use the layout's all-caps heading grammar. Do not whitelist
+// asset classes: a newly encountered explicit section must not silently
+// become a continuation of the previous table. Only known running headings
+// are ignored; an unknown title is conservatively a section boundary.
 function explicitHoldingsSection(text) {
-  const title = text.trim().replace(/\s+\(CONTINUED\)$/, "");
-  return HOLDINGS_SECTION_TITLES.has(title) ? title : null;
+  const title = text.trim().replace(/\s+\(CONTINUED\)$/i, "");
+  if (
+    title === "HOLDINGS" ||
+    title === "CLIENT STATEMENT" ||
+    /^FOR THE PERIOD\b/.test(title)
+  )
+    return null;
+  return /^[A-Z][A-Z0-9 ,&%'/()+^-]{3,}$/.test(title) ? title : null;
 }
 
 /** "CUSIP 00000WNF1" on a bond's detail line. */
@@ -1033,6 +1036,16 @@ function positionFromBlock(block, columns, context) {
         : `the ${context.section} holdings table states no Market Value or NAV column this ` +
           `parser reads, so this security block over ${block.length} line(s) states no value ` +
           "to record",
+    };
+  }
+  // A Total or dated lot at the top of a continuation page does not identify
+  // a new security. Without the security start from this table (or a proven
+  // carried block), retaining it as an anonymous position would publish a
+  // fragment after rejecting the prefix. The original text remains retained.
+  if (context.description === null) {
+    return {
+      position: null,
+      reason: "holding continuation has no proven security start",
     };
   }
   const { row, merged } = resolved;

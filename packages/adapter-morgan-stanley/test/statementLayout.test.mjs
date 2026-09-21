@@ -529,7 +529,14 @@ test("an unnumbered cover can anchor a complete adjacent printed-page run", () =
 
 test("matching columns cannot join an explicitly different holdings section", () => {
   for (const printedTotal of [false, true]) {
-    for (const section of ["MUTUAL FUNDS", "COMMON STOCKS (CONTINUED)"]) {
+    for (const section of [
+      "MUTUAL FUNDS",
+      "ETFS & CEFS",
+      "MUNICIPAL BONDS",
+      "ALTERNATIVE INVESTMENTS",
+      "SYNTHETIC NEW ASSET CLASS",
+      "COMMON STOCKS (CONTINUED)",
+    ]) {
       const pages = pageSplitEquityPages().map((page) =>
         printedTotal ? page : page.filter((line) => !/\bTotal\s+\d/.test(line)),
       );
@@ -544,8 +551,9 @@ test("matching columns cannot join an explicitly different holdings section", ()
       const joined = parsed.holdings.positions.find(
         (position) => position.instrument?.symbol === "WNDF",
       );
-      if (section === "MUTUAL FUNDS") {
+      if (section !== "COMMON STOCKS (CONTINUED)") {
         assert.equal(joined, undefined);
+        assert.deepEqual(parsed.holdings.positions, []);
         assert.match(parsed.parseNote, /holdings block\(s\) left unparsed/);
       } else {
         assert.equal(joined.marketValue, "4776");
@@ -556,6 +564,17 @@ test("matching columns cannot join an explicitly different holdings section", ()
 
 test("page topology and semantic changes cannot complete an interrupted lot block", () => {
   const cases = [
+    {
+      name: "zero-based printed page",
+      mutate(pages) {
+        pages[0] = pages[0].map((line) =>
+          line.replace(/Page 1 of 2/g, "Page 0 of 2"),
+        );
+        pages[1] = pages[1].map((line) =>
+          line.replace(/Page 2 of 2/g, "Page 1 of 2"),
+        );
+      },
+    },
     {
       name: "missing cover",
       mutate(pages) {
@@ -681,15 +700,21 @@ test("a printed Total after a page gap cannot complete the interrupted security"
     pages.map((page) => page.join("\n")).join(`\n${PAGE_SEPARATOR}\n`),
     kind,
   );
-  // The Total row can still state a value on its own page, but it cannot take
-  // the interrupted prefix's description or make the document complete.
-  assert.equal(
-    parsed.holdings.positions.some(
-      (position) => position.instrument?.symbol === "WNDF",
-    ),
-    false,
-  );
+  // Neither the interrupted prefix nor its unidentified successor is a
+  // complete security. A printed aggregate alone cannot establish identity.
+  assert.deepEqual(parsed.holdings.positions, []);
   assert.match(parsed.parseNote, /holdings block\(s\) left unparsed/);
+});
+
+test("an isolated successor cannot become an anonymous holding", () => {
+  for (const printedTotal of [false, true]) {
+    const page = pageSplitEquityPages()[1].filter(
+      (line) => printedTotal || !/\bTotal\s+\d/.test(line),
+    );
+    const parsed = parseStatementLines(page.join("\n"), kind);
+    assert.deepEqual(parsed.holdings.positions, []);
+    assert.match(parsed.parseNote, /holdings block\(s\) left unparsed/);
+  }
 });
 
 test("an earlier topology defect cannot become a physical-number anchor", () => {
