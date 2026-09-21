@@ -1236,11 +1236,22 @@ async function runReparse(args: readonly string[]): Promise<void> {
 
         const importDocuments = await adapterPullToImportDocuments(tx, pull);
         const batch: ImportBatch = { source: adapter.institutionSlug, documents: importDocuments };
-        const summary = await publishImport(tx, batch, now);
+        const summary = await publishImport(tx, batch, now, {
+          authoritativeReparse: true,
+        });
+
+        const persisted = await tx.query<{ parsed_ok: boolean }>(
+          "SELECT parsed_ok FROM documents WHERE id = $1",
+          [doc.id],
+        );
+        const parsedOk = persisted.rows[0]?.parsed_ok;
+        if (parsedOk === undefined) {
+          throw new Error(`reparse lost documents row ${doc.id}`);
+        }
 
         outcome.documentsReparsed += 1;
-        if (parsed.parseNote) outcome.documentsStillUnparsed += 1;
-        else outcome.documentsNowParsed += 1;
+        if (parsedOk) outcome.documentsNowParsed += 1;
+        else outcome.documentsStillUnparsed += 1;
         outcome.rowsInserted += summary.rowsInserted;
         outcome.rowsDeduplicated += summary.rowsDeduplicated;
         outcome.rowsRefused += summary.rowsRefused;

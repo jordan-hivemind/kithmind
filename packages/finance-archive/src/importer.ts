@@ -363,6 +363,15 @@ export type ImportBatch = {
   documents: readonly ImportDocument[];
 };
 
+export type ImportOptions = {
+  /**
+   * The caller parsed one complete retained document again. This enables the
+   * fail-closed comparison against that document's full stored holdings
+   * projection. Ordinary acquisition and partial API pulls must omit it.
+   */
+  authoritativeReparse?: boolean;
+};
+
 export type ImportSummary = {
   importRunId: string;
   filesSeen: number;
@@ -596,9 +605,10 @@ export async function publishImport(
   client: ArchiveClient,
   batch: ImportBatch,
   now: Date = new Date(),
+  options: ImportOptions = {},
 ): Promise<PublishSummary> {
   return withArchiveTransaction(client, async (tx) => {
-    const summary = await importBatch(tx, batch, now);
+    const summary = await importBatch(tx, batch, now, options);
     // F1-59: scoped to what this import inserted, so publishing a document
     // costs a handful of round trips against the periods that document
     // moved rather than a whole-archive pass. `run.ts` runs the
@@ -642,6 +652,7 @@ export async function importBatch(
   client: ArchiveClient,
   batch: ImportBatch,
   now: Date = new Date(),
+  options: ImportOptions = {},
 ): Promise<ImportSummary> {
   const importRunId = randomUUID();
   const startedAt = now.toISOString();
@@ -804,6 +815,22 @@ export async function importBatch(
 
     reviewItemsOpened += toInsert.length;
     await insertRows(client, "review_items", REVIEW_COLUMNS, toInsert);
+  }
+
+  async function reopenSystemResolvedReview(
+    documentId: string,
+    kind: string,
+    rawValue: string,
+  ): Promise<void> {
+    const reopened = await client.query(
+      `UPDATE review_items SET status = 'open'
+        WHERE source_document_id = $1 AND kind = $2 AND raw_value = $3
+          AND status = 'resolved'
+          AND resolution_note LIKE
+            'resolved on reimport: the authoritative % projection now safely restates every stored row (import_runs.id=%'`,
+      [documentId, kind, rawValue],
+    );
+    reviewItemsUpdated += reopened.rowCount ?? 0;
   }
 
   /** One `weak_instrument_match` sighting, not yet written: the descriptor
@@ -1432,12 +1459,15 @@ export async function importBatch(
     rows: readonly ImportRow[],
     documentId: string,
     occurrences: Map<string, number>,
+    preparedOverride?: readonly PreparedTransaction[],
   ): Promise<boolean> {
-    const prepared: PreparedTransaction[] = [];
-    for (const row of rows) {
-      const ready = prepareRow(row, documentId, occurrences);
-      if (ready === null) rowsRefused += 1;
-      else prepared.push(ready);
+    const prepared: PreparedTransaction[] = [...(preparedOverride ?? [])];
+    if (preparedOverride === undefined) {
+      for (const row of rows) {
+        const ready = prepareRow(row, documentId, occurrences);
+        if (ready === null) rowsRefused += 1;
+        else prepared.push(ready);
+      }
     }
     if (prepared.length === 0) return false;
 
@@ -1564,6 +1594,112 @@ export async function importBatch(
 
     await insertRows(client, "transactions", TRANSACTION_COLUMNS, toInsert);
     return anySuccess;
+  }
+
+  async function activityProjectionIsSafe(
+    prepared: readonly PreparedTransaction[],
+    documentId: string,
+  ): Promise<boolean> {
+    const numericColumns = new Set([
+      "quantity",
+      "price",
+      "amount",
+      "amount_base",
+      "fx_rate",
+      "running_balance",
+    ]);
+    const semanticColumns = TRANSACTION_COLUMNS.filter(
+      (column) =>
+        column !== "id" &&
+        column !== "source_document_id" &&
+        column !== "source_locator" &&
+        column !== "imported_at",
+    );
+    const indexes = semanticColumns.map((column) =>
+      TRANSACTION_COLUMNS.indexOf(column),
+    );
+    const normalize = (column: string, value: unknown) => {
+      if (value === null || value === undefined) return null;
+      if (numericColumns.has(column)) return toNumericText(String(value));
+      if (value instanceof Date) return value.toISOString().slice(0, 10);
+      return value;
+    };
+    const keyFromValues = (values: readonly unknown[]) =>
+      JSON.stringify(
+        indexes.map((index, position) =>
+          normalize(semanticColumns[position]!, values[index]),
+        ),
+      );
+    const keyFromRow = (row: Record<string, unknown>) =>
+      JSON.stringify(
+        semanticColumns.map((column) => normalize(column, row[column])),
+      );
+
+    const stored = await client.query<Record<string, unknown>>(
+      `SELECT ${semanticColumns.join(", ")}
+         FROM transactions WHERE source_document_id = $1`,
+      [documentId],
+    );
+    const candidates = new Map<string, number>();
+    const semanticByIdentity = new Map<string, string>();
+    const semanticByHash = new Map<string, string>();
+    for (const candidate of prepared) {
+      const key = keyFromValues(candidate.values);
+      candidates.set(key, (candidates.get(key) ?? 0) + 1);
+      const priorHash = semanticByHash.get(candidate.hash);
+      if (priorHash !== undefined && priorHash !== key) return false;
+      semanticByHash.set(candidate.hash, key);
+      const identity = candidate.row.providerTxnId
+        ? `provider:${providerKey(candidate.row.accountId, candidate.row.providerTxnId)}`
+        : `hash:${candidate.hash}`;
+      const prior = semanticByIdentity.get(identity);
+      if (prior !== undefined && prior !== key) return false;
+      semanticByIdentity.set(identity, key);
+    }
+    for (const row of stored.rows) {
+      const key = keyFromRow(row);
+      const remaining = candidates.get(key) ?? 0;
+      if (remaining === 0) return false;
+      candidates.set(key, remaining - 1);
+    }
+
+    const byHash = await client.query<Record<string, unknown>>(
+      `SELECT ${semanticColumns.join(", ")}, source_document_id FROM transactions
+        WHERE row_hash = ANY($1::text[])`,
+      [prepared.map(({ hash }) => hash)],
+    );
+    if (
+      byHash.rows.some(
+        (row) =>
+          row.source_document_id !== documentId ||
+          semanticByHash.get(String(row.row_hash)) !== keyFromRow(row),
+      )
+    ) {
+      return false;
+    }
+
+    const withProviderId = prepared.filter((item) => item.row.providerTxnId);
+    if (withProviderId.length === 0) return true;
+    const byProvider = await client.query<Record<string, unknown>>(
+      `SELECT ${semanticColumns.join(", ")}, source_document_id FROM transactions
+        WHERE account_id = ANY($1::text[])
+          AND provider_txn_id = ANY($2::text[])`,
+      [
+        [...new Set(withProviderId.map((item) => item.row.accountId))],
+        [...new Set(withProviderId.map((item) => item.row.providerTxnId!))],
+      ],
+    );
+    return byProvider.rows.every((row) => {
+      const identity = `provider:${providerKey(
+        String(row.account_id),
+        String(row.provider_txn_id),
+      )}`;
+      const candidate = semanticByIdentity.get(identity);
+      return (
+        candidate === undefined ||
+        (row.source_document_id === documentId && candidate === keyFromRow(row))
+      );
+    });
   }
 
   /**
@@ -1812,6 +1948,96 @@ export async function importBatch(
     };
   }
 
+  type HoldingTable = "positions" | "balances" | "liabilities";
+
+  const holdingNumericColumns = new Set([
+    "quantity",
+    "price",
+    "market_value",
+    "cost_basis",
+    "unrealized",
+    "total_value",
+    "cash",
+    "period_start_value",
+    "period_end_value",
+    "balance",
+    "rate",
+  ]);
+
+  /**
+   * An authoritative reparse may add newly grounded rows only when every row
+   * this document already owns is restated exactly. The comparison covers all
+   * stored semantic columns, including fields omitted from row_hash. IDs and
+   * locators are provenance mechanics: IDs are generated, and an otherwise
+   * identical same-source replay is allowed to improve its locator.
+   *
+   * A global hash owned by another document is not proof that this document's
+   * projection was persisted. Without a membership table, accepting it would
+   * make a later omission invisible, so authoritative reparse fails closed.
+   */
+  async function holdingProjectionIsSafe(
+    table: HoldingTable,
+    columns: readonly string[],
+    prepared: readonly PreparedHolding[],
+    documentId: string,
+  ): Promise<boolean> {
+    const semanticColumns = columns.filter(
+      (column) =>
+        column !== "id" &&
+        column !== "source_document_id" &&
+        column !== "source_locator",
+    );
+    const indexes = semanticColumns.map((column) => columns.indexOf(column));
+    const semanticValue = (column: string, value: unknown) => {
+      if (value === null || value === undefined) return null;
+      return holdingNumericColumns.has(column)
+        ? toNumericText(String(value))
+        : value;
+    };
+    const keyFromValues = (values: readonly unknown[]) =>
+      JSON.stringify(
+        indexes.map((index, position) =>
+          semanticValue(semanticColumns[position]!, values[index]),
+        ),
+      );
+    const keyFromRow = (row: Record<string, unknown>) =>
+      JSON.stringify(
+        semanticColumns.map((column) => semanticValue(column, row[column])),
+      );
+
+    const stored = await client.query<Record<string, unknown>>(
+      `SELECT ${semanticColumns.join(", ")} FROM ${table} WHERE source_document_id = $1`,
+      [documentId],
+    );
+    const candidates = new Map<string, number>();
+    const semanticByHash = new Map<string, string>();
+    for (const candidate of prepared) {
+      const key = keyFromValues(candidate.values);
+      candidates.set(key, (candidates.get(key) ?? 0) + 1);
+      const prior = semanticByHash.get(candidate.hash);
+      if (prior !== undefined && prior !== key) return false;
+      semanticByHash.set(candidate.hash, key);
+    }
+    for (const row of stored.rows) {
+      const key = keyFromRow(row);
+      const remaining = candidates.get(key) ?? 0;
+      if (remaining === 0) return false;
+      candidates.set(key, remaining - 1);
+    }
+
+    if (prepared.length === 0) return true;
+    const global = await client.query<Record<string, unknown>>(
+      `SELECT ${semanticColumns.join(", ")}, source_document_id
+         FROM ${table} WHERE row_hash = ANY($1::text[])`,
+      [prepared.map(({ hash }) => hash)],
+    );
+    return global.rows.every(
+      (row) =>
+        row.source_document_id === documentId &&
+        semanticByHash.get(String(row.row_hash)) === keyFromRow(row),
+    );
+  }
+
   /**
    * One document's positions, balances or liabilities: one `row_hash` lookup
    * for the whole table and one multi-row INSERT, in place of two round trips
@@ -1828,11 +2054,16 @@ export async function importBatch(
     changed: Set<string> | null,
   ): Promise<boolean> {
     if (prepared.length === 0) return false;
-    const found = await client.query<{ row_hash: string; source_locator: string | null }>(
-      `SELECT row_hash, source_locator FROM ${table} WHERE row_hash = ANY($1::text[])`,
+    const found = await client.query<{
+      row_hash: string;
+      source_locator: string | null;
+      source_document_id: string | null;
+    }>(
+      `SELECT row_hash, source_locator, source_document_id
+         FROM ${table} WHERE row_hash = ANY($1::text[])`,
       [prepared.map((p) => p.hash)],
     );
-    const seen = new Map(found.rows.map((r) => [r.row_hash, r.source_locator]));
+    const seen = new Map(found.rows.map((r) => [r.row_hash, r]));
 
     // F1-8a. `row_hash` includes `cash` (balanceHash), so two documents
     // stating different cash at the same (account_id, as_of) never collide
@@ -1843,35 +2074,50 @@ export async function importBatch(
     // row, which is exactly the report the gate already refuses to compute
     // per-period. A review item names the other document at import time
     // instead, without changing which cash the gate reconciles against.
-    const storedBalances = table === "balances"
-      ? (await client.query<{
-          account_id: string;
-          as_of: string;
-          cash: string | null;
-          source_document_id: string | null;
-        }>(
-          `SELECT b.account_id, b.as_of::text AS as_of, b.cash, b.source_document_id
+    const storedBalances =
+      table === "balances"
+        ? (
+            await client.query<{
+              account_id: string;
+              as_of: string;
+              cash: string | null;
+              source_document_id: string | null;
+            }>(
+              `SELECT b.account_id, b.as_of::text AS as_of, b.cash, b.source_document_id
              FROM balances b
              JOIN (SELECT unnest($1::text[]) AS account_id,
                           unnest($2::date[]) AS as_of) pairs
                ON pairs.account_id = b.account_id AND pairs.as_of = b.as_of`,
-          [prepared.map((p) => p.accountId), prepared.map((p) => p.values[2] as string)],
-        )).rows
-      : null;
-    const cashConflicts = storedBalances === null
-      ? null
-      : new Map(storedBalances.map((r) => [JSON.stringify([r.account_id, r.as_of]), r]));
+              [
+                prepared.map((p) => p.accountId),
+                prepared.map((p) => p.values[2] as string),
+              ],
+            )
+          ).rows
+        : null;
+    const cashConflicts =
+      storedBalances === null
+        ? null
+        : new Map(
+            storedBalances.map((r) => [
+              JSON.stringify([r.account_id, r.as_of]),
+              r,
+            ]),
+          );
 
     // F1-8l. Keep every matching stored row when checking whether this
     // document already supplied a balance. The cross-document conflict map
     // retains only one row per account/date and cannot answer that question.
     // This set also grows as this batch accepts rows, so a second statement
     // of the same account/date is refused even when its amounts hash differently.
-    const balanceKeys = storedBalances === null
-      ? null
-      : new Set(storedBalances
-          .filter((r) => r.source_document_id === documentId)
-          .map((r) => JSON.stringify([r.account_id, r.as_of])));
+    const balanceKeys =
+      storedBalances === null
+        ? null
+        : new Set(
+            storedBalances
+              .filter((r) => r.source_document_id === documentId)
+              .map((r) => JSON.stringify([r.account_id, r.as_of])),
+          );
 
     const toInsert: unknown[][] = [];
     let anySuccess = false;
@@ -1898,7 +2144,8 @@ export async function importBatch(
           });
         }
       }
-      if (seen.has(p.hash)) {
+      const existingByHash = seen.get(p.hash);
+      if (existingByHash !== undefined) {
         rowsDeduplicated += 1;
         anySuccess = true;
         // F1-53. `row_hash` does not cover `source_locator` (positionHash's
@@ -1909,7 +2156,10 @@ export async function importBatch(
         // rather than re-insert (row_hash is UNIQUE, so a second row with
         // the same hash cannot exist anyway). A second reparse computes the
         // same locator and this becomes a no-op update.
-        if (seen.get(p.hash) !== p.sourceLocator) {
+        if (
+          existingByHash.source_document_id === documentId &&
+          existingByHash.source_locator !== p.sourceLocator
+        ) {
           await client.query(
             `UPDATE ${table} SET source_locator = $2 WHERE row_hash = $1`,
             [p.hash, p.sourceLocator],
@@ -1934,7 +2184,11 @@ export async function importBatch(
         }
         balanceKeys.add(key);
       }
-      seen.set(p.hash, p.sourceLocator);
+      seen.set(p.hash, {
+        row_hash: p.hash,
+        source_locator: p.sourceLocator,
+        source_document_id: documentId,
+      });
       if (changed !== null && p.changedKey !== null) changed.add(p.changedKey);
       toInsert.push(p.values);
       for (const candidate of p.pending) {
@@ -1960,7 +2214,7 @@ export async function importBatch(
   async function processHoldings(
     document: ImportDocument,
     documentId: string,
-  ): Promise<boolean> {
+  ): Promise<{ anySuccess: boolean; projectionSafe: boolean }> {
     let anySuccess = false;
 
     const preparedPositions: PreparedHolding[] = [];
@@ -1976,18 +2230,6 @@ export async function importBatch(
       if (ready === null) rowsRefused += 1;
       else preparedPositions.push(ready);
     }
-    if (
-      await importHoldings(
-        "positions",
-        POSITION_COLUMNS,
-        preparedPositions,
-        documentId,
-        changedPositions,
-      )
-    ) {
-      anySuccess = true;
-    }
-
     const preparedBalances: PreparedHolding[] = [];
     for (const balance of document.balances ?? []) {
       const accountId = balance.accountId ?? document.accountId;
@@ -2001,17 +2243,6 @@ export async function importBatch(
       if (ready === null) rowsRefused += 1;
       else preparedBalances.push(ready);
     }
-    if (
-      await importHoldings(
-        "balances",
-        BALANCE_COLUMNS,
-        preparedBalances,
-        documentId,
-        changedBalances,
-      )
-    ) {
-      anySuccess = true;
-    }
 
     const preparedLiabilities: PreparedHolding[] = [];
     for (const liability of document.liabilities ?? []) {
@@ -2024,6 +2255,75 @@ export async function importBatch(
       if (ready === null) rowsRefused += 1;
       else preparedLiabilities.push(ready);
     }
+
+    if (options.authoritativeReparse) {
+      const checks = [
+        await holdingProjectionIsSafe(
+          "positions",
+          POSITION_COLUMNS,
+          preparedPositions,
+          documentId,
+        ),
+        await holdingProjectionIsSafe(
+          "balances",
+          BALANCE_COLUMNS,
+          preparedBalances,
+          documentId,
+        ),
+        await holdingProjectionIsSafe(
+          "liabilities",
+          LIABILITY_COLUMNS,
+          preparedLiabilities,
+          documentId,
+        ),
+      ];
+      const unsafeTables = (
+        ["positions", "balances", "liabilities"] as const
+      ).filter((_, index) => !checks[index]);
+      if (unsafeTables.length > 0) {
+        const rawValue = unsafeTables.join(",");
+        await reopenSystemResolvedReview(
+          documentId,
+          "reparse_projection_mismatch",
+          rawValue,
+        );
+        openReview(document.accountId, documentId, null, {
+          kind: "reparse_projection_mismatch",
+          rawValue,
+          reason:
+            `authoritative reparse did not exactly restate this document's stored ` +
+            `${rawValue} projection, or matched a row owned by another document; ` +
+            "old rows and evidence were preserved, no reparsed holdings were published, " +
+            "and the document remains partial pending a reviewed replacement",
+        });
+        return { anySuccess: false, projectionSafe: false };
+      }
+    }
+
+    if (
+      await importHoldings(
+        "positions",
+        POSITION_COLUMNS,
+        preparedPositions,
+        documentId,
+        changedPositions,
+      )
+    ) {
+      anySuccess = true;
+    }
+
+    if (
+      await importHoldings(
+        "balances",
+        BALANCE_COLUMNS,
+        preparedBalances,
+        documentId,
+        changedBalances,
+      )
+    ) {
+      anySuccess = true;
+    }
+
     if (
       await importHoldings(
         "liabilities",
@@ -2036,7 +2336,7 @@ export async function importBatch(
       anySuccess = true;
     }
 
-    return anySuccess;
+    return { anySuccess, projectionSafe: true };
   }
 
   return withArchiveTransaction(client, async () => {
@@ -2080,7 +2380,11 @@ export async function importBatch(
         [document.sha256],
       );
       const existing = found.rows[0];
-      if (existing !== undefined && existing.parsed_ok === true) {
+      if (
+        existing !== undefined &&
+        existing.parsed_ok === true &&
+        !options.authoritativeReparse
+      ) {
         // Ground rule 1: raw files are immutable. Byte-identical bytes that
         // already imported successfully contribute nothing new to
         // `transactions`: `document.rows`' own occurrence-ordinal dedupe
@@ -2106,7 +2410,8 @@ export async function importBatch(
         // statements takes, so it is the only place those decisions can land.
         // Only these two kinds: every other kind stays skipped exactly as it
         // was, which is what F1-56 made this branch for.
-        for (const item of document.reviewItems ?? []) routeInstrumentMatch(item);
+        for (const item of document.reviewItems ?? [])
+          routeInstrumentMatch(item);
         await flushWeakInstrumentMatches(existing.id);
         await flushInstitutionSymbolMatches(existing.id);
         await invalidateStaleInstitutionSymbolMatches(
@@ -2163,7 +2468,10 @@ export async function importBatch(
             document.providerDocumentId ?? null,
           ],
         );
-      } else if (document.textPath !== null && document.textPath !== undefined) {
+      } else if (
+        document.textPath !== null &&
+        document.textPath !== undefined
+      ) {
         // F1-44: a document retained before there was an extractor has no
         // retained text. Its bytes are immutable and its sha256 therefore
         // unchanged, so the reimport that finally parses it reuses this row --
@@ -2217,7 +2525,10 @@ export async function importBatch(
         // so without this check a rerun reopens a duplicate document_unparsed
         // row forever instead of being recognized as already flagged.
         const reason = document.parseNote.slice(0, 500);
-        const alreadyFlagged = await client.query<{ id: string; reason: string }>(
+        const alreadyFlagged = await client.query<{
+          id: string;
+          reason: string;
+        }>(
           `SELECT id, reason FROM review_items
            WHERE kind = 'document_unparsed' AND source_document_id = $1
            ORDER BY status = 'open' DESC
@@ -2253,18 +2564,92 @@ export async function importBatch(
           );
           reviewItemsUpdated += updated.rowCount ?? 0;
         }
-      } else {
-        // F1-55. Ground rule 1: the bytes this document was reimported from
-        // are the same immutable bytes as last time (`documents.sha256` is
-        // this document's identity, and the whole-document skip above never
-        // reaches here for a document already `parsed_ok`), so a reimport
-        // that now parses -- typically a fixed extractor rereading a
-        // document an older one could not -- is the same content read
-        // better, not new evidence. Close whatever `document_unparsed` item
-        // that earlier failure opened rather than leaving it open forever or
-        // opening a second one next to it; the resolution note names the
-        // import run that cleared it, and only an `open` item is touched, so
-        // a reviewer's own dismissal is never silently reopened or relitigated.
+      }
+
+      let activityProjectionSafe = true;
+      let preparedActivity: PreparedTransaction[] | undefined;
+      if (options.authoritativeReparse) {
+        preparedActivity = [];
+        for (const row of document.rows) {
+          const ready = prepareRow(row, documentId, occurrences);
+          if (ready === null) rowsRefused += 1;
+          else preparedActivity.push(ready);
+        }
+        activityProjectionSafe = await activityProjectionIsSafe(
+          preparedActivity,
+          documentId,
+        );
+        if (!activityProjectionSafe) {
+          await reopenSystemResolvedReview(
+            documentId,
+            "reparse_activity_projection_mismatch",
+            "activity",
+          );
+          openReview(document.accountId, documentId, null, {
+            kind: "reparse_activity_projection_mismatch",
+            rawValue: "activity",
+            reason:
+              "authoritative reparse did not safely restate this document's stored activity projection, or matched activity owned by another document; old activity and evidence were preserved and the document remains partial",
+          });
+        }
+      }
+      if (
+        activityProjectionSafe &&
+        (await importRows(
+          document.rows,
+          documentId,
+          occurrences,
+          preparedActivity,
+        ))
+      ) {
+        anySuccess = true;
+      }
+
+      // F1-46: each holding's own accountId (a consolidated statement's
+      // per-section attribution) wins over the document's, which stays the
+      // fallback for the ordinary one-document-one-account case -- see
+      // ImportPosition.accountId's doc comment. See `processHoldings` above,
+      // shared with the already-`parsed_ok` reparse path.
+      let projectionSafe = true;
+      const holdings = await processHoldings(document, documentId);
+      if (holdings.anySuccess) anySuccess = true;
+      projectionSafe = holdings.projectionSafe;
+
+      if (options.authoritativeReparse && projectionSafe) {
+        const resolved = await client.query(
+          `UPDATE review_items
+              SET status = 'resolved', resolved_at = $2,
+                  resolution_note = $3
+            WHERE source_document_id = $1
+              AND kind = 'reparse_projection_mismatch'
+              AND status = 'open'`,
+          [
+            documentId,
+            now.toISOString(),
+            `resolved on reimport: the authoritative holdings projection now safely restates every stored row (import_runs.id=${importRunId})`,
+          ],
+        );
+        reviewItemsResolved += resolved.rowCount ?? 0;
+      }
+
+      if (options.authoritativeReparse && activityProjectionSafe) {
+        const resolved = await client.query(
+          `UPDATE review_items
+              SET status = 'resolved', resolved_at = $2,
+                  resolution_note = $3
+            WHERE source_document_id = $1
+              AND kind = 'reparse_activity_projection_mismatch'
+              AND status = 'open'`,
+          [
+            documentId,
+            now.toISOString(),
+            `resolved on reimport: the authoritative activity projection now safely restates every stored row (import_runs.id=${importRunId})`,
+          ],
+        );
+        reviewItemsResolved += resolved.rowCount ?? 0;
+      }
+
+      if (!document.parseNote && activityProjectionSafe && projectionSafe) {
         const resolved = await client.query(
           `UPDATE review_items
              SET status = 'resolved', resolved_at = $2, resolution_note = $3
@@ -2276,18 +2661,6 @@ export async function importBatch(
           ],
         );
         reviewItemsResolved += resolved.rowCount ?? 0;
-      }
-      if (await importRows(document.rows, documentId, occurrences)) {
-        anySuccess = true;
-      }
-
-      // F1-46: each holding's own accountId (a consolidated statement's
-      // per-section attribution) wins over the document's, which stays the
-      // fallback for the ordinary one-document-one-account case -- see
-      // ImportPosition.accountId's doc comment. See `processHoldings` above,
-      // shared with the already-`parsed_ok` reparse path.
-      if (await processHoldings(document, documentId)) {
-        anySuccess = true;
       }
 
       await flushReviews(documentId);
@@ -2311,7 +2684,11 @@ export async function importBatch(
       // matched; a document that landed some things and sent others to
       // review is TRUE, and the whole-document skip above is safe to take
       // next time (see that branch's comment).
-      const parsedOk = !document.parseNote && anySuccess;
+      const parsedOk =
+        !document.parseNote &&
+        anySuccess &&
+        activityProjectionSafe &&
+        projectionSafe;
       await client.query("UPDATE documents SET parsed_ok = $2 WHERE id = $1", [
         documentId,
         parsedOk,
@@ -2471,7 +2848,11 @@ function resolveAmountBase(
   fxRate: string | null;
   amountBaseRounding: RoundingRule | null;
 } {
-  const fxRate = canonicalizeAmbiguous(fxRateText, "ambiguous_fx_rate", pending);
+  const fxRate = canonicalizeAmbiguous(
+    fxRateText,
+    "ambiguous_fx_rate",
+    pending,
+  );
 
   if (amountBaseText !== null) {
     let amountBase: string | null;
