@@ -24,6 +24,7 @@ import {
 import { initialCheckpoint, journalCodec, PipelineRunner } from "./runner.js";
 import { HttpWorkerTransport } from "./transport.js";
 import { previewSelectedFromPaths } from "./previewSelected.js";
+import { transitionPreviewLauncherFromPaths } from "./previewLauncherTransition.js";
 import { transitionProviderV2FromPaths } from "./providerV2Transition.js";
 import { reprioritizeFromPaths } from "./reprioritize.js";
 import type {
@@ -36,7 +37,7 @@ import type { RunnerCheckpoint } from "./runnerState.js";
 
 function usage(): never {
   throw new Error(
-    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked [--operator-clear --max-clears <n>]] and [--accept-retirement <root_selection_would_retire_items|root_contents_collapsed|journal_behind_server>], or adopt-provider-v2 --previous-config <old-path> --config <new-path>, or reprioritize|preview-selected --config <path> --manifest <private-json>, or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
+    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked [--operator-clear --max-clears <n>]] and [--accept-retirement <root_selection_would_retire_items|root_contents_collapsed|journal_behind_server>], or adopt-provider-v2|adopt-preview-launcher --previous-config <old-path> --config <new-path>, or reprioritize|preview-selected --config <path> --manifest <private-json>, or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
   );
 }
 export function argumentsFor(argv: string[]):
@@ -58,6 +59,11 @@ export function argumentsFor(argv: string[]):
       configPath: string;
     }
   | {
+      command: "adopt-preview-launcher";
+      previousConfigPath: string;
+      configPath: string;
+    }
+  | {
       command: "reconcile-receipts";
       configPath: string;
       apply: boolean;
@@ -72,7 +78,10 @@ export function argumentsFor(argv: string[]):
       json: boolean;
     } {
   const forwarded = argv[0] === "--" ? argv.slice(1) : argv;
-  if (forwarded[0] === "adopt-provider-v2") {
+  if (
+    forwarded[0] === "adopt-provider-v2" ||
+    forwarded[0] === "adopt-preview-launcher"
+  ) {
     const values = new Map<string, string>();
     for (let index = 1; index < forwarded.length; index += 1) {
       const flag = forwarded[index];
@@ -86,12 +95,9 @@ export function argumentsFor(argv: string[]):
     const previousConfigPath = values.get("--previous-config");
     const configPath = values.get("--config");
     if (!previousConfigPath || !configPath) usage();
-    return { command: "adopt-provider-v2", previousConfigPath, configPath };
+    return { command: forwarded[0], previousConfigPath, configPath };
   }
-  if (
-    forwarded[0] === "reprioritize" ||
-    forwarded[0] === "preview-selected"
-  ) {
+  if (forwarded[0] === "reprioritize" || forwarded[0] === "preview-selected") {
     const values = new Map<string, string>();
     for (let index = 1; index < forwarded.length; index += 1) {
       const flag = forwarded[index];
@@ -502,6 +508,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     const result = await reprioritizeFromPaths(configPath, parsed.manifestPath);
     process.stdout.write(`${JSON.stringify(result)}\n`);
     if (result.state !== "reprioritized") process.exitCode = 1;
+    return;
+  }
+  if (command === "adopt-preview-launcher") {
+    const result = await transitionPreviewLauncherFromPaths({
+      previousConfigPath: parsed.previousConfigPath,
+      proposedConfigPath: configPath,
+    });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
     return;
   }
   if (command === "preview-selected") {

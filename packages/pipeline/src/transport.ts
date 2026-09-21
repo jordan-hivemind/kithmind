@@ -1423,15 +1423,19 @@ function assessment(value: Record<string, unknown>, page: boolean): void {
 }
 
 function recordedPreview(value: Record<string, unknown>): void {
-  exact(value, [
-    "operation",
-    "previewId",
-    "sourceItemId",
-    "observedContentHash",
-    "previewFingerprint",
-    "state",
-    "reused",
-  ], ["sourceRevisionId"]);
+  exact(
+    value,
+    [
+      "operation",
+      "previewId",
+      "sourceItemId",
+      "observedContentHash",
+      "previewFingerprint",
+      "state",
+      "reused",
+    ],
+    ["sourceRevisionId"],
+  );
   if (value.operation !== "discovery.recordPreview")
     failure("preview operation is invalid");
   id(value.previewId, "previewId");

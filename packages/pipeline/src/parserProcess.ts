@@ -3524,10 +3524,7 @@ function validateDocumentPreviewResult(
     ),
     unitStates: [],
     method: "spreadsheet_manifest_v1",
-    methodFingerprint: previewMethod(
-      value.method,
-      "spreadsheet_manifest_v1",
-    ),
+    methodFingerprint: previewMethod(value.method, "spreadsheet_manifest_v1"),
   };
 }
 
@@ -3536,7 +3533,9 @@ export async function runDocumentPreview(
   input: RunDocumentPreviewInput,
 ): Promise<DocumentPreviewResult> {
   requiredPlatform();
-  const limits = validateLimits(input.limits ?? DEFAULT_DOCUMENT_PREVIEW_LIMITS);
+  const limits = validateLimits(
+    input.limits ?? DEFAULT_DOCUMENT_PREVIEW_LIMITS,
+  );
   if (
     !SHA256.test(input.expectedSha256) ||
     !SHA256.test(input.expectedPythonSha256) ||
@@ -3594,10 +3593,14 @@ export async function runDocumentPreview(
   );
   if (canonicalSource !== input.sourcePath)
     fail("unsafe_path", "preview source is not canonical");
-  const work = await trustedDirectory(input.work.path, "preview work directory", {
-    private: true,
-    rejectBroad: true,
-  });
+  const work = await trustedDirectory(
+    input.work.path,
+    "preview work directory",
+    {
+      private: true,
+      rejectBroad: true,
+    },
+  );
   const workRoot = await trustedDirectory(input.workRoot, "preview work root", {
     private: true,
     rejectBroad: true,
@@ -3632,7 +3635,10 @@ export async function runDocumentPreview(
     !contains(packageRoot.path, launcher.canonical) ||
     digest(launcher.bytes) !== input.expectedLauncherSha256
   )
-    fail("executable_mismatch", "parser launcher identity does not match configuration");
+    fail(
+      "executable_mismatch",
+      "parser launcher identity does not match configuration",
+    );
   const python = await boundedFile(
     input.pythonExecutable,
     "Python executable",
@@ -3640,7 +3646,10 @@ export async function runDocumentPreview(
     { executable: true, allowSymlink: true },
   );
   if (digest(python.bytes) !== input.expectedPythonSha256)
-    fail("executable_mismatch", "Python executable identity does not match configuration");
+    fail(
+      "executable_mismatch",
+      "Python executable identity does not match configuration",
+    );
   const pythonEnvironmentRoot = resolve(dirname(input.pythonExecutable), "..");
   const pythonRuntimeRoot = resolve(dirname(python.canonical), "..");
   await trustedDirectory(pythonEnvironmentRoot, "Python environment root", {
@@ -3684,7 +3693,13 @@ export async function runDocumentPreview(
     "--cpu-seconds",
     String(limits.cpuSeconds),
     "--file-bytes",
-    String(BINARY_CLASSES[input.mediaType === "application/pdf" ? "pdf_docqa_v1" : "spreadsheet_v1"].maxOriginalBytes),
+    String(
+      BINARY_CLASSES[
+        input.mediaType === "application/pdf"
+          ? "pdf_docqa_v1"
+          : "spreadsheet_v1"
+      ].maxOriginalBytes,
+    ),
     "--open-files",
     String(limits.maxOpenFiles),
   ];

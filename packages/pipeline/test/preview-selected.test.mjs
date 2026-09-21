@@ -226,8 +226,14 @@ test("refuses current, stale, malformed-window, unsafe-phase, and pending select
             config: {},
             manifest: selected,
             manifestSha256: "9".repeat(64),
-            transport: { async call() { throw new Error("unused"); } },
-            executePreview: async () => { throw new Error("unused"); },
+            transport: {
+              async call() {
+                throw new Error("unused");
+              },
+            },
+            executePreview: async () => {
+              throw new Error("unused");
+            },
           }),
         (error) => error.message === "target_missing_or_stale",
       );
@@ -322,7 +328,8 @@ test("partial transport failure is safely retryable with deterministic request I
             },
           },
         }),
-      (error) => error.message === "server_refused" && error.recordedCount === 1,
+      (error) =>
+        error.message === "server_refused" && error.recordedCount === 1,
     );
     assert.deepEqual(state.journal.checkpoint, initial);
   } finally {

@@ -190,7 +190,12 @@ export async function loadPreviewManifest(path: string): Promise<{
     const bytes = Buffer.alloc(MAX_MANIFEST_BYTES + 1);
     let offset = 0;
     while (offset < bytes.length) {
-      const read = await handle.read(bytes, offset, bytes.length - offset, offset);
+      const read = await handle.read(
+        bytes,
+        offset,
+        bytes.length - offset,
+        offset,
+      );
       if (read.bytesRead === 0) break;
       offset += read.bytesRead;
     }
@@ -281,7 +286,10 @@ function declaration(preview: DocumentPreviewResult): TriagePreviewDeclaration {
   };
 }
 
-function stableRequestId(identityValue: ArchivedWorkIdentity, preview: TriagePreviewDeclaration): string {
+function stableRequestId(
+  identityValue: ArchivedWorkIdentity,
+  preview: TriagePreviewDeclaration,
+): string {
   const bytes = createHash("sha256")
     .update("kithmind-selected-preview-request:v1\0")
     .update(JSON.stringify([identityValue, preview]))
@@ -307,8 +315,7 @@ export async function previewSelectedJournal(args: {
   if (args.journal.pending !== undefined)
     throw new PreviewRefusal("pending_unsafe");
   const checkpoint = args.journal.checkpoint;
-  if (checkpoint.phase !== "archived")
-    throw new PreviewRefusal("phase_unsafe");
+  if (checkpoint.phase !== "archived") throw new PreviewRefusal("phase_unsafe");
   const checkpointBytes = JSON.stringify(checkpoint);
   const suffix = checkpoint.files.slice(checkpoint.pdfIndex + 1);
   const available = new Map(suffix.map((plan) => [key(plan), plan]));
@@ -336,7 +343,9 @@ export async function previewSelectedJournal(args: {
     let preview: DocumentPreviewResult;
     try {
       preview = await args.executePreview(plan, windows);
-    } catch {
+    } catch (error) {
+      if (error instanceof PreviewRefusal && error.code === "source_changed")
+        throw new PreviewRefusal("source_changed", recordedCount);
       throw new PreviewRefusal("preview_failed", recordedCount);
     }
     if (
@@ -447,13 +456,17 @@ export async function previewSelectedFromPaths(
       codec: journalCodec,
     });
     try {
+      let execute: Awaited<ReturnType<typeof productionExecutor>> | undefined;
       const result = await previewSelectedJournal({
         journal,
         config,
         manifest: loaded.manifest,
         manifestSha256,
         transport: new HttpWorkerTransport(config, credential),
-        executePreview: await productionExecutor(config),
+        executePreview: async (plan, windows) => {
+          execute ??= await productionExecutor(config);
+          return execute(plan, windows);
+        },
       });
       recordedCount = result.recordedCount;
       return result;

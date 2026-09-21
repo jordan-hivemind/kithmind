@@ -311,9 +311,7 @@ test("provider v2 config transition accepts only the exact credential move and b
   ]) {
     const changed = structuredClone(proposed);
     mutate(changed);
-    assert.throws(() =>
-      validateProviderV2ConfigTransition(previous, changed),
-    );
+    assert.throws(() => validateProviderV2ConfigTransition(previous, changed));
   }
 });
 
