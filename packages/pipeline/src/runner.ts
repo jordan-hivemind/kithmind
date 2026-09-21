@@ -1278,7 +1278,7 @@ function sameObservationPlan(
   return equalJson(current, observedPlan);
 }
 
-function bindingsFromScan(checkpoint: {
+export function bindingsFromScan(checkpoint: {
   files: FilePlan[];
   missingBindings: IdentityBinding[];
 }): IdentityBinding[] {
@@ -1315,6 +1315,15 @@ function bindingsFromScan(checkpoint: {
     paths.add(key);
   }
   return result;
+}
+
+export function findDiscoveryPlan(
+  files: FilePlan[],
+  uri: string,
+): FilePlan | undefined {
+  return files.find(
+    (candidate) => toFsUri(candidate.rootAlias, candidate.relativePath) === uri,
+  );
 }
 
 function plannedTerminal(
@@ -1540,6 +1549,25 @@ export class PipelineRunner {
     private readonly providerFileIdSources:
       ProviderFileIdSource[] | undefined = undefined,
   ) {}
+
+  /**
+   * Settle the one answered request that the operator priority control may
+   * encounter. This drives exactly the current archived-step handler once. It
+   * cannot start a pass, and an unanswered request is refused before entry.
+   */
+  async settleAnsweredArchivedRequest(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    const pending = this.journal.pending;
+    if (
+      checkpoint.phase !== "archived" ||
+      pending === undefined ||
+      pending.result === undefined
+    ) {
+      throw new PipelineWorkerError("priority_pending_conflict");
+    }
+    this.archiveCatalog = await openArchiveCatalog({ journal: this.journal });
+    await this.driveArchived();
+  }
 
   /**
    * Sends a worker mutation and, on a `rate_limited` response, waits with
@@ -1988,6 +2016,9 @@ export class PipelineRunner {
           step: "intent",
           reservationRound: 0,
           archivedPublished,
+          ...(checkpoint.priorityReceipt === undefined
+            ? {}
+            : { priorityReceipt: checkpoint.priorityReceipt }),
         }
       : {
           version: 1,
@@ -3975,10 +4006,7 @@ export class PipelineRunner {
       return;
     }
     const target = checkpoint.targets[checkpoint.index]!;
-    const plan = checkpoint.files.find(
-      (candidate) =>
-        toFsUri(candidate.rootAlias, candidate.relativePath) === target.uri,
-    );
+    const plan = findDiscoveryPlan(checkpoint.files, target.uri);
     let currentFile: DiscoveryFile | undefined;
     if (!this.journal.pending) {
       if (target.leaseExpiresAt <= Date.now() + LEASE_SAFETY_MARGIN_MS) {

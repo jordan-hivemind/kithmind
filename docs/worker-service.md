@@ -546,6 +546,39 @@ assessment still counts it under `pending`, or under `unavailable` when it was
 never admitted. An assessment carrying a parked document therefore reads
 `incomplete`, which is correct: that document has not been filed.
 
+### Prioritize an active archived-work suffix
+
+To move exact goal-critical revisions ahead of the unstarted archived-work
+suffix in an active pass, stop the watcher and use a private owner-only JSON
+manifest:
+
+```json
+{
+  "version": 1,
+  "reason": "active_goal",
+  "targets": [
+    {
+      "rootAlias": "documents",
+      "relativePath": "synthetic/return.pdf",
+      "revisionHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ]
+}
+```
+
+```sh
+chmod 600 /absolute/path/to/priority.json
+pnpm --silent brain:worker -- reprioritize --config /absolute/path/to/pipeline.json --manifest /absolute/path/to/priority.json
+```
+
+The command works only after scan reconciliation while the checkpoint is in
+the archived phase. It preserves the current document and completed prefix,
+settles at most one already-answered archived request through its normal
+handler, and refuses unanswered requests, stale hashes, missing targets, other
+phases, and lock contention. Its JSON receipt contains counts and digests but
+no source paths. Reprioritization changes queue order only. It does not add
+two-pass discovery, goal-aware stopping, or change the parser page limit.
+
 ## Template validation
 
 The macOS plist and both shell wrappers are syntax-checked in this repository.

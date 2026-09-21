@@ -2053,7 +2053,7 @@ test("backup replay accepts a changed remote root only for the cataloged artifac
   }
 });
 
-test("a cached provider preflight is revalidated and revoked authority prevents locator side effects", async () => {
+test("the narrow priority replay settles an answered provider locator snapshot and preserves failure", async () => {
   const setup = await fixture(0);
   const age = join(setup.base, "age");
   const restic = join(setup.base, "restic");
@@ -2067,7 +2067,7 @@ test("a cached provider preflight is revalidated and revoked authority prevents 
   const canonicalRestic = await realpath(restic);
   const plan = pdfPlan();
   const checkpoint = archivedCheckpoint(plan, {
-    preflightAction: "provider_verify",
+    preflightAction: "provider_locator_snapshot",
   });
   const journal = await openJournal(setup.journalDir, checkpoint);
   const original = {
@@ -2159,7 +2159,7 @@ test("a cached provider preflight is revalidated and revoked authority prevents 
     throw new Error("provider side effect must not run");
   };
   try {
-    await runner.driveArchivedPreflight();
+    await runner.settleAnsweredArchivedRequest();
     assert.equal(published, 0);
     assert.deepEqual(sent, [body]);
     assert.equal(journal.pending, undefined);

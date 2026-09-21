@@ -247,6 +247,13 @@ type ArchivedRun = ActiveScan & {
   stagePhase?:
     "pages" | "evidence" | "documents" | "chunks" | "seal" | "staged";
   stageOrdinal?: number;
+  priorityReceipt?: {
+    version: 1;
+    manifestSha256: string;
+    reason: "active_goal" | "code_acceptance" | "explicit_user_request";
+    selectedCount: number;
+    selectedIdentitySha256: string;
+  };
 };
 
 export type RunnerCheckpoint =
@@ -774,6 +781,33 @@ function parserArtifactReuse(value: unknown): ParserArtifactReuse {
   };
 }
 
+function priorityReceipt(
+  value: unknown,
+): NonNullable<ArchivedRun["priorityReceipt"]> {
+  const row = object(value);
+  exact(row, [
+    "version",
+    "manifestSha256",
+    "reason",
+    "selectedCount",
+    "selectedIdentitySha256",
+  ]);
+  if (
+    row.version !== 1 ||
+    (row.reason !== "active_goal" &&
+      row.reason !== "code_acceptance" &&
+      row.reason !== "explicit_user_request")
+  )
+    fail();
+  return {
+    version: 1,
+    manifestSha256: string(row.manifestSha256, 64, HEX_64),
+    reason: row.reason,
+    selectedCount: integer(row.selectedCount, 1, MAX_FILES),
+    selectedIdentitySha256: string(row.selectedIdentitySha256, 64, HEX_64),
+  };
+}
+
 const scanBaseFields = [
   "version",
   "phase",
@@ -992,6 +1026,7 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
         "stageId",
         "stagePhase",
         "stageOrdinal",
+        "priorityReceipt",
       ],
     );
     const steps: ArchivedStep[] = [
@@ -1111,6 +1146,9 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       ...(input.stageOrdinal === undefined
         ? {}
         : { stageOrdinal: integer(input.stageOrdinal) }),
+      ...(input.priorityReceipt === undefined
+        ? {}
+        : { priorityReceipt: priorityReceipt(input.priorityReceipt) }),
     };
     const catalogFieldCount = [
       result.originalCatalogId,
