@@ -105,10 +105,27 @@ export async function PATCH(request: Request): Promise<Response> {
     const body = await parsedBody(request, patchSchema);
     if ("response" in body) return body.response;
     if (body.value.state !== undefined) {
-      if (body.value.rootAlias !== undefined || body.value.relativePath !== undefined || body.value.area !== undefined) return problem(400, "Invalid request");
-      await admin.setSourceRootState(ctx, { principal, sourceRootId: body.value.sourceRootId, state: body.value.state });
-    } else if (body.value.rootAlias !== undefined && body.value.relativePath !== undefined) {
-      await admin.editSourceRoot(ctx, { principal, ...body.value, rootAlias: body.value.rootAlias, relativePath: body.value.relativePath });
+      if (
+        body.value.rootAlias !== undefined ||
+        body.value.relativePath !== undefined ||
+        body.value.area !== undefined
+      )
+        return problem(400, "Invalid request");
+      await admin.setSourceRootState(ctx, {
+        principal,
+        sourceRootId: body.value.sourceRootId,
+        state: body.value.state,
+      });
+    } else if (
+      body.value.rootAlias !== undefined &&
+      body.value.relativePath !== undefined
+    ) {
+      await admin.editSourceRoot(ctx, {
+        principal,
+        ...body.value,
+        rootAlias: body.value.rootAlias,
+        relativePath: body.value.relativePath,
+      });
     } else return problem(400, "Invalid request");
     return noContent();
   });

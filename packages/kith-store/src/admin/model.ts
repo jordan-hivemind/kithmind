@@ -27,7 +27,10 @@ import { exec, type IdentityCtx, row, rows } from "../identity/db.js";
 import { IdentityError } from "../identity/errors.js";
 import { assertKithId, newKithId } from "../ids.js";
 import { spacePredicate } from "../spaces.js";
-import { watcherStaleness, type WatcherStaleness } from "../workers/diagnostics.js";
+import {
+  watcherStaleness,
+  type WatcherStaleness,
+} from "../workers/diagnostics.js";
 
 /** The same bound `listSourceAccounts` applies, for the same reason. */
 const MAX_LISTED = 200;
@@ -45,11 +48,7 @@ const NAME_MAX_CHARS = 200;
 const PATH_MAX_CHARS = 1024;
 
 /** Section 5: the closed list of source root kinds. */
-export const SOURCE_ROOT_KINDS = [
-  "folder",
-  "institution",
-  "manual",
-] as const;
+export const SOURCE_ROOT_KINDS = ["folder", "institution", "manual"] as const;
 export type SourceRootKind = (typeof SOURCE_ROOT_KINDS)[number];
 
 export const SOURCE_ROOT_STATES = [
@@ -101,11 +100,7 @@ export type InvestmentEntryType = (typeof INVESTMENT_ENTRY_TYPES)[number];
 export const INVESTMENT_STATUSES = ["active", "closed", "written_off"] as const;
 export type InvestmentStatus = (typeof INVESTMENT_STATUSES)[number];
 
-export const CORRECTION_TARGET_KINDS = [
-  "document",
-  "field",
-  "record",
-] as const;
+export const CORRECTION_TARGET_KINDS = ["document", "field", "record"] as const;
 export type CorrectionTargetKind = (typeof CORRECTION_TARGET_KINDS)[number];
 
 // ---------------------------------------------------------------------------
@@ -263,11 +258,7 @@ function sourceRootNotFound(): never {
   throw new IdentityError("Source root not found");
 }
 
-function boundedText(
-  value: string,
-  name: string,
-  maximum: number,
-): void {
+function boundedText(value: string, name: string, maximum: number): void {
   if (
     typeof value !== "string" ||
     !value.trim() ||
@@ -283,7 +274,10 @@ function oneOf<T extends string>(
   allowed: readonly T[],
   name: string,
 ): T {
-  if (typeof value !== "string" || !(allowed as readonly string[]).includes(value)) {
+  if (
+    typeof value !== "string" ||
+    !(allowed as readonly string[]).includes(value)
+  ) {
     typedError("invalid_input", `${name} is not a known value`);
   }
   return value as T;
@@ -509,7 +503,9 @@ function toInventoryRow(
     accountId: record.account_id ?? "",
     enabled: record.enabled ?? false,
     allowedRootAliases: Array.isArray(record.allowed_root_aliases)
-      ? record.allowed_root_aliases.filter((alias): alias is string => typeof alias === "string")
+      ? record.allowed_root_aliases.filter(
+          (alias): alias is string => typeof alias === "string",
+        )
       : [],
     area: record.area,
     kind: (record.root_kind as SourceRootKind | null) ?? null,
@@ -589,7 +585,8 @@ function toSourceRoot(record: SourceRootDbRow): SourceRoot {
     reportState: (record.report_state as SourceRootReportState | null) ?? null,
     reportedAt: epoch(record.reported_at),
     reportItemCount:
-      record.report_item_count === null || record.report_item_count === undefined
+      record.report_item_count === null ||
+      record.report_item_count === undefined
         ? null
         : Number(record.report_item_count),
   };
@@ -900,9 +897,20 @@ export async function retireSourceRoot(
  * presented as a report about a folder the worker has not scanned yet. */
 export async function editSourceRoot(
   ctx: IdentityCtx,
-  args: { principal: Principal; sourceRootId: string; rootAlias: string; relativePath: string; area?: string | null },
+  args: {
+    principal: Principal;
+    sourceRootId: string;
+    rootAlias: string;
+    relativePath: string;
+    area?: string | null;
+  },
 ): Promise<{ id: string }> {
-  const old = await row<{ id: string; source_account_id: string; kind: SourceRootKind; expected_types: unknown }>(
+  const old = await row<{
+    id: string;
+    source_account_id: string;
+    kind: SourceRootKind;
+    expected_types: unknown;
+  }>(
     ctx,
     "SELECT id, source_account_id, kind, expected_types FROM kith.source_roots WHERE id = $1",
     [assertKithId(args.sourceRootId, "invalid_source_root_id")],
@@ -915,11 +923,17 @@ export async function editSourceRoot(
     kind: old.kind,
     rootAlias: args.rootAlias,
     relativePath: args.relativePath,
-    expectedTypes: Array.isArray(old.expected_types) ? old.expected_types as string[] : [],
+    expectedTypes: Array.isArray(old.expected_types)
+      ? (old.expected_types as string[])
+      : [],
     ...(args.area === undefined ? {} : { area: args.area }),
   });
   if (next.id !== old.id) {
-    await exec(ctx, "UPDATE kith.source_roots SET state = 'retired', updated_at = $1 WHERE id = $2 AND space_id = $3", [new Date(ctx.now), old.id, writable.spaceId]);
+    await exec(
+      ctx,
+      "UPDATE kith.source_roots SET state = 'retired', updated_at = $1 WHERE id = $2 AND space_id = $3",
+      [new Date(ctx.now), old.id, writable.spaceId],
+    );
   }
   return { id: next.id };
 }
@@ -948,7 +962,10 @@ export async function upsertSourceRootReport(
     state?: SourceRootReportState;
   },
 ): Promise<string> {
-  const sourceRootId = assertKithId(args.sourceRootId, "invalid_source_root_id");
+  const sourceRootId = assertKithId(
+    args.sourceRootId,
+    "invalid_source_root_id",
+  );
   const state =
     args.state === undefined
       ? "ok"
