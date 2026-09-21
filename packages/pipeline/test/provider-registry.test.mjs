@@ -59,6 +59,16 @@ test("provider registry publishes one immutable protected manifest and replays e
       verified,
     });
     assert.deepEqual(second, first);
+    const originalBytes = await readFile(first.manifestPath);
+    const refreshed = await persistProviderBinding({
+      registryDirectory: root,
+      verified: {
+        ...verified,
+        metadata: { ...verified.metadata, verifiedAt: 2 },
+      },
+    });
+    assert.deepEqual(refreshed, first);
+    assert.deepEqual(await readFile(first.manifestPath), originalBytes);
     assert.deepEqual(
       (
         await loadProviderBinding({
@@ -88,6 +98,59 @@ test("provider registry publishes one immutable protected manifest and replays e
         error instanceof ProviderRegistryError &&
         /conflicts/.test(error.message),
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("provider registry recovers an immutable binding after a newer verification temporary", async () => {
+  const root = await realpath(
+    await mkdtemp(join(tmpdir(), "provider-registry-")),
+  );
+  await chmod(root, 0o700);
+  try {
+    const first = await persistProviderBinding({
+      registryDirectory: root,
+      verified,
+    });
+    const staging = await realpath(
+      await mkdtemp(join(tmpdir(), "provider-registry-refresh-")),
+    );
+    await chmod(staging, 0o700);
+    const newer = await persistProviderBinding({
+      registryDirectory: staging,
+      verified: {
+        ...verified,
+        metadata: { ...verified.metadata, verifiedAt: 3 },
+      },
+    });
+    await writeFile(
+      join(root, `${verified.binding.bindingId}.tmp`),
+      await readFile(newer.manifestPath),
+      { mode: 0o600 },
+    );
+    const replay = await persistProviderBinding({
+      registryDirectory: root,
+      verified: {
+        ...verified,
+        metadata: { ...verified.metadata, verifiedAt: 4 },
+      },
+    });
+    assert.deepEqual(replay, first);
+    await assert.rejects(
+      () => stat(join(root, `${verified.binding.bindingId}.tmp`)),
+      { code: "ENOENT" },
+    );
+    assert.equal(
+      (
+        await loadProviderBinding({
+          registryDirectory: root,
+          bindingId: verified.binding.bindingId,
+        })
+      ).verified.metadata.verifiedAt,
+      1,
+    );
+    await rm(staging, { recursive: true, force: true });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -198,6 +198,39 @@ function validateManifest(
   };
 }
 
+function verifiedWithoutTime(value: VerifiedDropboxOriginal) {
+  const { verifiedAt: _verifiedAt, ...metadata } = value.metadata;
+  return { metadata, binding: value.binding };
+}
+
+function existingImmutableBinding(
+  bytes: Buffer,
+  expected: VerifiedDropboxOriginal,
+): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    fail("manifest is invalid");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    fail("manifest is invalid");
+  const verified = validateManifest(
+    parsed as Record<string, unknown>,
+    expected.binding.bindingId,
+  );
+  const canonical = canonicalManifest(verified);
+  try {
+    if (!canonical.equals(bytes)) fail("manifest is not canonical");
+  } finally {
+    canonical.fill(0);
+  }
+  return (
+    JSON.stringify(verifiedWithoutTime(verified)) ===
+    JSON.stringify(verifiedWithoutTime(expected))
+  );
+}
+
 async function readExact(path: string): Promise<Buffer | undefined> {
   const info = await lstat(path).catch((error: unknown) => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
@@ -336,7 +369,11 @@ export async function persistProviderBinding(input: {
       let temporary = await readExact(temporaryPath);
       if (temporary) {
         try {
-          if (!temporary.equals(expected)) fail("temporary binding conflicts");
+          if (
+            !temporary.equals(expected) &&
+            !existingImmutableBinding(temporary, input.verified)
+          )
+            fail("temporary binding conflicts");
         } finally {
           temporary.fill(0);
         }
@@ -362,7 +399,10 @@ export async function persistProviderBinding(input: {
       });
       existing = await readExact(finalPath);
       if (!existing) fail("published binding is missing");
-      if (!existing.equals(expected))
+      if (
+        !existing.equals(expected) &&
+        !existingImmutableBinding(existing, input.verified)
+      )
         fail("binding conflicts with existing entry");
       await unlink(temporaryPath).catch((error: unknown) => {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT")
@@ -370,12 +410,19 @@ export async function persistProviderBinding(input: {
       });
       await syncDirectory(input.registryDirectory);
     } else {
-      if (!existing.equals(expected))
+      if (
+        !existing.equals(expected) &&
+        !existingImmutableBinding(existing, input.verified)
+      )
         fail("binding conflicts with existing entry");
       const temporary = await readExact(temporaryPath);
       if (temporary) {
         try {
-          if (!temporary.equals(expected)) fail("temporary binding conflicts");
+          if (
+            !temporary.equals(expected) &&
+            !existingImmutableBinding(temporary, input.verified)
+          )
+            fail("temporary binding conflicts");
         } finally {
           temporary.fill(0);
         }
@@ -391,8 +438,8 @@ export async function persistProviderBinding(input: {
     return {
       bindingId,
       manifestPath: finalPath,
-      manifestFingerprint: createHash("sha256").update(expected).digest("hex"),
-      manifestByteLength: expected.length,
+      manifestFingerprint: createHash("sha256").update(existing).digest("hex"),
+      manifestByteLength: existing.length,
     };
   } finally {
     existing?.fill(0);
