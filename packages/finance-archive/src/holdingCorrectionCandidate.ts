@@ -8,11 +8,7 @@ import type {
 } from "./importer.js";
 import { toMinorUnits } from "./money.js";
 import { toNumericText } from "./pgNumeric.js";
-import {
-  balanceHash,
-  liabilityHash,
-  positionHash,
-} from "./rowHash.js";
+import { balanceHash, liabilityHash, positionHash } from "./rowHash.js";
 import type { ArchiveClient } from "./pgStore.js";
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -40,13 +36,13 @@ export type StoredHoldingProjection = Readonly<
   Record<HoldingProjectionTable, readonly StoredHoldingRow[]>
 >;
 
-type CandidateHoldingRow = {
+export type CandidateHoldingRow = {
   readonly rowHash: string;
   readonly sourceLocator: string;
   readonly semantic: readonly (string | null)[];
 };
 
-type CandidateHoldingProjection = Readonly<
+export type CandidateHoldingProjection = Readonly<
   Record<HoldingProjectionTable, readonly CandidateHoldingRow[]>
 >;
 
@@ -87,6 +83,11 @@ export type HoldingCorrectionCandidateManifest = {
   };
   /** Digest of every field above, under its own versioned domain. */
   readonly candidateDigest: string;
+};
+
+export type PreparedHoldingCorrectionCandidate = {
+  readonly manifest: HoldingCorrectionCandidateManifest;
+  readonly projection: CandidateHoldingProjection;
 };
 
 type CandidateBuild = {
@@ -215,7 +216,10 @@ function validDate(value: string): boolean {
   return ISO_DATE.test(value);
 }
 
-function assertCurrencyCode(value: string, table: HoldingProjectionTable): void {
+function assertCurrencyCode(
+  value: string,
+  table: HoldingProjectionTable,
+): void {
   if (!CURRENCY_CODE.test(value)) {
     fail(`${table} candidate has an invalid currency code`);
   }
@@ -439,14 +443,13 @@ function prepareCandidate(document: ImportDocument): CandidateBuild {
   const projection = {
     positions: dedupeCandidateRows(
       "positions",
-      collect(document.positions, (row) => preparePosition(row, document, issue)),
+      collect(document.positions, (row) =>
+        preparePosition(row, document, issue),
+      ),
     ),
-    balances: keepFirstBalancePerAccountDate(
-      preparedBalances,
-      () => {
-        rejectedRows += 1;
-      },
-    ),
+    balances: keepFirstBalancePerAccountDate(preparedBalances, () => {
+      rejectedRows += 1;
+    }),
     liabilities: dedupeCandidateRows(
       "liabilities",
       collect(document.liabilities, (row) =>
@@ -472,16 +475,26 @@ function projectionDigest(
   const tables = TABLES.map((table) => [
     table,
     domain === "old"
-      ? sortedRows(
-          (projection as StoredHoldingProjection)[table],
-          (row) => [row.id, row.rowHash, row.sourceLocator, row.semantic],
-        ).map((row) => [row.id, row.rowHash, row.sourceLocator, row.semantic])
-      : sortedRows(
-          (projection as CandidateHoldingProjection)[table],
-          (row) => [row.rowHash, row.sourceLocator, row.semantic],
-        ).map((row) => [row.rowHash, row.sourceLocator, row.semantic]),
+      ? sortedRows((projection as StoredHoldingProjection)[table], (row) => [
+          row.id,
+          row.rowHash,
+          row.sourceLocator,
+          row.semantic,
+        ]).map((row) => [row.id, row.rowHash, row.sourceLocator, row.semantic])
+      : sortedRows((projection as CandidateHoldingProjection)[table], (row) => [
+          row.rowHash,
+          row.sourceLocator,
+          row.semantic,
+        ]).map((row) => [row.rowHash, row.sourceLocator, row.semantic]),
   ]);
   return digest(`kith-finance-holding-correction-${domain}:v1`, tables);
+}
+
+/** Digest of a materialized current mirror, including its stable record ids. */
+export function holdingProjectionCurrentDigest(
+  projection: StoredHoldingProjection,
+): string {
+  return projectionDigest("old", projection);
 }
 
 function removeSemanticMatches(
@@ -590,12 +603,12 @@ function validateIdentity(documentId: string, retainedSha256: string): void {
   }
 }
 
-export function buildHoldingCorrectionCandidateManifest(input: {
+export function prepareHoldingCorrectionCandidate(input: {
   readonly documentId: string;
   readonly retainedSha256: string;
   readonly stored: StoredHoldingProjection;
   readonly candidate: ImportDocument;
-}): HoldingCorrectionCandidateManifest {
+}): PreparedHoldingCorrectionCandidate {
   validateIdentity(input.documentId, input.retainedSha256);
   if (
     input.candidate.retainedSha256 !== input.retainedSha256 ||
@@ -620,7 +633,9 @@ export function buildHoldingCorrectionCandidateManifest(input: {
   } as const;
   const completeness = {
     state:
-      input.candidate.parseNote || built.issueCount > 0 || built.rejectedRows > 0
+      input.candidate.parseNote ||
+      built.issueCount > 0 ||
+      built.rejectedRows > 0
         ? ("partial" as const)
         : ("unproven" as const),
     reasons: [...reasons].sort(),
@@ -637,13 +652,23 @@ export function buildHoldingCorrectionCandidateManifest(input: {
     tables,
     completeness,
   };
-  return {
+  const manifest = {
     ...withoutDigest,
     candidateDigest: digest(
       "kith-finance-holding-correction-manifest:v1",
       withoutDigest,
     ),
   };
+  return { manifest, projection: built.projection };
+}
+
+export function buildHoldingCorrectionCandidateManifest(input: {
+  readonly documentId: string;
+  readonly retainedSha256: string;
+  readonly stored: StoredHoldingProjection;
+  readonly candidate: ImportDocument;
+}): HoldingCorrectionCandidateManifest {
+  return prepareHoldingCorrectionCandidate(input).manifest;
 }
 
 export async function readStoredHoldingProjection(
@@ -654,27 +679,27 @@ export async function readStoredHoldingProjection(
   // currently queues overlapping query calls but deprecates that behavior,
   // and a candidate must not depend on an implicit client-side queue.
   const positions = await client.query<StoredPositionRow>(
-      `SELECT id, account_id, as_of::text AS as_of, instrument_id,
+    `SELECT id, account_id, as_of::text AS as_of, instrument_id,
               quantity::text, price::text, market_value::text, cost_basis::text,
               unrealized::text, currency, valuation_basis, valuation_note,
               source_locator, row_hash
          FROM positions WHERE source_document_id = $1 ORDER BY id`,
-      [documentId],
-    );
+    [documentId],
+  );
   const balances = await client.query<StoredBalanceRow>(
-      `SELECT id, account_id, as_of::text AS as_of, total_value::text, cash::text,
+    `SELECT id, account_id, as_of::text AS as_of, total_value::text, cash::text,
               currency, period_start_value::text, period_end_value::text,
               source_locator, row_hash
          FROM balances WHERE source_document_id = $1 ORDER BY id`,
-      [documentId],
-    );
+    [documentId],
+  );
   const liabilities = await client.query<StoredLiabilityRow>(
-      `SELECT id, institution_id, account_id, kind, display_name, balance::text,
+    `SELECT id, institution_id, account_id, kind, display_name, balance::text,
               currency, rate::text, as_of::text AS as_of, collateral_note,
               source_locator, row_hash
          FROM liabilities WHERE source_document_id = $1 ORDER BY id`,
-      [documentId],
-    );
+    [documentId],
+  );
   return {
     positions: positions.rows.map((row) => ({
       id: row.id,
@@ -744,11 +769,7 @@ export async function assertCandidateHashesOwnedByDocument(
         WHERE row_hash = ANY($1::text[])`,
       [hashes],
     );
-    if (
-      found.rows.some(
-        (row) => row.source_document_id !== documentId,
-      )
-    ) {
+    if (found.rows.some((row) => row.source_document_id !== documentId)) {
       fail(`${table} candidate row hash is owned by another document`);
     }
   }

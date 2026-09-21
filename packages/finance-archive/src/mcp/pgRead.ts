@@ -2939,11 +2939,36 @@ async function aggregateMoney(
  * field name that column fills. Frozen and keyed by the id prefix this
  * surface itself mints: nothing a caller sends reaches the SQL below. */
 const RECORD_TABLES: Readonly<
-  Record<string, { table: string; money: string; field: string } | undefined>
+  Record<
+    string,
+    | {
+        table: string;
+        money: string;
+        field: string;
+        historyKind?: "position" | "balance" | "liability";
+      }
+    | undefined
+  >
 > = Object.freeze({
   txn: { table: "transactions", money: "amount", field: "amount" },
-  pos: { table: "positions", money: "market_value", field: "marketValue" },
-  bal: { table: "balances", money: "total_value", field: "totalValue" },
+  pos: {
+    table: "positions",
+    money: "market_value",
+    field: "marketValue",
+    historyKind: "position",
+  },
+  bal: {
+    table: "balances",
+    money: "total_value",
+    field: "totalValue",
+    historyKind: "balance",
+  },
+  liab: {
+    table: "liabilities",
+    money: "balance",
+    field: "balance",
+    historyKind: "liability",
+  },
 });
 
 async function getEvidence(
@@ -2962,7 +2987,8 @@ async function getEvidence(
     // archive has never heard of is a coverage gap, not a citation-free row.
     scope.withheld.add("source_gap");
   } else {
-    const found = await client.query<
+    const liability = record.table === "liabilities";
+    let found = await client.query<
       EvidenceRow & {
         quantity?: string | null;
         price?: string | null;
@@ -2975,12 +3001,35 @@ async function getEvidence(
               r.source_document_id, r.source_locator,
               ${EVIDENCE_COLUMNS}
          FROM ${record.table} r
-         JOIN accounts a ON a.id = r.account_id
-         JOIN institutions i ON i.id = a.institution_id
+         ${liability ? "LEFT JOIN" : "JOIN"} accounts a ON a.id = r.account_id
+         JOIN institutions i ON i.id = ${liability ? "coalesce(a.institution_id, r.institution_id)" : "a.institution_id"}
          LEFT JOIN documents d ON d.id = r.source_document_id
         WHERE r.id = $1`,
       [id],
     );
+    if (found.rows.length === 0 && record.historyKind !== undefined) {
+      found = await client.query<
+        EvidenceRow & {
+          quantity?: string | null;
+          price?: string | null;
+          cost_basis?: string | null;
+          unrealized?: string | null;
+        }
+      >(
+        `SELECT r.${record.historyKind === "liability" ? "liability_balance" : record.money} AS money,
+                r.currency,
+                ${record.historyKind === "position" ? "r.quantity, r.price, r.cost_basis, r.unrealized," : ""}
+                r.source_document_id, r.source_locator,
+                ${EVIDENCE_COLUMNS}
+           FROM holding_projection_assertions r
+           ${record.historyKind === "liability" ? "LEFT JOIN" : "JOIN"} accounts a ON a.id = r.account_id
+           JOIN institutions i ON i.id = ${record.historyKind === "liability" ? "coalesce(a.institution_id, r.institution_id)" : "a.institution_id"}
+           LEFT JOIN documents d ON d.id = r.source_document_id
+          WHERE r.assertion_kind = $2 AND r.record_id = $1
+            AND d.retained_sha256 = r.retained_sha256`,
+        [id, record.historyKind],
+      );
+    }
     const row = found.rows[0];
     const fields =
       record.table === "positions"

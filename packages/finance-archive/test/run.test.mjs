@@ -2653,6 +2653,101 @@ test(
 );
 
 test(
+  "reparse exact selectors process only the bound retained document and refuse a revision mismatch",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-reparse-exact-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, brokenAdapterModulePath, sessionModulePath } =
+      writeReparseAdapterFixtures(t);
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        accountId: ACCOUNT.id,
+        docType: "statement",
+        docDate: null,
+        selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q1" },
+      },
+      {
+        accountId: ACCOUNT.id,
+        docType: "statement",
+        docDate: null,
+        selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q2" },
+      },
+    ]);
+    makeRunner({
+      adapterModulePath: brokenAdapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    })();
+
+    const documents = await all(
+      client,
+      `SELECT id, provider_document_id, retained_sha256, parsed_ok
+         FROM documents ORDER BY provider_document_id`,
+    );
+    assert.equal(documents.length, 2);
+    assert.equal(documents[0].parsed_ok, false);
+    assert.equal(documents[1].parsed_ok, false);
+    const target = documents.find(
+      (document) => document.provider_document_id === "doc-stmt-2025-q1",
+    );
+    const untouched = documents.find(
+      (document) => document.provider_document_id === "doc-stmt-2025-q2",
+    );
+    assert.ok(target);
+    assert.ok(untouched);
+
+    const runReparse = makeReparseRunner({ adapterModulePath, schema, rawDir });
+    const output = runReparse([
+      "--document-id",
+      target.id,
+      "--retained-sha256",
+      target.retained_sha256,
+    ]);
+    assert.match(output, /documents considered: 1/);
+    assert.match(output, /documents reparsed: 1/);
+    assert.equal(
+      (
+        await all(client, "SELECT parsed_ok FROM documents WHERE id = $1", [
+          target.id,
+        ])
+      )[0].parsed_ok,
+      true,
+    );
+    assert.equal(
+      (
+        await all(client, "SELECT parsed_ok FROM documents WHERE id = $1", [
+          untouched.id,
+        ])
+      )[0].parsed_ok,
+      false,
+    );
+
+    assert.throws(
+      () =>
+        runReparse([
+          "--document-id",
+          target.id,
+          "--retained-sha256",
+          "f".repeat(64),
+        ]),
+      (error) => {
+        assert.match(
+          String(error.stderr),
+          /no current retained document matches the exact document id and retained sha256/,
+        );
+        return true;
+      },
+    );
+  },
+);
+
+test(
   "F1-66: an import stores the retained text in the archive beside the raw tree file, and a reparse of the same document rewrites neither",
   { skip },
   async (t) => {

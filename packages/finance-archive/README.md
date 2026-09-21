@@ -836,9 +836,33 @@ that all three holding tables were extracted completely. A missing
 `partial` when parsing or row preparation reported a gap and otherwise
 `unproven`; `removalsAuthorized` is always false. In particular, a zero-row
 candidate or a reported removal is an observation for review, never an
-instruction to delete. A later generation/activation contract must add
-positive completeness evidence and compare the reviewed candidate digest
-before it can replace any current row.
+instruction to delete.
+
+After separately proving completeness, prepare a private
+`holding_projection_approval_v1` that binds the manifest's document, retained
+SHA-256, active generation and every digest, with explicit removal and empty
+projection authority. Publish it through the same retained-byte/parser/mapping
+path:
+
+```sh
+node dist/run.js holding-correction-publish \
+  --adapter <module path> \
+  --document-id <documents.id> \
+  --retained-sha256 <documents.retained_sha256> \
+  --approval <private approval JSON path>
+```
+
+The publisher atomically replaces the document-owned current positions,
+balances and liabilities while retaining immutable typed generation history.
+It does not set `parsed_ok` or close parser findings. Finalize through an exact
+authoritative replay without walking the rest of the corpus:
+
+```sh
+node dist/run.js reparse \
+  --adapter <module path> \
+  --document-id <documents.id> \
+  --retained-sha256 <documents.retained_sha256>
+```
 
 `scripts/nullNonCashAmounts.mjs` is what applies it. It reads the taxonomy off
 the adapter rather than naming activity types, so it cannot drift from the

@@ -58,7 +58,8 @@
 // adapter's `parse()` over documents this or an earlier run already
 // acquired and retained, with no browser and no network at all:
 //
-//   node dist/run.js reparse --adapter <module path> [--only-unparsed] [--now <iso instant>]
+//   node dist/run.js reparse --adapter <module path> [--only-unparsed]
+//     [--document-id <id> --retained-sha256 <sha256>] [--now <iso instant>]
 //
 // It exists for exactly one situation: the extractor a document was first
 // parsed with had a defect (F1-55's PDF routing bug is the first case), the
@@ -138,6 +139,10 @@ import {
   readStoredHoldingProjection,
   type HoldingCorrectionCandidateManifest,
 } from "./holdingCorrectionCandidate.js";
+import {
+  publishHoldingProjectionReplacement,
+  type HoldingProjectionApproval,
+} from "./holdingProjectionPublisher.js";
 import {
   closeArchiveClient,
   createArchiveClient,
@@ -1271,6 +1276,182 @@ async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<v
   console.log(JSON.stringify(manifest));
 }
 
+/**
+ * Rebuilds the exact reviewed candidate through the same retained-byte,
+ * parser and mapping path as the rollback-only manifest command, then hands
+ * it to the atomic generation publisher. The approval file is deliberately
+ * external to the repository and its path/content are never printed.
+ */
+async function runHoldingCorrectionPublish(
+  args: readonly string[],
+): Promise<void> {
+  const { values } = parseArgs({
+    args: [...args],
+    options: {
+      adapter: { type: "string" },
+      "document-id": { type: "string" },
+      "retained-sha256": { type: "string" },
+      approval: { type: "string" },
+    },
+  });
+  if (!values.adapter) throw new Error("--adapter <module path> is required");
+  if (!values["document-id"]) throw new Error("--document-id <id> is required");
+  if (!values["retained-sha256"]) {
+    throw new Error("--retained-sha256 <sha256> is required");
+  }
+  if (!/^[0-9a-f]{64}$/.test(values["retained-sha256"])) {
+    throw new Error("--retained-sha256 must be a lowercase sha256");
+  }
+  if (!values.approval)
+    throw new Error("--approval <private-json-path> is required");
+
+  let approval: HoldingProjectionApproval;
+  try {
+    approval = JSON.parse(
+      readFileSync(resolve(values.approval), "utf8"),
+    ) as HoldingProjectionApproval;
+  } catch {
+    throw new Error("holding correction publish failed: approval_open");
+  }
+
+  const adapter = await loadAdapter(values.adapter);
+  const rawTreeRoot = resolveRawTreeRoot();
+  const pgClient = createArchiveClient();
+  await pgClient.connect();
+  const capabilities = adapter.capabilities();
+  const loadAccountsByExternalKey = accountsByExternalKeyLoader(() => pgClient);
+  try {
+    const publication = await withArchiveTransaction(pgClient, async (tx) => {
+      await lockArchiveForWrite(tx);
+      const documents = await selectRetainedDocuments(tx, {
+        documentId: values["document-id"],
+        retainedSha256: values["retained-sha256"],
+      });
+      if (documents.length !== 1) {
+        throw new Error(
+          "no current retained document matches the exact document id and retained sha256",
+        );
+      }
+      const doc = documents[0]!;
+      if (doc.sha256 !== doc.retained_sha256) {
+        throw new Error(
+          "holding correction publication requires a single-file document revision",
+        );
+      }
+      const opened = await runBoundedHoldingCandidateStage(
+        "retained_document_open",
+        () => openRetainedDocument(rawTreeRoot, doc),
+      );
+      if (opened === null) {
+        throw new Error(
+          "holding correction publication requires a document-tier capture",
+        );
+      }
+      if (
+        opened.manifest.documentSha256 !== doc.retained_sha256 ||
+        opened.manifest.sourceId !== doc.institution_id ||
+        opened.manifest.docType !== doc.doc_type
+      ) {
+        throw new Error(
+          "capture manifest does not match the selected document revision",
+        );
+      }
+      const parsed = await runBoundedHoldingCandidateStage(
+        "adapter_parse",
+        () =>
+          adapter.parse({
+            kind: opened.manifest.capabilityTier,
+            bytes: opened.bytes,
+          }),
+      );
+      const accountsByExternalKey = await loadAccountsByExternalKey(
+        doc.institution_id,
+      );
+      const pull: AdapterPull = {
+        institutionId: doc.institution_id,
+        accountId: doc.account_id,
+        acquired: {
+          bytes: opened.bytes,
+          retention: opened.manifest.retention,
+          manifest: {
+            kind: opened.manifest.capabilityTier,
+            periodStart: opened.manifest.periodStart,
+            periodEnd: opened.manifest.periodEnd,
+            capturedAt: opened.manifest.capturedAt,
+            contentHash: doc.retained_sha256,
+            mediaType: doc.media_type as RetainedMediaType,
+            reportedRowCount: null,
+            gaps: opened.manifest.gaps,
+          },
+        },
+        rows: parsed.activity,
+        holdings: parsed.holdings,
+        parseNote: parsed.parseNote,
+        docType: doc.doc_type,
+        docDate: doc.doc_date,
+        persisted: {
+          filePath: doc.file_path,
+          textPath: null,
+          captureId: doc.capture_id,
+          capturePath: opened.capturePath,
+          documentWrite: {
+            path: rawDocumentPath(rawTreeRoot, doc.retained_sha256),
+            sha256: doc.retained_sha256,
+            status: "already_exists",
+          },
+          textWrite: null,
+          captureWrite: {
+            path: opened.capturePath,
+            status: "already_exists",
+            manifestSha256: opened.captureSha256,
+          },
+        },
+        activityTaxonomy: capabilities.activityTaxonomy,
+        accountsByExternalKey,
+      };
+
+      await tx.query("SAVEPOINT holding_correction_publish_mapping");
+      const candidates = await runBoundedHoldingCandidateStage(
+        "adapter_mapping",
+        () => adapterPullToImportDocuments(tx, pull),
+      );
+      if (candidates.length !== 1) {
+        throw new Error(
+          "exact retained document did not produce one candidate document",
+        );
+      }
+      const candidate = candidates[0]!;
+      await tx.query(
+        "ROLLBACK TO SAVEPOINT holding_correction_publish_mapping",
+      );
+      await tx.query("RELEASE SAVEPOINT holding_correction_publish_mapping");
+
+      const holdingInstrumentIds = [
+        ...new Set(
+          (candidate.positions ?? [])
+            .map((position) => position.instrumentId)
+            .filter((id): id is string => id !== null),
+        ),
+      ];
+      if (holdingInstrumentIds.length > 0) {
+        const existing = await tx.query<{ id: string }>(
+          "SELECT id FROM instruments WHERE id = ANY($1::text[])",
+          [holdingInstrumentIds],
+        );
+        if (existing.rows.length !== holdingInstrumentIds.length) {
+          throw new Error(
+            "candidate requires an unreviewed instrument identity",
+          );
+        }
+      }
+      return publishHoldingProjectionReplacement(tx, { candidate, approval });
+    });
+    console.log(JSON.stringify(publication));
+  } finally {
+    await closeArchiveClient(pgClient);
+  }
+}
+
 type OpenedDocument = {
   readonly manifest: CaptureManifest;
   readonly capturePath: string;
@@ -1329,10 +1510,22 @@ async function runReparse(args: readonly string[]): Promise<void> {
     options: {
       adapter: { type: "string" },
       "only-unparsed": { type: "boolean", default: false },
+      "document-id": { type: "string" },
+      "retained-sha256": { type: "string" },
       now: { type: "string" },
     },
   });
   if (!values.adapter) throw new Error("--adapter <module path> is required");
+  const documentId = values["document-id"];
+  const retainedSha256 = values["retained-sha256"];
+  if ((documentId === undefined) !== (retainedSha256 === undefined)) {
+    throw new Error(
+      "--document-id and --retained-sha256 must be supplied together",
+    );
+  }
+  if (retainedSha256 !== undefined && !/^[0-9a-f]{64}$/.test(retainedSha256)) {
+    throw new Error("--retained-sha256 must be a lowercase sha256");
+  }
   const now = values.now ? new Date(values.now) : new Date();
   if (Number.isNaN(now.getTime())) {
     throw new Error(`--now ${values.now} is not a valid date`);
@@ -1375,7 +1568,16 @@ async function runReparse(args: readonly string[]): Promise<void> {
   };
 
   try {
-    const documents = await selectRetainedDocuments(pgClient, { onlyUnparsed });
+    const documents = await selectRetainedDocuments(pgClient, {
+      onlyUnparsed,
+      documentId,
+      retainedSha256,
+    });
+    if (documentId !== undefined && documents.length !== 1) {
+      throw new Error(
+        "no current retained document matches the exact document id and retained sha256",
+      );
+    }
     outcome.documentsConsidered = documents.length;
 
     for (const doc of documents) {
@@ -2284,6 +2486,9 @@ function printDocumentKindPreview(
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
+  if (argv[0] === "holding-correction-publish") {
+    return runHoldingCorrectionPublish(argv.slice(1));
+  }
   if (argv[0] === "holding-correction-candidate") {
     return runHoldingCorrectionCandidate(argv.slice(1));
   }

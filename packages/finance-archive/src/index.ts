@@ -124,6 +124,12 @@ export {
   pgSchemaVersion,
 } from "./pgSchema.js";
 export {
+  holdingProjectionApprovalDigest,
+  publishHoldingProjectionReplacement,
+  type HoldingProjectionApproval,
+  type HoldingProjectionPublication,
+} from "./holdingProjectionPublisher.js";
+export {
   ARCHIVE_TYPES,
   ARCHIVE_WRITE_LOCK_KEY,
   archiveDatabaseUrl,

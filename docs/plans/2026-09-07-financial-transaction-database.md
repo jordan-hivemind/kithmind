@@ -468,6 +468,26 @@ not encode a positive, complete, zero-position observation for every
 account/date, and this read rule does not claim that it does. Parser replay and
 source-projection replacement are separate importer concerns.
 
+Reviewed source-projection replacement keeps immutable generations and full
+typed assertions for positions, balances and liabilities while atomically
+maintaining the existing current tables. An approval binds the exact document,
+retained SHA-256, active generation, old and candidate projection digests,
+candidate manifest digest, explicit removal and empty-projection authority,
+reviewer and time. Changed assertions receive new record ids; unchanged ids are
+retained only when their semantic values, locator and provenance all match.
+Historical evidence resolves through the retained assertion after checking its
+retained SHA-256 against the document. Exact authoritative replay then validates
+both activity and the active reviewed holding projection before restoring
+`parsed_ok` or resolving system-owned parser findings.
+
+Migration 14 adds `holding_projection_generations`,
+`holding_projection_assertions` and
+`holding_projection_generation_memberships`. Existing production reader roles
+use `NO_DEFAULT_SELECT`, so rollout applies the migration as the archive owner,
+then grants the existing finance reader `SELECT` on those three tables without
+rotating its password. Historical position, balance and liability evidence is
+verified through the reader credential before any correction is activated.
+
 Coverage is reported at the same granularity as the record contract requires,
 so the later Kith Mind adapter wraps this surface rather than re-deriving it.
 

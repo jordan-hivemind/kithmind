@@ -36,6 +36,11 @@ import { randomUUID } from "node:crypto";
 
 import { multiplyDecimal } from "./decimal.js";
 import {
+  assertCandidateHashesOwnedByDocument,
+  prepareHoldingCorrectionCandidate,
+  readStoredHoldingProjection,
+} from "./holdingCorrectionCandidate.js";
+import {
   emptyInstrumentMatchSummary,
   INSTITUTION_SYMBOL_INVALIDATED,
   INSTITUTION_SYMBOL_RULE,
@@ -1266,7 +1271,7 @@ export async function importBatch(
     if (accepted) institutionSymbolReviews.push(candidate);
     else weakInstrumentReviews.push(candidate);
 
-    const key = `${item.kind} ${weakInstrumentKey(
+    const key = `${item.kind}\u0000${weakInstrumentKey(
       candidate.institutionId,
       candidate.rawValue,
       candidate.matchedInstrumentId,
@@ -2375,11 +2380,23 @@ export async function importBatch(
         );
       }
 
-      const found = await client.query<{ id: string; parsed_ok: boolean }>(
-        "SELECT id, parsed_ok FROM documents WHERE sha256 = $1",
+      const found = await client.query<{
+        id: string;
+        parsed_ok: boolean;
+        active_holding_projection_generation_id: string | null;
+      }>(
+        `SELECT id, parsed_ok, active_holding_projection_generation_id
+           FROM documents WHERE sha256 = $1`,
         [document.sha256],
       );
       const existing = found.rows[0];
+      const versionedGenerationId =
+        existing?.active_holding_projection_generation_id ?? null;
+      if (versionedGenerationId !== null && !options.authoritativeReparse) {
+        throw new Error(
+          "document has versioned holdings; use an authoritative exact replay",
+        );
+      }
       if (
         existing !== undefined &&
         existing.parsed_ok === true &&
@@ -2611,9 +2628,60 @@ export async function importBatch(
       // ImportPosition.accountId's doc comment. See `processHoldings` above,
       // shared with the already-`parsed_ok` reparse path.
       let projectionSafe = true;
-      const holdings = await processHoldings(document, documentId);
-      if (holdings.anySuccess) anySuccess = true;
-      projectionSafe = holdings.projectionSafe;
+      if (versionedGenerationId !== null) {
+        const stored = await readStoredHoldingProjection(client, documentId);
+        const prepared = prepareHoldingCorrectionCandidate({
+          documentId,
+          retainedSha256: document.retainedSha256 ?? "",
+          stored,
+          candidate: document,
+        });
+        const active = await client.query<{
+          retained_sha256: string;
+          projection_digest: string;
+          candidate_projection_digest: string | null;
+        }>(
+          `SELECT retained_sha256, projection_digest, candidate_projection_digest
+             FROM holding_projection_generations
+            WHERE document_id = $1 AND id = $2`,
+          [documentId, versionedGenerationId],
+        );
+        projectionSafe =
+          prepared.manifest.completeness.state === "unproven" &&
+          active.rows[0]?.retained_sha256 === document.retainedSha256 &&
+          active.rows[0]?.projection_digest ===
+            prepared.manifest.oldProjectionDigest &&
+          active.rows[0]?.candidate_projection_digest ===
+            prepared.manifest.candidateProjectionDigest;
+        if (projectionSafe) {
+          await assertCandidateHashesOwnedByDocument(
+            client,
+            documentId,
+            document,
+          );
+          anySuccess =
+            anySuccess ||
+            prepared.projection.positions.length > 0 ||
+            prepared.projection.balances.length > 0 ||
+            prepared.projection.liabilities.length > 0;
+        } else {
+          await reopenSystemResolvedReview(
+            documentId,
+            "reparse_projection_mismatch",
+            "holdings",
+          );
+          openReview(document.accountId, documentId, null, {
+            kind: "reparse_projection_mismatch",
+            rawValue: "holdings",
+            reason:
+              "authoritative replay did not exactly restate this document's active reviewed holding projection; current holdings and history were preserved and the document remains partial",
+          });
+        }
+      } else {
+        const holdings = await processHoldings(document, documentId);
+        if (holdings.anySuccess) anySuccess = true;
+        projectionSafe = holdings.projectionSafe;
+      }
 
       if (options.authoritativeReparse && projectionSafe) {
         const resolved = await client.query(
@@ -2684,11 +2752,24 @@ export async function importBatch(
       // matched; a document that landed some things and sent others to
       // review is TRUE, and the whole-document skip above is safe to take
       // next time (see that branch's comment).
+      const versionedOpenGaps =
+        versionedGenerationId === null
+          ? false
+          : (
+              await client.query<{ present: boolean }>(
+                `SELECT EXISTS (
+                   SELECT 1 FROM review_items
+                    WHERE source_document_id = $1 AND status = 'open'
+                 ) AS present`,
+                [documentId],
+              )
+            ).rows[0]?.present === true;
       const parsedOk =
         !document.parseNote &&
         anySuccess &&
         activityProjectionSafe &&
-        projectionSafe;
+        projectionSafe &&
+        !versionedOpenGaps;
       await client.query("UPDATE documents SET parsed_ok = $2 WHERE id = $1", [
         documentId,
         parsedOk,
