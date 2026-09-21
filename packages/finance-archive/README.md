@@ -793,9 +793,15 @@ its locator, and newly grounded rows may be added only after the complete
 three-table comparison passes. A later safe authoritative projection resolves
 the open mismatch item without changing dismissed or previously resolved
 history. Existing source-owned activity is never replayed merely because a
-holdings mismatch changed `parsed_ok` to false. This is conservative because
-the current schema has no membership table that could prove a globally
-deduplicated holding also belongs to a second source document.
+holdings mismatch changed `parsed_ok` to false. Instead, authoritative activity
+uses the same full-projection rule: every source-owned row must be restated,
+and an addition is published only when neither its provider identity nor its
+content hash belongs to conflicting semantics or another document. Activity or
+holdings mismatches resolved by a safe reparse reopen if the same system-owned
+finding recurs; repeated failures remain one open item, and human dismissals or
+resolutions remain closed. This is conservative because the current schema has
+no membership table that could prove a globally deduplicated holding also
+belongs to a second source document.
 
 `scripts/nullNonCashAmounts.mjs` is what applies it. It reads the taxonomy off
 the adapter rather than naming activity types, so it cannot drift from the

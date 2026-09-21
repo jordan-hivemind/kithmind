@@ -1242,6 +1242,95 @@ test(
     assert.equal(repeat.rowsInserted, 0);
     assert.equal(repeat.reviewItemsResolved, 0);
     assert.equal(await count(client, "positions"), 2);
+
+    const regressed = await authoritativeReparse(client, {
+      ...original,
+      positions: [
+        position({ instrumentId: "inst_original", marketValueText: "120" }),
+      ],
+    });
+    assert.equal(
+      regressed.reviewItemsUpdated,
+      1,
+      "system-resolved finding reopens",
+    );
+    const [reopened] = await all(
+      client,
+      `SELECT status, resolved_at, resolution_note FROM review_items
+        WHERE kind = 'reparse_projection_mismatch'`,
+    );
+    assert.equal(reopened.status, "open");
+    assert.ok(
+      reopened.resolved_at,
+      "prior recovery timestamp remains auditable",
+    );
+    assert.match(reopened.resolution_note, /authoritative holdings projection/);
+    const repeatedRegression = await authoritativeReparse(client, {
+      ...original,
+      positions: [
+        position({ instrumentId: "inst_original", marketValueText: "120" }),
+      ],
+    });
+    assert.equal(repeatedRegression.reviewItemsUpdated, 0);
+    assert.equal(
+      await count(
+        client,
+        "review_items",
+        "WHERE kind = 'reparse_projection_mismatch'",
+      ),
+      1,
+    );
+  },
+);
+
+test(
+  "authoritative reparse imports recovered activity before claiming completeness",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const first = row({
+      description: "Synthetic first activity",
+      sourceLocator: "row:1",
+    });
+    const recovered = row({
+      description: "Synthetic recovered activity",
+      amountText: "-7.25",
+      sourceLocator: "row:2",
+    });
+    const partial = document("ae".padEnd(64, "0"), [first], {
+      parseNote: "synthetic activity table was truncated",
+    });
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [partial] },
+      NOW,
+    );
+
+    const summary = await authoritativeReparse(client, {
+      ...partial,
+      rows: [first, recovered],
+      providerReportedCount: 2,
+      parseNote: null,
+    });
+    assert.equal(summary.rowsInserted, 1);
+    assert.equal(await count(client, "transactions"), 2);
+    assert.equal(
+      (
+        await one(client, "SELECT parsed_ok FROM documents WHERE sha256 = $1", [
+          partial.sha256,
+        ])
+      ).parsed_ok,
+      true,
+    );
+    assert.equal(
+      await count(
+        client,
+        "review_items",
+        "WHERE kind = 'document_unparsed' AND status = 'open'",
+      ),
+      0,
+    );
   },
 );
 
@@ -1317,6 +1406,71 @@ test(
         "WHERE kind = 'reparse_projection_mismatch'",
       ),
       0,
+    );
+  },
+);
+
+test(
+  "same holding identity with conflicting non-hash semantics fails every table closed",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const balance = {
+      asOf: "2026-03-31",
+      totalValueText: "10000",
+      totalValueNote: null,
+      cash: "500",
+      currency: "USD",
+      periodStartValue: "9500",
+      periodEndValue: "10000",
+      sourceLocator: "holdings:balance",
+    };
+    const liability = {
+      kind: "margin_loan",
+      displayName: "Synthetic margin balance",
+      balanceText: "2000",
+      balanceNote: null,
+      currency: "USD",
+      rate: "4.5",
+      asOf: "2026-03-31",
+      collateralNote: "Synthetic collateral note.",
+      sourceLocator: "holdings:liability",
+    };
+    const originalPosition = position();
+    const original = document("af".padEnd(64, "0"), [], {
+      positions: [originalPosition],
+      balances: [balance],
+      liabilities: [liability],
+    });
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [original] },
+      NOW,
+    );
+
+    await authoritativeReparse(client, {
+      ...original,
+      positions: [originalPosition, { ...originalPosition, price: "11" }],
+      balances: [balance, { ...balance, periodStartValue: "9400" }],
+      liabilities: [liability, { ...liability, rate: "4.75" }],
+    });
+
+    assert.equal(await count(client, "positions"), 1);
+    assert.equal(await count(client, "balances"), 1);
+    assert.equal(await count(client, "liabilities"), 1);
+    const [review] = await all(
+      client,
+      "SELECT raw_value FROM review_items WHERE kind = 'reparse_projection_mismatch'",
+    );
+    assert.equal(review.raw_value, "positions,balances,liabilities");
+    assert.equal(
+      (
+        await one(client, "SELECT parsed_ok FROM documents WHERE sha256 = $1", [
+          original.sha256,
+        ])
+      ).parsed_ok,
+      false,
     );
   },
 );
