@@ -26,7 +26,7 @@ import {
 
 import { collapseDuplicateDocuments } from "../scripts/collapseDuplicateDocuments.mjs";
 
-import { all, archive, count, skip } from "./helpers/pgArchive.mjs";
+import { all, archive, count, one, skip } from "./helpers/pgArchive.mjs";
 
 const INSTITUTION_ID = "inst_collapse";
 const ACCOUNT_ID = "acct_collapse";
@@ -521,6 +521,56 @@ test(
     );
     assert.equal(await count(client, "holding_projection_generations"), 1);
     assert.equal(await count(client, "holding_projection_assertions"), 1);
+  },
+);
+
+test(
+  "refuses a selected duplicate group that owns immutable position scope history",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    const root = rawTree(t);
+    await seed(client);
+
+    await writeCapture(client, root, {
+      id: "doc-scope-a",
+      rendering: "first",
+      capturedAt: "2026-04-01T10:00:00.000Z",
+    });
+    await writeCapture(client, root, {
+      id: "doc-scope-b",
+      rendering: "second",
+      capturedAt: "2026-04-02T10:00:00.000Z",
+    });
+    const revision = await one(
+      client,
+      "SELECT retained_sha256 FROM documents WHERE id = 'doc-scope-a'",
+    );
+    await client.query(
+      `INSERT INTO position_scope_observations
+         (id, source_document_id, retained_sha256, account_id, as_of,
+          proof_version, status, emitted_position_count, gap_codes,
+          zero_basis, evidence, created_at)
+       VALUES ('collapse-scope-proof', 'doc-scope-a', $1, $2,
+               DATE '2026-03-31', 'position_scope_v1', 'complete', 0,
+               '{}', 'source_stated_none',
+               '{"tables":[],"explicitNone":{"source":"synthetic","index":1}}',
+               now())`,
+      [revision.retained_sha256, ACCOUNT_ID],
+    );
+
+    await assert.rejects(
+      collapseDuplicateDocuments(client, { rawTreeRoot: root }),
+      /owns immutable holding projection history or position scope history/,
+    );
+    assert.deepEqual(
+      await all(client, "SELECT id, superseded_by FROM documents ORDER BY id"),
+      [
+        { id: "doc-scope-a", superseded_by: null },
+        { id: "doc-scope-b", superseded_by: null },
+      ],
+    );
+    assert.equal(await count(client, "position_scope_observations"), 1);
   },
 );
 

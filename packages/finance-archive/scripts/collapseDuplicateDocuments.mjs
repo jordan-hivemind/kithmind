@@ -129,6 +129,7 @@ const DOCUMENT_REFERENCES = [
 const PROTECTED_DOCUMENT_REFERENCES = [
   { table: "holding_projection_generations", column: "document_id" },
   { table: "holding_projection_assertions", column: "source_document_id" },
+  { table: "position_scope_observations", column: "source_document_id" },
 ];
 
 /** `documents.superseded_by` is this script's own output, not something it
@@ -387,11 +388,16 @@ export async function collapseDuplicateDocuments(
           WHERE h.source_document_id IN (
             SELECT duplicate_id FROM collapse_map
             UNION SELECT canonical_id FROM collapse_map)
+         UNION ALL
+         SELECT 1 FROM position_scope_observations h
+          WHERE h.source_document_id IN (
+            SELECT duplicate_id FROM collapse_map
+            UNION SELECT canonical_id FROM collapse_map)
        ) AS present`,
     );
     if (protectedReference.rows[0]?.present === true) {
       throw new Error(
-        "cannot collapse a selected document group that owns immutable holding projection history",
+        "cannot collapse a selected document group that owns immutable holding projection history or position scope history",
       );
     }
 

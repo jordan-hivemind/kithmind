@@ -1936,6 +1936,10 @@ test(
         server.connect(serverTransport),
         client.connect(clientTransport),
       ]);
+      assert.deepEqual(client.getServerVersion(), {
+        name: "kith-finance-archive",
+        version: "2.0.2",
+      });
       const tools = await client.listTools();
       const financeRead = tools.tools.find(
         (tool) => tool.name === "finance_read",
