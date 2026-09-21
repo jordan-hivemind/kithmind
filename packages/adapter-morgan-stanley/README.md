@@ -509,11 +509,21 @@ The parser reads these security-block shapes:
   `Total` row. The block's rows are merged under the same agree-or-leave-null
   rule, and the CUSIP is read off the detail line.
 - A security with more lots than fit on a page runs past the page footer
-  (`Page N of M`) and continues on the next page under a reprint of the
-  identical table header, with the `Total` row among the continued rows. The
-  interrupted block is carried across to that reprint -- same header text,
-  same account -- rather than refused as a block with no `Total`. A block
-  nothing continues is flushed and read exactly as it was before.
+  (`Page N of M`) and continues on the next page under a reprint of the same
+  ordered semantic columns, with the `Total` row among the continued rows.
+  Column offsets may shift on the reprint; every row is bound against its own
+  page's header, so its retained-text evidence remains exact. The interrupted
+  block is carried only when the extracted pages are physically adjacent,
+  their printed page numbers are adjacent under one declared total, that
+  printed-page run has a positive `Page 1` or physical-page anchor, and the
+  account and semantic columns agree. An explicit change of asset-class
+  table title prevents joining even when the columns match, including titles
+  the parser has not encountered before. Unidentified successor rows cannot
+  become anonymous holdings when their prefix or continuation proof is missing.
+  This accepts an unnumbered cover page
+  but refuses missing, repeated, reordered, inconsistently numbered or
+  semantically changed continuations. A block without that proof is flushed
+  and read exactly as it was before.
 - A NAV-priced fund prints one row under a `Value` column instead of a
   `Market Value` one.
 
