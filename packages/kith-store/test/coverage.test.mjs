@@ -7,6 +7,7 @@ import {
   newKithId,
   withKithTransaction,
 } from "../dist/index.js";
+import { webPrincipal } from "../dist/identity/index.js";
 import { connect, skip, throwawayDatabase } from "./helpers/pgDatabase.mjs";
 
 const NOW = 1_800_000_000_000;
@@ -27,7 +28,11 @@ async function setup(t) {
     [spaceId, userId],
   );
   await client.query(
-    "INSERT INTO kith.source_accounts(id,space_id,created_at,enabled,freshness_ms) VALUES($1,$2,transaction_timestamp(),true,1000)",
+    "INSERT INTO kith.space_members(id,space_id,user_id,role) VALUES($1,$2,$3,'owner')",
+    [newKithId(), spaceId, userId],
+  );
+  await client.query(
+    "INSERT INTO kith.source_accounts(id,space_id,created_at,name,connector,account_id,enabled,freshness_ms) VALUES($1,$2,transaction_timestamp(),'Synthetic statements','filesystem','synthetic-account',true,1000)",
     [accountId, spaceId],
   );
   return { client, pool, userId, spaceId, accountId };
@@ -141,8 +146,15 @@ test(
     try {
       await corrupt.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
       await corrupt.query(
-        "INSERT INTO kith.coverage_gaps(id,space_id,created_at,source_account_id,record_type,entity_id,reason,detected_at,status) VALUES($1,$2,transaction_timestamp(),$3,'lab',$4,'private cross-space reason',$5,'open')",
-        [newKithId(), f.spaceId, f.accountId, foreignEntity, new Date(NOW)],
+        "INSERT INTO kith.coverage_gaps(id,space_id,created_at,source_account_id,record_type,entity_id,reason,detected_at,status,condition_key) VALUES($1,$2,transaction_timestamp(),$3,'lab',$4,'private cross-space reason',$5,'open',$6)",
+        [
+          newKithId(),
+          f.spaceId,
+          f.accountId,
+          foreignEntity,
+          new Date(NOW),
+          "synthetic-corrupt-cross-space",
+        ],
       );
       const hidden = await coverage.calculateCoverage(
         { client: corrupt, now: NOW },
@@ -155,7 +167,7 @@ test(
       corrupt.release();
     }
     await f.client.query(
-      "INSERT INTO kith.coverage_gaps(id,space_id,created_at,source_account_id,record_type,reason,detected_at,status) VALUES($1,$2,transaction_timestamp(),$3,'lab','',$4,'open')",
+      "INSERT INTO kith.coverage_gaps(id,space_id,created_at,source_account_id,record_type,reason,detected_at,status,condition_key) VALUES($1,$2,transaction_timestamp(),$3,'lab','',$4,'open','synthetic-corrupt-empty-reason')",
       [newKithId(), f.spaceId, f.accountId, new Date(NOW)],
     );
     let r = await tx(f, (c) => coverage.calculateCoverage(c, args(f)));
@@ -363,6 +375,171 @@ test(
       await corrupt.query("ROLLBACK");
       corrupt.release();
     }
+  },
+);
+
+test(
+  "gap detection is idempotent, resolution is audited, and recurrence reopens",
+  { skip },
+  async (t) => {
+    const f = await setup(t);
+    await complete(f);
+    const input = {
+      spaceId: f.spaceId,
+      sourceAccountId: f.accountId,
+      recordType: "statement",
+      from: NOW - 10_000,
+      to: NOW - 5_000,
+      reason: "missing_statement",
+      detectedAt: NOW,
+    };
+    const first = await tx(f, (ctx) => coverage.openCoverageGap(ctx, input));
+    assert.equal(
+      await tx(f, (ctx) =>
+        coverage.openCoverageGap(ctx, { ...input, detectedAt: NOW + 1 }),
+      ),
+      first,
+    );
+    assert.equal(
+      Number(
+        (
+          await f.client.query(
+            "SELECT count(*) n FROM kith.coverage_gaps WHERE status='open'",
+          )
+        ).rows[0].n,
+      ),
+      1,
+    );
+
+    await tx(f, (ctx) =>
+      coverage.resolveCoverageGap(ctx, {
+        spaceId: f.spaceId,
+        gapId: first,
+        resolvedAt: NOW + 2,
+        note: "Synthetic reconciliation cleared the condition",
+      }),
+    );
+    assert.deepEqual(
+      (
+        await f.client.query(
+          "SELECT actor_kind,actor_user_id,action,note FROM kith.coverage_gap_actions WHERE coverage_gap_id=$1",
+          [first],
+        )
+      ).rows,
+      [
+        {
+          actor_kind: "system",
+          actor_user_id: null,
+          action: "condition_cleared",
+          note: "Synthetic reconciliation cleared the condition",
+        },
+      ],
+    );
+
+    const recurrent = await tx(f, (ctx) =>
+      coverage.openCoverageGap(ctx, { ...input, detectedAt: NOW + 3 }),
+    );
+    assert.notEqual(recurrent, first);
+    assert.equal(
+      Number(
+        (
+          await f.client.query(
+            "SELECT count(*) n FROM kith.coverage_gaps WHERE status='open'",
+          )
+        ).rows[0].n,
+      ),
+      1,
+    );
+    const listed = await tx(f, (ctx) =>
+      coverage.listCoverageGaps(ctx, { principal: webPrincipal(f.userId) }),
+    );
+    assert.deepEqual(listed.items.map((item) => item.id), [recurrent]);
+    assert.equal(listed.items[0].sourceName, "Synthetic statements");
+  },
+);
+
+test(
+  "acknowledgement is authorized, audited, and leaves query coverage honest",
+  { skip },
+  async (t) => {
+    const f = await setup(t);
+    await complete(f);
+    const gapId = await tx(f, (ctx) =>
+      coverage.openCoverageGap(ctx, {
+        spaceId: f.spaceId,
+        sourceAccountId: f.accountId,
+        recordType: "lab",
+        from: 20,
+        to: 30,
+        reason: "source_gap",
+        detectedAt: NOW,
+      }),
+    );
+    const otherUserId = newKithId();
+    await f.client.query(
+      "INSERT INTO kith.users(id,created_at) VALUES($1,transaction_timestamp())",
+      [otherUserId],
+    );
+    await f.client.query(
+      "INSERT INTO kith.space_members(id,space_id,user_id,role) VALUES($1,$2,$3,'reader')",
+      [newKithId(), f.spaceId, otherUserId],
+    );
+    assert.deepEqual(
+      await tx(f, (ctx) =>
+        coverage.listCoverageGaps(ctx, {
+          principal: webPrincipal(otherUserId),
+        }),
+      ),
+      { items: [], overflow: false },
+    );
+    await assert.rejects(
+      tx(f, (ctx) =>
+        coverage.acknowledgeCoverageGap(ctx, {
+          principal: webPrincipal(otherUserId),
+          gapId,
+          action: "mark_unavailable",
+        }),
+      ),
+      /Coverage gap not found/,
+    );
+
+    const acknowledged = await tx(f, (ctx) =>
+      coverage.acknowledgeCoverageGap(ctx, {
+        principal: webPrincipal(f.userId),
+        gapId,
+        action: "mark_not_expected",
+        note: "This synthetic account starts later",
+      }),
+    );
+    assert.equal(acknowledged.changed, true);
+    assert.ok(acknowledged.actionId);
+    assert.deepEqual(
+      (
+        await f.client.query(
+          "SELECT actor_kind,actor_user_id,action,note FROM kith.coverage_gap_actions WHERE id=$1",
+          [acknowledged.actionId],
+        )
+      ).rows,
+      [
+        {
+          actor_kind: "user",
+          actor_user_id: f.userId,
+          action: "mark_not_expected",
+          note: "This synthetic account starts later",
+        },
+      ],
+    );
+    assert.equal(
+      (
+        await f.client.query(
+          "SELECT status FROM kith.coverage_gaps WHERE id=$1",
+          [gapId],
+        )
+      ).rows[0].status,
+      "resolved",
+    );
+    const after = await tx(f, (ctx) => coverage.calculateCoverage(ctx, args(f)));
+    assert.deepEqual(after.knownGaps, []);
   },
 );
 
