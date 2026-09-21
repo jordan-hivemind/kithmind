@@ -199,6 +199,23 @@ This approval does not apply to upstream or other contributors' deployments.
 - Use conventional commits (`feat:`, `fix:`, `docs:`, `tracker:`) with a body
   that explains why.
 
+## Owner storage policy
+
+On 2026-09-21 the owner explicitly confirmed that Dropbox is sufficient for
+files and Neon is sufficient for Postgres. Do not create, schedule or require
+separate file or database backups for this deployment. In particular, do not
+gate ingestion on restic snapshots, redundant encrypted copies, database dumps
+or a separate backup restore drill. This instruction supersedes older plans
+and handoffs requiring those operations. Do not optimize or restart that
+backup machinery as a substitute for removing the requirement.
+
+Preserve source identity, content hashes, citations, access controls and
+truthful source availability. Those checks do not authorize duplicate backup
+storage. Reuse the provider-backed original. Preserve existing copies and
+checkpoints while removing obsolete gates; deleting old backup data is a
+separate action. Do not reintroduce separate backups without a new explicit
+owner request.
+
 ## Archive writers
 
 Before an archive-root relocation, or a change to an archive writer’s runtime
