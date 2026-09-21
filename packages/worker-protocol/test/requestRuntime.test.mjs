@@ -500,6 +500,14 @@ test("existing provider original selection binds archive cardinality to its vers
     },
   };
   assert.deepEqual(parseWorkerRequest(selectedV1), selectedV1);
+  const explicitV1 = {
+    ...selectedV1,
+    existingProviderOriginal: {
+      ...selectedV1.existingProviderOriginal,
+      referenceVersion: "provider_original_v1",
+    },
+  };
+  assert.deepEqual(parseWorkerRequest(explicitV1), explicitV1);
 });
 
 test("provider original v2 detach acknowledgement is locator-free and closed", () => {
