@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import test from "node:test";
 
 import { digestParsedMappingManifest } from "@repo/worker-protocol";
@@ -3994,11 +3995,7 @@ test(
       assert.equal(
         (
           await call((ctx) =>
-            acknowledgeProviderOriginalDetach(
-              ctx,
-              f.principal,
-              detachRequest,
-            ),
+            acknowledgeProviderOriginalDetach(ctx, f.principal, detachRequest),
           )
         ).reused,
         true,
@@ -4040,6 +4037,375 @@ test(
           }),
         ),
         expectProtocolCode("scan_conflict"),
+      );
+    } finally {
+      await pool.end();
+    }
+  },
+);
+
+test(
+  "four archived-ready items complete full assessment proof within one transport budget",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const pool = createKithPool(f.databaseUrl, 2);
+    const call = (work) => withWorkerTransaction(pool, work, NOW);
+    const endpoint = await listenWorker(t, pool, NOW);
+    const transport = new HttpWorkerTransport(
+      { endpoint },
+      f.credential.rawKey,
+    );
+    const httpCall = (request) => transport.call(request);
+    const parserFingerprint = "1".repeat(64);
+    const extractionConfigurationFingerprint = "3".repeat(64);
+    const outputHash = "b".repeat(64);
+    const parsedTextHash = await sha256Hex("abcdefgh");
+    const page = {
+      ordinal: 0,
+      start: 0,
+      end: 8,
+      text: "abcdefgh",
+      textHash: parsedTextHash,
+    };
+    const evidence = {
+      ordinal: 0,
+      pageOrdinal: 0,
+      start: 0,
+      end: 8,
+      quoteHash: parsedTextHash,
+      locator: {
+        kind: "parser_page_v1",
+        pageNumber: 1,
+        pageTextHash: parsedTextHash,
+      },
+    };
+    const mappingHash = await digestParsedMappingManifest([page], [evidence]);
+    const bundleHash = "e".repeat(64);
+    const common = {
+      protocolVersion: 1,
+      spaceId: f.spaceId,
+      sourceAccountId: f.sourceAccountId,
+    };
+    const entries = Array.from({ length: 4 }, (_, index) => ({
+      ...readyEntry(),
+      externalId: randomUUID(),
+      uri: `fs://synthetic/assessment-ready-${index}.pdf`,
+      title: `Assessment ready ${index}`,
+      docType: "pdf",
+      content: {
+        status: "ready_binary_v1",
+        sha256: HASH_A,
+        byteLength: 10,
+        mediaType: "application/pdf",
+        parserProfileId: "pdf_docqa_v1",
+        parserFingerprint,
+        extractionConfigurationFingerprint,
+        extractorFingerprint: "docling-document-qa:v1",
+        recordSchemaFingerprint: "no-records:v1",
+        normalizationFingerprint: "docling-pages:v1",
+        chunkerFingerprint: "page-aware:v1",
+        correctionRevision: "correction:1",
+      },
+    }));
+    try {
+      await f.client.query(
+        `UPDATE kith.source_accounts SET binary_profile_ids = $1,
+         binary_profile_audit_digest = $2, binary_profile_enabled_at = $3
+         WHERE id = $4`,
+        [
+          JSON.stringify(["pdf_docqa_v1"]),
+          parserFingerprint,
+          new Date(NOW),
+          f.sourceAccountId,
+        ],
+      );
+      const begun = await call((ctx) =>
+        beginWorkerScan(ctx, f.principal, {
+          ...common,
+          operation: "scan.begin",
+          requestId: "ready-batch-scan-begin",
+          watcherId: "watcher-1",
+          connectorVersion: "fs-v1",
+          mode: "normal",
+          expectedInventoryEpoch: 0,
+        }),
+      );
+      await call((ctx) =>
+        appendWorkerScanPage(ctx, f.principal, {
+          ...common,
+          operation: "scan.appendPage",
+          scanId: begun.scanId,
+          requestId: "ready-batch-scan-page",
+          ordinal: 0,
+          entries,
+        }),
+      );
+      await call((ctx) =>
+        sealWorkerScan(ctx, f.principal, {
+          ...common,
+          operation: "scan.seal",
+          scanId: begun.scanId,
+          requestId: "ready-batch-scan-seal",
+          expectedPageCount: 1,
+          health: { status: "healthy" },
+        }),
+      );
+      await call((ctx) =>
+        reconcileWorkerScan(ctx, f.principal, {
+          ...common,
+          operation: "scan.reconcile",
+          scanId: begun.scanId,
+          requestId: "ready-batch-scan-reconcile",
+          expectedInventoryEpoch: 1,
+          ordinal: 0,
+          maxItems: 10,
+        }),
+      );
+      const workRows = (
+        await f.client.query(
+          `SELECT * FROM kith.worker_discovery_work
+           WHERE source_account_id = $1 ORDER BY source_item_id`,
+          [f.sourceAccountId],
+        )
+      ).rows;
+      assert.equal(workRows.length, 4);
+
+      for (const [index, work] of workRows.entries()) {
+        const suffix = `ready-batch-${index}`;
+        const archiveLeaseToken = await sha256Hex(`${suffix}-lease`);
+        const parsedLeaseToken = await sha256Hex(`${suffix}-parsed-lease`);
+        const providerFileIdHash = await sha256Hex(`${suffix}-file`);
+        const identity = {
+          sourceItemId: work.source_item_id,
+          scanId: begun.scanId,
+          observationEpoch: Number(work.observation_epoch),
+          processingEpoch: Number(work.processing_epoch),
+          contentHash: HASH_A,
+          byteLength: 10,
+          mediaType: "application/pdf",
+          parserProfileId: "pdf_docqa_v1",
+          parserFingerprint,
+          extractionConfigurationFingerprint,
+          extractorFingerprint: "docling-document-qa:v1",
+          recordSchemaFingerprint: "no-records:v1",
+          normalizationFingerprint: "docling-pages:v1",
+          chunkerFingerprint: "page-aware:v1",
+          correctionRevision: "correction:1",
+        };
+        const leased = await call((ctx) =>
+          reserveArchivedDiscovery(
+            ctx,
+            f.principal,
+            {
+              ...common,
+              operation: "discovery.reserveArchived",
+              requestId: `${suffix}-reserve`,
+              identity,
+            },
+            archiveLeaseToken,
+          ),
+        );
+        const extractionFingerprint = await artifactBoundExtractionFingerprint(
+          parserFingerprint,
+          outputHash,
+          extractionConfigurationFingerprint,
+        );
+        const admitted = await call((ctx) =>
+          admitArchivedDiscovery(ctx, f.principal, {
+            ...common,
+            operation: "discovery.admitArchived",
+            requestId: `${suffix}-admit`,
+            workId: leased.workId,
+            leaseEpoch: leased.leaseEpoch,
+            leaseToken: leased.leaseToken,
+            parserArtifact: {
+              kind: "create",
+              clientArtifactId: randomUUID(),
+              outputHash,
+              outputByteLength: 20,
+              outputMediaType: "application/vnd.docling+json",
+              createdAt: NOW,
+            },
+            archives: [
+              {
+                kind: "create",
+                subjectKind: "parser_output",
+                copyRole: "primary",
+                clientReceiptId: randomUUID(),
+                archiveProfileFingerprint: "4".repeat(64),
+                archiveIdentityFingerprint: "5".repeat(64),
+                recipientFingerprint: "6".repeat(64),
+                repositoryKeyDomainFingerprint: "7".repeat(64),
+                storageFailureDomainFingerprint: "8".repeat(64),
+                archiveObjectId: randomUUID(),
+                ciphertextHash: "9".repeat(64),
+                ciphertextByteLength: 30,
+                createdAt: NOW,
+                readbackVerifiedAt: NOW,
+              },
+            ],
+            providerOriginal: {
+              referenceVersion: "provider_original_v2",
+              providerKind: "dropbox_v1",
+              clientReferenceId: randomUUID(),
+              sourceContentHash: HASH_A,
+              sourceByteLength: 10,
+              providerAccountIdHash: "a".repeat(64),
+              providerRootDirectoryIdHash: "b".repeat(64),
+              providerFileIdHash,
+              providerRevision: `rev-${suffix}`,
+              providerContentHash: "c".repeat(64),
+              verifiedAt: NOW,
+              createdAt: NOW,
+            },
+            parsedText: {
+              extractionFingerprint,
+              textHash: parsedTextHash,
+              byteLength: 8,
+              utf16Length: 8,
+              pageCount: 1,
+              mappingManifestHash: mappingHash,
+              normalizedBundleDigest: bundleHash,
+              expectedEvidenceSpanCount: 1,
+              expectedDocumentCount: 1,
+              expectedChunkCount: 1,
+            },
+          }),
+        );
+        const reserved = await call((ctx) =>
+          reserveParsedJobs(
+            ctx,
+            f.principal,
+            {
+              ...common,
+              operation: "jobs.reserveParsed",
+              requestId: `${suffix}-parsed-reserve`,
+              maxItems: 1,
+              jobId: admitted.ingestJobId,
+            },
+            [parsedLeaseToken],
+          ),
+        );
+        const lease = reserved.targets[0];
+        const leaseRequest = {
+          ...common,
+          jobId: lease.jobId,
+          leaseEpoch: lease.leaseEpoch,
+          leaseToken: lease.leaseToken,
+        };
+        const stage = await httpCall({
+          ...leaseRequest,
+          operation: "jobs.stageParsedBegin",
+          requestId: `${suffix}-parsed-begin`,
+          extractionFingerprint,
+          mappingManifestHash: mappingHash,
+          normalizedBundleDigest: bundleHash,
+          expectedPageCount: 1,
+          expectedEvidenceSpanCount: 1,
+          expectedDocumentCount: 1,
+          expectedChunkCount: 1,
+        });
+        const batch = (phase, rows) =>
+          httpCall({
+            ...leaseRequest,
+            operation: "jobs.stageParsedBatch",
+            requestId: `${suffix}-parsed-${phase}`,
+            stageId: stage.stageId,
+            phase,
+            ordinal: 0,
+            rows,
+          });
+        await batch("pages", [page]);
+        await batch("evidence", [evidence]);
+        await batch("documents", [
+          {
+            documentKey: "document-1",
+            title: `Synthetic document ${index}`,
+            docType: "pdf",
+            capturedAt: NOW,
+            evidence: [{ pageOrdinal: 0, evidenceOrdinal: 0 }],
+          },
+        ]);
+        await batch("chunks", [
+          {
+            documentKey: "document-1",
+            ordinal: 0,
+            start: 0,
+            end: 8,
+            text: "abcdefgh",
+            evidence: [{ pageOrdinal: 0, evidenceOrdinal: 0 }],
+          },
+        ]);
+        await httpCall({
+          ...leaseRequest,
+          operation: "jobs.stageParsedSeal",
+          requestId: `${suffix}-parsed-seal`,
+          stageId: stage.stageId,
+          normalizedBundleDigest: bundleHash,
+        });
+        assert.equal(
+          (
+            await httpCall({
+              ...leaseRequest,
+              operation: "jobs.activateParsed",
+              requestId: `${suffix}-parsed-activate`,
+            })
+          ).state,
+          "ready",
+        );
+      }
+
+      const account = (
+        await f.client.query(
+          `SELECT inventory_epoch, manifest_version FROM kith.source_accounts
+           WHERE id=$1`,
+          [f.sourceAccountId],
+        )
+      ).rows[0];
+      const assessment = await call((ctx) =>
+        beginProcessingAssessment(ctx, f.principal, {
+          ...common,
+          operation: "processing.assessBegin",
+          requestId: "ready-batch-assess-begin",
+          scanId: begun.scanId,
+          expectedInventoryEpoch: Number(account.inventory_epoch),
+          expectedManifestVersion: Number(account.manifest_version),
+        }),
+      );
+      const startedAt = performance.now();
+      const itemPage = await call((ctx) =>
+        advanceProcessingAssessment(ctx, f.principal, {
+          ...common,
+          operation: "processing.assessPage",
+          requestId: "ready-batch-assess-items",
+          assessmentId: assessment.assessmentId,
+          ordinal: 0,
+          maxItems: 4,
+        }),
+      );
+      const elapsedMs = performance.now() - startedAt;
+      assert.equal(itemPage.state, "running");
+      assert.equal(itemPage.phase, "unresolved_entries");
+      assert.equal(itemPage.inspected, 4);
+      assert.ok(
+        elapsedMs < 30_000,
+        `four archived-ready proofs took ${elapsedMs.toFixed(1)}ms`,
+      );
+      const completed = await call((ctx) =>
+        advanceProcessingAssessment(ctx, f.principal, {
+          ...common,
+          operation: "processing.assessPage",
+          requestId: "ready-batch-assess-unresolved",
+          assessmentId: assessment.assessmentId,
+          ordinal: 1,
+          maxItems: 4,
+        }),
+      );
+      assert.equal(completed.state, "complete");
+      assert.equal(completed.counts.items.ready, 4);
+      t.diagnostic(
+        `four archived-ready assessment proofs completed in ${elapsedMs.toFixed(1)}ms`,
       );
     } finally {
       await pool.end();

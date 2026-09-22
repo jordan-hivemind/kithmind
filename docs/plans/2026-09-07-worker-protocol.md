@@ -331,6 +331,9 @@ without skipping unchanged items. Every item in the batch still receives the
 same revision, generation, archive, receipt, and sealed-payload checks. Treat
 parser duration and assessment duration as separate measurements: completing
 PDF conversion does not complete the full-catalog processing assessment.
+The server accepts up to eight items for compatible replay and future tuning.
+The ordinary runner currently requests four, leaving headroom in the 30-second
+transport timeout for archived receipt and sealed-payload verification.
 
 A source change during either walk invalidates the assessment. The server also
 checks generic revision admissions and availability changes, so a document

@@ -1515,7 +1515,7 @@ test("a complete assessment with parked documents ends the pass complete", async
           return { operation: "source.status", sourceAccountId: "source" };
         }
         assert.equal(request.operation, "processing.assessPage");
-        assert.equal(request.maxItems, 8);
+        assert.equal(request.maxItems, 4);
         return assessPageResponse(request.ordinal, "complete", {
           parked: 7,
           explicitGap: 24,

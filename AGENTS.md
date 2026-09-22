@@ -69,6 +69,12 @@ For a capability rollout, also test the actual pass-ending checkpoint, its
 configuration rebind boundary, and the next scan with previously exhausted
 selected work. A mid-state handler test can pass while an earlier eligibility
 gate still filters the capability out.
+Metadata-first catalog assessment may validly finish `processing_incomplete`
+when deferred or unselected revisions have no active full representation. Keep
+the counts and review outcome and diagnose them separately. Do not describe the
+result as complete, but do not block safe filesystem watching or a separately
+authorized capability rollout when the pass is terminal, has no pending
+request, and has no active credential session.
 When diagnosing ingestion latency, separate parser or model time from worker
 request overhead. Record the number and batch size of assessment calls; a
 finished parse can still be followed by a full-catalog assessment walk.
