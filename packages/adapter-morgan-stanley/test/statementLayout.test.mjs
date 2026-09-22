@@ -1308,6 +1308,187 @@ test("an adjacent anchored ACTIVITY section closes an independently complete car
   assert.equal(scope.evidence.tables[0].end.binding.quote, "ACTIVITY");
 });
 
+function adjacentSummaryText({
+  nextPage = "Page 2 of 2",
+  nextAccount = CONSOLIDATED_ACCOUNT_ONE,
+  nextClient = "CLIENT STATEMENT   For the Period March 1-31, 2026",
+  includeSection = true,
+  beforeSummary = [],
+  afterSummaryHeader = [],
+} = {}) {
+  const client = "CLIENT STATEMENT   For the Period March 1-31, 2026";
+  const personal = "Personal investment statement";
+  const accountTitle = "Account Synthetic Household";
+  const accountTitleContinuation = "PERSONAL ADVISORY SERVICES";
+  return [
+    [
+      "        Page 1 of 2",
+      `        ${client}`,
+      `        ${personal}`,
+      CONSOLIDATED_ACCOUNT_ONE,
+      `        ${accountTitle}`,
+      `        ${accountTitleContinuation}`,
+      "        HOLDINGS",
+      ...(includeSection ? equityBlockLines() : equityBlockLines().slice(1)),
+    ].join("\n"),
+    [
+      `        ${nextPage}`,
+      `        ${nextClient}`,
+      `        ${personal}`,
+      nextAccount,
+      `        ${accountTitle}`,
+      `        ${accountTitleContinuation}`,
+      ...beforeSummary,
+      ...sectionSummaryLines().slice(0, 2),
+      ...afterSummaryHeader,
+      ...sectionSummaryLines().slice(2),
+      "        ACTIVITY",
+    ].join("\n"),
+  ].join(`\n${PAGE_SEPARATOR}\n`);
+}
+
+test("an exact repeated next-page header and section summary close a carried position", () => {
+  const parsed = parseStatementLines(adjacentSummaryText(), kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+  assert.match(scope.evidence.tables[0].end.binding.quote, /^Percentage\b/);
+});
+
+test("the repeated account header bounds a successor summary without a nearby section title", () => {
+  const parsed = parseStatementLines(
+    adjacentSummaryText({ includeSection: false }),
+    kind,
+  );
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+});
+
+test("successor summary uses the latest header of a table carried across several pages", () => {
+  const client = "CLIENT STATEMENT   For the Period March 1-31, 2026";
+  const personal = "Personal investment statement";
+  const accountTitle = "Account Synthetic Household";
+  const continuation = "Personal advisory services";
+  const block = equityBlockLines();
+  const runningHeader = [
+    `        ${client}`,
+    `        ${personal}`,
+    CONSOLIDATED_ACCOUNT_ONE,
+    `        ${accountTitle}`,
+    `        ${continuation}`,
+  ];
+  const text = [
+    [
+      "        Page 1 of 3",
+      ...runningHeader,
+      "        HOLDINGS",
+      block[0],
+      block[1],
+      block[2],
+    ].join("\n"),
+    [
+      "        Page 2 of 3",
+      ...runningHeader,
+      block[1],
+      block[3],
+      block[4],
+      block[5],
+    ].join("\n"),
+    [
+      "        Page 3 of 3",
+      ...runningHeader,
+      ...sectionSummaryLines(),
+      "        ACTIVITY",
+    ].join("\n"),
+  ].join(`\n${PAGE_SEPARATOR}\n`);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+});
+
+test("the first percentage row proves closure without consuming later summaries", () => {
+  const percentage = sectionSummaryLines()[2];
+  const parsed = parseStatementLines(
+    adjacentSummaryText({
+      afterSummaryHeader: [
+        percentage,
+        "        SYNTHETIC SUMMARY CLASS",
+        "        Summary class detail",
+        ...sectionSummaryLines().slice(0, 2),
+        percentage,
+        "        TOTAL HOLDINGS",
+        "        Subsequent summary prose is outside the proved boundary",
+      ],
+    }),
+    kind,
+  );
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+});
+
+test("adjacent summary closure refuses topology, account, header and security changes", () => {
+  const datedSecurity = equityBlockLines()[2];
+  const cases = [
+    {
+      name: "missing printed page",
+      options: { nextPage: "Page 3 of 3" },
+    },
+    {
+      name: "changed account",
+      options: { nextAccount: CONSOLIDATED_ACCOUNT_TWO },
+    },
+    {
+      name: "changed repeated header",
+      options: {
+        nextClient: "CLIENT STATEMENT   For the Period February 1-28, 2026",
+      },
+    },
+    {
+      name: "unknown intervening content",
+      options: { beforeSummary: ["        New unsupported section"] },
+    },
+    {
+      name: "dated security after summary",
+      options: { afterSummaryHeader: [datedSecurity] },
+    },
+    {
+      name: "dated TOTAL-named security after summary",
+      options: {
+        afterSummaryHeader: [
+          datedSecurity.replace(
+            "WIDGET NEUTRAL FUND (WNDF)",
+            "TOTAL RETURN FUND (TRNF)",
+          ),
+        ],
+      },
+    },
+    {
+      name: "new section label after summary",
+      options: { afterSummaryHeader: ["        UNKNOWN ASSET CLASS"] },
+    },
+  ];
+  for (const { name, options } of cases) {
+    const parsed = parseStatementLines(adjacentSummaryText(options), kind);
+    assert.equal(
+      parsed.holdings.positions.length,
+      1,
+      `${name}: row emission remains unchanged`,
+    );
+    const scope = parsed.holdings.positionScopes.find(
+      (candidate) => candidate.accountExternalKey === CONSOLIDATED_ACCOUNT_ONE,
+    );
+    assert.equal(scope.status, "partial", name);
+    assert.ok(scope.gapCodes.includes("page_sequence_gap"), name);
+  }
+});
+
 test("an ACTIVITY marker after a printed-page gap cannot close a carried table", () => {
   const text = [
     [

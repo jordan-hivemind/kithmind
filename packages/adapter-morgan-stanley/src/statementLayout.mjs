@@ -1941,6 +1941,148 @@ function parseHoldings(
     }
     return null;
   };
+  const adjacentSummaryBoundaryAfterCarried = (pending) => {
+    if (pending.footerPage !== pending.page + 1) return null;
+    if (
+      !printedPageRunContinuesThrough(
+        pending.page,
+        pending.footerPage,
+        printedByPage,
+        populatedPages,
+      )
+    ) {
+      return null;
+    }
+
+    let summaryIndex = -1;
+    for (
+      let index = pending.footerIndex + 1;
+      index < lines.length;
+      index += 1
+    ) {
+      if (lines[index].page !== pending.footerPage) return null;
+      if (/^Percentage\b/.test(lines[index].text.trim())) {
+        summaryIndex = index;
+        break;
+      }
+    }
+    if (summaryIndex < 0) return null;
+
+    // The next page must repeat the prior page's own running header exactly.
+    // Bound that header by the successor's positive summary marker and the
+    // account marker/title structure, rather than by the table's first line:
+    // a carried table can have begun many pages earlier, and some supported
+    // tables print no HOLDINGS/asset-class title immediately before their
+    // latest Security Description header.
+    const priorMarker = markerLines[pending.headerIndex];
+    if (
+      priorMarker === null ||
+      lines[priorMarker].page !== pending.page ||
+      accountKeys[priorMarker] !== pending.context.accountKey
+    ) {
+      return null;
+    }
+    let priorStart = -1;
+    for (let index = priorMarker; index >= 0; index -= 1) {
+      if (lines[index].page !== pending.page) break;
+      if (/^CLIENT STATEMENT\b/.test(lines[index].text.trim())) {
+        priorStart = index;
+        break;
+      }
+    }
+    if (priorStart < 0) return null;
+    const repeatedHeader = lines
+      .slice(pending.footerIndex + 1, summaryIndex)
+      .map((line) => line.text.trim());
+    // Keep a small structural ceiling so exact equality cannot turn an
+    // arbitrarily long repeated source section into page furniture.
+    if (repeatedHeader.length < 3 || repeatedHeader.length > 8) return null;
+    const expectedHeader = lines
+      .slice(priorStart, priorStart + repeatedHeader.length)
+      .map((line) => line.text.trim());
+    if (
+      expectedHeader.length !== repeatedHeader.length ||
+      lines[priorStart + expectedHeader.length - 1]?.page !== pending.page ||
+      priorStart + expectedHeader.length > pending.headerIndex ||
+      repeatedHeader.some((text, index) => text !== expectedHeader[index])
+    ) {
+      return null;
+    }
+    const expectedMarker = expectedHeader.findIndex((text) =>
+      BARE_ACCOUNT_LINE.test(text),
+    );
+    if (
+      expectedMarker < 0 ||
+      expectedHeader.filter((text) => BARE_ACCOUNT_LINE.test(text)).length !==
+        1 ||
+      priorStart + expectedMarker !== priorMarker ||
+      BARE_ACCOUNT_LINE.exec(expectedHeader[expectedMarker])?.[1] !==
+        pending.context.accountKey ||
+      !/^Account\s+[A-Za-z][A-Za-z .,&'-]*$/.test(
+        expectedHeader[expectedMarker + 1] ?? "",
+      ) ||
+      // One provider account-title continuation is supported, but only as a
+      // single-cell, value-free line immediately after the title and only
+      // when the prior and successor pages repeat it byte-for-byte.
+      expectedHeader.length - (expectedMarker + 2) > 1 ||
+      expectedHeader
+        .slice(expectedMarker + 2)
+        .some(
+          (text) =>
+            splitCells(text).length !== 1 ||
+            /\d/.test(text) ||
+            observedHoldingsHeader(text) ||
+            SECTION_SUMMARY.test(text) ||
+            ACTIVITY_SECTION.test(text),
+        )
+    ) {
+      return null;
+    }
+    if (accountKeys[summaryIndex] !== pending.context.accountKey) {
+      return null;
+    }
+    const secondSummaryLine = lines[summaryIndex + 1];
+    if (
+      secondSummaryLine === undefined ||
+      secondSummaryLine.page !== pending.footerPage ||
+      !/^of Holdings\b/.test(secondSummaryLine.text.trim()) ||
+      accountKeys[summaryIndex + 1] !== pending.context.accountKey
+    ) {
+      return null;
+    }
+
+    // The header alone could precede a malformed or unrecognized security.
+    // Its first percentage row is the positive source evidence that this is
+    // the provider's summary and therefore that the independently complete
+    // carried table ended. Later summaries, totals and prose belong to the
+    // following document sections and are outside this boundary proof.
+    const firstSummaryRow = lines[summaryIndex + 2];
+    if (
+      firstSummaryRow === undefined ||
+      firstSummaryRow.page !== pending.footerPage ||
+      accountKeys[summaryIndex + 2] !== pending.context.accountKey
+    ) {
+      return null;
+    }
+    const { bound } = bindRow(firstSummaryRow.text, pending.columns);
+    const percentage = bound.get("tradeDate")?.text;
+    if (
+      percentage === undefined ||
+      !/^\d+(?:\.\d+)?%$/.test(percentage) ||
+      TRADE_DATE_CELL.test(percentage)
+    ) {
+      return null;
+    }
+    return {
+      lineIndex: summaryIndex,
+      locator: lineSpanLocator(
+        lines[summaryIndex],
+        kind,
+        "holdings section summary boundary",
+        textMeta,
+      ),
+    };
+  };
   const flushCarried = (
     nextAccountKey = null,
     nextMarker = null,
@@ -1954,6 +2096,9 @@ function parseHoldings(
       }).position !== null;
     const activityBoundary = independentlyComplete
       ? activityBoundaryAfterCarried(carried)
+      : null;
+    const summaryBoundary = independentlyComplete
+      ? adjacentSummaryBoundaryAfterCarried(carried)
       : null;
     if (nextMarker !== null && nextAccountKey !== carried.context.accountKey) {
       carried.table.end = lineSpanLocator(
@@ -1999,6 +2144,9 @@ function parseHoldings(
       } else {
         carried.table.gapCodes.add("page_sequence_gap");
       }
+    } else if (summaryBoundary !== null) {
+      carried.table.end = summaryBoundary.locator;
+      carried.table.lastLineIndex = summaryBoundary.lineIndex;
     } else if (activityBoundary !== null) {
       carried.table.end = activityBoundary.locator;
       carried.table.lastLineIndex = activityBoundary.lineIndex;
@@ -2030,6 +2178,7 @@ function parseHoldings(
   for (let i = 0; i < lines.length; i += 1) {
     if (!HOLDINGS_HEADER.test(lines[i].text)) continue;
     if (REALIZED_TABLE.test(lines[i].text)) continue;
+    const headerIndex = i;
     const marker = markerLines[i];
     const accountKey = accountKeys[i];
     const accountLocator = accountSpanLocator(
@@ -2192,6 +2341,7 @@ function parseHoldings(
         block,
         description,
         columns,
+        headerIndex,
         context: {
           ...context,
           section,
