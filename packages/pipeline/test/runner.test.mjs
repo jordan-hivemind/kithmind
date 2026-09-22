@@ -1515,6 +1515,7 @@ test("a complete assessment with parked documents ends the pass complete", async
           return { operation: "source.status", sourceAccountId: "source" };
         }
         assert.equal(request.operation, "processing.assessPage");
+        assert.equal(request.maxItems, 4);
         return assessPageResponse(request.ordinal, "complete", {
           parked: 7,
           explicitGap: 24,
@@ -1524,6 +1525,45 @@ test("a complete assessment with parked documents ends the pass complete", async
     const result = await runner.run();
     assert.equal(result.state, "complete");
     assert.equal(result.code, undefined);
+    assert.equal(journal.pending, undefined);
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("an in-flight one-item assessment page replays exactly after batching is adopted", async () => {
+  const setup = await fixture(0);
+  const checkpoint = assessPageCheckpoint();
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const requestId = randomUUID();
+  const legacyRequest = {
+    protocolVersion: 1,
+    operation: "processing.assessPage",
+    spaceId: setup.config.spaceId,
+    sourceAccountId: setup.config.sourceAccountId,
+    requestId,
+    assessmentId: checkpoint.assessmentId,
+    ordinal: checkpoint.ordinal,
+    maxItems: 1,
+  };
+  await journal.planRequest({
+    operation: legacyRequest.operation,
+    requestId,
+    requestBody: JSON.stringify(legacyRequest),
+    createdAt: Date.now(),
+  });
+  let calls = 0;
+  try {
+    const runner = new PipelineRunner(setup.config, journal, {
+      async call(request) {
+        assert.deepEqual(request, legacyRequest);
+        calls += 1;
+        return assessPageResponse(request.ordinal, "complete");
+      },
+    });
+    assert.equal((await runner.run()).state, "complete");
+    assert.equal(calls, 1);
     assert.equal(journal.pending, undefined);
   } finally {
     await journal.close();

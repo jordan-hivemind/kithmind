@@ -74,6 +74,24 @@ test("source.itemCounts takes the envelope and nothing else, and an unknown oper
   }
 });
 
+test("processing.assessPage accepts bounded batches of at most eight items", () => {
+  const page = {
+    ...source,
+    operation: "processing.assessPage",
+    requestId: "assessment-page-1",
+    assessmentId: "j1234567890123456789012345678903",
+    ordinal: 4,
+    maxItems: 8,
+  };
+  assert.deepEqual(parseWorkerRequest(page), page);
+  for (const maxItems of [0, 9, 1.5]) {
+    assert.throws(
+      () => parseWorkerRequest({ ...page, maxItems }),
+      WorkerProtocolParseError,
+    );
+  }
+});
+
 test("source.rootReport takes a closed state and a bounded count", () => {
   const report = {
     ...source,

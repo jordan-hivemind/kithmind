@@ -30,6 +30,11 @@ orchestrator name and session ID, `status` to `in_progress`, and `updated` to
 the current date, then save the tracker before work begins. Work on the branch
 named in the task and push it at the end of every session.
 
+Use the tracker's current execution snapshot plus searches for the relevant
+task rows. Do not reread the entire historical log on every turn. Update one
+current snapshot instead of continually prepending status prose, while keeping
+existing task rows and history intact.
+
 For every state change (`blocked`, `review`, or `done`), update the tracker
 with a next action that stands on its own, the verification command, and the PR
 URL where applicable. Never delete tracker rows. A task is done only after its
@@ -64,6 +69,15 @@ For a capability rollout, also test the actual pass-ending checkpoint, its
 configuration rebind boundary, and the next scan with previously exhausted
 selected work. A mid-state handler test can pass while an earlier eligibility
 gate still filters the capability out.
+Metadata-first catalog assessment may validly finish `processing_incomplete`
+when deferred or unselected revisions have no active full representation. Keep
+the counts and review outcome and diagnose them separately. Do not describe the
+result as complete, but do not block safe filesystem watching or a separately
+authorized capability rollout when the pass is terminal, has no pending
+request, and has no active credential session.
+When diagnosing ingestion latency, separate parser or model time from worker
+request overhead. Record the number and batch size of assessment calls; a
+finished parse can still be followed by a full-catalog assessment walk.
 Before a finance repair, inspect both legacy unversioned scope proofs and the
 active generation's versioned proofs. They are immutable and require a new
 generation when corrected source evidence changes their payload or membership.
