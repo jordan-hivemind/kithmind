@@ -751,6 +751,14 @@ test(
     assert.equal(
       await count(
         client,
+        "position_reconciliations",
+        "WHERE id = 'stale-a-old-verdict'",
+      ),
+      1,
+    );
+    assert.equal(
+      await count(
+        client,
         "position_scope_observations",
         `WHERE source_document_id = '${DOCUMENT}' AND holding_projection_generation_id = '${published.activeGenerationId}'`,
       ),

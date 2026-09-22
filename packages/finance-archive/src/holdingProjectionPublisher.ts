@@ -2366,6 +2366,7 @@ export async function publishHoldingScopedPositionCorrection(
 
     const positionChangeMap = new Map<string, PositionChange>();
     for (const item of oldSelectedAssertions) {
+      if (item.kind !== "position") continue;
       const accountId = item.semantic[0];
       const date = item.semantic[1];
       const instrumentId = item.semantic[2];
