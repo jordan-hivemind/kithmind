@@ -19,6 +19,7 @@ import {
   mapRemovedTransactionId,
   mapSecurity,
   mapTransaction,
+  normalizeOptionalString,
   plaidErrorCode,
   todayIsoDate,
 } from "../dist/index.js";
@@ -252,4 +253,73 @@ test("mapCurrency uppercases a lowercase code", () => {
 
 test("mapCurrency passes through a code longer than three letters, trimmed", () => {
   assert.equal(mapCurrency(null, "  DOGE1  "), "DOGE1");
+});
+
+// PLAID-4: the second real pull failed partway through -- after 949
+// investment-transaction rows had already been fetched and written -- on
+// "new row for relation \"plaid_investment_transactions\" violates check
+// constraint \"plaid_investment_transactions_subtype_check\"": Plaid sent an
+// empty string, not just an unexpected one, for `subtype`. `normalizeOptionalString`
+// is the fallback that feeds migration 047's relaxed CHECKs.
+test("normalizeOptionalString trims and keeps a normal string", () => {
+  assert.equal(normalizeOptionalString("  buy  "), "buy");
+  assert.equal(normalizeOptionalString("buy"), "buy");
+});
+
+test("normalizeOptionalString maps an empty or whitespace-only string to null", () => {
+  assert.equal(normalizeOptionalString(""), null);
+  assert.equal(normalizeOptionalString("   "), null);
+});
+
+test("normalizeOptionalString maps null, undefined and a non-string value to null instead of throwing", () => {
+  assert.equal(normalizeOptionalString(null), null);
+  assert.equal(normalizeOptionalString(undefined), null);
+  assert.equal(normalizeOptionalString(42), null);
+  assert.equal(normalizeOptionalString({}), null);
+});
+
+test("mapAccount normalizes an empty official_name, mask and subtype to null", () => {
+  const row = mapAccount(
+    { ...account, official_name: "", mask: "", subtype: "" },
+    "item-1",
+  );
+  assert.equal(row.officialName, null);
+  assert.equal(row.mask, null);
+  assert.equal(row.subtype, null);
+});
+
+test("mapSecurity normalizes an empty name, ticker_symbol and type to null", () => {
+  const row = mapSecurity({ ...security, name: "", ticker_symbol: "", type: "" });
+  assert.equal(row.name, null);
+  assert.equal(row.tickerSymbol, null);
+  assert.equal(row.type, null);
+});
+
+test("mapTransaction normalizes an empty name, merchant_name and category to null", () => {
+  const row = mapTransaction(
+    {
+      ...transaction,
+      name: "",
+      merchant_name: "",
+      personal_finance_category: { primary: "" },
+    },
+    "item-1",
+  );
+  assert.equal(row.name, null);
+  assert.equal(row.merchantName, null);
+  assert.equal(row.category, null);
+});
+
+test("mapInvestmentTransaction normalizes an empty name, type and subtype to null instead of the string \"undefined\"", () => {
+  // The exact bug: the old `String(transaction.subtype)` coercion turned an
+  // empty subtype into the string "" (still empty, still rejected by the
+  // old CHECK) and would have turned a missing one into the literal string
+  // "undefined" (accepted by the old CHECK, but wrong data).
+  const row = mapInvestmentTransaction(
+    { ...investmentTransaction, name: "", type: "", subtype: "" },
+    "item-1",
+  );
+  assert.equal(row.name, null);
+  assert.equal(row.type, null);
+  assert.equal(row.subtype, null);
 });

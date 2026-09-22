@@ -386,6 +386,134 @@ test("a row failure with no other error still makes the caller's process exit no
   assert.ok(result.rowFailures > 0);
 });
 
+// PLAID-4: the second real pull failed partway through -- after 949
+// investment-transaction rows had already been fetched and written -- on a
+// single row's own CHECK violation. A transaction or investment-transaction
+// row upsert failure must be isolated the same way PLAID-2 isolated a
+// security or holding row failure: counted, not thrown, with the rest of
+// the item still attempted -- but it must also withhold the cursor or
+// watermark advance for the window it happened in, so a retried pull sees
+// the failed row again instead of skipping past it.
+
+test("an added-transaction row upsert failure is counted and withholds the cursor advance", async () => {
+  const pool = fakePool((text) => text.startsWith("INSERT INTO kith.plaid_transactions"));
+  const client = happyClient();
+
+  const result = await pullItem(client, pool, item, "access-token-1");
+  assert.equal(result.status, "ok");
+  assert.equal(result.rowFailures, 1);
+  assert.equal(result.transactionsAdded, 0, "the failed transaction was not counted as written");
+  // The rest of the item, including investment transactions fetched after
+  // this block, still ran.
+  assert.equal(result.investmentTransactions, 1);
+
+  const success = pool.calls.find((call) =>
+    call.text.includes("SET last_pulled_at = transaction_timestamp(),\n            last_pull_error = NULL"),
+  );
+  assert.ok(success, "the item is still recorded as a success");
+  assert.deepEqual(
+    success.params,
+    ["item-1", null],
+    "the cursor was withheld -- item.transactionsCursor was null, so it stays null rather than advancing to cursor-1",
+  );
+});
+
+test("a removed-transaction row failure is counted and withholds the cursor advance", async () => {
+  const pool = fakePool((text) => text.startsWith("UPDATE kith.plaid_transactions"));
+  const client = happyClient();
+  client.transactionsSync = async () => ({
+    data: {
+      accounts: [],
+      added: [],
+      modified: [],
+      removed: [{ transaction_id: "tx-removed-1" }],
+      next_cursor: "cursor-1",
+      has_more: false,
+    },
+  });
+
+  const result = await pullItem(client, pool, item, "access-token-1");
+  assert.equal(result.status, "ok");
+  assert.equal(result.rowFailures, 1);
+  assert.equal(result.transactionsRemoved, 0);
+
+  const success = pool.calls.find((call) =>
+    call.text.includes("SET last_pulled_at = transaction_timestamp(),\n            last_pull_error = NULL"),
+  );
+  assert.deepEqual(success.params, ["item-1", null]);
+});
+
+test("a resumed item's cursor stays at its own stored value when a row fails, rather than advancing", async () => {
+  const pool = fakePool((text) => text.startsWith("INSERT INTO kith.plaid_transactions"));
+  const client = happyClient();
+  // happyClient's default transactionsSync asserts the first call's cursor
+  // is undefined (the "first pull" shape every other test in this file
+  // uses); this test starts from a stored cursor instead, so it needs its
+  // own stub rather than that assertion.
+  client.transactionsSync = async ({ cursor }) => {
+    assert.equal(cursor, "stored-cursor");
+    return {
+      data: {
+        accounts: [],
+        added: [
+          {
+            transaction_id: "tx-1",
+            account_id: "acc-1",
+            date: "2026-09-20",
+            authorized_date: "2026-09-19",
+            name: "Coffee",
+            merchant_name: "Cafe",
+            amount: 5,
+            iso_currency_code: "USD",
+            unofficial_currency_code: null,
+            pending: false,
+            personal_finance_category: { primary: "FOOD_AND_DRINK" },
+          },
+        ],
+        modified: [],
+        removed: [],
+        next_cursor: "cursor-1",
+        has_more: false,
+      },
+    };
+  };
+  const resumingItem = { ...item, transactionsCursor: "stored-cursor" };
+
+  const result = await pullItem(client, pool, resumingItem, "access-token-1");
+  assert.equal(result.status, "ok");
+  assert.equal(result.rowFailures, 1);
+
+  const success = pool.calls.find((call) =>
+    call.text.includes("SET last_pulled_at = transaction_timestamp(),\n            last_pull_error = NULL"),
+  );
+  assert.deepEqual(success.params, ["item-1", "stored-cursor"]);
+});
+
+test("an investment-transaction row upsert failure is counted and withholds the watermark advance", async () => {
+  const pool = fakePool((text) =>
+    text.startsWith("INSERT INTO kith.plaid_investment_transactions"),
+  );
+  const client = happyClient();
+
+  const result = await pullItem(client, pool, item, "access-token-1");
+  assert.equal(result.status, "ok");
+  assert.equal(result.rowFailures, 1);
+  assert.equal(result.investmentTransactions, 0, "the failed investment transaction was not counted as written");
+  // The rest of the item, including transactions-sync, still ran.
+  assert.equal(result.transactionsAdded, 1);
+
+  const watermark = pool.calls.find((call) =>
+    call.text.includes("investment_transactions_pulled_through = $2"),
+  );
+  assert.equal(watermark, undefined, "the watermark was withheld for this window");
+
+  // The cursor, an unrelated call, still advanced normally.
+  const success = pool.calls.find((call) =>
+    call.text.includes("SET last_pulled_at = transaction_timestamp(),\n            last_pull_error = NULL"),
+  );
+  assert.deepEqual(success.params, ["item-1", "cursor-1"]);
+});
+
 // PLAID-3: pull as much investment-transaction history as Plaid allows, not
 // just the last 30 days -- and page until every transaction in the window
 // has actually been fetched, not just the first page of it.

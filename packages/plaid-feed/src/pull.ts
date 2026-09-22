@@ -16,11 +16,14 @@
 // process. Every other unexpected error also ends that item's pull and is
 // reported, but does not touch `needs_relink_at`.
 //
-// A single security or holding row's own upsert failing (for example a
-// value shaped in a way the schema still rejects) does not end the item's
-// pull either: it is counted in `rowFailures` and the rest of that item --
-// including transactions, fetched after holdings -- is still attempted and
-// still written.
+// A single security, holding, transaction or investment-transaction row's
+// own upsert failing (for example a value shaped in a way the schema still
+// rejects) does not end the item's pull either: it is counted in
+// `rowFailures` and the rest of that item -- including whatever is fetched
+// after it -- is still attempted and still written. PLAID-4: a transaction
+// or investment-transaction row failure additionally withholds that call's
+// own cursor/watermark advance for the window it happened in (see below),
+// so a retried pull sees that row again rather than skipping past it.
 //
 // Nothing here prints a balance, a holding value, or a transaction amount --
 // only counts -- and the process exits non-zero when any item failed or had
@@ -262,8 +265,16 @@ export async function pullItem(
     }
   }
 
-  // Transactions sync: best-effort, cursor persisted per item.
+  // Transactions sync: best-effort, cursor persisted per item. PLAID-4: a
+  // single added/modified/removed row's own upsert failing (the same shape
+  // of failure PLAID-2 hit on securities and holdings) must not abort the
+  // rest of this sync -- count it and keep going -- but it must also keep
+  // the cursor from advancing past a page this pull did not fully write, or
+  // a retried pull would never see that row again. `transactionsRowFailure`
+  // tracks that across every page of this call; the cursor is only advanced
+  // to the new value once the whole call finished with no row failure.
   let cursor = item.transactionsCursor ?? undefined;
+  let transactionsRowFailure = false;
   try {
     let hasMore = true;
     let pages = 0;
@@ -277,16 +288,31 @@ export async function pullItem(
         await upsertAccount(pool, mapAccount(account, item.itemId));
       }
       for (const transaction of response.data.added) {
-        await upsertTransaction(pool, mapTransaction(transaction, item.itemId));
-        result.transactionsAdded += 1;
+        try {
+          await upsertTransaction(pool, mapTransaction(transaction, item.itemId));
+          result.transactionsAdded += 1;
+        } catch {
+          result.rowFailures += 1;
+          transactionsRowFailure = true;
+        }
       }
       for (const transaction of response.data.modified) {
-        await upsertTransaction(pool, mapTransaction(transaction, item.itemId));
-        result.transactionsModified += 1;
+        try {
+          await upsertTransaction(pool, mapTransaction(transaction, item.itemId));
+          result.transactionsModified += 1;
+        } catch {
+          result.rowFailures += 1;
+          transactionsRowFailure = true;
+        }
       }
       for (const removed of response.data.removed) {
-        await markTransactionRemoved(pool, mapRemovedTransactionId(removed));
-        result.transactionsRemoved += 1;
+        try {
+          await markTransactionRemoved(pool, mapRemovedTransactionId(removed));
+          result.transactionsRemoved += 1;
+        } catch {
+          result.rowFailures += 1;
+          transactionsRowFailure = true;
+        }
       }
       cursor = response.data.next_cursor;
       hasMore = response.data.has_more;
@@ -303,6 +329,7 @@ export async function pullItem(
   // migration 045. Skipped for the same reason holdings is, otherwise
   // best-effort and paginated.
   if (investmentsConsented) {
+    let investmentTransactionsRowFailure = false;
     try {
       const end = asOf;
       const startDate = investmentTransactionsStartDate(
@@ -335,11 +362,16 @@ export async function pullItem(
           }
         }
         for (const transaction of response.data.investment_transactions) {
-          await upsertInvestmentTransaction(
-            pool,
-            mapInvestmentTransaction(transaction, item.itemId),
-          );
-          result.investmentTransactions += 1;
+          try {
+            await upsertInvestmentTransaction(
+              pool,
+              mapInvestmentTransaction(transaction, item.itemId),
+            );
+            result.investmentTransactions += 1;
+          } catch {
+            result.rowFailures += 1;
+            investmentTransactionsRowFailure = true;
+          }
         }
         total = response.data.total_investment_transactions;
         offset += response.data.investment_transactions.length;
@@ -347,15 +379,29 @@ export async function pullItem(
       }
       // Only reached once every page of this window was fetched without
       // throwing: a page that fails partway through must not advance the
-      // watermark past transactions this pull never actually saw.
-      await recordInvestmentTransactionsPulledThrough(pool, item.itemId, end);
+      // watermark past transactions this pull never actually saw. PLAID-4:
+      // a row that failed its own upsert (caught above, not thrown) is the
+      // same kind of gap -- this pull never actually wrote it -- so it
+      // withholds the watermark advance exactly like a thrown page failure
+      // does.
+      if (!investmentTransactionsRowFailure) {
+        await recordInvestmentTransactionsPulledThrough(pool, item.itemId, end);
+      }
     } catch (error) {
       if (isItemLoginRequired(error)) return await failItem(pool, item, result, error);
       if (!isProductNotSupported(error)) return await failItem(pool, item, result, error);
     }
   }
 
-  await recordPullSuccess(pool, item.itemId, cursor ?? null);
+  // A row failure anywhere in the transactions-sync loop above withholds the
+  // cursor advance the same way an investment-transactions row failure
+  // withholds that watermark: the original stored cursor is kept so a
+  // retried pull sees the failed page's rows again, rather than the sync
+  // resuming past them.
+  const nextCursor = transactionsRowFailure
+    ? (item.transactionsCursor ?? null)
+    : (cursor ?? null);
+  await recordPullSuccess(pool, item.itemId, nextCursor);
   return result;
 }
 
