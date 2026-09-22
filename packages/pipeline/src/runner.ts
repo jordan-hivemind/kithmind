@@ -17,6 +17,7 @@ import {
 } from "@repo/worker-protocol";
 import {
   MAX_TARGETED_TAX_BATCH_PAGES,
+  MAX_WORKER_ASSESSMENT_ITEMS,
   MAX_WORKER_SCAN_ENTRIES,
   parseWorkerRequest,
   type SourceRootReportState,
@@ -284,16 +285,12 @@ function sleep(ms: number): Promise<void> {
 
 /**
  * Default `assessmentPacingMs` applied when a config omits the field
- * (P2-80k). `processing.assessPage` sends one worker mutation per file
- * (`maxItems: 1`); an unpaced assessment phase for an N-file pass fires N of
- * those mutations back to back, which is by far the largest unpaced burst in
- * a pass (see the `WORKER_MUTATION_RATE_LIMIT` arithmetic in
- * packages/convex/convex/models/workers/rateLimit.ts) and the one most
- * likely to trip the server's per-source rate limit on its own. 200ms keeps
- * that phase's sustained rate (5/s) well under the raised budget without
- * meaningfully slowing a normal backfill, so a burst never starts the
- * backoff in the first place. An explicit `assessmentPacingMs` (including
- * `0`, to disable pacing) always overrides this default.
+ * (P2-80k). `processing.assessPage` used to send one worker mutation per file;
+ * bounded batches now reduce that request count while each request still runs
+ * the full retained-proof checks for up to eight files. 200ms keeps consecutive
+ * assessment transactions paced without imposing that delay once per file.
+ * An explicit `assessmentPacingMs` (including `0`, to disable pacing) always
+ * overrides this default.
  */
 export const DEFAULT_ASSESSMENT_PACING_MS = 200;
 
@@ -3561,11 +3558,22 @@ export class PipelineRunner {
         if (checkpoint.phase !== "assess_page") {
           throw new PipelineWorkerError("journal_phase_conflict");
         }
+        let pendingPage;
+        try {
+          pendingPage = parseWorkerRequest(body);
+        } catch {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        if (pendingPage.operation !== "processing.assessPage") {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
         expected = request(this.config, operation, {
           requestId,
           assessmentId: checkpoint.assessmentId,
           ordinal: checkpoint.ordinal,
-          maxItems: 1,
+          // Preserve an exact in-flight request across a worker upgrade from
+          // the former one-item contract. New calls use the current cap below.
+          maxItems: pendingPage.maxItems,
         });
         break;
       }
@@ -9268,7 +9276,7 @@ export class PipelineRunner {
           requestId: randomUUID(),
           assessmentId: checkpoint.assessmentId,
           ordinal: checkpoint.ordinal,
-          maxItems: 1,
+          maxItems: MAX_WORKER_ASSESSMENT_ITEMS,
         }),
       (current, response) => {
         if (current.phase !== "assess_page") {

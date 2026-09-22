@@ -1496,7 +1496,7 @@ export async function advanceProcessingAssessment(
       ctx,
       `SELECT *, created_at::text AS cursor_created_at FROM kith.source_items
        WHERE source_account_id = $1 ${tail.sql}`,
-      [source.account.id, ...tail.values, 2],
+      [source.account.id, ...tail.values, request.maxItems + 1],
     );
     const page = keysetPage(
       fetched.map((value) => ({
@@ -1504,7 +1504,7 @@ export async function advanceProcessingAssessment(
         id: String(value.id),
         value: camelizeSourceItem(value),
       })),
-      1,
+      request.maxItems,
     );
     for (const wrapped of page.page) {
       const item = wrapped.value;
@@ -1548,7 +1548,7 @@ export async function advanceProcessingAssessment(
       ctx,
       `SELECT *, created_at::text AS cursor_created_at FROM kith.worker_scan_entries
        WHERE scan_id = $1 AND source_item_id IS NULL ${tail.sql}`,
-      [assessment.scanId, ...tail.values, 2],
+      [assessment.scanId, ...tail.values, request.maxItems + 1],
     );
     const page = keysetPage(
       fetched.map((value) => ({
@@ -1556,7 +1556,7 @@ export async function advanceProcessingAssessment(
         id: String(value.id),
         value: camelizeScanEntry(value),
       })),
-      1,
+      request.maxItems,
     );
     for (const wrapped of page.page) {
       const entry = wrapped.value;

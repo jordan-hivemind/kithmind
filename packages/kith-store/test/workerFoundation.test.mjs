@@ -4048,6 +4048,140 @@ test(
 );
 
 test(
+  "processing assessment batches preserve cursor replay and phase boundaries",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const { scan, pageId } = await makeScan(f, 1);
+    for (let index = 0; index < 10; index += 1) {
+      const item = await provenance.createOrGetSourceItem(f.client, {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        externalId: `fixture/unavailable-${index}.pdf`,
+        title: `Unavailable ${index}`,
+      });
+      await provenance.markSourceItemUnavailable(f.client, {
+        spaceId: f.spaceId,
+        sourceItemId: item.id,
+      });
+    }
+    for (let index = 0; index < 2; index += 1) {
+      await f.client.query(
+        `INSERT INTO kith.worker_scan_entries
+         (id,space_id,source_account_id,scan_id,scan_page_id,source_item_id,
+          identity_key_hash,uri_digest,inventory_metadata_digest,
+          source_modified_at,state,observed_at,retire_at)
+         VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,$8,$9,'needs_review',$9,$10)`,
+        [
+          newKithId(),
+          f.spaceId,
+          f.sourceAccountId,
+          scan.id,
+          pageId,
+          `${index + 1}`.padStart(64, "0"),
+          `${index + 11}`.padStart(64, "0"),
+          `${index + 21}`.padStart(64, "0"),
+          new Date(NOW),
+          new Date(NOW + 120_000),
+        ],
+      );
+    }
+    await f.client.query(
+      "UPDATE kith.worker_scan_pages SET entry_count=2 WHERE id=$1",
+      [pageId],
+    );
+    await f.client.query(
+      `UPDATE kith.worker_source_scans SET state='enumerated', inventory_done=true,
+       completed_at=$2, reconcile_manifest_version=0, entry_count=2,
+       review_count=2 WHERE id=$1`,
+      [scan.id, new Date(NOW)],
+    );
+    await f.client.query(
+      `UPDATE kith.source_accounts SET inventory_epoch=1,
+       completed_inventory_epoch=1, last_enumerated_at=$2,
+       active_worker_scan_id=NULL WHERE id=$1`,
+      [f.sourceAccountId, new Date(NOW)],
+    );
+    const pool = createKithPool(f.databaseUrl, 2);
+    const common = {
+      protocolVersion: 1,
+      spaceId: f.spaceId,
+      sourceAccountId: f.sourceAccountId,
+    };
+    const call = (work) => withWorkerTransaction(pool, work, NOW);
+    try {
+      const begun = await call((ctx) =>
+        beginProcessingAssessment(ctx, f.principal, {
+          ...common,
+          operation: "processing.assessBegin",
+          requestId: "batched-assess-begin",
+          scanId: scan.id,
+          expectedInventoryEpoch: 1,
+          expectedManifestVersion: 0,
+        }),
+      );
+      const page0 = {
+        ...common,
+        operation: "processing.assessPage",
+        requestId: "batched-assess-page-0",
+        assessmentId: begun.assessmentId,
+        ordinal: 0,
+        maxItems: 8,
+      };
+      const first = await call((ctx) =>
+        advanceProcessingAssessment(ctx, f.principal, page0),
+      );
+      assert.equal(first.state, "running");
+      assert.equal(first.phase, "items");
+      assert.equal(first.inspected, 8);
+      assert.equal(first.nextOrdinal, 1);
+      assert.equal(
+        (
+          await call((ctx) =>
+            advanceProcessingAssessment(ctx, f.principal, page0),
+          )
+        ).reused,
+        true,
+      );
+      await assert.rejects(
+        call((ctx) =>
+          advanceProcessingAssessment(ctx, f.principal, {
+            ...page0,
+            maxItems: 7,
+          }),
+        ),
+        expectProtocolCode("request_conflict"),
+      );
+
+      const second = await call((ctx) =>
+        advanceProcessingAssessment(ctx, f.principal, {
+          ...page0,
+          requestId: "batched-assess-page-1",
+          ordinal: 1,
+        }),
+      );
+      assert.equal(second.state, "running");
+      assert.equal(second.phase, "unresolved_entries");
+      assert.equal(second.inspected, 2);
+      const completed = await call((ctx) =>
+        advanceProcessingAssessment(ctx, f.principal, {
+          ...page0,
+          requestId: "batched-assess-page-2",
+          ordinal: 2,
+        }),
+      );
+      assert.equal(completed.state, "incomplete");
+      assert.equal(completed.phase, "done");
+      assert.equal(completed.inspected, 2);
+      assert.equal(completed.counts.items.unavailable, 10);
+      assert.equal(completed.counts.unresolvedEntries.needsReview, 2);
+    } finally {
+      await pool.end();
+    }
+  },
+);
+
+test(
   "processing assessment snapshots complete scans, replays pages, and expires stale work",
   { skip },
   async (t) => {
@@ -4098,7 +4232,7 @@ test(
         requestId: "assess-page-0",
         assessmentId: begun.assessmentId,
         ordinal: 0,
-        maxItems: 10,
+        maxItems: 8,
       };
       assert.equal(
         (
