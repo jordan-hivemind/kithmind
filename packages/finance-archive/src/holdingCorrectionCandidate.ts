@@ -704,7 +704,9 @@ export function prepareHoldingPartialPositionScopes(input: {
         positions.length !== declaration.emittedPositionCount ||
         new Set(positions.map((row) => row.rowHash)).size !== positions.length
       ) {
-        fail("selected partial position scope does not exactly match its mapped members");
+        fail(
+          "selected partial position scope does not exactly match its mapped members",
+        );
       }
       const scopeDigest = digest(
         "kith-finance-partial-position-scope-candidate:v1",

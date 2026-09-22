@@ -184,12 +184,18 @@ import { storeRetainedText } from "./retainedTexts.js";
 
 type AcquireSelectionInput =
   | {
-      readonly kind: Extract<CapabilityTier, "structured_api" | "tabular_export">;
+      readonly kind: Extract<
+        CapabilityTier,
+        "structured_api" | "tabular_export"
+      >;
       readonly periodStart: string;
       readonly periodEnd: string;
     }
   | {
-      readonly kind: Extract<CapabilityTier, "pdf_statement" | "trade_confirmation">;
+      readonly kind: Extract<
+        CapabilityTier,
+        "pdf_statement" | "trade_confirmation"
+      >;
       readonly externalId: string;
     };
 
@@ -237,7 +243,10 @@ type SelectionEntry = {
  */
 type ExpandDiscoveredEntry = {
   readonly expand: "discovered";
-  readonly kinds: readonly Extract<CapabilityTier, "pdf_statement" | "trade_confirmation">[];
+  readonly kinds: readonly Extract<
+    CapabilityTier,
+    "pdf_statement" | "trade_confirmation"
+  >[];
   readonly docType: string;
   readonly requireExhaustive: boolean;
 };
@@ -257,7 +266,8 @@ type ExpandActivityRangesEntry = {
   readonly periodEnd: string;
 };
 
-type SelectionPull = SelectionEntry | ExpandDiscoveredEntry | ExpandActivityRangesEntry;
+type SelectionPull =
+  SelectionEntry | ExpandDiscoveredEntry | ExpandActivityRangesEntry;
 
 type SelectionFile = {
   /**
@@ -289,7 +299,9 @@ function readSelectionFile(path: string): SelectionFile {
     raw.institutionId !== undefined &&
     (typeof raw.institutionId !== "string" || raw.institutionId.length === 0)
   ) {
-    throw new Error(`${path}: "institutionId", when present, must be a non-empty string`);
+    throw new Error(
+      `${path}: "institutionId", when present, must be a non-empty string`,
+    );
   }
   if (!Array.isArray(raw.pulls) || raw.pulls.length === 0) {
     throw new Error(`${path}: "pulls" must be a non-empty array`);
@@ -315,7 +327,9 @@ function readSelectionFile(path: string): SelectionFile {
         throw new Error(`${path}: pulls[${index}].docType is required`);
       }
       if (typeof pull.requireExhaustive !== "boolean") {
-        throw new Error(`${path}: pulls[${index}].requireExhaustive must be a boolean`);
+        throw new Error(
+          `${path}: pulls[${index}].requireExhaustive must be a boolean`,
+        );
       }
       return;
     }
@@ -329,7 +343,10 @@ function readSelectionFile(path: string): SelectionFile {
       if (typeof pull.docType !== "string" || pull.docType.length === 0) {
         throw new Error(`${path}: pulls[${index}].docType is required`);
       }
-      if (typeof pull.periodStart !== "string" || typeof pull.periodEnd !== "string") {
+      if (
+        typeof pull.periodStart !== "string" ||
+        typeof pull.periodEnd !== "string"
+      ) {
         throw new Error(
           `${path}: pulls[${index}] needs "periodStart" and "periodEnd"`,
         );
@@ -382,10 +399,15 @@ function readSelectionFile(path: string): SelectionFile {
       throw new Error(`${path}: pulls[${index}].docType is required`);
     }
     if (pull.docDate !== null && typeof pull.docDate !== "string") {
-      throw new Error(`${path}: pulls[${index}].docDate must be a string or null`);
+      throw new Error(
+        `${path}: pulls[${index}].docDate must be a string or null`,
+      );
     }
     if (kind === "structured_api" || kind === "tabular_export") {
-      if (typeof selection.periodStart !== "string" || typeof selection.periodEnd !== "string") {
+      if (
+        typeof selection.periodStart !== "string" ||
+        typeof selection.periodEnd !== "string"
+      ) {
         throw new Error(
           `${path}: pulls[${index}].selection needs "periodStart" and "periodEnd" for kind ${kind}`,
         );
@@ -409,8 +431,7 @@ async function loadModule(path: string): Promise<Record<string, unknown>> {
 async function loadAdapter(path: string): Promise<InstitutionAdapter> {
   const module = await loadModule(path);
   const candidate = (module.default ?? module.adapter) as
-    | InstitutionAdapter
-    | undefined;
+    InstitutionAdapter | undefined;
   if (!candidate || typeof candidate.discover !== "function") {
     throw new Error(
       `${path} has no default export or named "adapter" export implementing InstitutionAdapter`,
@@ -681,7 +702,10 @@ function resolveEntryAccountId(
   return id;
 }
 
-const DOCUMENT_TIER_KINDS = new Set<CapabilityTier>(["pdf_statement", "trade_confirmation"]);
+const DOCUMENT_TIER_KINDS = new Set<CapabilityTier>([
+  "pdf_statement",
+  "trade_confirmation",
+]);
 
 /**
  * F1-54. A signed-out session (or a documents endpoint stuck answering 400)
@@ -770,8 +794,11 @@ async function loadRecordedDocuments(
   const providerIds = new Set<string>();
   const metadataKeys = new Set<string>();
   for (const row of existing.rows) {
-    if (row.provider_document_id !== null) providerIds.add(row.provider_document_id);
-    metadataKeys.add(documentMetadataKey(row.doc_type, row.account_id, row.doc_date));
+    if (row.provider_document_id !== null)
+      providerIds.add(row.provider_document_id);
+    metadataKeys.add(
+      documentMetadataKey(row.doc_type, row.account_id, row.doc_date),
+    );
   }
   return { providerIds, metadataKeys };
 }
@@ -781,10 +808,17 @@ function recordedAs(
   recorded: RecordedDocuments,
   spec: PullSpec,
 ): "provider_id" | "metadata" | null {
-  if (spec.providerDocumentId !== null && recorded.providerIds.has(spec.providerDocumentId)) {
+  if (
+    spec.providerDocumentId !== null &&
+    recorded.providerIds.has(spec.providerDocumentId)
+  ) {
     return "provider_id";
   }
-  if (recorded.metadataKeys.has(documentMetadataKey(spec.docType, spec.accountId, spec.docDate))) {
+  if (
+    recorded.metadataKeys.has(
+      documentMetadataKey(spec.docType, spec.accountId, spec.docDate),
+    )
+  ) {
     return "metadata";
   }
   return null;
@@ -812,7 +846,11 @@ function splitIntoCalendarYears(
 ): Array<{ readonly periodStart: string; readonly periodEnd: string }> {
   const startYear = Number(periodStart.slice(0, 4));
   const endYear = Number(periodEnd.slice(0, 4));
-  if (!Number.isInteger(startYear) || !Number.isInteger(endYear) || endYear < startYear) {
+  if (
+    !Number.isInteger(startYear) ||
+    !Number.isInteger(endYear) ||
+    endYear < startYear
+  ) {
     throw new Error(
       `"expand": "activity-ranges" needs periodStart <= periodEnd, both YYYY-MM-DD; got ` +
         `${periodStart}..${periodEnd}`,
@@ -856,7 +894,10 @@ function expandSelectionPulls(
   }
   for (const entry of entries) {
     if (entry.expand === "discovered") {
-      if (entry.requireExhaustive && discovered.documents.status === "incomplete") {
+      if (
+        entry.requireExhaustive &&
+        discovered.documents.status === "incomplete"
+      ) {
         throw new Error(
           `"expand": "discovered" with "requireExhaustive": true refuses to start: discover()'s ` +
             `document listing is incomplete (${discovered.documents.reason})`,
@@ -907,7 +948,10 @@ function expandSelectionPulls(
       continue;
     }
     if (entry.expand === "activity-ranges") {
-      for (const range of splitIntoCalendarYears(entry.periodStart, entry.periodEnd)) {
+      for (const range of splitIntoCalendarYears(
+        entry.periodStart,
+        entry.periodEnd,
+      )) {
         specs.push({
           accountId: null,
           docType: entry.docType,
@@ -964,7 +1008,10 @@ function expandSelectionPulls(
 // (F1-55) touches those two tiers, so they are simply left alone here
 // rather than taught a paging model reparse does not need yet.
 
-const REPARSEABLE_TIERS = new Set<CapabilityTier>(["pdf_statement", "trade_confirmation"]);
+const REPARSEABLE_TIERS = new Set<CapabilityTier>([
+  "pdf_statement",
+  "trade_confirmation",
+]);
 
 type ReparseDocumentRow = {
   readonly id: string;
@@ -1021,14 +1068,16 @@ function accountsByExternalKeyLoader(
       // F1-56: `accounts.external_key` plus every learned `account_aliases`
       // key, so a holdings row carrying a statement's printed number
       // resolves exactly as a row carrying the API's key does.
-      cached = accountIdsByExternalKey(getClient(), institutionId).catch((error) => {
-        // F1-69: a failed lookup (the connection died mid-query) must not
-        // stay cached -- a caller retrying after `withReconnect` reconnected
-        // needs this to actually re-query the fresh client, not replay the
-        // same rejected promise forever.
-        cache.delete(institutionId);
-        throw error;
-      });
+      cached = accountIdsByExternalKey(getClient(), institutionId).catch(
+        (error) => {
+          // F1-69: a failed lookup (the connection died mid-query) must not
+          // stay cached -- a caller retrying after `withReconnect` reconnected
+          // needs this to actually re-query the fresh client, not replay the
+          // same rejected promise forever.
+          cache.delete(institutionId);
+          throw error;
+        },
+      );
       cache.set(institutionId, cached);
     }
     return cached;
@@ -1142,7 +1191,9 @@ function candidateHoldingInstrumentIds(
  * candidate projections are compared. The outer transaction is then rolled
  * back as a second boundary. This command cannot activate or delete anything.
  */
-async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<void> {
+async function runHoldingCorrectionCandidate(
+  args: readonly string[],
+): Promise<void> {
   const { values } = parseArgs({
     args: [...args],
     options: {
@@ -1323,7 +1374,9 @@ async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<v
         );
       }
       const candidate = candidates[0]!;
-      await tx.query("ROLLBACK TO SAVEPOINT holding_correction_candidate_mapping");
+      await tx.query(
+        "ROLLBACK TO SAVEPOINT holding_correction_candidate_mapping",
+      );
       await tx.query("RELEASE SAVEPOINT holding_correction_candidate_mapping");
 
       const holdingInstrumentIds = candidateHoldingInstrumentIds(
@@ -1395,7 +1448,9 @@ async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<v
       }
       throw new HoldingCorrectionCandidateRollback(manifest);
     });
-    throw new Error("holding correction candidate transaction committed unexpectedly");
+    throw new Error(
+      "holding correction candidate transaction committed unexpectedly",
+    );
   } catch (error) {
     if (!(error instanceof HoldingCorrectionCandidateRollback)) throw error;
     manifest = error.manifest;
@@ -1442,9 +1497,7 @@ async function runHoldingCorrectionPublish(
     | HoldingScopedProjectionApproval
     | HoldingAdditiveProjectionApproval;
   try {
-    approval = JSON.parse(
-      readFileSync(resolve(values.approval), "utf8"),
-    ) as
+    approval = JSON.parse(readFileSync(resolve(values.approval), "utf8")) as
       | HoldingProjectionApproval
       | HoldingScopedProjectionApproval
       | HoldingAdditiveProjectionApproval;
@@ -1699,7 +1752,14 @@ async function runReparse(args: readonly string[]): Promise<void> {
   // idempotent by content hash / row hash).
   const reconnectBudget = createReconnectBudget();
   function reconnect<T>(attempt: () => Promise<T>): Promise<T> {
-    return withReconnect(reconnectBudget, () => pgClient, (client) => { pgClient = client; }, attempt);
+    return withReconnect(
+      reconnectBudget,
+      () => pgClient,
+      (client) => {
+        pgClient = client;
+      },
+      attempt,
+    );
   }
 
   const outcome: ReparseOutcome = {
@@ -1738,108 +1798,121 @@ async function runReparse(args: readonly string[]): Promise<void> {
       // connection dropped mid-document reopens on a fresh client and retries
       // this same document's transaction from BEGIN, rather than losing it or
       // crashing the process.
-      await reconnect(() => withArchiveTransaction(pgClient, async (tx) => {
-        const opened = openRetainedDocument(rawTreeRoot, doc);
-        if (opened === null) {
-          outcome.documentsSkippedTier += 1;
-          return;
-        }
-        const { manifest, bytes } = opened;
-        const parsed = await adapter.parse({ kind: manifest.capabilityTier, bytes });
-        // F1-66: the retained text lands in both places it has to be
-        // resolvable from -- the raw tree, which is the thing ground rule 1
-        // says can never be reconstructed, and the archive, which is the only
-        // one of the two a hosted read surface can reach. Both are keyed on
-        // the same content hash and both writes are idempotent, so a reparse
-        // of an already-reparsed document rewrites neither.
-        let textPath: string | null = null;
-        if (parsed.extractedText) {
-          textPath = writeRetainedText(rawTreeRoot, parsed.extractedText).path;
-          await storeRetainedText(tx, parsed.extractedText);
-        }
-        const accountsByExternalKey = await loadAccountsByExternalKey(doc.institution_id);
-
-        const pull: AdapterPull = {
-          institutionId: doc.institution_id,
-          accountId: doc.account_id,
-          acquired: {
+      await reconnect(() =>
+        withArchiveTransaction(pgClient, async (tx) => {
+          const opened = openRetainedDocument(rawTreeRoot, doc);
+          if (opened === null) {
+            outcome.documentsSkippedTier += 1;
+            return;
+          }
+          const { manifest, bytes } = opened;
+          const parsed = await adapter.parse({
+            kind: manifest.capabilityTier,
             bytes,
-            retention: manifest.retention,
-            manifest: {
-              kind: manifest.capabilityTier,
-              periodStart: manifest.periodStart,
-              periodEnd: manifest.periodEnd,
-              capturedAt: manifest.capturedAt,
-              contentHash: doc.retained_sha256,
-              mediaType: doc.media_type as RetainedMediaType,
-              // Never applicable for a single-file document-tier pull
-              // (adapter.ts's `AcquisitionManifestEntry.reportedRowCount`
-              // doc comment); the original acquisition recorded the same.
-              reportedRowCount: null,
-              gaps: manifest.gaps,
-            },
-          },
-          rows: parsed.activity,
-          holdings: parsed.holdings,
-          parseNote: parsed.parseNote,
-          docType: doc.doc_type,
-          docDate: doc.doc_date,
-          persisted: {
-            filePath: doc.file_path,
-            textPath,
-            captureId: doc.capture_id,
-            // Nothing outside `persistAcquiredDocument` reads a
-            // `PersistedAcquisition`'s write-result fields
-            // (`documentWrite`/`textWrite`/`captureWrite`/`capturePath`), but
-            // reparse writes no new capture, so these name the real capture
-            // and document already on disk (both just verified above)
-            // rather than inventing one.
-            capturePath: opened.capturePath,
-            documentWrite: {
-              path: rawDocumentPath(rawTreeRoot, doc.retained_sha256),
-              sha256: doc.retained_sha256,
-              status: "already_exists",
-            },
-            textWrite: null,
-            captureWrite: {
-              path: opened.capturePath,
-              status: "already_exists",
-              manifestSha256: opened.captureSha256,
-            },
-          },
-          activityTaxonomy: capabilities.activityTaxonomy,
-          accountsByExternalKey,
-        };
+          });
+          // F1-66: the retained text lands in both places it has to be
+          // resolvable from -- the raw tree, which is the thing ground rule 1
+          // says can never be reconstructed, and the archive, which is the only
+          // one of the two a hosted read surface can reach. Both are keyed on
+          // the same content hash and both writes are idempotent, so a reparse
+          // of an already-reparsed document rewrites neither.
+          let textPath: string | null = null;
+          if (parsed.extractedText) {
+            textPath = writeRetainedText(
+              rawTreeRoot,
+              parsed.extractedText,
+            ).path;
+            await storeRetainedText(tx, parsed.extractedText);
+          }
+          const accountsByExternalKey = await loadAccountsByExternalKey(
+            doc.institution_id,
+          );
 
-        const importDocuments = await adapterPullToImportDocuments(tx, pull);
-        const batch: ImportBatch = { source: adapter.institutionSlug, documents: importDocuments };
-        const summary = await publishImport(tx, batch, now, {
-          authoritativeReparse: true,
-        });
+          const pull: AdapterPull = {
+            institutionId: doc.institution_id,
+            accountId: doc.account_id,
+            acquired: {
+              bytes,
+              retention: manifest.retention,
+              manifest: {
+                kind: manifest.capabilityTier,
+                periodStart: manifest.periodStart,
+                periodEnd: manifest.periodEnd,
+                capturedAt: manifest.capturedAt,
+                contentHash: doc.retained_sha256,
+                mediaType: doc.media_type as RetainedMediaType,
+                // Never applicable for a single-file document-tier pull
+                // (adapter.ts's `AcquisitionManifestEntry.reportedRowCount`
+                // doc comment); the original acquisition recorded the same.
+                reportedRowCount: null,
+                gaps: manifest.gaps,
+              },
+            },
+            rows: parsed.activity,
+            holdings: parsed.holdings,
+            parseNote: parsed.parseNote,
+            docType: doc.doc_type,
+            docDate: doc.doc_date,
+            persisted: {
+              filePath: doc.file_path,
+              textPath,
+              captureId: doc.capture_id,
+              // Nothing outside `persistAcquiredDocument` reads a
+              // `PersistedAcquisition`'s write-result fields
+              // (`documentWrite`/`textWrite`/`captureWrite`/`capturePath`), but
+              // reparse writes no new capture, so these name the real capture
+              // and document already on disk (both just verified above)
+              // rather than inventing one.
+              capturePath: opened.capturePath,
+              documentWrite: {
+                path: rawDocumentPath(rawTreeRoot, doc.retained_sha256),
+                sha256: doc.retained_sha256,
+                status: "already_exists",
+              },
+              textWrite: null,
+              captureWrite: {
+                path: opened.capturePath,
+                status: "already_exists",
+                manifestSha256: opened.captureSha256,
+              },
+            },
+            activityTaxonomy: capabilities.activityTaxonomy,
+            accountsByExternalKey,
+          };
 
-        const persisted = await tx.query<{ parsed_ok: boolean }>(
-          "SELECT parsed_ok FROM documents WHERE id = $1",
-          [doc.id],
-        );
-        const parsedOk = persisted.rows[0]?.parsed_ok;
-        if (parsedOk === undefined) {
-          throw new Error(`reparse lost documents row ${doc.id}`);
-        }
+          const importDocuments = await adapterPullToImportDocuments(tx, pull);
+          const batch: ImportBatch = {
+            source: adapter.institutionSlug,
+            documents: importDocuments,
+          };
+          const summary = await publishImport(tx, batch, now, {
+            authoritativeReparse: true,
+          });
 
-        outcome.documentsReparsed += 1;
-        if (parsedOk) outcome.documentsNowParsed += 1;
-        else outcome.documentsStillUnparsed += 1;
-        outcome.rowsInserted += summary.rowsInserted;
-        outcome.rowsDeduplicated += summary.rowsDeduplicated;
-        outcome.rowsRefused += summary.rowsRefused;
-        outcome.reviewItemsOpened += summary.reviewItemsOpened;
-        outcome.reviewItemsResolved += summary.reviewItemsResolved;
-        outcome.reviewItemsUpdated += summary.reviewItemsUpdated;
-        addInstrumentMatchSummary(
-          outcome.instrumentMatches,
-          summary.instrumentMatches,
-        );
-      }));
+          const persisted = await tx.query<{ parsed_ok: boolean }>(
+            "SELECT parsed_ok FROM documents WHERE id = $1",
+            [doc.id],
+          );
+          const parsedOk = persisted.rows[0]?.parsed_ok;
+          if (parsedOk === undefined) {
+            throw new Error(`reparse lost documents row ${doc.id}`);
+          }
+
+          outcome.documentsReparsed += 1;
+          if (parsedOk) outcome.documentsNowParsed += 1;
+          else outcome.documentsStillUnparsed += 1;
+          outcome.rowsInserted += summary.rowsInserted;
+          outcome.rowsDeduplicated += summary.rowsDeduplicated;
+          outcome.rowsRefused += summary.rowsRefused;
+          outcome.reviewItemsOpened += summary.reviewItemsOpened;
+          outcome.reviewItemsResolved += summary.reviewItemsResolved;
+          outcome.reviewItemsUpdated += summary.reviewItemsUpdated;
+          addInstrumentMatchSummary(
+            outcome.instrumentMatches,
+            summary.instrumentMatches,
+          );
+        }),
+      );
     }
 
     // F1-59. Each document above gated only what it changed; this is the one
@@ -1884,7 +1957,9 @@ function printReparseSummary(
 ): void {
   console.log(`mode: reparse${onlyUnparsed ? " (--only-unparsed)" : ""}`);
   console.log(`documents considered: ${outcome.documentsConsidered}`);
-  console.log(`documents skipped (not a document-tier capture): ${outcome.documentsSkippedTier}`);
+  console.log(
+    `documents skipped (not a document-tier capture): ${outcome.documentsSkippedTier}`,
+  );
   console.log(`documents reparsed: ${outcome.documentsReparsed}`);
   console.log(`documents now parsed: ${outcome.documentsNowParsed}`);
   console.log(`documents still unparsed: ${outcome.documentsStillUnparsed}`);
@@ -2041,7 +2116,9 @@ async function runLearnAccountAliases(args: readonly string[]): Promise<void> {
     );
     const resolved = await accountIdsByExternalKey(pgClient, institutionId);
 
-    const documents = await selectRetainedDocuments(pgClient, { institutionId });
+    const documents = await selectRetainedDocuments(pgClient, {
+      institutionId,
+    });
     walk.considered = documents.length;
 
     const observations: AliasObservation[] = [];
@@ -2062,7 +2139,9 @@ async function runLearnAccountAliases(args: readonly string[]): Promise<void> {
       observations.push({ accountId: doc.account_id, keys });
     }
 
-    const learning = planAccountAliases(observations, (key) => resolved.has(key));
+    const learning = planAccountAliases(observations, (key) =>
+      resolved.has(key),
+    );
     const written = dryRun
       ? 0
       : await withArchiveTransaction(pgClient, (tx) =>
@@ -2141,7 +2220,10 @@ function planDocumentTargets(
     holdings: {
       positions: readonly { accountExternalKey?: string; locators: unknown }[];
       balances: readonly { accountExternalKey?: string; locators: unknown }[];
-      liabilities: readonly { accountExternalKey?: string; locators: unknown }[];
+      liabilities: readonly {
+        accountExternalKey?: string;
+        locators: unknown;
+      }[];
     };
   },
   fromAccountId: string,
@@ -2158,7 +2240,10 @@ function planDocumentTargets(
     balances: new Set(),
     liabilities: new Set(),
   };
-  const byTable: Record<HoldingTable, readonly { accountExternalKey?: string; locators: unknown }[]> = {
+  const byTable: Record<
+    HoldingTable,
+    readonly { accountExternalKey?: string; locators: unknown }[]
+  > = {
     positions: parsed.holdings.positions,
     balances: parsed.holdings.balances,
     liabilities: parsed.holdings.liabilities,
@@ -2221,7 +2306,9 @@ async function runReattributeAccounts(args: readonly string[]): Promise<void> {
     // is minutes of CPU, and holding one transaction open across it (on a
     // hosted endpoint, no less) buys nothing -- the plan is a pure function
     // of immutable retained bytes, so nothing it reads can change under it.
-    const documents = await selectRetainedDocuments(pgClient, { institutionId });
+    const documents = await selectRetainedDocuments(pgClient, {
+      institutionId,
+    });
     outcome.considered = documents.length;
     const plans: ReattributionPlan[] = [];
     for (const doc of documents) {
@@ -2256,7 +2343,10 @@ async function runReattributeAccounts(args: readonly string[]): Promise<void> {
       }
     }
     const accountIds = [...touched];
-    const openBefore = await countOpenReviewItems(pgClient, "unknown_account_key");
+    const openBefore = await countOpenReviewItems(
+      pgClient,
+      "unknown_account_key",
+    );
     const before = await holdingsSnapshot(pgClient, accountIds);
 
     let openAfter = openBefore;
@@ -2336,7 +2426,8 @@ async function runReattributeAccounts(args: readonly string[]): Promise<void> {
             snapshots: [
               ...outcome.moved
                 .filter(
-                  (move) => move.table === "positions" && move.instrumentId !== null,
+                  (move) =>
+                    move.table === "positions" && move.instrumentId !== null,
                 )
                 .flatMap((move) => [
                   {
@@ -2352,7 +2443,8 @@ async function runReattributeAccounts(args: readonly string[]): Promise<void> {
                 ]),
               ...outcome.removed
                 .filter(
-                  (row) => row.table === "positions" && row.instrumentId !== null,
+                  (row) =>
+                    row.table === "positions" && row.instrumentId !== null,
                 )
                 .map((row) => ({
                   accountId: row.accountId,
@@ -2413,7 +2505,11 @@ async function holdingsSnapshot(
   return {
     positions: await countHoldingsByAccount(client, "positions", accountIds),
     balances: await countHoldingsByAccount(client, "balances", accountIds),
-    liabilities: await countHoldingsByAccount(client, "liabilities", accountIds),
+    liabilities: await countHoldingsByAccount(
+      client,
+      "liabilities",
+      accountIds,
+    ),
   };
 }
 
@@ -2568,7 +2664,10 @@ async function runConcurrentPool(
       await worker(specs[index]!);
     }
   }
-  const lanes = Array.from({ length: Math.min(concurrency, specs.length) }, () => runOneLane());
+  const lanes = Array.from(
+    { length: Math.min(concurrency, specs.length) },
+    () => runOneLane(),
+  );
   await Promise.all(lanes);
 }
 
@@ -2595,7 +2694,8 @@ function printDocumentKindPreview(
 ): void {
   const subTypeByExternalId = new Map<string, string>();
   for (const doc of discovered.documents.items) {
-    if (doc.subType !== undefined) subTypeByExternalId.set(doc.externalId, doc.subType);
+    if (doc.subType !== undefined)
+      subTypeByExternalId.set(doc.externalId, doc.subType);
   }
   const kinds = new Set<string>(Object.keys(documentsDiscoveredByKind));
   for (const spec of pullSpecs) {
@@ -2684,7 +2784,9 @@ async function main(): Promise<void> {
   // each of those always gets its own transaction (see runPulls below).
   const commitEvery = Number(values["commit-every"]);
   if (!Number.isInteger(commitEvery) || commitEvery < 1) {
-    throw new Error(`--commit-every must be a positive integer, got ${values["commit-every"]}`);
+    throw new Error(
+      `--commit-every must be a positive integer, got ${values["commit-every"]}`,
+    );
   }
   // F1-59. Every document's publication gates incrementally either way (see
   // publishImport). This decides only whether the run ends with one
@@ -2714,7 +2816,11 @@ async function main(): Promise<void> {
   // Postgres commit that follows each one stays strictly one at a time
   // regardless (see runConcurrentPool/createMutex above).
   const concurrency = Number(values.concurrency);
-  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > MAX_CONCURRENCY) {
+  if (
+    !Number.isInteger(concurrency) ||
+    concurrency < 1 ||
+    concurrency > MAX_CONCURRENCY
+  ) {
     throw new Error(
       `--concurrency must be an integer between 1 and ${MAX_CONCURRENCY}, got ${values.concurrency}`,
     );
@@ -2743,7 +2849,14 @@ async function main(): Promise<void> {
   const reconnectBudget = createReconnectBudget();
   function reconnect<T>(attempt: () => Promise<T>): Promise<T> {
     if (dryRun) return attempt();
-    return withReconnect(reconnectBudget, () => pgClient, (client) => { pgClient = client; }, attempt);
+    return withReconnect(
+      reconnectBudget,
+      () => pgClient,
+      (client) => {
+        pgClient = client;
+      },
+      attempt,
+    );
   }
   // F1-69b. `session = await buildSession()` and `adapter.discover()` below
   // are both browser work with no query on `pgClient` at all -- a real
@@ -2801,7 +2914,10 @@ async function main(): Promise<void> {
     const discovered = await adapter.discover(
       session,
       requestedDiscoveredKinds.size > 0
-        ? ([...requestedDiscoveredKinds] as Extract<CapabilityTier, "pdf_statement" | "trade_confirmation">[])
+        ? ([...requestedDiscoveredKinds] as Extract<
+            CapabilityTier,
+            "pdf_statement" | "trade_confirmation"
+          >[])
         : undefined,
     );
     // F1-32: makes every account discover() reported resolvable by its own
@@ -2831,7 +2947,8 @@ async function main(): Promise<void> {
     // selection entry actually asked for them.
     const documentsDiscoveredByKind: Record<string, number> = {};
     for (const doc of discovered.documents.items) {
-      documentsDiscoveredByKind[doc.kind] = (documentsDiscoveredByKind[doc.kind] ?? 0) + 1;
+      documentsDiscoveredByKind[doc.kind] =
+        (documentsDiscoveredByKind[doc.kind] ?? 0) + 1;
     }
 
     // F1-39: expands "expand": "discovered" and "expand": "activity-ranges"
@@ -2885,7 +3002,8 @@ async function main(): Promise<void> {
     // F1-68. Total document-tier pulls this run's loop will process, for the
     // "pulled N of M" progress line below -- every document-tier pull is
     // filed one way or the other above, so their sum is the whole count.
-    const totalDocumentPulls = documentsFiledByAccount + documentsFiledInstitutionWide;
+    const totalDocumentPulls =
+      documentsFiledByAccount + documentsFiledInstitutionWide;
 
     // F1-68. One line per document kind, to stderr, before anything is
     // pulled: what the provider's own listing reports, what discover()
@@ -2911,9 +3029,13 @@ async function main(): Promise<void> {
     // means every lookup during the concurrent pool below is a cache hit (a
     // synchronous Map read), never a query.
     for (const accountId of new Set(
-      pullSpecs.map((spec) => spec.accountId).filter((id): id is string => id !== null),
+      pullSpecs
+        .map((spec) => spec.accountId)
+        .filter((id): id is string => id !== null),
     )) {
-      await reconnect(() => resolveAccountLast4(pgClient, accountId, accountLast4Cache));
+      await reconnect(() =>
+        resolveAccountLast4(pgClient, accountId, accountLast4Cache),
+      );
     }
 
     // F1-35: an institution-wide pull's own accountId is null, and its rows
@@ -2964,7 +3086,10 @@ async function main(): Promise<void> {
         skipped: 0,
         failed: 0,
       };
-      documentPullsByKind.set(kind, { ...existing, [field]: existing[field] + 1 });
+      documentPullsByKind.set(kind, {
+        ...existing,
+        [field]: existing[field] + 1,
+      });
     }
 
     function reportFailure(spec: PullSpec, error: unknown): void {
@@ -2995,7 +3120,10 @@ async function main(): Promise<void> {
     async function acquireAndPersist(spec: PullSpec): Promise<Acquired> {
       const selection = { ...spec.selection, session } as AcquireSelection;
       const acquired = await adapter.acquire(selection);
-      const parsed = await adapter.parse({ kind: spec.selection.kind, bytes: acquired.bytes });
+      const parsed = await adapter.parse({
+        kind: spec.selection.kind,
+        bytes: acquired.bytes,
+      });
       // F1-35: an institution-wide pull names no single account, so there is
       // no accounts.acct_last4 to look up either -- "all" says so on the
       // capture manifest rather than a guessed or borrowed last4 (see
@@ -3003,7 +3131,11 @@ async function main(): Promise<void> {
       const accountLast4 =
         spec.accountId === null
           ? "all"
-          : await resolveAccountLast4(pgClient, spec.accountId, accountLast4Cache);
+          : await resolveAccountLast4(
+              pgClient,
+              spec.accountId,
+              accountLast4Cache,
+            );
       const persisted = persistAcquiredDocument(
         rawTreeRoot,
         {
@@ -3089,7 +3221,11 @@ async function main(): Promise<void> {
       const accountLast4 =
         spec.accountId === null
           ? "all"
-          : await resolveAccountLast4(pgClient, spec.accountId, accountLast4Cache);
+          : await resolveAccountLast4(
+              pgClient,
+              spec.accountId,
+              accountLast4Cache,
+            );
       const persisted = persistAcquiredDocument(
         rawTreeRoot,
         {
@@ -3208,7 +3344,9 @@ async function main(): Promise<void> {
      * `withArchiveTransaction` already joins a transaction already open on
      * it (see `main`'s `--dry-run` branch below) rather than nesting a
      * second one, so this needs no dry-run-specific branch of its own. */
-    async function publishOne(acquiredPulls: readonly Acquired[]): Promise<void> {
+    async function publishOne(
+      acquiredPulls: readonly Acquired[],
+    ): Promise<void> {
       await withArchiveTransaction(pgClient, async (tx) => {
         // F1-36: adapterPullToImportDocuments (adapterImport.ts) opens its
         // own review items during conversion -- weak instrument matches,
@@ -3222,19 +3360,28 @@ async function main(): Promise<void> {
         const reviewItemsBeforeConversion = await countReviewItems(tx);
         const documents: ImportDocument[] = [];
         for (const acquired of acquiredPulls) {
-          documents.push(...(await adapterPullToImportDocuments(tx, acquired.pull)));
+          documents.push(
+            ...(await adapterPullToImportDocuments(tx, acquired.pull)),
+          );
         }
         const conversionReviewItemsOpened =
           (await countReviewItems(tx)) - reviewItemsBeforeConversion;
-        const batch: ImportBatch = { source: adapter.institutionSlug, documents };
+        const batch: ImportBatch = {
+          source: adapter.institutionSlug,
+          documents,
+        };
         // Reuses publishImport: import both gates and publication happen
         // exactly as it already defines them, as one atomic step.
         const publishSummary = await publishImport(tx, batch, now);
         rowsInserted += publishSummary.rowsInserted;
         rowsDeduplicated += publishSummary.rowsDeduplicated;
         rowsRefused += publishSummary.rowsRefused;
-        reviewItemsOpened += conversionReviewItemsOpened + publishSummary.reviewItemsOpened;
-        addInstrumentMatchSummary(instrumentMatches, publishSummary.instrumentMatches);
+        reviewItemsOpened +=
+          conversionReviewItemsOpened + publishSummary.reviewItemsOpened;
+        addInstrumentMatchSummary(
+          instrumentMatches,
+          publishSummary.instrumentMatches,
+        );
         // F1-59: what the incremental gates checked for this publication.
         incrementalCashPeriods += publishSummary.cash.periodsChecked;
         incrementalPositionPeriods += publishSummary.positions.periodsChecked;
@@ -3242,13 +3389,19 @@ async function main(): Promise<void> {
       });
     }
 
-    let pendingDocBatch: Array<{ readonly spec: PullSpec; readonly acquired: Acquired }> = [];
+    let pendingDocBatch: Array<{
+      readonly spec: PullSpec;
+      readonly acquired: Acquired;
+    }> = [];
 
     async function flushDocBatch(): Promise<void> {
       if (pendingDocBatch.length === 0) return;
       const batch = pendingDocBatch;
       pendingDocBatch = [];
-      const toImport: Array<{ readonly spec: PullSpec; readonly acquired: Acquired }> = [];
+      const toImport: Array<{
+        readonly spec: PullSpec;
+        readonly acquired: Acquired;
+      }> = [];
       for (const item of batch) {
         // ponytail: already acquired/persisted above (flushDocBatch only
         // ever receives entries acquireAndPersist already succeeded for);
@@ -3275,9 +3428,12 @@ async function main(): Promise<void> {
         // because publishImport (inside publishOne) dedupes by content hash
         // and row hash, so replaying this same batch from BEGIN is a no-op
         // for anything a first attempt already committed.
-        await reconnect(() => publishOne(toImport.map((item) => item.acquired)));
+        await reconnect(() =>
+          publishOne(toImport.map((item) => item.acquired)),
+        );
         documentPullsAcquired += toImport.length;
-        for (const item of toImport) bumpDocKind(item.acquired.kind, "acquired");
+        for (const item of toImport)
+          bumpDocKind(item.acquired.kind, "acquired");
       } catch (error) {
         documentPullsFailed += toImport.length;
         for (const item of toImport) {
@@ -3332,7 +3488,11 @@ async function main(): Promise<void> {
         // Stop instead: what was committed stays committed, and the rerun
         // skips documents already imported (or, under --acquire-only,
         // already retained).
-        if (/SIGNED_OUT|no session headers captured yet|no Authorization bearer captured yet/.test(message)) {
+        if (
+          /SIGNED_OUT|no session headers captured yet|no Authorization bearer captured yet/.test(
+            message,
+          )
+        ) {
           stopped ??= new Error(
             `run stopped: the browser session is gone (${message.slice(0, 120)}). ` +
               `${documentPullsAcquired} document pull(s) were committed before this; sign in again and rerun the same selection to continue.`,
@@ -3340,7 +3500,8 @@ async function main(): Promise<void> {
           return;
         }
         if (consecutiveDocumentFailures >= CONSECUTIVE_DOCUMENT_FAILURE_LIMIT) {
-          const errorClass = error instanceof Error ? error.constructor.name : typeof error;
+          const errorClass =
+            error instanceof Error ? error.constructor.name : typeof error;
           stopped ??= new Error(
             `run stopped: ${consecutiveDocumentFailures} consecutive document pulls failed ` +
               `(last error: ${errorClass}: ${message.slice(0, 200)}). ` +
@@ -3375,7 +3536,9 @@ async function main(): Promise<void> {
           // F1-69: retries this one document's transaction on a fresh client
           // if the connection died since acquisition -- safe because
           // commitRetainedOnly checks `documents.sha256` before inserting.
-          const result = await commitLock(() => reconnect(() => commitRetainedOnly(acquired)));
+          const result = await commitLock(() =>
+            reconnect(() => commitRetainedOnly(acquired)),
+          );
           if (result === "already_retained") {
             documentPullsSkipped += 1;
             bumpDocKind(acquired.kind, "skipped");
@@ -3407,7 +3570,8 @@ async function main(): Promise<void> {
           // phase. F1-69: retried on a fresh client if the connection died --
           // idempotent by content hash (retainedTexts.ts's ON CONFLICT DO
           // NOTHING).
-          if (extractedText) await reconnect(() => storeRetainedText(pgClient, extractedText));
+          if (extractedText)
+            await reconnect(() => storeRetainedText(pgClient, extractedText));
           pendingDocBatch.push({ spec, acquired });
           // F1-69: flushDocBatch reconnects internally around its own two
           // queries (see its own doc comment), so no wrapping is needed here.
@@ -3415,8 +3579,15 @@ async function main(): Promise<void> {
         });
       }
 
-      async function runDocumentGroup(group: readonly PullSpec[]): Promise<void> {
-        await runConcurrentPool(group, concurrency, processDocumentSpec, () => stopped !== null);
+      async function runDocumentGroup(
+        group: readonly PullSpec[],
+      ): Promise<void> {
+        await runConcurrentPool(
+          group,
+          concurrency,
+          processDocumentSpec,
+          () => stopped !== null,
+        );
         // Whatever this group's lanes queued but did not reach commitEvery
         // for yet -- flushed before a following structured_api/tabular_export
         // pull (which must never share a transaction with a document-tier
@@ -3442,7 +3613,8 @@ async function main(): Promise<void> {
         await commitLock(async () => {
           // F1-69: both retried on a fresh client if the connection died --
           // idempotent (content-hash ON CONFLICT / row-hash dedupe).
-          if (extractedText) await reconnect(() => storeRetainedText(pgClient, extractedText));
+          if (extractedText)
+            await reconnect(() => storeRetainedText(pgClient, extractedText));
           await reconnect(() => publishOne([acquired]));
         });
       }
@@ -3453,9 +3625,15 @@ async function main(): Promise<void> {
     async function buildOutcome(): Promise<RunOutcome> {
       // F1-69: reads, retried on a fresh client the same as every write above
       // -- there is nothing for them to lose by retrying.
-      const currencySums = await reconnect(() => sumByCurrency(pgClient, allDocumentShas));
-      const cashVerdicts = await reconnect(() => fetchCashVerdicts(pgClient, accountIds));
-      const positionVerdicts = await reconnect(() => fetchPositionVerdicts(pgClient, accountIds));
+      const currencySums = await reconnect(() =>
+        sumByCurrency(pgClient, allDocumentShas),
+      );
+      const cashVerdicts = await reconnect(() =>
+        fetchCashVerdicts(pgClient, accountIds),
+      );
+      const positionVerdicts = await reconnect(() =>
+        fetchPositionVerdicts(pgClient, accountIds),
+      );
       // One digest standing for this run's whole acquisition manifest: the
       // sha256 of every acquired document's own content hash, sorted so the
       // digest does not depend on acquisition order.
@@ -3486,7 +3664,9 @@ async function main(): Promise<void> {
         // first pull is bumped first depends on completion order, not spec
         // order, and the printed summary must not depend on that.
         documentPullsByKind: Object.fromEntries(
-          [...documentPullsByKind.entries()].sort(([a], [b]) => a.localeCompare(b)),
+          [...documentPullsByKind.entries()].sort(([a], [b]) =>
+            a.localeCompare(b),
+          ),
         ),
         documentsFiledByAccount,
         documentsFiledInstitutionWide,
@@ -3573,7 +3753,11 @@ async function main(): Promise<void> {
  */
 function printSummary(
   outcome: RunOutcome,
-  meta: { readonly dryRun: boolean; readonly committed: boolean; readonly acquireOnly: boolean },
+  meta: {
+    readonly dryRun: boolean;
+    readonly committed: boolean;
+    readonly acquireOnly: boolean;
+  },
 ): void {
   console.log(
     `mode: ${meta.dryRun ? "dry-run (rolled back, nothing committed)" : "committed"}` +
@@ -3587,7 +3771,8 @@ function printSummary(
   for (const [kind, n] of Object.entries(outcome.documentsDiscoveredByKind)) {
     console.log(`  ${kind}: ${n}`);
   }
-  if (Object.keys(outcome.documentsDiscoveredByKind).length === 0) console.log("  (none)");
+  if (Object.keys(outcome.documentsDiscoveredByKind).length === 0)
+    console.log("  (none)");
   // F1-62. Under --acquire-only these count documents retained (a document
   // row with retained bytes and no parse), not documents imported.
   console.log(
@@ -3604,7 +3789,8 @@ function printSummary(
       `  ${kind}: acquired=${counts.acquired} skipped=${counts.skipped} failed=${counts.failed}`,
     );
   }
-  if (Object.keys(outcome.documentPullsByKind).length === 0) console.log("  (none)");
+  if (Object.keys(outcome.documentPullsByKind).length === 0)
+    console.log("  (none)");
   console.log(
     `documents filed: by account=${outcome.documentsFiledByAccount} ` +
       `institution-wide=${outcome.documentsFiledInstitutionWide}`,
@@ -3622,7 +3808,9 @@ function printSummary(
       `positions=${outcome.incrementalPeriodsChecked.positions}`,
   );
   if (meta.acquireOnly) {
-    console.log("whole-archive gate pass: skipped (--acquire-only: no gate runs in acquire-only mode)");
+    console.log(
+      "whole-archive gate pass: skipped (--acquire-only: no gate runs in acquire-only mode)",
+    );
   } else if (outcome.wholeArchiveGates === null) {
     console.log("whole-archive gate pass: skipped (--gates incremental)");
   } else {

@@ -1051,7 +1051,8 @@ export async function prepareHoldingAdditivePositionCorrection(input: {
   readonly selectors: readonly HoldingAdditivePositionSelection[];
   readonly selectedRowHashes: readonly string[];
 }): Promise<PreparedAdditiveCorrection> {
-  if (input.selectors.length === 0) refuse("no partial position scopes were selected");
+  if (input.selectors.length === 0)
+    refuse("no partial position scopes were selected");
   const selectors = input.selectors.map((selector) => {
     if (
       selector === null ||
@@ -1955,8 +1956,7 @@ async function insertGeneration(
         null,
       fullApproval?.authorizeEmptyProjection ??
         scopedApproval?.authorizeEmptySelectedScopes ??
-        (additiveApproval === null ? null : false) ??
-        null,
+        (additiveApproval === null ? null : false),
       input.approval?.expectedActiveGenerationId ?? null,
       input.previousGenerationId,
       input.now,
@@ -3218,11 +3218,7 @@ export async function publishHoldingAdditivePositionCorrection(
       now: now.toISOString(),
     });
     await insertMemberships(tx, activeGenerationId, nextAssertions);
-    await appendCurrentPositions(
-      tx,
-      document.id,
-      additions.assertions,
-    );
+    await appendCurrentPositions(tx, document.id, additions.assertions);
 
     const selectedScopeKeys = new Set(
       prepared.selectedPositionScopes.map((scope) => scopeKey(scope.selector)),

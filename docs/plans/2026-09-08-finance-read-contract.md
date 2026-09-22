@@ -453,3 +453,58 @@ dated-lot suffix, as well as equal quantity, price, value, cost, unrealized,
 currency, row hash, account and date. Literal notes, nulls and disclaimers stay
 exact. Each source's original note and locator remain immutable evidence; no
 canonical row is rewritten or rehomed.
+
+### Additions from a partial source proof
+
+Migration 18 adds a separate positions-only publication contract for a source
+that proves new rows while its account/date scope remains partial. It does not
+reuse the whole-document or complete-scope attestations. The candidate names
+explicit partial scopes and explicit row hashes, binds the retained SHA and
+current generation, and audits the old and composed projection digests. Its
+manifest fixes changed and removed row counts at zero. Approval attests only to
+the selected source additions.
+
+Publication carries every prior assertion ID, digest, locator and semantic
+value into the next full generation. It appends selected source-owned positions
+and does not replace current rows. An exact canonical row owned by another
+document remains that document's row and may appear only as a semantically
+equal membership reference. A selected row that already exists, has an
+unreadable typed value, or collides with an existing source-owned evidence
+boundary is refused.
+
+The new generation records each selected observation with its actual `partial`
+status, gap codes, evidence and complete emitted membership. Unselected parser
+differences remain partial membership evidence and cannot rewrite a reviewed
+assertion. Nonselected scope proofs carry forward unchanged. For a document
+without an active generation, the publisher first records the current rows as
+an immutable baseline, then moves legacy unversioned proofs into the published
+generation without updating or deleting their history. It leaves `parsed_ok`
+and review status unchanged, so holdings freshness and aggregation continue to
+fail closed.
+
+The existing operator commands accept an additive selection file through
+`--scope-selection`:
+
+```json
+{
+  "kind": "holding_additive_position_selection_v1",
+  "scopes": [
+    {
+      "scopeKind": "positions",
+      "accountId": "synthetic-account",
+      "asOf": "2026-06-30",
+      "proofVersion": "position_scope_v1"
+    }
+  ],
+  "selectedRowHashes": [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ]
+}
+```
+
+Candidate preparation runs under the archive writer lock and rolls back all
+adapter mapping writes. Publication rebuilds the candidate from the same
+retained bytes and uses the ordinary writer lock, document row lock, active
+generation compare-and-swap and one database transaction. A stale approval,
+changed retained bytes, canonical ownership change, selected evidence conflict
+or assertion mismatch leaves the archive unchanged.
