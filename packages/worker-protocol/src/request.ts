@@ -371,6 +371,28 @@ export type TargetedTaxArtifactDeclaration = {
   extractionFingerprint: string;
 };
 
+export const TARGETED_TAX_FORM_FAMILIES = [
+  "form_1040",
+  "schedule_k1_1065",
+  "schedule_k1_1041",
+  "schedule_k1_1120s",
+  "unknown",
+] as const;
+export type TargetedTaxFormFamily =
+  (typeof TARGETED_TAX_FORM_FAMILIES)[number];
+
+/**
+ * Cumulative semantic coverage through this batch. These flags are not a
+ * claim that optional boxes contain values. They say the requested region
+ * and every continuation it points to have been inspected, so an absent box
+ * remains absent rather than becoming zero.
+ */
+export type TargetedTaxCoverageDeclaration = {
+  formFamily: TargetedTaxFormFamily;
+  requestedRegionsClosed: boolean;
+  continuationsClosed: boolean;
+};
+
 export type WorkerRequest =
   | (WorkerSourceRequest & {
       operation: "source.status";
@@ -583,6 +605,7 @@ export type WorkerRequest =
       batchOrdinal: number;
       artifact: TargetedTaxArtifactDeclaration;
       pages: TargetedTaxPageInput[];
+      coverage: TargetedTaxCoverageDeclaration;
     })
   | (WorkerSourceRequest & {
       operation: "extraction.targetedTaxStatus";
@@ -1688,6 +1711,26 @@ function targetedArtifact(value: unknown): TargetedTaxArtifactDeclaration {
     artifactFingerprint: string(input.artifactFingerprint, { maxUtf16: 64, pattern: SHA256 }),
     parserFingerprint: string(input.parserFingerprint, { maxUtf8: 1024 }),
     extractionFingerprint: string(input.extractionFingerprint, { maxUtf8: 1024 }),
+  };
+}
+
+function targetedCoverage(value: unknown): TargetedTaxCoverageDeclaration {
+  const input = object(value);
+  exactKeys(input, [
+    "formFamily",
+    "requestedRegionsClosed",
+    "continuationsClosed",
+  ]);
+  if (
+    typeof input.formFamily !== "string" ||
+    !(TARGETED_TAX_FORM_FAMILIES as readonly string[]).includes(input.formFamily) ||
+    typeof input.requestedRegionsClosed !== "boolean" ||
+    typeof input.continuationsClosed !== "boolean"
+  ) invalid();
+  return {
+    formFamily: input.formFamily as TargetedTaxFormFamily,
+    requestedRegionsClosed: input.requestedRegionsClosed,
+    continuationsClosed: input.continuationsClosed,
   };
 }
 
@@ -2975,6 +3018,7 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         "batchOrdinal",
         "artifact",
         "pages",
+        "coverage",
       ]);
       const artifact = targetedArtifact(input.artifact);
       const pages = targetedPages(input.pages);
@@ -2991,6 +3035,7 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         batchOrdinal: integer(input.batchOrdinal, 0, 10_000),
         artifact,
         pages,
+        coverage: targetedCoverage(input.coverage),
       };
     }
     case "extraction.targetedTaxStatus":

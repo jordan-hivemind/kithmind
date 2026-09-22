@@ -369,6 +369,63 @@ test("discovery.recordPreview rejects ambiguous unit coverage and open metadata"
   }
 });
 
+test("targeted tax batches are closed, original-page bound and transport bounded", () => {
+  const begin = {
+    ...source,
+    operation: "extraction.beginTargetedTax",
+    requestId: "target-begin",
+    sourceItemId: "j1234567890123456789012345678903",
+    sourceRevisionId: "j1234567890123456789012345678904",
+    observedContentHash: "a".repeat(64),
+    goalKind: "form_1040_totals_v1",
+    instanceKey: "primary-return",
+    requiredFields: ["tax_year", "total_tax"],
+    optionalFields: ["amount_owed"],
+    sourcePageCount: 500,
+    requestDigest: "b".repeat(64),
+  };
+  assert.deepEqual(parseWorkerRequest(begin), begin);
+  const artifact = {
+    artifactKind: "selective_pdf_pages_v1",
+    sourceSha256: "a".repeat(64),
+    selectedPdfSha256: "c".repeat(64),
+    sourcePageCount: 500,
+    originalPages: [137, 138],
+    coverageFingerprint: "d".repeat(64),
+    artifactFingerprint: "e".repeat(64),
+    parserFingerprint: "parser-v1",
+    extractionFingerprint: "extract-v1",
+  };
+  const append = {
+    ...source,
+    operation: "extraction.appendTargetedTaxBatch",
+    requestId: "target-append",
+    targetId: "j1234567890123456789012345678905",
+    sourceRevisionId: begin.sourceRevisionId,
+    batchOrdinal: 0,
+    artifact,
+    coverage: {
+      formFamily: "form_1040",
+      requestedRegionsClosed: false,
+      continuationsClosed: false,
+    },
+    pages: [
+      { originalPage: 137, text: "Form 1040", textHash: "f".repeat(64) },
+      { originalPage: 138, text: "Total tax", textHash: "0".repeat(64) },
+    ],
+  };
+  assert.deepEqual(parseWorkerRequest(append), append);
+  for (const bad of [
+    { ...append, artifact: { ...artifact, originalPages: [138, 137] } },
+    { ...append, pages: [...append.pages].reverse() },
+    { ...append, pages: [{ ...append.pages[0], originalPage: true }] },
+    { ...append, coverage: { ...append.coverage, continuationsClosed: "yes" } },
+    { ...append, pages: append.pages.concat(Array(11).fill(append.pages[1])) },
+    { ...begin, requiredFields: ["tax_year"], optionalFields: ["tax_year"] },
+    { ...begin, goalKind: "generic_tax_v1" },
+  ]) assert.throws(() => parseWorkerRequest(bad), WorkerProtocolParseError);
+});
+
 const archivedAdmissionReceipt = (subjectKind, copyRole, suffix) => ({
   kind: "create",
   subjectKind,

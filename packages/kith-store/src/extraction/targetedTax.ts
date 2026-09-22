@@ -1,5 +1,6 @@
 import type { Pool, PoolClient } from "pg";
 
+import type { DocumentFieldValueType } from "../admin/model.js";
 import { TerminalDeferredWorkError, type DeferredWorkRow } from "../deferred/core.js";
 import { sha256 } from "../hash.js";
 import { KITH_ID, newKithId } from "../ids.js";
@@ -10,9 +11,11 @@ import type {
   TargetedTaxRow,
 } from "../workers/targetedTax.js";
 import { FEDERAL_INDIVIDUAL_RETURN } from "./taxCatalog.js";
+import { candidatesFor, checkValue } from "./gate.js";
+import { citedLines, numberedPage, pageLines } from "./lines.js";
 import type { ExtractionModel, ExtractionRequest, ModelReading } from "./provider.js";
 
-type ValueType = "text" | "date" | "number" | "money";
+type ValueType = Extract<DocumentFieldValueType, "text" | "date" | "number" | "money">;
 
 const K1_FIELDS: Readonly<Record<string, ValueType>> = {
   tax_year: "number",
@@ -107,7 +110,44 @@ export function targetedTaxFieldsAgree(
   optional: readonly string[],
 ): boolean {
   const allowed = TARGETED_TAX_FIELD_CATALOG[goalKind];
-  return [...required, ...optional].every((field) => field in allowed);
+  const fields = [...required, ...optional];
+  if (!fields.every((field) => field in allowed)) return false;
+  return goalKind !== "schedule_k1_key_fields_v1" || fields.some(isK1KeyFigureField);
+}
+
+const K1_IDENTITY_FIELDS = new Set([
+  "tax_year",
+  "form_family",
+  "partnership_name",
+  "partnership_ein",
+  "recipient_name",
+  "recipient_tax_id_suffix",
+  "amended_return",
+  "final_return",
+  "publicly_traded_partnership",
+  "partner_type",
+  "domestic_or_foreign",
+  "schedule_k3_attached",
+]);
+
+function isK1KeyFigureField(field: string): boolean {
+  return field in K1_FIELDS && !K1_IDENTITY_FIELDS.has(field);
+}
+
+export function detectTargetedTaxFormFamily(
+  goalKind: keyof typeof TARGETED_TAX_FIELD_CATALOG,
+  pages: readonly { text: string }[],
+): "form_1040" | "schedule_k1_1065" | "schedule_k1_1041" | "schedule_k1_1120s" | "unknown" {
+  const text = pages.map((page) => page.text.slice(0, 4_000)).join("\n");
+  if (goalKind === "form_1040_totals_v1") {
+    return /\bform\s+1040(?!\s*-\s*x)\b|u\.?s\.?\s+individual\s+income\s+tax\s+return/iu.test(text)
+      ? "form_1040"
+      : "unknown";
+  }
+  if (/\bschedule\s+k-?1\s*\(\s*form\s+1065\s*\)/iu.test(text)) return "schedule_k1_1065";
+  if (/\bschedule\s+k-?1\s*\(\s*form\s+1041\s*\)/iu.test(text)) return "schedule_k1_1041";
+  if (/\bschedule\s+k-?1\s*\(\s*form\s+1120\s*-?\s*s\s*\)/iu.test(text)) return "schedule_k1_1120s";
+  return "unknown";
 }
 
 type Loaded = {
@@ -211,17 +251,13 @@ async function load(
   };
 }
 
-function numbered(text: string): string {
-  return text.split(/\r?\n/u).map((line, index) => `${index + 1}| ${line}`).join("\n");
-}
-
 function requestFor(loaded: Loaded): ExtractionRequest {
   const fields = [...loaded.target.requiredFields, ...loaded.target.optionalFields];
   const kind = loaded.target.goalKind === "form_1040_totals_v1"
     ? "tax_return_1040"
     : "schedule_k1_1065";
   const body = loaded.pages.map((page) =>
-    `=== original page ${page.originalPage} ===\n${numbered(page.text)}`
+    `=== original page ${page.originalPage} ===\n${numberedPage(pageLines(page.text))}`
   ).join("\n\n");
   return {
     kinds: [kind],
@@ -230,58 +266,12 @@ function requestFor(loaded: Loaded): ExtractionRequest {
   };
 }
 
-function normalizeDecimal(value: string): string | null {
-  const trimmed = value.trim();
-  const negative = /^\(.*\)$/u.test(trimmed);
-  const bare = trimmed.replace(/^\(/u, "").replace(/\)$/u, "")
-    .replace(/^\$/u, "").replaceAll(",", "").trim();
-  if (!/^[+-]?(?:\d+|\d*\.\d+)$/u.test(bare)) return null;
-  let sign = "";
-  let body = bare;
-  if (body.startsWith("-") || body.startsWith("+")) {
-    sign = body[0] === "-" ? "-" : "";
-    body = body.slice(1);
-  }
-  let [whole, fraction] = body.split(".");
-  whole = (whole ?? "0").replace(/^0+(?=\d)/u, "") || "0";
-  fraction = fraction?.replace(/0+$/u, "");
-  const normalized = `${whole}${fraction ? `.${fraction}` : ""}`;
-  return (negative || sign === "-") && normalized !== "0" ? `-${normalized}` : normalized;
-}
-
-function typedValue(type: ValueType, value: unknown): unknown | null {
-  if (typeof value !== "string" || value.trim().length === 0) return null;
-  if (type === "text") return value.trim();
-  if (type === "date") return /^\d{4}-\d{2}-\d{2}$/u.test(value.trim()) ? value.trim() : null;
-  const decimal = normalizeDecimal(value);
-  if (decimal === null) return null;
-  return type === "money" ? { amount: decimal, currency: "USD" } : decimal;
-}
-
-function lineRange(text: string, lineIds: readonly number[]): { start: number; end: number } | null {
-  if (
-    lineIds.length < 1 ||
-    lineIds.length > 3 ||
-    lineIds.some((line, index) => !Number.isInteger(line) || line < 1 || (index > 0 && line !== lineIds[index - 1]! + 1))
-  ) return null;
-  const lines = text.split(/\r?\n/u);
-  if (lineIds.some((line) => line > lines.length)) return null;
-  let offset = 0;
-  const starts: number[] = [];
-  for (const line of lines) {
-    starts.push(offset);
-    offset += line.length + 1;
-  }
-  const first = lineIds[0]! - 1;
-  const last = lineIds[lineIds.length - 1]! - 1;
-  return { start: starts[first]!, end: starts[last]! + lines[last]!.length };
-}
-
 async function storeReading(
   client: PoolClient,
   loaded: Loaded,
   reading: ModelReading,
   modelName: string,
+  preconditionCode?: string,
 ): Promise<void> {
   const targetRaw = (
     await client.query<Record<string, unknown>>(
@@ -292,56 +282,99 @@ async function storeReading(
   ).rows[0];
   if (!targetRaw) return;
   const target = targetRow(targetRaw);
+  const current = (
+    await client.query<{ desired_revision_id: string | null; lifecycle: string }>(
+      `SELECT desired_revision_id, lifecycle FROM kith.source_items
+        WHERE id=$1 AND space_id=$2 AND source_account_id=$3
+        FOR UPDATE`,
+      [target.sourceItemId, target.spaceId, target.sourceAccountId],
+    )
+  ).rows[0];
+  if (
+    !current ||
+    current.lifecycle !== "available" ||
+    current.desired_revision_id !== target.sourceRevisionId
+  ) return;
   const batchIndex = target.batches.findIndex((batch) => batch.ordinal === loaded.batch.ordinal);
-  if (batchIndex < 0 || target.batches[batchIndex]!.state === "extracted") return;
+  if (
+    batchIndex < 0 ||
+    target.batches[batchIndex]!.state === "extracted" ||
+    target.status === "conflict"
+  ) return;
+  const currentBatch = target.batches[batchIndex]!;
   if (
     target.sourceRevisionId !== loaded.target.sourceRevisionId ||
-    target.batches[batchIndex]!.artifactFingerprint !== loaded.batch.artifactFingerprint
+    currentBatch.requestDigest !== loaded.batch.requestDigest ||
+    JSON.stringify(currentBatch.artifact) !== JSON.stringify(loaded.batch.artifact) ||
+    JSON.stringify(currentBatch.requestedPages) !== JSON.stringify(loaded.batch.requestedPages) ||
+    JSON.stringify(currentBatch.pages) !== JSON.stringify(loaded.batch.pages) ||
+    JSON.stringify(currentBatch.coverage) !== JSON.stringify(loaded.batch.coverage)
   ) throw new TerminalDeferredWorkError("targeted_tax_batch_changed");
 
   const allowed = TARGETED_TAX_FIELD_CATALOG[target.goalKind];
   const requested = new Set([...target.requiredFields, ...target.optionalFields]);
   const outcomes = structuredClone(target.outcomes);
-  let conflict = false;
-  let spanOrdinal = 0;
-  for (const statement of reading.statements.slice(0, 128)) {
+  for (const statement of preconditionCode ? [] : reading.statements.slice(0, 128)) {
     if (!requested.has(statement.field) || !(statement.field in allowed)) continue;
     const page = loaded.pages.find((candidate) => candidate.originalPage === statement.page);
-    const range = page && lineRange(page.text, statement.lines);
+    if (!page) continue;
+    const lines = citedLines(pageLines(page.text), statement.lines);
+    if (!lines) continue;
     const valueType = allowed[statement.field]!;
-    const value = typedValue(valueType, statement.value);
-    if (!page || !range || value === null) continue;
+    const candidates = candidatesFor(lines, valueType);
+    const gated = checkValue({
+      valueType,
+      value: statement.value,
+      candidates,
+      pageText: page.text,
+      defaultCurrency: "USD",
+    });
+    if (!gated.ok || gated.values.length !== 1 || gated.support.length !== 1) continue;
+    const value = gated.values[0]!;
+    const range = candidates[gated.support[0]!]!;
     const existing = outcomes.find((outcome) => outcome.field === statement.field);
-    if (existing && JSON.stringify(existing.value) !== JSON.stringify(value)) {
-      conflict = true;
-      continue;
-    }
-    const evidenceSpanId = newKithId();
     const quote = page.text.slice(range.start, range.end);
-    await client.query(
-      `INSERT INTO kith.evidence_spans
-         (id, space_id, created_at, source_revision_id, source_text_version_id,
-          source_page_id, ordinal, start, "end", quote_hash, locator,
-          card_extraction_fingerprints)
-       VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'[]'::jsonb)`,
-      [
-        evidenceSpanId,
-        target.spaceId,
-        target.sourceRevisionId,
-        loaded.batch.sourceTextVersionId,
-        page.sourcePageId,
-        spanOrdinal++,
-        range.start,
-        range.end,
-        sha256(quote),
-        JSON.stringify({
-          kind: "targeted_tax_v1",
-          goalKind: target.goalKind,
-          originalPage: page.originalPage,
-          batchOrdinal: loaded.batch.ordinal,
-        }),
-      ],
-    );
+    let evidenceSpanId = (
+      await client.query<{ id: string }>(
+        `SELECT id FROM kith.evidence_spans
+          WHERE source_page_id=$1 AND start=$2 AND "end"=$3 LIMIT 1`,
+        [page.sourcePageId, range.start, range.end],
+      )
+    ).rows[0]?.id;
+    if (!evidenceSpanId) {
+      evidenceSpanId = newKithId();
+      const ordinal = Number((
+        await client.query<{ ordinal: string }>(
+          `SELECT COALESCE(max(ordinal),-1)+1 AS ordinal
+             FROM kith.evidence_spans WHERE source_page_id=$1`,
+          [page.sourcePageId],
+        )
+      ).rows[0]?.ordinal ?? 0);
+      await client.query(
+        `INSERT INTO kith.evidence_spans
+           (id, space_id, created_at, source_revision_id, source_text_version_id,
+            source_page_id, ordinal, start, "end", quote_hash, locator,
+            card_extraction_fingerprints)
+         VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'[]'::jsonb)`,
+        [
+          evidenceSpanId,
+          target.spaceId,
+          target.sourceRevisionId,
+          loaded.batch.sourceTextVersionId,
+          page.sourcePageId,
+          ordinal,
+          range.start,
+          range.end,
+          sha256(quote),
+          JSON.stringify({
+            kind: "targeted_tax_v1",
+            goalKind: target.goalKind,
+            originalPage: page.originalPage,
+            batchOrdinal: loaded.batch.ordinal,
+          }),
+        ],
+      );
+    }
     const citation = {
       sourceTextVersionId: loaded.batch.sourceTextVersionId,
       sourcePageId: page.sourcePageId,
@@ -349,25 +382,62 @@ async function storeReading(
       evidenceSpanId,
     };
     if (existing) {
-      if (!existing.citations.some((item) => item.evidenceSpanId === evidenceSpanId)) {
-        existing.citations.push(citation);
+      let prior = existing.readings.find((candidate) =>
+        JSON.stringify(candidate.value) === JSON.stringify(value)
+      );
+      if (!prior) {
+        prior = {
+          value,
+          ...(gated.currencyAssumed ? { currencyAssumed: true as const } : {}),
+          citations: [],
+        };
+        existing.readings.push(prior);
+        existing.status = "conflict";
+      }
+      if (!prior.citations.some((item) => item.evidenceSpanId === evidenceSpanId)) {
+        prior.citations.push(citation);
       }
     } else {
-      outcomes.push({ field: statement.field, status: "cited", valueType, value, citations: [citation] });
+      outcomes.push({
+        field: statement.field,
+        status: "cited",
+        valueType,
+        readings: [{
+          value,
+          ...(gated.currencyAssumed ? { currencyAssumed: true as const } : {}),
+          citations: [citation],
+        }],
+      });
     }
   }
   const batches = structuredClone(target.batches);
   batches[batchIndex] = { ...batches[batchIndex]!, state: "extracted" };
-  const cited = new Set(outcomes.map((outcome) => outcome.field));
+  const cited = new Set(
+    outcomes.filter((outcome) => outcome.status === "cited").map((outcome) => outcome.field),
+  );
   const unresolvedFields = target.requiredFields.filter((field) => !cited.has(field));
+  const conflict = outcomes.some((outcome) => outcome.status === "conflict");
+  const identityFields = target.goalKind === "form_1040_totals_v1"
+    ? ["tax_year", "return_version"]
+    : ["tax_year", "form_family"];
+  const coverageClosed =
+    currentBatch.coverage.requestedRegionsClosed &&
+    currentBatch.coverage.continuationsClosed &&
+    identityFields.every((field) => cited.has(field));
   const status = conflict
     ? "conflict"
-    : unresolvedFields.length === 0
+    : unresolvedFields.length === 0 && coverageClosed && preconditionCode === undefined
       ? "complete"
       : "incomplete_resumable";
   const unresolvedCodes = conflict
     ? ["field_value_conflict"]
-    : unresolvedFields.map((field) => `missing_required:${field}`);
+    : [
+        ...(preconditionCode ? [preconditionCode] : []),
+        ...unresolvedFields.map((field) => `missing_required:${field}`),
+        ...(!currentBatch.coverage.requestedRegionsClosed ? ["requested_regions_open"] : []),
+        ...(!currentBatch.coverage.continuationsClosed ? ["continuations_open"] : []),
+        ...identityFields.filter((field) => !cited.has(field)).map((field) => `missing_identity:${field}`),
+      ];
   await client.query(
     `UPDATE kith.document_targeted_extractions
         SET batches=$2::jsonb, outcomes=$3::jsonb, unresolved_codes=$4::jsonb,
@@ -406,9 +476,33 @@ export async function runTargetedTaxExtractionJob(
   if (!targetedTaxFieldsAgree(loaded.target.goalKind, loaded.target.requiredFields, loaded.target.optionalFields)) {
     throw new TerminalDeferredWorkError("targeted_tax_fields_invalid");
   }
+  const supportedFamily = loaded.target.goalKind === "form_1040_totals_v1"
+    ? "form_1040"
+    : "schedule_k1_1065";
+  if (loaded.batch.coverage.formFamily !== supportedFamily) {
+    await withKithTransaction(pool, (client) =>
+      storeReading(
+        client,
+        loaded,
+        { kind: "unsupported", summary: "", statements: [], unnamed: 0 },
+        model.name,
+        `unsupported_form_family:${loaded.batch.coverage.formFamily}`,
+      ),
+    );
+    return;
+  }
   const reading = await model.read(requestFor(loaded));
+  const expectedKind = loaded.target.goalKind === "form_1040_totals_v1"
+    ? "tax_return_1040"
+    : "schedule_k1_1065";
   await withKithTransaction(pool, (client) =>
-    storeReading(client, loaded, reading, model.name),
+    storeReading(
+      client,
+      loaded,
+      reading,
+      model.name,
+      reading.kind === expectedKind ? undefined : "model_kind_mismatch",
+    ),
   );
   void now;
 }

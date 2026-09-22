@@ -71,14 +71,17 @@ export type TargetedTaxExtraction = {
   unresolvedCodes: string[];
   outcomes: Array<{
     field: string;
-    status: "cited";
+    status: "cited" | "conflict";
     valueType: string;
-    value: unknown;
-    citations: Array<{
-      originalPage: number;
-      evidenceSpanId: string;
-      quote: string;
-      quoteHash: string;
+    readings: Array<{
+      value: unknown;
+      currencyAssumed?: true;
+      citations: Array<{
+        originalPage: number;
+        evidenceSpanId: string;
+        quote: string;
+        quoteHash: string;
+      }>;
     }>;
   }>;
 };
@@ -98,7 +101,8 @@ export async function readTargetedTaxExtractions(
          JOIN kith.source_items i ON i.id=x.source_item_id AND i.space_id=x.space_id
         WHERE x.source_item_id=$1 AND x.space_id=ANY($2::kith.kith_id[])
           AND i.lifecycle='available'
-          AND ($3::kith.kith_id IS NULL OR x.source_revision_id=$3)
+          AND (($3::kith.kith_id IS NULL AND x.source_revision_id=i.desired_revision_id)
+            OR x.source_revision_id=$3)
         ORDER BY x.created_at, x.id LIMIT 17`,
       [sourceItemId, spaceIds, sourceRevisionId ?? null],
     )
@@ -112,13 +116,18 @@ export async function readTargetedTaxExtractions(
     }>;
     const outcomes = row.outcomes as Array<{
       field: string;
-      status: "cited";
+      status: "cited" | "conflict";
       valueType: string;
-      value: unknown;
-      citations: Array<{ originalPage: number; evidenceSpanId: string }>;
+      readings: Array<{
+        value: unknown;
+        currencyAssumed?: true;
+        citations: Array<{ originalPage: number; evidenceSpanId: string }>;
+      }>;
     }>;
     const citationIds = outcomes.flatMap((outcome) =>
-      outcome.citations.map((citation) => citation.evidenceSpanId),
+      outcome.readings.flatMap((reading) =>
+        reading.citations.map((citation) => citation.evidenceSpanId)
+      ),
     );
     if (citationIds.length > 256) throw new Error("Targeted extraction citation bound exceeded");
     const spans = citationIds.length === 0
@@ -164,17 +173,20 @@ export async function readTargetedTaxExtractions(
         field: outcome.field,
         status: outcome.status,
         valueType: outcome.valueType,
-        value: outcome.value,
-        citations: outcome.citations.flatMap((citation) => {
-          const span = byId.get(citation.evidenceSpanId);
-          if (!span) return [];
-          return [{
-            originalPage: citation.originalPage,
-            evidenceSpanId: citation.evidenceSpanId,
-            quote: span.text.slice(Number(span.start), Number(span.end)),
-            quoteHash: span.quote_hash,
-          }];
-        }),
+        readings: outcome.readings.map((reading) => ({
+          value: reading.value,
+          ...(reading.currencyAssumed ? { currencyAssumed: true as const } : {}),
+          citations: reading.citations.flatMap((citation) => {
+            const span = byId.get(citation.evidenceSpanId);
+            if (!span) return [];
+            return [{
+              originalPage: citation.originalPage,
+              evidenceSpanId: citation.evidenceSpanId,
+              quote: span.text.slice(Number(span.start), Number(span.end)),
+              quoteHash: span.quote_hash,
+            }];
+          }),
+        })),
       })),
     });
   }

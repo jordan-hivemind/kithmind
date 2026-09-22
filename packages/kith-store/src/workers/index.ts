@@ -29,6 +29,7 @@ export * from "./rows.js";
 export * from "./scans.js";
 export * from "./sourceRoots.js";
 export * from "./status.js";
+export * from "./targetedTax.js";
 
 /**
  * Runs one worker operation with Convex-equivalent atomicity.

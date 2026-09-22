@@ -1,5 +1,6 @@
 import type {
   TargetedTaxArtifactDeclaration,
+  TargetedTaxCoverageDeclaration,
   TargetedTaxGoalKind,
   WorkerRequest,
   WorkerTargetedTaxStatus,
@@ -13,7 +14,10 @@ import { requireWorkerSourceAccount } from "./auth.js";
 import { exec, row, rows, type WorkerCtx } from "./db.js";
 import { workerProtocolError } from "./errors.js";
 import { consumeWorkerMutationRateLimit } from "./rateLimit.js";
-import { targetedTaxFieldsAgree } from "../extraction/targetedTax.js";
+import {
+  detectTargetedTaxFormFamily,
+  targetedTaxFieldsAgree,
+} from "../extraction/targetedTax.js";
 
 type BeginRequest = Extract<
   WorkerRequest,
@@ -34,6 +38,7 @@ export type TargetedTaxBatchManifest = {
   requestDigest: string;
   sourceTextVersionId: string | null;
   artifact: TargetedTaxArtifactDeclaration;
+  coverage: TargetedTaxCoverageDeclaration;
   requestedPages: Array<{ originalPage: number; textHash: string }>;
   artifactFingerprint: string;
   coverageFingerprint: string;
@@ -50,14 +55,17 @@ export type TargetedTaxBatchManifest = {
 
 export type TargetedTaxOutcome = {
   field: string;
-  status: "cited";
+  status: "cited" | "conflict";
   valueType: string;
-  value: unknown;
-  citations: Array<{
-    sourceTextVersionId: string;
-    sourcePageId: string;
-    originalPage: number;
-    evidenceSpanId: string;
+  readings: Array<{
+    value: unknown;
+    currencyAssumed?: true;
+    citations: Array<{
+      sourceTextVersionId: string;
+      sourcePageId: string;
+      originalPage: number;
+      evidenceSpanId: string;
+    }>;
   }>;
 };
 
@@ -177,7 +185,11 @@ function result(
   const inspectedOriginalPages = [
     ...new Set(target.batches.flatMap((batch) => batch.pages.map((page) => page.originalPage))),
   ].sort((a, b) => a - b);
-  const cited = new Set(target.outcomes.map((outcome) => outcome.field));
+  const cited = new Set(
+    target.outcomes
+      .filter((outcome) => outcome.status === "cited")
+      .map((outcome) => outcome.field),
+  );
   return {
     operation,
     targetId: target.id,
@@ -287,6 +299,13 @@ export async function appendTargetedTaxBatch(
   if (request.artifact.sourcePageCount !== target.sourcePageCount) {
     workerProtocolError("request_conflict");
   }
+  const priorFamily = target.batches[0]?.coverage.formFamily;
+  const detectedFamily = detectTargetedTaxFormFamily(target.goalKind, request.pages);
+  if (
+    (priorFamily === undefined && detectedFamily !== request.coverage.formFamily) ||
+    (priorFamily !== undefined && priorFamily !== request.coverage.formFamily) ||
+    (detectedFamily !== "unknown" && detectedFamily !== request.coverage.formFamily)
+  ) workerProtocolError("request_conflict");
   const appendDigest = sha256(
     `kith-targeted-tax-batch:v1\0${JSON.stringify([
       target.id,
@@ -294,6 +313,7 @@ export async function appendTargetedTaxBatch(
       request.batchOrdinal,
       request.artifact,
       request.pages.map((page) => [page.originalPage, page.textHash]),
+      request.coverage,
     ])}`,
   );
   const priorOrdinal = target.batches.find((batch) => batch.ordinal === request.batchOrdinal);
@@ -303,7 +323,8 @@ export async function appendTargetedTaxBatch(
       priorOrdinal.requestDigest !== appendDigest ||
       JSON.stringify(priorOrdinal.artifact) !== JSON.stringify(request.artifact) ||
       JSON.stringify(priorOrdinal.requestedPages) !==
-        JSON.stringify(request.pages.map((page) => ({ originalPage: page.originalPage, textHash: page.textHash })))
+        JSON.stringify(request.pages.map((page) => ({ originalPage: page.originalPage, textHash: page.textHash }))) ||
+      JSON.stringify(priorOrdinal.coverage) !== JSON.stringify(request.coverage)
     ) workerProtocolError("request_conflict");
     return result("extraction.appendTargetedTaxBatch", target, true);
   }
@@ -420,6 +441,7 @@ export async function appendTargetedTaxBatch(
     requestDigest: appendDigest,
     sourceTextVersionId: textVersionId,
     artifact: request.artifact,
+    coverage: request.coverage,
     requestedPages: request.pages.map((page) => ({
       originalPage: page.originalPage,
       textHash: page.textHash,
