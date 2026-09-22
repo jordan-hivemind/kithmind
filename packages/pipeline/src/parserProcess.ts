@@ -209,7 +209,7 @@ export type RunCapturedPdfParserInput = {
 
 export type RunCapturedPdfSelectiveArtifactInput = Omit<
   RunCapturedPdfParserInput,
-  "tableStructureBypass"
+  "launcherPath" | "expectedLauncherSha256" | "tableStructureBypass"
 > & {
   /** Exact, strictly increasing one-based pages in the original PDF. */
   originalPages: number[];
@@ -4495,8 +4495,13 @@ export async function runCapturedPdfSelectiveArtifact(
     originalPages,
     selectiveLauncherPath,
     expectedSelectiveLauncherSha256,
-    ...parserInput
+    ...parserFields
   } = input;
+  const parserInput: RunCapturedPdfParserInput = {
+    ...parserFields,
+    launcherPath: selectiveLauncherPath,
+    expectedLauncherSha256: expectedSelectiveLauncherSha256,
+  };
   return (await runCapturedPdfParserInternal(parserInput, {
     originalPages,
     launcherPath: selectiveLauncherPath,

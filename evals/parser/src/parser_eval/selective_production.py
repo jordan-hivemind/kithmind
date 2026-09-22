@@ -19,6 +19,46 @@ from .production import (
 )
 
 MAX_SELECTED_PAGES = 64
+PDF_TRAILER = re.compile(
+    rb"trailer\s*<<(.*?)>>\s*startxref\s*\d+\s*%%EOF\s*$", re.DOTALL
+)
+PDFIUM_DOCUMENT_ID = re.compile(
+    rb"/ID\s*\[\s*<([0-9A-Fa-f]{32})>\s*<([0-9A-Fa-f]{32})>\s*\]"
+)
+
+
+def _stable_pdfium_document_id(
+    value: bytes, source: bytes, original_pages: tuple[int, ...]
+) -> bytes:
+    """Replace PDFium's random trailer ID without changing PDF byte offsets."""
+    trailer_start = value.rfind(b"trailer")
+    trailer = (
+        PDF_TRAILER.fullmatch(value[trailer_start:])
+        if trailer_start >= 0
+        else None
+    )
+    if trailer is None:
+        raise ProductionFailure("conversion_output_invalid")
+    matches = list(PDFIUM_DOCUMENT_ID.finditer(trailer.group(1)))
+    if len(matches) != 1:
+        raise ProductionFailure("conversion_output_invalid")
+    identifier = (
+        hashlib.sha256(
+            b"kith-selective-pdf-id:v1\0"
+            + hashlib.sha256(source).digest()
+            + _canonical_json_bytes(list(original_pages))
+        )
+        .hexdigest()[:32]
+        .upper()
+        .encode("ascii")
+    )
+    stabilized = bytearray(value)
+    for group in (1, 2):
+        relative_start, relative_end = matches[0].span(group)
+        start = trailer_start + trailer.start(1) + relative_start
+        end = trailer_start + trailer.start(1) + relative_end
+        stabilized[start:end] = identifier
+    return bytes(stabilized)
 
 
 def select_pdf_pages(
@@ -46,7 +86,9 @@ def select_pdf_pages(
         selected.import_pages(source, pages=[page - 1 for page in original_pages])
         output = BytesIO()
         selected.save(output)
-        value = output.getvalue()
+        value = _stable_pdfium_document_id(
+            output.getvalue(), data, original_pages
+        )
         if not value.startswith(b"%PDF-") or len(selected) != len(original_pages):
             raise ProductionFailure("conversion_output_invalid")
         return value, source_page_count
@@ -95,6 +137,12 @@ def convert_selective_captured_pdf(
 ) -> dict[str, Any]:
     """Convert only requested pages and bind them to the original PDF."""
     try:
+        if (
+            not isinstance(parent_boundary, ParentExecutionBoundary)
+            or not parent_boundary.network_denied
+            or not parent_boundary.resource_bounded
+        ):
+            raise ProductionFailure("execution_prerequisite_missing")
         if (
             not isinstance(data, bytes)
             or not data.startswith(b"%PDF-")
