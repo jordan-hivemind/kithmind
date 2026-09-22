@@ -34,6 +34,7 @@ import {
   runDocumentPreview,
   resolveRawLocators,
   runCapturedPdfParser,
+  runCapturedPdfSelectiveArtifact,
   validateDocumentPreviewResult,
 } from "../dist/parserProcess.js";
 import {
@@ -420,6 +421,202 @@ else:
   };
 }
 
+async function selectiveArtifactFixture(fixture, originalPages) {
+  const packageRoot = join(fixture.base, "selective-artifact-package");
+  const modelAssetsPath = join(fixture.base, "selective-models");
+  await mkdir(packageRoot, { mode: 0o700 });
+  await mkdir(modelAssetsPath, { mode: 0o700 });
+  await chmod(packageRoot, 0o700);
+  await chmod(modelAssetsPath, 0o700);
+  const modelManifestSha256 = "a".repeat(64);
+  const modelLockPath = join(fixture.base, "selective-model-lock.json");
+  await writeFile(
+    modelLockPath,
+    JSON.stringify({ manifestSha256: modelManifestSha256 }),
+    { mode: 0o600 },
+  );
+  const parserDescriptor = {
+    schemaVersion: 2,
+    runtime: {
+      python: "3.12.12",
+      versions: {
+        docling: "2.126.0",
+        "docling-core": "2.95.0",
+        "docling-ibm-models": "4.0.2",
+        "docling-parse": "7.17.0",
+        onnxruntime: "1.23.2",
+        rapidocr: "3.9.2",
+        pypdfium2: "5.13.0",
+        numpy: "2.5.3",
+      },
+    },
+    modelManifestSha256,
+    implementationSha256: "b".repeat(64),
+    configuration: {
+      maxInputBytes: 16 * 1024 * 1024,
+      maxConversionPages: 64,
+      outputFormat: "docling_lossless_canonical_json_v1",
+      timeoutSeconds: 480,
+      tableStructure: "on",
+    },
+  };
+  parserDescriptor.fingerprint = fingerprintDescriptorForTest(parserDescriptor);
+  const raw = {
+    texts: [],
+    tables: [],
+    groups: [],
+    pictures: [],
+    key_value_items: [],
+    form_items: [],
+    field_regions: [],
+    field_items: [],
+    body: { children: [] },
+  };
+  const rawBytes = Buffer.from(canonicalJsonForTest(raw));
+  const rawSha256 = sha256(rawBytes);
+  const selectedPdfSha256 = "e".repeat(64);
+  const extractionConfiguration = {
+    schemaVersion: 1,
+    parserFingerprint: parserDescriptor.fingerprint,
+    implementationSha256: "c".repeat(64),
+    configuration: {
+      mappingFormat: "docling_utf16_pages_v3",
+      maxPages: 64,
+      maxRetainedUtf8Bytes: 1024 * 1024,
+      maxBundleBytes: 4 * 1024 * 1024,
+    },
+  };
+  extractionConfiguration.fingerprint = sha256(
+    Buffer.from(canonicalJsonForTest(extractionConfiguration)),
+  );
+  const extractionFingerprint = sha256(
+    Buffer.concat([
+      Buffer.from("kith-parsed-extraction:v1\0"),
+      Buffer.from(
+        canonicalJsonForTest([
+          parserDescriptor.fingerprint,
+          rawSha256,
+          extractionConfiguration.fingerprint,
+        ]),
+      ),
+    ]),
+  );
+  const selectedBundle = {
+    schemaVersion: 1,
+    candidate: "docling-standard-cpu-ocr",
+    sourceSha256: selectedPdfSha256,
+    parserFingerprint: parserDescriptor,
+    pages: originalPages.map((_originalPage, index) => ({
+      page: index + 1,
+      text: "",
+      segments: [],
+    })),
+    mappingGaps: [],
+    extractionFingerprint: {
+      schemaVersion: 2,
+      parserFingerprint: parserDescriptor.fingerprint,
+      parserArtifactSha256: rawSha256,
+      extractionConfigurationFingerprint: extractionConfiguration.fingerprint,
+      implementationSha256: extractionConfiguration.implementationSha256,
+      configuration: extractionConfiguration.configuration,
+      fingerprint: extractionFingerprint,
+    },
+  };
+  const coverageFields = {
+    schemaVersion: 1,
+    sourceSha256: fixture.common.capture.sha256,
+    selectedPdfSha256,
+    sourcePageCount: 500,
+    originalPages,
+  };
+  const coverageFingerprint = sha256(
+    Buffer.concat([
+      Buffer.from("kith-selective-pdf-coverage:v1\0"),
+      Buffer.from(canonicalJsonForTest(coverageFields)),
+    ]),
+  );
+  const artifactFingerprint = sha256(
+    Buffer.concat([
+      Buffer.from("kith-selective-pdf-artifact:v1\0"),
+      Buffer.from(
+        canonicalJsonForTest([
+          "f".repeat(64),
+          coverageFingerprint,
+          rawSha256,
+          extractionFingerprint,
+        ]),
+      ),
+    ]),
+  );
+  const bundle = {
+    schemaVersion: 1,
+    artifactKind: "selective_pdf_pages_v1",
+    sourceSha256: fixture.common.capture.sha256,
+    selectiveImplementationSha256: "f".repeat(64),
+    coverage: { ...coverageFields, fingerprint: coverageFingerprint },
+    selectedBundle,
+    artifactFingerprint,
+  };
+  const bundleBytes = Buffer.from(canonicalJsonForTest(bundle));
+  const rawFixture = join(packageRoot, "raw.json");
+  const bundleFixture = join(packageRoot, "bundle.json");
+  await writeFile(rawFixture, rawBytes, { mode: 0o600 });
+  await writeFile(bundleFixture, bundleBytes, { mode: 0o600 });
+  const response = {
+    state: "complete",
+    sourceSha256: fixture.common.capture.sha256,
+    rawSha256,
+    rawByteLength: rawBytes.length,
+    bundleSha256: sha256(bundleBytes),
+    bundleByteLength: bundleBytes.length,
+    parserFingerprint: parserDescriptor.fingerprint,
+    extractionFingerprint,
+    modelManifestSha256,
+    pageCount: originalPages.length,
+    sourcePageCount: 500,
+    selectedOriginalPages: originalPages,
+    selectedPdfSha256,
+    coverageFingerprint,
+    artifactFingerprint,
+    selectiveImplementationSha256: "f".repeat(64),
+  };
+  const launcherPath = join(packageRoot, "launcher.py");
+  await writeFile(
+    launcherPath,
+    `
+import json, os, sys
+from pathlib import Path
+mode = sys.argv[sys.argv.index("--mode") + 1]
+def emit(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\\n")
+if mode == "network-probe": emit({"state":"complete","probe":"network_denied"})
+elif mode == "process-probe": emit({"state":"complete","probe":"fork_denied"})
+elif mode == "exec-probe": emit({"state":"complete","probe":"exec_denied"})
+elif mode in ("convert", "convert-selective"):
+    expected = ${JSON.stringify(JSON.stringify(originalPages))}
+    if "--selected-original-pages" in sys.argv and sys.argv[sys.argv.index("--selected-original-pages") + 1] != expected:
+        emit({"state":"failed","code":"invalid_input"}); raise SystemExit(2)
+    base = Path(__file__).parent
+    for argument, name in (("--raw-output", "raw.json"), ("--bundle-output", "bundle.json")):
+        target = Path(sys.argv[sys.argv.index(argument) + 1])
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as output: output.write(base.joinpath(name).read_bytes())
+    emit(json.loads(${JSON.stringify(JSON.stringify(response))}))
+else: emit({"state":"failed","code":"invalid_input"})
+`,
+    { mode: 0o600 },
+  );
+  return {
+    ...fixture.common,
+    packageRoot,
+    selectiveLauncherPath: launcherPath,
+    expectedSelectiveLauncherSha256: sha256(await readFile(launcherPath)),
+    modelAssetsPath,
+    modelLockPath,
+    expectedModelLockSha256: sha256(await readFile(modelLockPath)),
+  };
+}
+
 async function legacySchemaFixture(fixture) {
   const packageRoot = join(fixture.base, "legacy-schema-package");
   await cp(join(parserRoot, "src"), packageRoot, { recursive: true });
@@ -449,6 +646,59 @@ _fingerprint = _legacy_fingerprint
     expectedLauncherSha256: sha256(await readFile(launcherPath)),
   };
 }
+
+test(
+  "selective PDF artifacts retain original page coverage and cannot masquerade as whole documents",
+  { skip: !hasPythonRuntime },
+  async () => {
+    const f = await fixture();
+    const originalPages = [137, 138];
+    const common = await selectiveArtifactFixture(f, originalPages);
+    try {
+      const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      const result = await runCapturedPdfSelectiveArtifact({
+        ...common,
+        outputId,
+        outputDirectory: output,
+        originalPages,
+      });
+      assert.equal(result.artifactKind, "selective_pdf_pages_v1");
+      assert.equal(result.sourcePageCount, 500);
+      assert.equal(result.selectedPageCount, 2);
+      assert.deepEqual(result.originalPageMapping, [
+        { artifactPage: 1, originalPage: 137 },
+        { artifactPage: 2, originalPage: 138 },
+      ]);
+      assert.deepEqual(result.coverage.originalPages, originalPages);
+      assert.equal(result.coverage.fingerprint.length, 64);
+      assert.equal(result.artifactFingerprint.length, 64);
+      assert.equal(
+        result.selectiveBundle.path.endsWith("selective-bundle.json"),
+        true,
+      );
+      assert.equal("artifacts" in result, false);
+
+      const wholeOutputId = randomUUID();
+      const wholeOutput = await outputDirectory(f, wholeOutputId);
+      await assert.rejects(
+        () =>
+          runCapturedPdfParser({
+            ...common,
+            launcherPath: common.selectiveLauncherPath,
+            expectedLauncherSha256: common.expectedSelectiveLauncherSha256,
+            outputId: wholeOutputId,
+            outputDirectory: wholeOutput,
+          }),
+        (error) =>
+          error instanceof ParserProcessError &&
+          error.code === "output_invalid",
+      );
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
 
 function multiSpanLocatorFixture(separator = " ") {
   const text = `A${separator}B`;
