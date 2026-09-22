@@ -94,6 +94,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client-17
           pg_dump --version
+      # @repo/ingest-simple shells out to poppler's pdftotext/pdftoppm
+      # directly (no bundled PDF library); its test suite needs them too.
+      - name: Install poppler-utils
+        run: |
+          sudo apt-get install -y poppler-utils
+          pdftotext -v
       # Each test file applies the whole kith schema in one transaction
       # (about 2,100 locks), and the kith-store and web suites run files in
       # parallel against this server. The default lock table (64 x 100 slots)
