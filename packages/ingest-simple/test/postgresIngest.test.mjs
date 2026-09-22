@@ -175,7 +175,16 @@ test("ingests a synthetic 40-page text document, over the old 32-page cap", { sk
   assert.ok(document, "getDocument returned null for the 40-page document");
   assert.equal(document.pages.length, pageCount, "getDocument did not return all 40 pages");
   assert.match(document.pages[0].text, /Page 1 of a long synthetic/);
-  assert.match(document.pages[pageCount - 1].text, new RegExp(`Page ${pageCount} of a long synthetic`));
+  // Full-text equality on the last page, not just a substring match: proves
+  // `getDocument` returns a page's complete text untruncated (the
+  // `CitationOutputBudget` in documents/model.ts only ever gates the
+  // `evidence` citation array -- see the PR discussion -- never `page.text`
+  // itself), for the page furthest from the start of the document.
+  assert.equal(
+    document.pages[pageCount - 1].text,
+    pages[pageCount - 1],
+    "the last page's text came back incomplete or altered",
+  );
   for (const page of document.pages) {
     assert.ok(page.evidence.length > 0, `page ${page.ordinal} has no evidence spans`);
   }

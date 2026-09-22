@@ -46,3 +46,42 @@ export function batches<T>(items: readonly T[], size: number): T[][] {
   }
   return out;
 }
+
+/**
+ * Splits `items` into batches of at most `maxRows` items whose combined
+ * `textOf` UTF-8 byte length never exceeds `maxBytes`, preserving order.
+ *
+ * `stagePages` and `stageChunks` (`provenance/model.ts`) each sum every
+ * row's own text in the batch and reject the whole call past
+ * `MAX_STAGING_TEXT_UTF8_BYTES` (128 KiB) -- independent of, and tighter
+ * than, `MAX_STAGING_ROWS` once rows carry real text: 25 chunks at this
+ * package's own 8 KiB chunk target is up to 200 KiB, well over that per-call
+ * limit, so row-count batching alone (`batches` above, still correct for
+ * evidence spans, which carry no text) is not enough for pages or chunks.
+ * A single item whose own text already exceeds `maxBytes` still gets its own
+ * one-item batch, unbatchable smaller; `stagePages`/`stageChunks` reject
+ * that call on the resource limit, which is the correct, existing error for
+ * that case, not a change this function should hide.
+ */
+export function batchesByRowsAndBytes<T>(
+  items: readonly T[],
+  maxRows: number,
+  maxBytes: number,
+  textOf: (item: T) => string,
+): T[][] {
+  const out: T[][] = [];
+  let current: T[] = [];
+  let currentBytes = 0;
+  for (const item of items) {
+    const itemBytes = Buffer.byteLength(textOf(item), "utf8");
+    if (current.length > 0 && (current.length >= maxRows || currentBytes + itemBytes > maxBytes)) {
+      out.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(item);
+    currentBytes += itemBytes;
+  }
+  if (current.length > 0) out.push(current);
+  return out;
+}

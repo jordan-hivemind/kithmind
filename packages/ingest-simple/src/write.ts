@@ -40,9 +40,13 @@ import type { Pool, PoolClient } from "pg";
 import { ingestion, newKithId, provenance, sha256, withKithTransaction, workers } from "@repo/kith-store";
 import { scheduleDocumentExtraction } from "@repo/kith-store/extraction";
 
-import { batches, pageChunkRanges } from "./chunker.js";
+import { batches, batchesByRowsAndBytes, pageChunkRanges } from "./chunker.js";
 
 const MAX_STAGING_ROWS = 25;
+// `provenance.MAX_STAGING_TEXT_UTF8_BYTES`: the same per-call text-byte
+// budget `requireBatchBounds` enforces for `stagePages`/`stageChunks`,
+// independent of MAX_STAGING_ROWS -- see `batchesByRowsAndBytes`.
+const MAX_STAGING_TEXT_UTF8_BYTES = provenance.MAX_STAGING_TEXT_UTF8_BYTES;
 const DOCUMENT_KEY = "document:0";
 const EXTRACTOR_FINGERPRINT = "ingest-simple";
 const RECORD_SCHEMA_FINGERPRINT = "ingest-simple-v1";
@@ -257,12 +261,18 @@ async function stageOneFile(
   }
 
   // Batched the same way `stageEvidenceSpans`/`stageChunks` already are
-  // below: `stagePages` enforces a MAX_STAGING_ROWS-per-call row limit
-  // (`requireBatchBounds` in provenance/model.ts) regardless of
+  // below: `stagePages` enforces both a MAX_STAGING_ROWS-per-call row limit
+  // and a MAX_STAGING_TEXT_UTF8_BYTES-per-call text-byte limit
+  // (`requireBatchBounds` in provenance/model.ts), each independent of
   // MAX_SOURCE_PAGES, so a 1000-page document staged in one call would fail
-  // on the per-call limit long before the resource limit.
+  // on a per-call limit long before the resource limit.
   const stagedPages: provenance.SourcePageRow[] = [];
-  for (const batch of batches(sourcePages, MAX_STAGING_ROWS)) {
+  for (const batch of batchesByRowsAndBytes(
+    sourcePages,
+    MAX_STAGING_ROWS,
+    MAX_STAGING_TEXT_UTF8_BYTES,
+    (page) => page.text,
+  )) {
     const staged = await provenance.stagePages(client, {
       spaceId,
       sourceTextVersionId: textVersion.id,
@@ -315,25 +325,38 @@ async function stageOneFile(
   });
   if (!document) throw new Error("Document staging is incomplete");
 
+  // Text materialized up front (not inside the batching callback) so
+  // `batchesByRowsAndBytes` can weigh each chunk's real byte size: at this
+  // package's 8 KiB chunk target, MAX_STAGING_ROWS (25) chunks can be up to
+  // ~200 KiB, well over the per-call MAX_STAGING_TEXT_UTF8_BYTES (128 KiB)
+  // `stageChunks` also enforces.
+  let spanCursor = 0;
   const chunkInputs = stagedPages.flatMap((_page, pageIndex) =>
-    perPageRanges[pageIndex]!.map((range) => ({ pageIndex, range })),
+    perPageRanges[pageIndex]!.map((range) => {
+      const spanId = spanIds[spanCursor]!;
+      spanCursor += 1;
+      return {
+        text: input.pages[pageIndex]!.slice(range.start, range.end),
+        evidenceSpanIds: [spanId],
+      };
+    }),
   );
   let chunkTotal = 0;
-  let spanCursor = 0;
-  for (const batch of batches(chunkInputs, MAX_STAGING_ROWS)) {
+  for (const batch of batchesByRowsAndBytes(
+    chunkInputs,
+    MAX_STAGING_ROWS,
+    MAX_STAGING_TEXT_UTF8_BYTES,
+    (chunk) => chunk.text,
+  )) {
     const staged = await provenance.stageChunks(client, {
       spaceId,
       processingGenerationId: generation.id,
-      chunks: batch.map(({ pageIndex, range }) => {
-        const spanId = spanIds[spanCursor]!;
-        spanCursor += 1;
-        return {
-          documentId: document.id,
-          ordinal: chunkTotal++,
-          text: input.pages[pageIndex]!.slice(range.start, range.end),
-          evidenceSpanIds: [spanId],
-        };
-      }),
+      chunks: batch.map((chunk) => ({
+        documentId: document.id,
+        ordinal: chunkTotal++,
+        text: chunk.text,
+        evidenceSpanIds: chunk.evidenceSpanIds,
+      })),
     });
     if (staged.length !== batch.length) throw new Error("Chunk staging is incomplete");
   }

@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { batches, CHUNK_TARGET_BYTES, pageChunkRanges } from "../dist/chunker.js";
+import { batches, batchesByRowsAndBytes, CHUNK_TARGET_BYTES, pageChunkRanges } from "../dist/chunker.js";
 
 test("pageChunkRanges returns no ranges for empty text", () => {
   assert.deepEqual(pageChunkRanges(""), []);
@@ -61,4 +61,27 @@ test("batches splits into groups of at most `size`, preserving order", () => {
   assert.deepEqual(batches(items, 3), [[0, 1, 2], [3, 4, 5], [6]]);
   assert.deepEqual(batches([], 3), []);
   assert.deepEqual(batches([1], 25), [[1]]);
+});
+
+test("batchesByRowsAndBytes splits on whichever bound (rows or bytes) is hit first", () => {
+  const items = ["aa", "bb", "cc", "dd", "ee"]; // 2 bytes each
+  // Row bound binds first: 5 bytes/row well under a 100-byte budget.
+  assert.deepEqual(
+    batchesByRowsAndBytes(items, 2, 100, (s) => s),
+    [["aa", "bb"], ["cc", "dd"], ["ee"]],
+  );
+  // Byte bound binds first: a 5-byte budget admits at most 2 two-byte rows.
+  assert.deepEqual(
+    batchesByRowsAndBytes(items, 25, 5, (s) => s),
+    [["aa", "bb"], ["cc", "dd"], ["ee"]],
+  );
+  assert.deepEqual(batchesByRowsAndBytes([], 25, 100, (s) => s), []);
+});
+
+test("batchesByRowsAndBytes never splits mid-item, even one whose own text exceeds the byte budget", () => {
+  const items = ["short", "x".repeat(50)];
+  const result = batchesByRowsAndBytes(items, 25, 10, (s) => s);
+  // The oversized item still gets exactly one batch to itself, not dropped
+  // and not split; the caller's own row-limit check is what refuses it.
+  assert.deepEqual(result, [["short"], ["x".repeat(50)]]);
 });

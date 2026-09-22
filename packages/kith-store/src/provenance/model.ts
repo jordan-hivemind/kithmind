@@ -62,13 +62,27 @@ import {
 export const MAX_SOURCE_INLINE_UTF8_BYTES = 8 * 1024 * 1024;
 // Bounds one household's own documents, not untrusted input.
 export const MAX_SOURCE_PAGES = 1000;
-export const MAX_EVIDENCE_SPANS = 128;
+// `packages/ingest-simple/src/chunker.ts`'s `pageChunkRanges` (the inline
+// lane's only chunker) makes at least one, and at most
+// `ceil(pageBytes / 8192)`, evidence spans/chunks per non-empty page (8192 =
+// its `CHUNK_TARGET_BYTES`). So across a whole text version, spans/chunks
+// are bounded by `MAX_SOURCE_INLINE_UTF8_BYTES / 8192 + MAX_SOURCE_PAGES`:
+// 8,388,608 / 8192 + 1000 = 1024 + 1000 = 2024. Chosen: 2024, the exact
+// worst case for the current inline-lane bounds above -- bounds one
+// household's own documents, not untrusted input.
+export const MAX_EVIDENCE_SPANS = 2024;
 export const MAX_GENERATION_DOCUMENTS = 16;
-export const MAX_GENERATION_CHUNKS = 128;
+// Same 2024 as MAX_EVIDENCE_SPANS: the inline lane stages exactly one
+// evidence span per chunk (see `write.ts`), so the two counts are always
+// equal for a document this ingester writes.
+export const MAX_GENERATION_CHUNKS = 2024;
 const MAX_PARSED_GENERATION_CHUNKS = 256;
 const MAX_PARSED_GENERATION_CHUNK_TEXT_UTF8_BYTES = 1_024 * 1_024;
 export const MAX_CHUNK_TEXT_UTF8_BYTES = 16 * 1_024;
-export const MAX_GENERATION_CHUNK_TEXT_UTF8_BYTES = 256 * 1_024;
+// A text version's chunks partition its pages' text with no gap and no
+// overlap (see `write.ts`'s `pageChunkRanges` usage), so their combined
+// byte length can never exceed the source text version's own bound.
+export const MAX_GENERATION_CHUNK_TEXT_UTF8_BYTES = MAX_SOURCE_INLINE_UTF8_BYTES;
 export const MAX_STAGING_ROWS = 25;
 export const MAX_STAGING_TEXT_UTF8_BYTES = 128 * 1_024;
 
