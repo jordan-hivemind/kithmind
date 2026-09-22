@@ -196,6 +196,7 @@ test("records bounded PDF and spreadsheet previews without changing the active c
       inspectedOriginalUnits: [1, 90],
       provisionalMetadata: {
         documentKind: "tax_return",
+        title: "Form 1040",
         uncertaintyCodes: ["image_only", "insufficient_text"],
       },
       confidence: 0.95,
