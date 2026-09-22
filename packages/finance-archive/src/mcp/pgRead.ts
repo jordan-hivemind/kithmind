@@ -1264,6 +1264,7 @@ function exactPositionScope(
   document: string,
   account: string,
   asOf: string,
+  positionRelation = "positions",
 ): string {
   return `${observation}.account_id = ${account}
     AND ${observation}.as_of = ${asOf}
@@ -1277,13 +1278,13 @@ function exactPositionScope(
           = ${observation}.emitted_position_count
     AND NOT EXISTS (
       SELECT 1 FROM position_scope_memberships expected_member
-      LEFT JOIN positions represented_position
+      LEFT JOIN ${positionRelation} represented_position
         ON ${positionMatchesScopeMember("represented_position", "expected_member")}
        WHERE expected_member.scope_id = ${observation}.id
          AND represented_position.id IS NULL
     )
     AND NOT EXISTS (
-      SELECT 1 FROM positions current_position
+      SELECT 1 FROM ${positionRelation} current_position
        WHERE current_position.account_id = ${account}
          AND current_position.as_of = ${asOf}
          AND NOT EXISTS (
@@ -1306,134 +1307,137 @@ function documentHasExactPositionScope(
   )`;
 }
 
-/**
- * The durable facts that can disqualify one account/date from being called a
- * complete holdings snapshot. Keep these predicates in one place: inventory,
- * direct snapshot reads and holdings aggregates must not disagree about the
- * same stored state.
- *
- * A document can belong to an account directly, through a contributed
- * position, or through review attribution. The last form matters for
- * consolidated statements whose document-level account_id is null. Review
- * status deliberately does not affect partial-source attribution: resolving
- * a review does not make a parser produce rows it previously omitted.
- */
-function holdingsDatePredicates(account: string, asOf: string) {
-  const exactScope = documentHasExactPositionScope("pd", account, asOf);
-  const openReviewExactScope = documentHasExactPositionScope(
-    "open_d",
-    account,
-    asOf,
-  );
-  return {
-    partialSource: `EXISTS (
-      SELECT 1 FROM documents pd
-       WHERE pd.superseded_by IS NULL
-         AND (
-           (pd.account_id = ${account} AND pd.doc_date = ${asOf})
-           OR EXISTS (
-             SELECT 1 FROM positions partial_p
-              WHERE partial_p.source_document_id = pd.id
-                AND partial_p.account_id = ${account}
-                AND partial_p.as_of = ${asOf}
-           )
-           OR EXISTS (
-             SELECT 1 FROM review_items partial_r
-             WHERE partial_r.source_document_id = pd.id
-                AND partial_r.account_id = ${account}
-                AND CASE
-                      WHEN partial_r.projection_scope_kind = 'activity'
-                        THEN pd.doc_date
-                      ELSE coalesce(
-                        partial_r.projection_scope_as_of,
-                        pd.doc_date
-                      )
-                    END = ${asOf}
-           )
-           OR EXISTS (
-             SELECT 1 FROM position_scope_observations attributed_scope
-              WHERE attributed_scope.source_document_id = pd.id
-                AND attributed_scope.account_id = ${account}
-                AND attributed_scope.as_of = ${asOf}
-           )
-         )
-         AND (
-           (pd.parsed_ok = FALSE AND NOT ${exactScope})
-           OR (
-             EXISTS (
-               SELECT 1 FROM position_scope_observations known_scope
-                WHERE known_scope.source_document_id = pd.id
-                  AND known_scope.account_id = ${account}
-                  AND known_scope.as_of = ${asOf}
-             )
-             AND NOT ${exactScope}
-           )
-         )
-    )`,
-    openReview: `EXISTS (
-      SELECT 1 FROM review_items open_r
-      JOIN documents open_d ON open_d.id = open_r.source_document_id
-       WHERE open_r.status = 'open'
-         AND open_d.superseded_by IS NULL
-         AND (open_r.account_id = ${account} OR open_r.account_id IS NULL)
-         AND (
-           (
-             open_r.projection_scope_kind <> 'activity'
-             AND open_r.projection_scope_as_of = ${asOf}
-           )
-           OR (
-             (
-               open_r.projection_scope_as_of IS NULL
-               OR open_r.projection_scope_kind = 'activity'
-             )
-             AND (
-               open_d.doc_date = ${asOf}
-               OR EXISTS (
-                 SELECT 1 FROM positions open_p
-                  WHERE open_p.source_document_id = open_r.source_document_id
-                    AND open_p.account_id = ${account}
-                    AND open_p.as_of = ${asOf}
-               )
-               OR EXISTS (
-                 SELECT 1 FROM position_scope_observations open_scope
-                  WHERE open_scope.source_document_id = open_r.source_document_id
-                    AND open_scope.account_id = ${account}
-                    AND open_scope.as_of = ${asOf}
-               )
-             )
-           )
-         )
-         AND NOT (
-           open_r.kind = 'document_unparsed'
-           AND ${openReviewExactScope}
-         )
-    )`,
-    failedReconciliation: `EXISTS (
-      SELECT 1 FROM position_reconciliations failed_pr
-       WHERE failed_pr.account_id = ${account}
-         AND failed_pr.period_end = ${asOf}
-         AND failed_pr.status = 'fail'
-    )`,
-    pendingReconciliation: `EXISTS (
-      SELECT 1 FROM position_reconciliations pending_pr
-       WHERE pending_pr.account_id = ${account}
-         AND pending_pr.period_end = ${asOf}
-         AND pending_pr.status = 'unverified'
-    )`,
-  };
-}
-
 async function assessHoldingsDate(
   client: pg.ClientBase,
   accountId: string,
   asOf: string,
 ): Promise<HoldingsDateAssessment> {
-  const predicates = holdingsDatePredicates("$1", "$2::date");
+  const exactScope = exactPositionScope(
+    "exact_scope",
+    "exact_document",
+    "$1",
+    "$2::date",
+    "date_positions",
+  );
   const result = await client.query<HoldingsDateAssessment>(
-    `SELECT ${predicates.partialSource} AS partial_source,
-            ${predicates.openReview} AS open_review,
-            ${predicates.failedReconciliation} AS failed_reconciliation,
-            ${predicates.pendingReconciliation} AS pending_reconciliation,
+    `WITH date_positions AS MATERIALIZED (
+       SELECT p.* FROM positions p
+        WHERE p.account_id = $1 AND p.as_of = $2::date
+     ),
+     date_scopes AS MATERIALIZED (
+       SELECT observed.*
+         FROM position_scope_observations observed
+         JOIN documents observed_document
+           ON observed_document.id = observed.source_document_id
+        WHERE observed.account_id = $1
+          AND observed.as_of = $2::date
+          AND observed_document.superseded_by IS NULL
+     ),
+     exact_scope_documents AS MATERIALIZED (
+       SELECT DISTINCT exact_scope.source_document_id
+         FROM date_scopes exact_scope
+         JOIN documents exact_document
+           ON exact_document.id = exact_scope.source_document_id
+        WHERE exact_scope.status = 'complete'
+          AND cardinality(exact_scope.gap_codes) = 0
+          AND exact_scope.retained_sha256 = exact_document.retained_sha256
+          AND exact_scope.holding_projection_generation_id
+                IS NOT DISTINCT FROM
+                exact_document.active_holding_projection_generation_id
+          AND ${exactScope}
+     ),
+     partial_review_sources AS MATERIALIZED (
+       SELECT DISTINCT partial_r.source_document_id
+         FROM review_items partial_r
+         JOIN documents partial_d ON partial_d.id = partial_r.source_document_id
+        WHERE partial_r.account_id = $1
+          AND CASE
+                WHEN partial_r.projection_scope_kind = 'activity'
+                  THEN partial_d.doc_date
+                ELSE coalesce(
+                  partial_r.projection_scope_as_of,
+                  partial_d.doc_date
+                )
+              END = $2::date
+     ),
+     attributed_documents AS MATERIALIZED (
+       SELECT direct_d.id AS source_document_id
+         FROM documents direct_d
+        WHERE direct_d.account_id = $1 AND direct_d.doc_date = $2::date
+       UNION
+       SELECT date_p.source_document_id
+         FROM date_positions date_p
+        WHERE date_p.source_document_id IS NOT NULL
+       UNION
+       SELECT partial_r.source_document_id FROM partial_review_sources partial_r
+       UNION
+       SELECT date_scope.source_document_id FROM date_scopes date_scope
+     ),
+     open_reviews AS MATERIALIZED (
+       SELECT open_r.kind, open_r.source_document_id
+         FROM review_items open_r
+         JOIN documents open_d ON open_d.id = open_r.source_document_id
+        WHERE open_r.status = 'open'
+          AND open_d.superseded_by IS NULL
+          AND (open_r.account_id = $1 OR open_r.account_id IS NULL)
+          AND (
+            (open_r.projection_scope_kind <> 'activity'
+             AND open_r.projection_scope_as_of = $2::date)
+            OR (
+              (open_r.projection_scope_as_of IS NULL
+               OR open_r.projection_scope_kind = 'activity')
+              AND (
+                open_d.doc_date = $2::date
+                OR EXISTS (
+                  SELECT 1 FROM date_positions open_p
+                   WHERE open_p.source_document_id = open_r.source_document_id
+                )
+                OR EXISTS (
+                  SELECT 1 FROM date_scopes open_scope
+                   WHERE open_scope.source_document_id = open_r.source_document_id
+                )
+              )
+            )
+          )
+     )
+     SELECT EXISTS (
+              SELECT 1
+                FROM attributed_documents attributed
+                JOIN documents partial_d
+                  ON partial_d.id = attributed.source_document_id
+               WHERE partial_d.superseded_by IS NULL
+                 AND (
+                   partial_d.parsed_ok = FALSE
+                   OR EXISTS (
+                     SELECT 1 FROM date_scopes known_scope
+                      WHERE known_scope.source_document_id = partial_d.id
+                   )
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM exact_scope_documents exact_d
+                    WHERE exact_d.source_document_id = partial_d.id
+                 )
+            ) AS partial_source,
+            EXISTS (
+              SELECT 1 FROM open_reviews open_r
+               WHERE open_r.kind <> 'document_unparsed'
+                  OR NOT EXISTS (
+                    SELECT 1 FROM exact_scope_documents exact_d
+                     WHERE exact_d.source_document_id = open_r.source_document_id
+                  )
+            ) AS open_review,
+            EXISTS (
+              SELECT 1 FROM position_reconciliations failed_pr
+               WHERE failed_pr.account_id = $1
+                 AND failed_pr.period_end = $2::date
+                 AND failed_pr.status = 'fail'
+            ) AS failed_reconciliation,
+            EXISTS (
+              SELECT 1 FROM position_reconciliations pending_pr
+               WHERE pending_pr.account_id = $1
+                 AND pending_pr.period_end = $2::date
+                 AND pending_pr.status = 'unverified'
+            ) AS pending_reconciliation,
             count(p.*)::text AS position_count,
             count(*) FILTER (WHERE p.market_value IS NULL)::text
               AS missing_market_value,
@@ -1443,8 +1447,7 @@ async function assessHoldingsDate(
               WHERE p.valuation_basis IS DISTINCT FROM 'market_price'
             )::text AS non_market_value,
             count(DISTINCT p.currency)::text AS currency_count
-       FROM positions p
-      WHERE p.account_id = $1 AND p.as_of = $2::date`,
+       FROM date_positions p`,
     [accountId, asOf],
   );
   return result.rows[0]!;
