@@ -30,6 +30,11 @@ orchestrator name and session ID, `status` to `in_progress`, and `updated` to
 the current date, then save the tracker before work begins. Work on the branch
 named in the task and push it at the end of every session.
 
+Use the tracker's current execution snapshot plus searches for the relevant
+task rows. Do not reread the entire historical log on every turn. Update one
+current snapshot instead of continually prepending status prose, while keeping
+existing task rows and history intact.
+
 For every state change (`blocked`, `review`, or `done`), update the tracker
 with a next action that stands on its own, the verification command, and the PR
 URL where applicable. Never delete tracker rows. A task is done only after its
