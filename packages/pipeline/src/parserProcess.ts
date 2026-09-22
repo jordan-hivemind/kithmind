@@ -352,6 +352,14 @@ export type DurableParserOutputArtifacts = {
   pageCount: number;
 };
 
+export type DurableSelectiveParserOutputArtifacts =
+  DurableParserOutputArtifacts & {
+    artifactKind: "selective_pdf_pages_v1";
+    coverage: SelectivePdfCoverage;
+    selectiveImplementationSha256: string;
+    artifactFingerprint: string;
+  };
+
 export type RecoveredParserOutput = {
   state: "recovered";
   artifacts: DurableParserOutputArtifacts;
@@ -411,6 +419,7 @@ export type CapturedPdfSelectiveArtifactResult = {
   coverage: SelectivePdfCoverage;
   selectiveImplementationSha256: string;
   artifactFingerprint: string;
+  artifacts: DurableSelectiveParserOutputArtifacts;
   validated: ValidatedNormalizedBundleResult;
   peakRssBytes: number;
   elapsedMs: number;
@@ -2717,6 +2726,35 @@ async function requireParserOutputEntries(
     fail("output_invalid", "parser output is incomplete");
 }
 
+async function requireSelectiveParserOutputEntries(
+  directory: DirectoryIdentity,
+  outputId: string,
+): Promise<void> {
+  const entries = await opendir(directory.path).catch(() =>
+    fail(
+      "output_invalid",
+      "selective parser output directory cannot be inspected",
+    ),
+  );
+  const required = new Set([
+    "selective-lossless.json",
+    "selective-bundle.json",
+  ]);
+  const auxiliary = new Set([`.home-${outputId}`, `.tmp-${outputId}`]);
+  try {
+    for await (const entry of entries) {
+      if (required.delete(entry.name)) continue;
+      if (!auxiliary.delete(entry.name))
+        fail("output_invalid", "selective parser output has an unknown entry");
+      await inspectAuxiliaryOutputDirectory(join(directory.path, entry.name));
+    }
+  } finally {
+    await entries.close().catch(() => undefined);
+  }
+  if (required.size !== 0)
+    fail("output_invalid", "selective parser output is incomplete");
+}
+
 export async function inspectParserOutputIntent(input: {
   outputRoot: string;
   outputId: string;
@@ -2997,6 +3035,133 @@ export async function inspectCapturedPdfParserOutput(
     ...input,
     profileId: "pdf_docqa_v1",
   });
+}
+
+export async function inspectCapturedPdfSelectiveOutput(
+  input: ParserOutputRecoveryInput & {
+    originalPages: number[];
+    expectedArtifactFingerprint: string;
+    expectedSelectiveImplementationSha256: string;
+  },
+): Promise<{
+  state: "recovered";
+  artifacts: DurableSelectiveParserOutputArtifacts;
+  validated: ValidatedNormalizedBundleResult;
+}> {
+  requiredPlatform();
+  const limits = validateLimits(input.limits);
+  const originalPages = requestedOriginalPages(input.originalPages);
+  if (
+    !OPAQUE_ID.test(input.outputIntent.outputId) ||
+    !SHA256.test(input.expectedParserFingerprint) ||
+    !SHA256.test(input.expectedExtractionConfigurationFingerprint) ||
+    !SHA256.test(input.expectedModelManifestSha256) ||
+    !SHA256.test(input.expectedArtifactFingerprint) ||
+    !SHA256.test(input.expectedSelectiveImplementationSha256)
+  )
+    fail("invalid_input", "selective parser recovery identity is invalid");
+  const root = await trustedDirectory(input.outputRoot, "parser output root", {
+    private: true,
+    rejectBroad: true,
+  });
+  const directory = await trustedDirectory(
+    join(root.path, input.outputIntent.outputId),
+    "parser output directory",
+    { private: true, rejectBroad: true },
+  );
+  if (
+    root.device !== input.outputIntent.outputRoot.device ||
+    root.inode !== input.outputIntent.outputRoot.inode ||
+    directory.device !== input.outputIntent.outputDirectory.device ||
+    directory.inode !== input.outputIntent.outputDirectory.inode ||
+    dirname(directory.path) !== root.path ||
+    basename(directory.path) !== input.outputIntent.outputId
+  )
+    fail("unsafe_path", "selective parser output intent changed");
+  await requireSelectiveParserOutputEntries(
+    directory,
+    input.outputIntent.outputId,
+  );
+  const capture = await inspectCapturedPdf({
+    captureDirectory: input.capture.captureDirectory.path,
+    captureId: input.capture.captureId,
+    expected: {
+      sha256: input.capture.sha256,
+      byteLength: input.capture.byteLength,
+      sourceModifiedAt: input.capture.sourceModifiedAt,
+    },
+    expectedDirectory: input.capture.captureDirectory,
+    mediaType: "application/pdf",
+  });
+  const rawPath = join(directory.path, "selective-lossless.json");
+  const bundlePath = join(directory.path, "selective-bundle.json");
+  const raw = await protectedOutputFile(rawPath, directory, limits.maxRawBytes);
+  const bundle = await protectedOutputFile(
+    bundlePath,
+    directory,
+    limits.maxBundleBytes,
+  );
+  const rawSha256 = digest(raw.bytes);
+  const bundleSha256 = digest(bundle.bytes);
+  const validated = validateSelectiveBundleAndRaw(
+    parseBoundedParserJson(raw.bytes, limits.maxRawBytes),
+    parseBoundedParserJson(bundle.bytes, limits.maxBundleBytes),
+    capture,
+    input.expectedModelManifestSha256,
+    rawSha256,
+    originalPages,
+  );
+  if (
+    validated.parserFingerprint !== input.expectedParserFingerprint ||
+    validated.extractionConfigurationFingerprint !==
+      input.expectedExtractionConfigurationFingerprint ||
+    validated.artifactFingerprint !== input.expectedArtifactFingerprint ||
+    validated.selectiveImplementationSha256 !==
+      input.expectedSelectiveImplementationSha256
+  )
+    fail("output_invalid", "selective parser recovery fingerprint changed");
+  await recheckDirectory(root, "parser output root");
+  await recheckDirectory(directory, "parser output directory");
+  const artifacts: DurableSelectiveParserOutputArtifacts = {
+    artifactKind: "selective_pdf_pages_v1",
+    outputId: input.outputIntent.outputId,
+    outputRoot: { device: root.device, inode: root.inode },
+    outputDirectory: { device: directory.device, inode: directory.inode },
+    sourceSha256: capture.sha256,
+    rawArtifact: {
+      path: rawPath,
+      device: raw.identity.device,
+      inode: raw.identity.inode,
+      sha256: rawSha256,
+      byteLength: raw.bytes.length,
+      mediaType: "application/vnd.docling+json",
+    },
+    normalizedBundle: {
+      path: bundlePath,
+      device: bundle.identity.device,
+      inode: bundle.identity.inode,
+      sha256: bundleSha256,
+      byteLength: bundle.bytes.length,
+      mediaType: "application/json",
+    },
+    parserFingerprint: validated.parserFingerprint,
+    extractionConfigurationFingerprint:
+      validated.extractionConfigurationFingerprint,
+    extractionFingerprint: validated.extractionFingerprint,
+    modelManifestSha256: input.expectedModelManifestSha256,
+    pageCount: validated.pageCount,
+    coverage: validated.coverage,
+    selectiveImplementationSha256: validated.selectiveImplementationSha256,
+    artifactFingerprint: validated.artifactFingerprint,
+  };
+  return {
+    state: "recovered",
+    artifacts,
+    validated: {
+      bundle: validated.bundle,
+      resolvedLocators: validated.resolvedLocators,
+    },
+  };
 }
 
 /** The workbook lane's recovery, over the same durable artifact pair. */
@@ -4382,6 +4547,31 @@ async function runCapturedPdfParserInternal(
       mediaType: "application/json",
     };
     if (selectedPages !== undefined) {
+      const artifacts: DurableSelectiveParserOutputArtifacts = {
+        artifactKind: "selective_pdf_pages_v1",
+        outputId: input.outputId,
+        outputRoot: {
+          device: outputRoot.device,
+          inode: outputRoot.inode,
+        },
+        outputDirectory: {
+          device: outputDirectory.device,
+          inode: outputDirectory.inode,
+        },
+        sourceSha256: capture.sha256,
+        rawArtifact,
+        normalizedBundle,
+        parserFingerprint: validated.parserFingerprint,
+        extractionConfigurationFingerprint:
+          validated.extractionConfigurationFingerprint,
+        extractionFingerprint: validated.extractionFingerprint,
+        modelManifestSha256,
+        pageCount: validated.pageCount,
+        coverage: selectiveValidated!.coverage,
+        selectiveImplementationSha256:
+          selectiveValidated!.selectiveImplementationSha256,
+        artifactFingerprint: selectiveValidated!.artifactFingerprint,
+      };
       return {
         state: "complete",
         artifactKind: "selective_pdf_pages_v1",
@@ -4404,6 +4594,7 @@ async function runCapturedPdfParserInternal(
         selectiveImplementationSha256:
           selectiveValidated!.selectiveImplementationSha256,
         artifactFingerprint: selectiveValidated!.artifactFingerprint,
+        artifacts,
         validated: {
           bundle: validated.bundle,
           resolvedLocators: validated.resolvedLocators,

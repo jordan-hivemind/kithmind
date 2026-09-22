@@ -8617,6 +8617,138 @@ for (const parserProfileId of ["pdf_docqa_v1", "spreadsheet_v1"]) {
   });
 }
 
+test("a selected K-1 creates one sparse primary-only batch with grounded closure", async () => {
+  const setup = await fixture(0);
+  const [captures, outputs, spool] = await Promise.all(
+    ["targeted-captures", "targeted-outputs", "targeted-spool"].map(
+      async (name) => {
+        const path = join(setup.base, name);
+        await mkdir(path, { mode: 0o700 });
+        return await realpath(path);
+      },
+    ),
+  );
+  const plan = pdfPlan({ discoveryState: "queued" });
+  const identity = {
+    sourceItemId: plan.sourceItemId,
+    observationEpoch: plan.observationEpoch,
+    processingEpoch: plan.processingEpoch,
+    sha256: plan.sha256,
+  };
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "intent",
+    preflightAction: undefined,
+    originalCatalogId: undefined,
+    expectedOriginalRevision: undefined,
+    processingCatalogId: undefined,
+    expectedProcessingRevision: undefined,
+    metadataFirst: {
+      version: 1,
+      triageStartIndex: 0,
+      refreshReady: false,
+      selected: [identity],
+      previewed: [identity],
+      previewGaps: [],
+      targetedTax: [
+        {
+          ...identity,
+          goalKind: "schedule_k1_key_fields_v1",
+          sourcePageCount: 140,
+        },
+      ],
+      targetedTaxClassified: [identity],
+      selectionReceipts: [],
+    },
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const original = {
+    originalCatalogId: randomUUID(),
+    rowRevision: 1,
+    origin: {
+      scanId: checkpoint.scanId,
+      observationEpoch: plan.observationEpoch,
+      sha256: plan.sha256,
+      byteLength: plan.byteLength,
+      mediaType: "application/pdf",
+    },
+    copies: {},
+    providerOriginal: {
+      referenceVersion: "provider_original_v2",
+      clientReferenceId: randomUUID(),
+      bindingId: randomUUID(),
+    },
+  };
+  let created;
+  const runner = new PipelineRunner(
+    {
+      ...setup.config,
+      pdfDocQa: {
+        captureDirectory: captures,
+        parserOutputRoot: outputs,
+        spoolDirectory: spool,
+        archive: { primary: {} },
+        providerOriginal: { rootAlias: "fixture" },
+      },
+    },
+    journal,
+    { async call() { throw new Error("network is not used"); } },
+  );
+  runner.copyIntent = (subject, role) => ({
+    role,
+    clientReceiptId: randomUUID(),
+    archiveObjectId: randomUUID(),
+    objectName: `${randomUUID()}.age`,
+  });
+  runner.executeMetadataPreview = async (_item, windows) => {
+    const inspectedOriginalUnits = windows.flatMap(({ startPage, pageCount }) =>
+      Array.from({ length: pageCount }, (_, index) => startPage + index),
+    );
+    return {
+      sourceSha256: plan.sha256,
+      mediaType: "application/pdf",
+      sourceUnitCount: 140,
+      inspectedOriginalUnits,
+      unitStates: inspectedOriginalUnits.map(() => "text_available"),
+      unitTexts: inspectedOriginalUnits.map((page) =>
+        page === 137
+          ? "Schedule K-1 (Form 1065) Box 1 Ordinary business income. See attached statement"
+          : page === 138
+            ? "Schedule K-1 (Form 1065) continued"
+            : page === 139
+              ? "Schedule K-1 statement detail"
+              : page === 140
+                ? "Form 1099 supporting attachment"
+                : `cover or index page ${page}`,
+      ),
+      unitTextTruncated: inspectedOriginalUnits.map(() => false),
+      method: "pdf_native_text_v1",
+      methodFingerprint: HASH,
+    };
+  };
+  runner.archiveCatalog = {
+    findOriginalExact() {
+      return original;
+    },
+    findProcessingExact() {},
+    async createProcessingIntent(value) {
+      created = value;
+      return { ...value, rowRevision: 1 };
+    },
+  };
+  try {
+    const next = await runner.createArchivedIntents(checkpoint);
+    assert.deepEqual(next.targetedTaxRun.plannedPages, [137, 138, 139]);
+    assert.equal(next.targetedTaxRun.requestedRegionsClosed, true);
+    assert.equal(next.targetedTaxRun.continuationsClosed, true);
+    assert.deepEqual(created.targetedBatch.originalPages, [137, 138, 139]);
+    assert.deepEqual(Object.keys(created.copies), ["primary"]);
+    assert.equal(next.step, "preflight");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
 test("legacy future admission replays exactly, then renews and admits without repeating archive work", async () => {
   const setup = await fixture(0);
   const future = Date.UTC(2036, 0, 1);

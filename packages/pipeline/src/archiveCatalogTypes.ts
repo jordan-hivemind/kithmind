@@ -249,6 +249,13 @@ export type ProcessingCatalogIdentity = {
     processingPolicyFingerprint: string;
     correctionFingerprint: string;
   };
+  /** Closed sparse tax batch identity. Absent for whole-document processing. */
+  targetedBatch?: {
+    goalKind: "form_1040_totals_v1" | "schedule_k1_key_fields_v1";
+    batchOrdinal: number;
+    sourcePageCount: number;
+    originalPages: number[];
+  };
   captureIntent: {
     captureId: string;
     directory: LocalDirectoryIdentity;
@@ -287,6 +294,20 @@ export type DurableParserOutput = {
   pageCount: number;
 };
 
+export type DurableSelectiveParserOutput = DurableParserOutput & {
+  artifactKind: "selective_pdf_pages_v1";
+  coverage: {
+    schemaVersion: 1;
+    sourceSha256: string;
+    selectedPdfSha256: string;
+    sourcePageCount: number;
+    originalPages: number[];
+    fingerprint: string;
+  };
+  selectiveImplementationSha256: string;
+  artifactFingerprint: string;
+};
+
 export type ProcessingCatalogRow = Omit<ProcessingCatalogIdentity, "copies"> & {
   rowRevision: number;
   copies: {
@@ -296,7 +317,7 @@ export type ProcessingCatalogRow = Omit<ProcessingCatalogIdentity, "copies"> & {
   /** Preserved evidence from an interrupted provider v1 run. Never executed. */
   legacyIndependentBackup?: ArchiveCopyRecord;
   capture?: LocalFileIdentity & { sourceModifiedAt: number };
-  parserOutput?: DurableParserOutput;
+  parserOutput?: DurableParserOutput | DurableSelectiveParserOutput;
   spoolPrepared?: LocalFileIdentity;
   spool?: LocalFileIdentity;
   /**
@@ -330,6 +351,12 @@ export type ProcessingCatalogRow = Omit<ProcessingCatalogIdentity, "copies"> & {
     activatedAt: number;
     reused: boolean;
     previousGenerationId?: string;
+  };
+  /** Terminal sparse-result receipt. It never implies full-text activation. */
+  targetedCompletion?: {
+    targetId: string;
+    status: "complete" | "incomplete_resumable" | "conflict";
+    completedAt: number;
   };
   receiptReconcile?: ReceiptReconcileNote[];
   updatedAt: number;

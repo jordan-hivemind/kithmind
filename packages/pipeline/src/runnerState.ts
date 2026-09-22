@@ -176,6 +176,10 @@ export type ArchivedStep =
   | "parsed_batch"
   | "parsed_seal"
   | "parsed_activate"
+  | "targeted_begin"
+  | "targeted_admit"
+  | "targeted_append"
+  | "targeted_status"
   | "cleanup"
   | "deferred_idle";
 
@@ -198,6 +202,11 @@ export type MetadataFirstPreviewGap = MetadataFirstIdentity & {
     | "workbook_oversized";
 };
 
+export type MetadataFirstTargetedTax = MetadataFirstIdentity & {
+  goalKind: "form_1040_totals_v1" | "schedule_k1_key_fields_v1";
+  sourcePageCount: number;
+};
+
 export type MetadataFirstRouting = {
   version: 1;
   triageStartIndex: number;
@@ -206,6 +215,10 @@ export type MetadataFirstRouting = {
   selected: MetadataFirstIdentity[];
   previewed: MetadataFirstIdentity[];
   previewGaps: MetadataFirstPreviewGap[];
+  /** Positive tax headings routed to selective goal-aware extraction. */
+  targetedTax?: MetadataFirstTargetedTax[];
+  /** Exact selected identities evaluated by the targeted-tax classifier. */
+  targetedTaxClassified?: MetadataFirstIdentity[];
   selectionReceipts: Array<{
     selectorSha256: string;
     reason:
@@ -306,6 +319,17 @@ type ArchivedRun = ActiveScan & {
     selectedIdentitySha256: string;
   };
   metadataFirst?: MetadataFirstRouting;
+  targetedTaxRun?: {
+    goalKind: "form_1040_totals_v1" | "schedule_k1_key_fields_v1";
+    sourcePageCount: number;
+    plannedPages: number[];
+    requestedRegionsClosed: boolean;
+    continuationsClosed: boolean;
+    batchOrdinal: number;
+    processingCatalogIds: string[];
+    targetId?: string;
+    priorProcessingGenerationId?: string;
+  };
   providerV2Transition?: {
     version: 1;
     previousConfigSha256: string;
@@ -900,6 +924,33 @@ function metadataFirstIdentity(value: unknown): MetadataFirstIdentity {
   };
 }
 
+function metadataFirstTargetedTax(value: unknown): MetadataFirstTargetedTax {
+  const row = object(value);
+  exact(row, [
+    "sourceItemId",
+    "observationEpoch",
+    "processingEpoch",
+    "sha256",
+    "goalKind",
+    "sourcePageCount",
+  ]);
+  if (
+    row.goalKind !== "form_1040_totals_v1" &&
+    row.goalKind !== "schedule_k1_key_fields_v1"
+  )
+    fail();
+  return {
+    ...metadataFirstIdentity({
+      sourceItemId: row.sourceItemId,
+      observationEpoch: row.observationEpoch,
+      processingEpoch: row.processingEpoch,
+      sha256: row.sha256,
+    }),
+    goalKind: row.goalKind,
+    sourcePageCount: integer(row.sourcePageCount, 1, 10_000),
+  };
+}
+
 function metadataFirstRouting(value: unknown): MetadataFirstRouting {
   const row = object(value);
   exact(
@@ -912,22 +963,32 @@ function metadataFirstRouting(value: unknown): MetadataFirstRouting {
       "previewed",
       "selectionReceipts",
     ],
-    ["previewGaps"],
+    ["previewGaps", "targetedTax", "targetedTaxClassified"],
   );
   if (
     row.version !== 1 ||
     !Array.isArray(row.selected) ||
     !Array.isArray(row.previewed) ||
     (row.previewGaps !== undefined && !Array.isArray(row.previewGaps)) ||
+    (row.targetedTax !== undefined && !Array.isArray(row.targetedTax)) ||
+    (row.targetedTaxClassified !== undefined &&
+      !Array.isArray(row.targetedTaxClassified)) ||
     !Array.isArray(row.selectionReceipts) ||
     row.selected.length > MAX_FILES ||
     row.previewed.length > MAX_FILES ||
     (Array.isArray(row.previewGaps) && row.previewGaps.length > MAX_FILES) ||
+    (Array.isArray(row.targetedTax) && row.targetedTax.length > MAX_FILES) ||
+    (Array.isArray(row.targetedTaxClassified) &&
+      row.targetedTaxClassified.length > MAX_FILES) ||
     row.selectionReceipts.length > MAX_FILES
   )
     fail();
   const selected = row.selected.map(metadataFirstIdentity);
   const previewed = row.previewed.map(metadataFirstIdentity);
+  const targetedTax = (row.targetedTax ?? []).map(metadataFirstTargetedTax);
+  const targetedTaxClassified = (row.targetedTaxClassified ?? []).map(
+    metadataFirstIdentity,
+  );
   const previewGaps = (row.previewGaps ?? []).map((value) => {
     const gap = object(value);
     exact(gap, [
@@ -961,8 +1022,19 @@ function metadataFirstRouting(value: unknown): MetadataFirstRouting {
   if (
     new Set(selected.map(key)).size !== selected.length ||
     new Set(previewed.map(key)).size !== previewed.length ||
+    new Set(targetedTax.map(key)).size !== targetedTax.length ||
+    new Set(targetedTaxClassified.map(key)).size !==
+      targetedTaxClassified.length ||
     new Set(previewGaps.map(key)).size !== previewGaps.length ||
-    previewGaps.some((gap) => previewed.some((item) => key(item) === key(gap)))
+    previewGaps.some((gap) =>
+      previewed.some((item) => key(item) === key(gap)),
+    ) ||
+    targetedTax.some(
+      (target) => !selected.some((item) => key(item) === key(target)),
+    ) ||
+    targetedTaxClassified.some(
+      (target) => !selected.some((item) => key(item) === key(target)),
+    )
   )
     fail();
   const selectionReceipts = row.selectionReceipts.map((value) => {
@@ -1002,6 +1074,8 @@ function metadataFirstRouting(value: unknown): MetadataFirstRouting {
     selected,
     previewed,
     previewGaps,
+    targetedTax,
+    targetedTaxClassified,
     selectionReceipts,
   };
 }
@@ -1327,6 +1401,7 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
         "stageOrdinal",
         "priorityReceipt",
         "metadataFirst",
+        "targetedTaxRun",
         "providerV2Transition",
       ],
     );
@@ -1349,6 +1424,10 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       "parsed_batch",
       "parsed_seal",
       "parsed_activate",
+      "targeted_begin",
+      "targeted_admit",
+      "targeted_append",
+      "targeted_status",
       "cleanup",
       "deferred_idle",
     ];
@@ -1455,6 +1534,76 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       ...(input.metadataFirst === undefined
         ? {}
         : { metadataFirst: metadataFirstRouting(input.metadataFirst) }),
+      ...(input.targetedTaxRun === undefined
+        ? {}
+        : {
+            targetedTaxRun: (() => {
+              const target = object(input.targetedTaxRun);
+              exact(
+                target,
+                [
+                  "goalKind",
+                  "sourcePageCount",
+                  "plannedPages",
+                  "requestedRegionsClosed",
+                  "continuationsClosed",
+                  "batchOrdinal",
+                  "processingCatalogIds",
+                ],
+                ["targetId", "priorProcessingGenerationId"],
+              );
+              if (
+                (target.goalKind !== "form_1040_totals_v1" &&
+                  target.goalKind !== "schedule_k1_key_fields_v1") ||
+                !Array.isArray(target.plannedPages) ||
+                !Array.isArray(target.processingCatalogIds)
+              )
+                fail();
+              const sourcePageCount = integer(
+                target.sourcePageCount,
+                1,
+                10_000,
+              );
+              const plannedPages = target.plannedPages.map((page) =>
+                integer(page, 1, sourcePageCount),
+              );
+              const batchOrdinal = integer(target.batchOrdinal, 0, 10_000);
+              const processingCatalogIds = target.processingCatalogIds.map(
+                (value) => string(value, 36, UUID),
+              );
+              if (
+                plannedPages.length < 1 ||
+                plannedPages.length > 10_000 ||
+                plannedPages.some(
+                  (page, index) =>
+                    index > 0 && page <= plannedPages[index - 1]!,
+                ) ||
+                processingCatalogIds.length !== batchOrdinal + 1 ||
+                new Set(processingCatalogIds).size !==
+                  processingCatalogIds.length
+              )
+                fail();
+              return {
+                goalKind: target.goalKind,
+                sourcePageCount,
+                plannedPages,
+                requestedRegionsClosed: boolean(target.requestedRegionsClosed),
+                continuationsClosed: boolean(target.continuationsClosed),
+                batchOrdinal,
+                processingCatalogIds,
+                ...(target.targetId === undefined
+                  ? {}
+                  : { targetId: id(target.targetId) }),
+                ...(target.priorProcessingGenerationId === undefined
+                  ? {}
+                  : {
+                      priorProcessingGenerationId: id(
+                        target.priorProcessingGenerationId,
+                      ),
+                    }),
+              };
+            })(),
+          }),
       ...(input.providerV2Transition === undefined
         ? {}
         : {
@@ -1553,6 +1702,10 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
         (identity) =>
           `${identity.sourceItemId}\0${identity.observationEpoch}\0${identity.processingEpoch}\0${identity.sha256}`,
       );
+      const targetedClassifiedKeys = (routing.targetedTaxClassified ?? []).map(
+        (identity) =>
+          `${identity.sourceItemId}\0${identity.observationEpoch}\0${identity.processingEpoch}\0${identity.sha256}`,
+      );
       if (
         selectedKeys.some((key) => !identities.has(key)) ||
         previewedKeys.some((key) => !identities.has(key)) ||
@@ -1561,16 +1714,20 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
         fail();
       if (result.step === "preview") {
         const plan = result.files[result.pdfIndex];
+        const planKey =
+          plan &&
+          "kind" in plan &&
+          plan.kind === "pdf" &&
+          plan.sourceItemId !== undefined &&
+          plan.observationEpoch !== undefined &&
+          plan.processingEpoch !== undefined
+            ? `${plan.sourceItemId}\0${plan.observationEpoch}\0${plan.processingEpoch}\0${plan.sha256}`
+            : undefined;
         if (
-          !plan ||
-          !("kind" in plan) ||
-          plan.kind !== "pdf" ||
-          plan.sourceItemId === undefined ||
-          plan.observationEpoch === undefined ||
-          plan.processingEpoch === undefined ||
-          previewedKeys.includes(
-            `${plan.sourceItemId}\0${plan.observationEpoch}\0${plan.processingEpoch}\0${plan.sha256}`,
-          )
+          planKey === undefined ||
+          (previewedKeys.includes(planKey) &&
+            (!selectedKeys.includes(planKey) ||
+              targetedClassifiedKeys.includes(planKey)))
         )
           fail();
       }

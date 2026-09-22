@@ -126,7 +126,7 @@ function declaration(text) {
 test("automatic routing requires strong tax and bulk-history evidence", () => {
   for (const text of [
     "Form 1040 U.S. Individual Income Tax Return",
-    "Schedule K-1 Partner's Share of Income",
+    "Schedule K-1 (Form 1065) Partner's Share of Income",
   ]) {
     const preview = declaration(text);
     assert.equal(preview.provisionalMetadata.documentKind, "tax_return");
@@ -134,6 +134,10 @@ test("automatic routing requires strong tax and bulk-history evidence", () => {
   }
   assert.equal(
     automaticPreviewRoute(declaration("Please see Form 1040 in the appendix")),
+    "defer",
+  );
+  assert.equal(
+    automaticPreviewRoute(declaration("Schedule K-1 (Form 1041) Beneficiary's Share")),
     "defer",
   );
   const history = declaration(
@@ -447,7 +451,11 @@ test("selected preview enters deep intent while FIFO routing precedes background
     assert.deepEqual(windows, [{ startPage: 1, pageCount: 2 }]);
     assert.equal(state.journal.checkpoint.step, "intent");
     assert.equal(state.journal.checkpoint.pdfIndex, 1);
-    assert.equal(JSON.stringify(requests).includes("Form 1040"), false);
+    assert.equal(
+      requests[0].preview.provisionalMetadata.title,
+      "Form 1040",
+    );
+    assert.equal(JSON.stringify(requests).includes("Individual Income"), false);
 
     worker.pdfNeedsArchivedWork = async (item) =>
       item.relativePath === selectedA.relativePath ||
@@ -460,9 +468,102 @@ test("selected preview enters deep intent while FIFO routing precedes background
     assert.equal(next.step, "intent");
     worker.pdfNeedsArchivedWork = async (item) =>
       item.relativePath === selectedB.relativePath;
+    worker.hasCompletedTargetedTax = (item) =>
+      item.relativePath === selectedA.relativePath;
     next = await worker.afterArchivedItem(next, 0);
     assert.equal(next.pdfIndex, 2);
     assert.equal(next.step, "preview");
+  } finally {
+    await state.journal.close();
+    await rm(state.directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy selected tax carry is reclassified once despite an exhausted full parser", async () => {
+  const selected = plan("legacy-tax", "6");
+  const identity = metadataFirstIdentity(selected);
+  const routing = {
+    version: 1,
+    triageStartIndex: 0,
+    refreshReady: false,
+    selected: [identity],
+    previewed: [identity],
+    selectionReceipts: [],
+  };
+  const state = await fixture(
+    checkpoint([selected], 0, { metadataFirst: routing }),
+  );
+  const original = {
+    originalCatalogId: randomUUID(),
+    rowRevision: 1,
+    origin: { sha256: selected.sha256, byteLength: selected.byteLength },
+  };
+  let exhausted = [];
+  const requests = [];
+  const worker = runner(
+    { spaceId: "space", sourceAccountId: "source" },
+    state.journal,
+    transport(requests),
+    async (item) =>
+      previewFor(item, "Form 1040 U.S. Individual Income Tax Return"),
+  );
+  exhausted = [1, 2].map((attempt) => ({
+    processingCatalogId: randomUUID(),
+    originalCatalogId: original.originalCatalogId,
+    rowRevision: 1,
+    currentObservation: {
+      scanId: `old-${attempt}`,
+      observationEpoch: selected.observationEpoch,
+      processingEpoch: selected.processingEpoch,
+    },
+    fingerprints: worker.processingFingerprints(selected),
+    parseFailure: { code: "bundle_too_large", attempts: 1, failedAt: attempt },
+  }));
+  worker.archiveCatalog = {
+    findOriginalExact() {
+      return original;
+    },
+    listOriginals() {
+      return [original];
+    },
+    listProcessings() {
+      return exhausted;
+    },
+  };
+  try {
+    const next = await worker.nextMetadataCheckpoint(
+      state.journal.checkpoint,
+      state.journal.checkpoint.metadataFirst,
+      4,
+    );
+    assert.equal(next.step, "preview");
+    await worker.driveArchived();
+    assert.equal(state.journal.checkpoint.step, "intent");
+    assert.deepEqual(state.journal.checkpoint.metadataFirst.targetedTax, [
+      {
+        ...identity,
+        goalKind: "form_1040_totals_v1",
+        sourcePageCount: 90,
+      },
+    ]);
+    assert.deepEqual(
+      state.journal.checkpoint.metadataFirst.targetedTaxClassified,
+      [identity],
+    );
+    assert.equal(requests.length, 1);
+
+    const settledRouting = {
+      ...routing,
+      previewGaps: [],
+      targetedTaxClassified: [identity],
+    };
+    worker.pdfNeedsArchivedWork = async () => false;
+    const settled = await worker.nextMetadataCheckpoint(
+      state.journal.checkpoint,
+      settledRouting,
+      4,
+    );
+    assert.equal(settled.phase, "discovery_reserve");
   } finally {
     await state.journal.close();
     await rm(state.directory, { recursive: true, force: true });
@@ -832,7 +933,8 @@ test("a positive tax heading durably auto-selects its exact revision", async () 
     { spaceId: "space", sourceAccountId: "source" },
     state.journal,
     transport(requests),
-    async () => previewFor(item, "Schedule K-1 Partner's Share of Income"),
+    async () =>
+      previewFor(item, "Schedule K-1 (Form 1065) Partner's Share of Income"),
   );
   try {
     await worker.driveArchived();
@@ -848,7 +950,11 @@ test("a positive tax heading durably auto-selects its exact revision", async () 
       state.journal.checkpoint.metadataFirst.selectionReceipts[0].selectedCount,
       1,
     );
-    assert.equal(JSON.stringify(requests).includes("Schedule K-1"), false);
+    assert.equal(
+      requests[0].preview.provisionalMetadata.title,
+      "Schedule K-1 (Form 1065)",
+    );
+    assert.equal(JSON.stringify(requests).includes("Income"), false);
     assert.equal(JSON.stringify(requests).includes("relativePath"), false);
   } finally {
     await state.journal.close();

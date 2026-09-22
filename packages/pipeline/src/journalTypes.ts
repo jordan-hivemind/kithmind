@@ -25,6 +25,10 @@ export const JOURNAL_OPERATIONS = [
   "jobs.stageParsedBatch",
   "jobs.stageParsedSeal",
   "jobs.activateParsed",
+  "extraction.beginTargetedTax",
+  "extraction.admitTargetedTaxBatch",
+  "extraction.appendTargetedTaxBatch",
+  "extraction.targetedTaxStatus",
 ] as const;
 
 export type JournalOperation = (typeof JOURNAL_OPERATIONS)[number];

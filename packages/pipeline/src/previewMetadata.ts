@@ -43,9 +43,21 @@ function bulkTradeHistory(text: string): boolean {
 function classifyPdf(preview: DocumentPreviewResult): {
   documentKind: TriageDocumentKind;
   confidence: number | null;
+  title?: string;
 } {
   const text = previewText(preview);
-  if (taxHeading(text)) return { documentKind: "tax_return", confidence: 0.95 };
+  if (taxHeading(text)) {
+    const title = /schedule\s+k-1\s*\(\s*form\s+1065\s*\)/.test(text)
+      ? "Schedule K-1 (Form 1065)"
+      : /(?:^|\n)\s*(?:(?:u\.?s\.?)\s+)?form\s+1040(?:-sr)?\b/m.test(text)
+        ? "Form 1040"
+        : undefined;
+    return {
+      documentKind: "tax_return",
+      confidence: 0.95,
+      ...(title ? { title } : {}),
+    };
+  }
   if (
     /\b(?:account|portfolio|brokerage|bank)\s+statement\b/.test(text) ||
     /\bstatement\s+period\b/.test(text)
@@ -110,7 +122,9 @@ export function previewDeclaration(
         ? { title: "Brokerage trade history" }
         : tradeConfirmation
           ? { title: "Trade confirmation" }
-          : {}),
+          : classified.title
+            ? { title: classified.title }
+            : {}),
       ...(uncertaintyCodes.length === 0 ? {} : { uncertaintyCodes }),
     },
     confidence: bulkHistory || tradeConfirmation ? 0.9 : classified.confidence,
@@ -123,6 +137,8 @@ export function automaticPreviewRoute(
 ): AutomaticPreviewRoute {
   if (
     preview.provisionalMetadata.documentKind === "tax_return" &&
+    (preview.provisionalMetadata.title === "Form 1040" ||
+      preview.provisionalMetadata.title === "Schedule K-1 (Form 1065)") &&
     preview.confidence !== null &&
     preview.confidence >= 0.9
   )

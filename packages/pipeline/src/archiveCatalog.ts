@@ -27,6 +27,7 @@ import type {
   ArchiveDeletionTarget,
   ArchiveSubject,
   DurableParserOutput,
+  DurableSelectiveParserOutput,
   LocalFileIdentity,
   OriginalCatalogIdentity,
   OriginalCatalogRow,
@@ -874,21 +875,32 @@ function providerOriginal(value: unknown) {
   return result;
 }
 
-function durableParserOutput(value: unknown): DurableParserOutput {
+function durableParserOutput(
+  value: unknown,
+): DurableParserOutput | DurableSelectiveParserOutput {
   const row = object(value);
-  exact(row, [
-    "outputId",
-    "outputRoot",
-    "outputDirectory",
-    "sourceSha256",
-    "rawArtifact",
-    "normalizedBundle",
-    "parserFingerprint",
-    "extractionConfigurationFingerprint",
-    "extractionFingerprint",
-    "modelManifestSha256",
-    "pageCount",
-  ]);
+  exact(
+    row,
+    [
+      "outputId",
+      "outputRoot",
+      "outputDirectory",
+      "sourceSha256",
+      "rawArtifact",
+      "normalizedBundle",
+      "parserFingerprint",
+      "extractionConfigurationFingerprint",
+      "extractionFingerprint",
+      "modelManifestSha256",
+      "pageCount",
+    ],
+    [
+      "artifactKind",
+      "coverage",
+      "selectiveImplementationSha256",
+      "artifactFingerprint",
+    ],
+  );
   const raw = object(row.rawArtifact);
   const bundle = object(row.normalizedBundle);
   exact(raw, [
@@ -914,7 +926,7 @@ function durableParserOutput(value: unknown): DurableParserOutput {
     bundle.mediaType !== "application/json"
   )
     fail("catalog_invalid");
-  return {
+  const common = {
     outputId: uuid(row.outputId),
     outputRoot: directoryIdentity(row.outputRoot),
     outputDirectory: directoryIdentity(row.outputDirectory),
@@ -937,7 +949,7 @@ function durableParserOutput(value: unknown): DurableParserOutput {
         sha256: bundle.sha256,
         byteLength: bundle.byteLength,
       }),
-      mediaType: "application/json",
+      mediaType: "application/json" as const,
     },
     parserFingerprint: sha(row.parserFingerprint),
     extractionConfigurationFingerprint: sha(
@@ -946,6 +958,58 @@ function durableParserOutput(value: unknown): DurableParserOutput {
     extractionFingerprint: sha(row.extractionFingerprint),
     modelManifestSha256: sha(row.modelManifestSha256),
     pageCount: integer(row.pageCount, 1, 64),
+  };
+  if (row.artifactKind === undefined) {
+    if (
+      row.coverage !== undefined ||
+      row.selectiveImplementationSha256 !== undefined ||
+      row.artifactFingerprint !== undefined
+    )
+      fail("catalog_invalid");
+    return common;
+  }
+  if (
+    row.artifactKind !== "selective_pdf_pages_v1" ||
+    row.coverage === undefined ||
+    row.selectiveImplementationSha256 === undefined ||
+    row.artifactFingerprint === undefined
+  )
+    fail("catalog_invalid");
+  const coverage = object(row.coverage);
+  exact(coverage, [
+    "schemaVersion",
+    "sourceSha256",
+    "selectedPdfSha256",
+    "sourcePageCount",
+    "originalPages",
+    "fingerprint",
+  ]);
+  if (coverage.schemaVersion !== 1 || !Array.isArray(coverage.originalPages))
+    fail("catalog_invalid");
+  const sourcePageCount = integer(coverage.sourcePageCount, 1, 10_000);
+  const originalPages = coverage.originalPages.map((page) =>
+    integer(page, 1, sourcePageCount),
+  );
+  if (
+    originalPages.length !== common.pageCount ||
+    originalPages.some(
+      (page, index) => index > 0 && page <= originalPages[index - 1]!,
+    )
+  )
+    fail("catalog_invalid");
+  return {
+    ...common,
+    artifactKind: "selective_pdf_pages_v1",
+    coverage: {
+      schemaVersion: 1,
+      sourceSha256: sha(coverage.sourceSha256),
+      selectedPdfSha256: sha(coverage.selectedPdfSha256),
+      sourcePageCount,
+      originalPages,
+      fingerprint: sha(coverage.fingerprint),
+    },
+    selectiveImplementationSha256: sha(row.selectiveImplementationSha256),
+    artifactFingerprint: sha(row.artifactFingerprint),
   };
 }
 
@@ -1105,6 +1169,8 @@ function processingRow(value: unknown): ProcessingCatalogRow {
       "parseFailure",
       "receiptReconcile",
       "legacyIndependentBackup",
+      "targetedBatch",
+      "targetedCompletion",
     ],
   );
   const current = object(row.currentObservation);
@@ -1149,6 +1215,47 @@ function processingRow(value: unknown): ProcessingCatalogRow {
       ),
       correctionFingerprint: sha(fingerprints.correctionFingerprint),
     },
+    ...(row.targetedBatch === undefined
+      ? {}
+      : {
+          targetedBatch: (() => {
+            const targeted = object(row.targetedBatch);
+            exact(targeted, [
+              "goalKind",
+              "batchOrdinal",
+              "sourcePageCount",
+              "originalPages",
+            ]);
+            if (
+              (targeted.goalKind !== "form_1040_totals_v1" &&
+                targeted.goalKind !== "schedule_k1_key_fields_v1") ||
+              !Array.isArray(targeted.originalPages)
+            )
+              fail("catalog_invalid");
+            const sourcePageCount = integer(
+              targeted.sourcePageCount,
+              1,
+              10_000,
+            );
+            const originalPages = targeted.originalPages.map((page) =>
+              integer(page, 1, sourcePageCount),
+            );
+            if (
+              originalPages.length < 1 ||
+              originalPages.length > 12 ||
+              originalPages.some(
+                (page, index) => index > 0 && page <= originalPages[index - 1]!,
+              )
+            )
+              fail("catalog_invalid");
+            return {
+              goalKind: targeted.goalKind,
+              batchOrdinal: integer(targeted.batchOrdinal, 0, 10_000),
+              sourcePageCount,
+              originalPages,
+            };
+          })(),
+        }),
     captureIntent: {
       captureId: uuid(captureIntent.captureId),
       directory: directoryIdentity(captureIntent.directory),
@@ -1265,6 +1372,21 @@ function processingRow(value: unknown): ProcessingCatalogRow {
   }
   if (row.receiptReconcile !== undefined)
     result.receiptReconcile = receiptReconcileNotes(row.receiptReconcile);
+  if (row.targetedCompletion !== undefined) {
+    const completion = object(row.targetedCompletion);
+    exact(completion, ["targetId", "status", "completedAt"]);
+    if (
+      completion.status !== "complete" &&
+      completion.status !== "incomplete_resumable" &&
+      completion.status !== "conflict"
+    )
+      fail("catalog_invalid");
+    result.targetedCompletion = {
+      targetId: id(completion.targetId),
+      status: completion.status,
+      completedAt: integer(completion.completedAt),
+    };
+  }
   return result;
 }
 
@@ -1324,12 +1446,8 @@ function parseSnapshot(value: unknown, authorityDigest: string) {
       fail("catalog_invalid");
     for (const copy of [
       ...Object.values(original.copies),
-      ...(providerV2 && provider.legacyPrimary
-        ? [provider.legacyPrimary]
-        : []),
-      ...(providerV2 && provider.legacyLocator
-        ? [provider.legacyLocator]
-        : []),
+      ...(providerV2 && provider.legacyPrimary ? [provider.legacyPrimary] : []),
+      ...(providerV2 && provider.legacyLocator ? [provider.legacyLocator] : []),
     ]) {
       for (const candidate of [copy.clientReceiptId, copy.archiveObjectId]) {
         if (stableIds.has(candidate)) fail("catalog_invalid");
@@ -1360,10 +1478,35 @@ function parseSnapshot(value: unknown, authorityDigest: string) {
         processing.copies.independent_backup !== undefined)
     )
       fail("catalog_invalid");
+    const targetedParserMismatch =
+      processing.targetedBatch !== undefined &&
+      processing.parserOutput !== undefined &&
+      (!("artifactKind" in processing.parserOutput) ||
+        processing.parserOutput.artifactKind !== "selective_pdf_pages_v1" ||
+        processing.parserOutput.coverage.sourceSha256 !==
+          parent.origin.sha256 ||
+        processing.parserOutput.coverage.sourcePageCount !==
+          processing.targetedBatch.sourcePageCount ||
+        !equal(
+          processing.parserOutput.coverage.originalPages,
+          processing.targetedBatch.originalPages,
+        ));
+    if (
+      (processing.targetedCompletion !== undefined &&
+        (processing.targetedBatch === undefined ||
+          processing.cloud === undefined)) ||
+      (processing.targetedBatch !== undefined &&
+        (parent.providerOriginal?.referenceVersion !== "provider_original_v2" ||
+          processing.copies.independent_backup !== undefined ||
+          processing.activation !== undefined ||
+          targetedParserMismatch))
+    )
+      fail("catalog_invalid");
     const processingIdentity = JSON.stringify([
       processing.originalCatalogId,
       processing.currentObservation,
       processing.fingerprints,
+      processing.targetedBatch ?? null,
     ]);
     if (processingIdentities.has(processingIdentity)) fail("catalog_invalid");
     processingIdentities.add(processingIdentity);
@@ -1953,11 +2096,7 @@ export class ArchiveCatalog {
       for (const processing of this.snapshot.processings) {
         const backup = processing.copies.independent_backup;
         if (backup)
-          collect(
-            backup,
-            "parser_backup",
-            processing.processingCatalogId,
-          );
+          collect(backup, "parser_backup", processing.processingCatalogId);
       }
       artifacts.sort(artifactOrder);
       artifactBindings.sort((left, right) =>
@@ -2154,7 +2293,10 @@ export class ArchiveCatalog {
   findProcessingExact(
     identity: Pick<
       ProcessingCatalogIdentity,
-      "originalCatalogId" | "currentObservation" | "fingerprints"
+      | "originalCatalogId"
+      | "currentObservation"
+      | "fingerprints"
+      | "targetedBatch"
     >,
   ): ProcessingCatalogRow | undefined {
     this.assertUsable();
@@ -2188,12 +2330,16 @@ export class ArchiveCatalog {
         ),
         correctionFingerprint: sha(fingerprints.correctionFingerprint),
       },
+      ...(identity.targetedBatch === undefined
+        ? {}
+        : { targetedBatch: identity.targetedBatch }),
     };
     const matches = this.snapshot.processings.filter(
       (row) =>
         row.originalCatalogId === probe.originalCatalogId &&
         equal(row.currentObservation, probe.currentObservation) &&
-        equal(row.fingerprints, probe.fingerprints),
+        equal(row.fingerprints, probe.fingerprints) &&
+        equal(row.targetedBatch, probe.targetedBatch),
     );
     if (matches.length > 1) fail("catalog_conflict");
     return matches[0] === undefined ? undefined : structuredClone(matches[0]);
@@ -2254,7 +2400,8 @@ export class ArchiveCatalog {
         (row) =>
           row.originalCatalogId === candidate.originalCatalogId &&
           equal(row.currentObservation, candidate.currentObservation) &&
-          equal(row.fingerprints, candidate.fingerprints),
+          equal(row.fingerprints, candidate.fingerprints) &&
+          equal(row.targetedBatch, candidate.targetedBatch),
       );
       if (exactExisting) return structuredClone(exactExisting);
       if (this.snapshot.processings.length >= MAX_PROCESSINGS)
@@ -2378,7 +2525,7 @@ export class ArchiveCatalog {
   async recordParserOutput(args: {
     catalogId: string;
     expectedRevision: number;
-    output: DurableParserOutput;
+    output: DurableParserOutput | DurableSelectiveParserOutput;
   }): Promise<ProcessingCatalogRow> {
     return (await this.updateRow(
       "parser_output",
@@ -2848,7 +2995,8 @@ export class ArchiveCatalog {
       );
       if (
         original.rowRevision !== integer(args.expectedOriginalRevision, 1) ||
-        processing.rowRevision !== integer(args.expectedProcessingRevision, 1) ||
+        processing.rowRevision !==
+          integer(args.expectedProcessingRevision, 1) ||
         processing.originalCatalogId !== original.originalCatalogId ||
         original.cloud
       )
@@ -2910,7 +3058,8 @@ export class ArchiveCatalog {
           row.cloud ||
           provider?.referenceVersion !== "provider_original_v2" ||
           !stored ||
-          args.verified.providerAccountIdHash !== stored.providerAccountIdHash ||
+          args.verified.providerAccountIdHash !==
+            stored.providerAccountIdHash ||
           args.verified.providerRootDirectoryIdHash !==
             stored.providerRootDirectoryIdHash ||
           args.verified.providerFileIdHash !== stored.providerFileIdHash ||
@@ -3135,6 +3284,33 @@ export class ArchiveCatalog {
         if (row.activation && !equal(row.activation, activation))
           fail("catalog_conflict");
         row.activation = activation;
+      },
+    )) as ProcessingCatalogRow;
+  }
+
+  async recordTargetedCompletion(args: {
+    catalogId: string;
+    expectedRevision: number;
+    completion: NonNullable<ProcessingCatalogRow["targetedCompletion"]>;
+  }): Promise<ProcessingCatalogRow> {
+    return (await this.updateRow(
+      "parser_output",
+      args.catalogId,
+      args.expectedRevision,
+      (value) => {
+        const row = value as ProcessingCatalogRow;
+        if (!row.targetedBatch || !row.cloud || row.activation)
+          fail("invalid_transition");
+        const completion = processingRow({
+          ...row,
+          targetedCompletion: args.completion,
+        }).targetedCompletion!;
+        if (
+          row.targetedCompletion &&
+          !equal(row.targetedCompletion, completion)
+        )
+          fail("catalog_conflict");
+        row.targetedCompletion = completion;
       },
     )) as ProcessingCatalogRow;
   }
