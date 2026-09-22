@@ -4,10 +4,12 @@ import {
   assertCandidateHashesOwnedByDocument,
   type CandidateHoldingProjection,
   type CandidateHoldingRow,
+  type HoldingBalanceScopeSelector,
   type HoldingPositionScopeSelector,
   type HoldingCorrectionCandidateManifest,
   type HoldingProjectionTable,
   holdingProjectionCurrentDigest,
+  prepareHoldingBalanceScopes,
   prepareHoldingPositionScopes,
   prepareHoldingCorrectionCandidate,
   readStoredHoldingProjection,
@@ -94,16 +96,23 @@ export type HoldingScopedCorrectionManifest = {
   readonly oldProjectionDigest: string;
   readonly candidateProjectionDigest: string;
   readonly selectedCurrentDigest: string;
-  readonly selectedScopes: readonly {
-    readonly scopeKind: "positions";
+  readonly selectedScopes: readonly ({
     readonly accountId: string;
     readonly asOf: string;
-    readonly proofVersion: "position_scope_v1";
     readonly emittedRowCount: number;
     readonly scopeDigest: string;
     readonly sourceOwnedRows: number;
     readonly foreignReferencedRows: number;
-  }[];
+  } & (
+    | {
+        readonly scopeKind: "positions";
+        readonly proofVersion: "position_scope_v1";
+      }
+    | {
+        readonly scopeKind: "balance";
+        readonly proofVersion: "balance_scope_v1";
+      }
+  ))[];
   readonly rows: Readonly<
     Record<
       HoldingProjectionTable,
@@ -174,9 +183,16 @@ type CanonicalPosition = {
 
 export type PreparedScopedCorrection = {
   readonly manifest: HoldingScopedCorrectionManifest;
-  readonly selectedScopes: ReturnType<typeof prepareHoldingPositionScopes>;
+  readonly selectedPositionScopes: ReturnType<
+    typeof prepareHoldingPositionScopes
+  >;
+  readonly selectedBalanceScopes: ReturnType<
+    typeof prepareHoldingBalanceScopes
+  >;
   readonly sourceOwnedPositions: readonly CandidateHoldingRow[];
-  readonly foreignReferencedHashes: ReadonlySet<string>;
+  readonly sourceOwnedBalances: readonly CandidateHoldingRow[];
+  readonly foreignReferencedPositionHashes: ReadonlySet<string>;
+  readonly foreignReferencedBalanceHashes: ReadonlySet<string>;
 };
 
 function canonical(value: unknown): string {
@@ -259,7 +275,9 @@ function sortedProjection(projection: StoredHoldingProjection): unknown {
   ]);
 }
 
-function scopeKey(scope: HoldingPositionScopeSelector): string {
+function scopeKey(
+  scope: HoldingPositionScopeSelector | HoldingBalanceScopeSelector,
+): string {
   return `${scope.accountId}\u0000${scope.asOf}\u0000${scope.proofVersion}`;
 }
 
@@ -272,18 +290,48 @@ function selectedPosition(
   );
 }
 
-function canonicalPositionDigest(rows: readonly CanonicalPosition[]): string {
+function selectedBalance(
+  semantic: readonly (string | null)[],
+  selected: ReadonlySet<string>,
+): boolean {
+  return selected.has(
+    `${semantic[0]}\u0000${semantic[1]}\u0000balance_scope_v1`,
+  );
+}
+
+function canonicalScopedCurrentDigest(input: {
+  positions: readonly CanonicalPosition[];
+  balances: readonly CanonicalPosition[];
+  includesBalanceScopes: boolean;
+}): string {
+  if (!input.includesBalanceScopes) {
+    return digest(
+      "kith-finance-holding-scoped-position-current:v1",
+      [...input.positions]
+        .sort((left, right) => left.id.localeCompare(right.id))
+        .map((row) => [
+          row.id,
+          row.sourceDocumentId,
+          row.rowHash,
+          row.sourceLocator,
+          row.semantic,
+        ]),
+    );
+  }
   return digest(
-    "kith-finance-holding-scoped-position-current:v1",
-    [...rows]
-      .sort((left, right) => left.id.localeCompare(right.id))
-      .map((row) => [
-        row.id,
-        row.sourceDocumentId,
-        row.rowHash,
-        row.sourceLocator,
-        row.semantic,
-      ]),
+    "kith-finance-holding-scoped-current:v1",
+    (["positions", "balances"] as const).map((table) => [
+      table,
+      [...input[table]]
+        .sort((left, right) => left.id.localeCompare(right.id))
+        .map((row) => [
+          row.id,
+          row.sourceDocumentId,
+          row.rowHash,
+          row.sourceLocator,
+          row.semantic,
+        ]),
+    ]),
   );
 }
 
@@ -293,20 +341,45 @@ function normalizedNumeric(value: string | null): string | null {
 
 function scopedCandidateProjectionDigest(input: {
   stored: StoredHoldingProjection;
-  selected: ReadonlySet<string>;
+  selectedPositions: ReadonlySet<string>;
+  selectedBalances: ReadonlySet<string>;
   sourceOwnedPositions: readonly CandidateHoldingRow[];
+  sourceOwnedBalances: readonly CandidateHoldingRow[];
 }): string {
-  return digest("kith-finance-holding-scoped-position-projection:v1", {
+  if (input.selectedBalances.size === 0) {
+    return digest("kith-finance-holding-scoped-position-projection:v1", {
+      preservedPositions: input.stored.positions
+        .filter(
+          (row) => !selectedPosition(row.semantic, input.selectedPositions),
+        )
+        .sort((left, right) => left.id.localeCompare(right.id))
+        .map((row) => [row.id, row.rowHash, row.sourceLocator, row.semantic]),
+      selectedSourceOwnedPositions: [...input.sourceOwnedPositions]
+        .sort((left, right) => left.rowHash.localeCompare(right.rowHash))
+        .map((row) => [row.rowHash, row.sourceLocator, row.semantic]),
+      balances: [...input.stored.balances]
+        .sort((left, right) => left.id.localeCompare(right.id))
+        .map((row) => [row.id, row.rowHash, row.sourceLocator, row.semantic]),
+      liabilities: [...input.stored.liabilities]
+        .sort((left, right) => left.id.localeCompare(right.id))
+        .map((row) => [row.id, row.rowHash, row.sourceLocator, row.semantic]),
+    });
+  }
+  return digest("kith-finance-holding-scoped-projection:v1", {
     preservedPositions: input.stored.positions
-      .filter((row) => !selectedPosition(row.semantic, input.selected))
+      .filter((row) => !selectedPosition(row.semantic, input.selectedPositions))
       .sort((left, right) => left.id.localeCompare(right.id))
       .map((row) => [row.id, row.rowHash, row.sourceLocator, row.semantic]),
     selectedSourceOwnedPositions: [...input.sourceOwnedPositions]
       .sort((left, right) => left.rowHash.localeCompare(right.rowHash))
       .map((row) => [row.rowHash, row.sourceLocator, row.semantic]),
-    balances: [...input.stored.balances]
+    preservedBalances: input.stored.balances
+      .filter((row) => !selectedBalance(row.semantic, input.selectedBalances))
       .sort((left, right) => left.id.localeCompare(right.id))
       .map((row) => [row.id, row.rowHash, row.sourceLocator, row.semantic]),
+    selectedSourceOwnedBalances: [...input.sourceOwnedBalances]
+      .sort((left, right) => left.rowHash.localeCompare(right.rowHash))
+      .map((row) => [row.rowHash, row.sourceLocator, row.semantic]),
     liabilities: [...input.stored.liabilities]
       .sort((left, right) => left.id.localeCompare(right.id))
       .map((row) => [row.id, row.rowHash, row.sourceLocator, row.semantic]),
@@ -429,6 +502,105 @@ async function readCanonicalPositionsByHash(
   }));
 }
 
+async function readCanonicalSelectedBalances(
+  client: ArchiveClient,
+  selectors: readonly HoldingBalanceScopeSelector[],
+): Promise<CanonicalPosition[]> {
+  if (selectors.length === 0) return [];
+  const found = await client.query<{
+    id: string;
+    source_document_id: string;
+    row_hash: string | null;
+    source_locator: string | null;
+    account_id: string;
+    as_of: string;
+    total_value: string | null;
+    cash: string | null;
+    currency: string;
+    period_start_value: string | null;
+    period_end_value: string | null;
+  }>(
+    `WITH selected AS (
+       SELECT * FROM jsonb_to_recordset($1::jsonb)
+         AS x(account_id text, as_of date)
+     )
+     SELECT b.id, b.source_document_id, b.row_hash, b.source_locator,
+            b.account_id, b.as_of::text AS as_of, b.total_value::text,
+            b.cash::text, b.currency::text, b.period_start_value::text,
+            b.period_end_value::text
+       FROM balances b
+       JOIN selected s ON s.account_id = b.account_id AND s.as_of = b.as_of
+      ORDER BY b.id
+      FOR UPDATE OF b`,
+    [
+      JSON.stringify(
+        selectors.map((scope) => ({
+          account_id: scope.accountId,
+          as_of: scope.asOf,
+        })),
+      ),
+    ],
+  );
+  return found.rows.map((row) => ({
+    id: row.id,
+    sourceDocumentId: row.source_document_id,
+    rowHash: row.row_hash,
+    sourceLocator: row.source_locator,
+    semantic: [
+      row.account_id,
+      row.as_of,
+      normalizedNumeric(row.total_value),
+      normalizedNumeric(row.cash),
+      row.currency,
+      normalizedNumeric(row.period_start_value),
+      normalizedNumeric(row.period_end_value),
+    ],
+  }));
+}
+
+async function readCanonicalBalancesByHash(
+  client: ArchiveClient,
+  hashes: readonly string[],
+): Promise<CanonicalPosition[]> {
+  if (hashes.length === 0) return [];
+  const found = await client.query<{
+    id: string;
+    source_document_id: string;
+    row_hash: string;
+    source_locator: string | null;
+    account_id: string;
+    as_of: string;
+    total_value: string | null;
+    cash: string | null;
+    currency: string;
+    period_start_value: string | null;
+    period_end_value: string | null;
+  }>(
+    `SELECT b.id, b.source_document_id, b.row_hash, b.source_locator,
+            b.account_id, b.as_of::text AS as_of, b.total_value::text,
+            b.cash::text, b.currency::text, b.period_start_value::text,
+            b.period_end_value::text
+       FROM balances b WHERE b.row_hash = ANY($1::text[])
+      ORDER BY b.id FOR UPDATE OF b`,
+    [hashes],
+  );
+  return found.rows.map((row) => ({
+    id: row.id,
+    sourceDocumentId: row.source_document_id,
+    rowHash: row.row_hash,
+    sourceLocator: row.source_locator,
+    semantic: [
+      row.account_id,
+      row.as_of,
+      normalizedNumeric(row.total_value),
+      normalizedNumeric(row.cash),
+      row.currency,
+      normalizedNumeric(row.period_start_value),
+      normalizedNumeric(row.period_end_value),
+    ],
+  }));
+}
+
 export async function prepareHoldingScopedPositionCorrection(input: {
   readonly client: ArchiveClient;
   readonly documentId: string;
@@ -438,37 +610,102 @@ export async function prepareHoldingScopedPositionCorrection(input: {
   readonly candidate: ImportDocument;
   readonly selectors: readonly HoldingScopedCorrectionSelector[];
 }): Promise<PreparedScopedCorrection> {
-  if (input.selectors.some((scope) => scope.scopeKind !== "positions")) {
-    refuse("this publisher does not yet implement selected balance scopes");
+  if (input.selectors.length === 0) refuse("no holding scopes were selected");
+  for (const selector of input.selectors) {
+    if (
+      selector === null ||
+      typeof selector !== "object" ||
+      canonical(Object.keys(selector).sort()) !==
+        canonical(["accountId", "asOf", "proofVersion", "scopeKind"]) ||
+      !(
+        (selector.scopeKind === "positions" &&
+          selector.proofVersion === "position_scope_v1") ||
+        (selector.scopeKind === "balance" &&
+          selector.proofVersion === "balance_scope_v1")
+      )
+    ) {
+      refuse("holding scope selector is invalid");
+    }
   }
-  const positionSelectors = input.selectors.map((scope) => ({
-    accountId: scope.accountId,
-    asOf: scope.asOf,
-    proofVersion: "position_scope_v1" as const,
-  }));
-  const selectedScopes = prepareHoldingPositionScopes({
-    documentId: input.documentId,
-    retainedSha256: input.retainedSha256,
-    candidate: input.candidate,
-    selectors: positionSelectors,
-  });
-  const selectors = selectedScopes.map((scope) => scope.selector);
-  const selected = new Set(selectors.map(scopeKey));
-  const canonicalRows = await readCanonicalSelectedPositions(
+  const positionSelectors = input.selectors
+    .filter((scope) => scope.scopeKind === "positions")
+    .map(({ accountId, asOf, proofVersion }) => ({
+      accountId,
+      asOf,
+      proofVersion,
+    }));
+  const balanceSelectors = input.selectors
+    .filter((scope) => scope.scopeKind === "balance")
+    .map(({ accountId, asOf, proofVersion }) => ({
+      accountId,
+      asOf,
+      proofVersion,
+    }));
+  const selectedPositionScopes =
+    positionSelectors.length === 0
+      ? []
+      : prepareHoldingPositionScopes({
+          documentId: input.documentId,
+          retainedSha256: input.retainedSha256,
+          candidate: input.candidate,
+          selectors: positionSelectors,
+        });
+  const selectedBalanceScopes =
+    balanceSelectors.length === 0
+      ? []
+      : prepareHoldingBalanceScopes({
+          documentId: input.documentId,
+          retainedSha256: input.retainedSha256,
+          candidate: input.candidate,
+          selectors: balanceSelectors,
+        });
+  if (
+    selectedPositionScopes.length + selectedBalanceScopes.length !==
+    input.selectors.length
+  ) {
+    refuse("holding scope selector is invalid");
+  }
+  const selectedPositions = new Set(positionSelectors.map(scopeKey));
+  const selectedBalances = new Set(balanceSelectors.map(scopeKey));
+  const canonicalPositions = await readCanonicalSelectedPositions(
     input.client,
-    selectors,
+    positionSelectors,
   );
-  const logicalRows = selectedScopes.flatMap((scope) => scope.positions);
-  const hashOwners = await readCanonicalPositionsByHash(
+  const canonicalBalances = await readCanonicalSelectedBalances(
     input.client,
-    logicalRows.map((row) => row.rowHash),
+    balanceSelectors,
   );
-  const byHash = new Map(hashOwners.map((row) => [row.rowHash!, row] as const));
-  const logicalByHash = new Map(logicalRows.map((row) => [row.rowHash, row]));
-  const foreignReferencedHashes = new Set<string>();
+  const logicalPositions = selectedPositionScopes.flatMap(
+    (scope) => scope.positions,
+  );
+  const logicalBalances = selectedBalanceScopes.flatMap(
+    (scope) => scope.balances,
+  );
+  const positionHashOwners = await readCanonicalPositionsByHash(
+    input.client,
+    logicalPositions.map((row) => row.rowHash),
+  );
+  const balanceHashOwners = await readCanonicalBalancesByHash(
+    input.client,
+    logicalBalances.map((row) => row.rowHash),
+  );
+  const positionByHash = new Map(
+    positionHashOwners.map((row) => [row.rowHash!, row] as const),
+  );
+  const balanceByHash = new Map(
+    balanceHashOwners.map((row) => [row.rowHash!, row] as const),
+  );
+  const logicalPositionByHash = new Map(
+    logicalPositions.map((row) => [row.rowHash, row]),
+  );
+  const logicalBalanceByHash = new Map(
+    logicalBalances.map((row) => [row.rowHash, row]),
+  );
+  const foreignReferencedPositionHashes = new Set<string>();
+  const foreignReferencedBalanceHashes = new Set<string>();
   const sourceOwnedPositions: CandidateHoldingRow[] = [];
-  for (const row of logicalRows) {
-    const current = byHash.get(row.rowHash);
+  for (const row of logicalPositions) {
+    const current = positionByHash.get(row.rowHash);
     if (
       current === undefined ||
       current.sourceDocumentId === input.documentId
@@ -479,12 +716,14 @@ export async function prepareHoldingScopedPositionCorrection(input: {
     if (canonical(current.semantic) !== canonical(row.semantic)) {
       refuse("a foreign-owned selected position has different semantics");
     }
-    foreignReferencedHashes.add(row.rowHash);
+    foreignReferencedPositionHashes.add(row.rowHash);
   }
-  for (const current of canonicalRows) {
+  for (const current of canonicalPositions) {
     if (current.sourceDocumentId === input.documentId) continue;
     const declared =
-      current.rowHash === null ? undefined : logicalByHash.get(current.rowHash);
+      current.rowHash === null
+        ? undefined
+        : logicalPositionByHash.get(current.rowHash);
     if (
       declared === undefined ||
       canonical(declared.semantic) !== canonical(current.semantic)
@@ -492,24 +731,74 @@ export async function prepareHoldingScopedPositionCorrection(input: {
       refuse("a selected scope does not represent every foreign-owned row");
     }
   }
+  const sourceOwnedBalances: CandidateHoldingRow[] = [];
+  for (const row of logicalBalances) {
+    const current = balanceByHash.get(row.rowHash);
+    if (
+      current === undefined ||
+      current.sourceDocumentId === input.documentId
+    ) {
+      sourceOwnedBalances.push(row);
+      continue;
+    }
+    if (canonical(current.semantic) !== canonical(row.semantic)) {
+      refuse("a foreign-owned selected balance has different semantics");
+    }
+    foreignReferencedBalanceHashes.add(row.rowHash);
+  }
+  for (const current of canonicalBalances) {
+    if (current.sourceDocumentId === input.documentId) continue;
+    const declared =
+      current.rowHash === null
+        ? undefined
+        : logicalBalanceByHash.get(current.rowHash);
+    if (
+      declared === undefined ||
+      canonical(declared.semantic) !== canonical(current.semantic)
+    ) {
+      refuse("a selected scope does not represent every foreign-owned balance");
+    }
+  }
 
-  const scopeSummaries = selectedScopes.map((scope) => ({
-    scopeKind: "positions" as const,
-    ...scope.selector,
-    emittedRowCount: scope.declaration.emittedPositionCount,
-    scopeDigest: scope.scopeDigest,
-    sourceOwnedRows: scope.positions.filter(
-      (row) => !foreignReferencedHashes.has(row.rowHash),
-    ).length,
-    foreignReferencedRows: scope.positions.filter((row) =>
-      foreignReferencedHashes.has(row.rowHash),
-    ).length,
-  }));
+  const scopeSummaries = [
+    ...selectedPositionScopes.map((scope) => ({
+      scopeKind: "positions" as const,
+      ...scope.selector,
+      emittedRowCount: scope.declaration.emittedPositionCount,
+      scopeDigest: scope.scopeDigest,
+      sourceOwnedRows: scope.positions.filter(
+        (row) => !foreignReferencedPositionHashes.has(row.rowHash),
+      ).length,
+      foreignReferencedRows: scope.positions.filter((row) =>
+        foreignReferencedPositionHashes.has(row.rowHash),
+      ).length,
+    })),
+    ...selectedBalanceScopes.map((scope) => ({
+      scopeKind: "balance" as const,
+      ...scope.selector,
+      emittedRowCount: scope.declaration.emittedBalanceCount,
+      scopeDigest: scope.scopeDigest,
+      sourceOwnedRows: scope.balances.filter(
+        (row) => !foreignReferencedBalanceHashes.has(row.rowHash),
+      ).length,
+      foreignReferencedRows: scope.balances.filter((row) =>
+        foreignReferencedBalanceHashes.has(row.rowHash),
+      ).length,
+    })),
+  ].sort((left, right) => canonical(left).localeCompare(canonical(right)));
   const oldSelectedPositions = input.stored.positions.filter((row) =>
-    selectedPosition(row.semantic, selected),
+    selectedPosition(row.semantic, selectedPositions),
   );
-  const candidateContent = new Set(
+  const oldSelectedBalances = input.stored.balances.filter((row) =>
+    selectedBalance(row.semantic, selectedBalances),
+  );
+  const positionCandidateContent = new Set(
     sourceOwnedPositions.map((row) =>
+      canonical([row.rowHash, row.sourceLocator, row.semantic]),
+    ),
+  );
+  const balanceCandidateContent = new Set(
+    sourceOwnedBalances.map((row) =>
       canonical([row.rowHash, row.sourceLocator, row.semantic]),
     ),
   );
@@ -522,29 +811,43 @@ export async function prepareHoldingScopedPositionCorrection(input: {
     oldProjectionDigest: holdingProjectionCurrentDigest(input.stored),
     candidateProjectionDigest: scopedCandidateProjectionDigest({
       stored: input.stored,
-      selected,
+      selectedPositions,
+      selectedBalances,
       sourceOwnedPositions,
+      sourceOwnedBalances,
     }),
-    selectedCurrentDigest: canonicalPositionDigest(canonicalRows),
+    selectedCurrentDigest: canonicalScopedCurrentDigest({
+      positions: canonicalPositions,
+      balances: canonicalBalances,
+      includesBalanceScopes: balanceSelectors.length > 0,
+    }),
     selectedScopes: scopeSummaries,
     rows: {
       positions: {
         oldSourceOwnedRows: input.stored.positions.length,
         candidateSourceOwnedRows:
           input.stored.positions.filter(
-            (row) => !selectedPosition(row.semantic, selected),
+            (row) => !selectedPosition(row.semantic, selectedPositions),
           ).length + sourceOwnedPositions.length,
         selectedSourceOwnedRemovals: oldSelectedPositions.filter(
           (row) =>
-            !candidateContent.has(
+            !positionCandidateContent.has(
               canonical([row.rowHash, row.sourceLocator, row.semantic]),
             ),
         ).length,
       },
       balances: {
         oldSourceOwnedRows: input.stored.balances.length,
-        candidateSourceOwnedRows: input.stored.balances.length,
-        selectedSourceOwnedRemovals: 0,
+        candidateSourceOwnedRows:
+          input.stored.balances.filter(
+            (row) => !selectedBalance(row.semantic, selectedBalances),
+          ).length + sourceOwnedBalances.length,
+        selectedSourceOwnedRemovals: oldSelectedBalances.filter(
+          (row) =>
+            !balanceCandidateContent.has(
+              canonical([row.rowHash, row.sourceLocator, row.semantic]),
+            ),
+        ).length,
       },
       liabilities: {
         oldSourceOwnedRows: input.stored.liabilities.length,
@@ -566,9 +869,12 @@ export async function prepareHoldingScopedPositionCorrection(input: {
   };
   return {
     manifest,
-    selectedScopes,
+    selectedPositionScopes,
+    selectedBalanceScopes,
     sourceOwnedPositions,
-    foreignReferencedHashes,
+    sourceOwnedBalances,
+    foreignReferencedPositionHashes,
+    foreignReferencedBalanceHashes,
   };
 }
 
@@ -1382,6 +1688,48 @@ async function replaceSelectedCurrentPositions(
   );
 }
 
+async function replaceSelectedCurrentBalances(
+  client: ArchiveClient,
+  documentId: string,
+  selectors: readonly HoldingBalanceScopeSelector[],
+  assertions: readonly Assertion[],
+): Promise<void> {
+  if (selectors.length === 0) return;
+  await client.query(
+    `DELETE FROM balances b
+      USING jsonb_to_recordset($2::jsonb) AS selected(account_id text, as_of date)
+      WHERE b.source_document_id = $1
+        AND b.account_id = selected.account_id AND b.as_of = selected.as_of`,
+    [
+      documentId,
+      JSON.stringify(
+        selectors.map((scope) => ({
+          account_id: scope.accountId,
+          as_of: scope.asOf,
+        })),
+      ),
+    ],
+  );
+  await insertRows(
+    client,
+    "balances",
+    BALANCE_COLUMNS,
+    assertions.map((item) => [
+      item.recordId,
+      item.semantic[0],
+      item.semantic[1],
+      item.semantic[2],
+      item.semantic[3],
+      item.semantic[4],
+      item.semantic[5],
+      item.semantic[6],
+      documentId,
+      item.sourceLocator,
+      item.rowHash,
+    ]),
+  );
+}
+
 const SCOPE_MEMBER_COLUMNS = [
   "source_document_id",
   "scope_id",
@@ -1839,8 +2187,11 @@ export async function publishHoldingScopedPositionCorrection(
     });
     validateScopedApproval(input.approval, prepared.manifest);
 
-    const selected = new Set(
-      prepared.selectedScopes.map((scope) => scopeKey(scope.selector)),
+    const selectedPositions = new Set(
+      prepared.selectedPositionScopes.map((scope) => scopeKey(scope.selector)),
+    );
+    const selectedBalances = new Set(
+      prepared.selectedBalanceScopes.map((scope) => scopeKey(scope.selector)),
     );
     const oldAssertions = assertionsForStored(
       stored,
@@ -1849,16 +2200,24 @@ export async function publishHoldingScopedPositionCorrection(
     );
     const oldSelectedAssertions = oldAssertions.filter(
       (item) =>
-        item.kind === "position" && selectedPosition(item.semantic, selected),
+        (item.kind === "position" &&
+          selectedPosition(item.semantic, selectedPositions)) ||
+        (item.kind === "balance" &&
+          selectedBalance(item.semantic, selectedBalances)),
     );
     const preservedAssertions = oldAssertions.filter(
       (item) =>
-        item.kind !== "position" || !selectedPosition(item.semantic, selected),
+        !(
+          (item.kind === "position" &&
+            selectedPosition(item.semantic, selectedPositions)) ||
+          (item.kind === "balance" &&
+            selectedBalance(item.semantic, selectedBalances))
+        ),
     );
     const selectedNext = assertionsForCandidate(
       {
         positions: prepared.sourceOwnedPositions,
-        balances: [],
+        balances: prepared.sourceOwnedBalances,
         liabilities: [],
       },
       oldSelectedAssertions,
@@ -1952,8 +2311,14 @@ export async function publishHoldingScopedPositionCorrection(
     await replaceSelectedCurrentPositions(
       tx,
       document.id,
-      prepared.selectedScopes.map((scope) => scope.selector),
-      selectedNext.assertions,
+      prepared.selectedPositionScopes.map((scope) => scope.selector),
+      selectedNext.assertions.filter((item) => item.kind === "position"),
+    );
+    await replaceSelectedCurrentBalances(
+      tx,
+      document.id,
+      prepared.selectedBalanceScopes.map((scope) => scope.selector),
+      selectedNext.assertions.filter((item) => item.kind === "balance"),
     );
 
     await carryForwardPositionScopes(tx, {
@@ -1961,10 +2326,10 @@ export async function publishHoldingScopedPositionCorrection(
       retainedSha256: document.retained_sha256,
       previousGenerationId: priorScopeGenerationId,
       activeGenerationId,
-      selected,
+      selected: selectedPositions,
       now: now.toISOString(),
     });
-    for (const scope of prepared.selectedScopes) {
+    for (const scope of prepared.selectedPositionScopes) {
       await insertVersionedPositionScope(tx, {
         documentId: document.id,
         generationId: activeGenerationId,
@@ -2001,6 +2366,7 @@ export async function publishHoldingScopedPositionCorrection(
 
     const positionChangeMap = new Map<string, PositionChange>();
     for (const item of oldSelectedAssertions) {
+      if (item.kind !== "position") continue;
       const accountId = item.semantic[0];
       const date = item.semantic[1];
       const instrumentId = item.semantic[2];
@@ -2017,7 +2383,7 @@ export async function publishHoldingScopedPositionCorrection(
       const value = { accountId, date, instrumentId };
       positionChangeMap.set(canonical(value), value);
     }
-    for (const scope of prepared.selectedScopes) {
+    for (const scope of prepared.selectedPositionScopes) {
       for (const row of scope.positions) {
         const instrumentId = row.semantic[2];
         if (instrumentId === null || instrumentId === undefined) continue;
@@ -2034,6 +2400,33 @@ export async function publishHoldingScopedPositionCorrection(
       undefined,
       { snapshots: [...positionChangeMap.values()], activity: [] },
     );
+    const cashChangeMap = new Map<string, CashChange>();
+    for (const item of oldSelectedAssertions) {
+      if (item.kind !== "balance") continue;
+      const accountId = item.semantic[0];
+      const date = item.semantic[1];
+      if (
+        accountId === null ||
+        accountId === undefined ||
+        date === null ||
+        date === undefined
+      ) {
+        continue;
+      }
+      const value = { accountId, date };
+      cashChangeMap.set(canonical(value), value);
+    }
+    for (const scope of prepared.selectedBalanceScopes) {
+      const value = {
+        accountId: scope.selector.accountId,
+        date: scope.selector.asOf,
+      };
+      cashChangeMap.set(canonical(value), value);
+    }
+    const cashReconciliations = await runReconciliationGate(tx, undefined, {
+      snapshots: [...cashChangeMap.values()],
+      activity: [],
+    });
 
     const updated = await tx.query(
       `UPDATE documents
@@ -2060,15 +2453,16 @@ export async function publishHoldingScopedPositionCorrection(
       rows: {
         positions: nextAssertions.filter((item) => item.kind === "position")
           .length,
-        balances: stored.balances.length,
+        balances: nextAssertions.filter((item) => item.kind === "balance")
+          .length,
         liabilities: stored.liabilities.length,
       },
       candidateDigest: prepared.manifest.candidateDigest,
       approvalDigest: input.approval.approvalDigest,
       reconciliations: {
-        cashPassed: 0,
-        cashFailed: 0,
-        cashUnverified: 0,
+        cashPassed: cashReconciliations.passed,
+        cashFailed: cashReconciliations.failed,
+        cashUnverified: cashReconciliations.unverified,
         positionsPassed: positionReconciliations.passed,
         positionsFailed: positionReconciliations.failed,
         positionsUnverified: positionReconciliations.unverified,

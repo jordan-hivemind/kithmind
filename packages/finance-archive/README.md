@@ -864,7 +864,7 @@ node dist/run.js reparse \
   --retained-sha256 <documents.retained_sha256>
 ```
 
-### Publishing complete account position scopes
+### Publishing complete account holding scopes
 
 A partially parsed consolidated statement can correct one positively complete
 account/date position section without asserting that its other accounts are
@@ -878,6 +878,21 @@ complete. Pass a private selection file to the same candidate command:
       "accountId": "<opaque account id>",
       "asOf": "2026-06-30",
       "proofVersion": "position_scope_v1"
+    }
+  ]
+}
+```
+
+An account-bound balance proof uses the same selection envelope:
+
+```json
+{
+  "scopes": [
+    {
+      "scopeKind": "balance",
+      "accountId": "<opaque account id>",
+      "asOf": "2026-06-30",
+      "proofVersion": "balance_scope_v1"
     }
   ]
 }
@@ -898,9 +913,15 @@ manifest binds the current canonical account/date set, the selected source
 members and the full source-owned projection. It reports counts and digests,
 not financial values or locators.
 
+A complete balance scope requires explicit account and date bindings, one
+bounded balance row and its numeric total, or an explicit source-stated empty
+balance. Household roll-ups without account attribution cannot authorize a
+correction. A balance-only publication carries every versioned position scope
+and membership into the new active generation unchanged.
+
 Publish a reviewed `holding_scoped_projection_approval_v1` with the ordinary
 `holding-correction-publish` command. The transaction creates one full immutable
-generation, replaces only selected source-owned rows and carries every
+generation, replaces only selected source-owned position or balance rows and carries every
 nonselected assertion and scope proof forward unchanged. An exact row already
 owned by another retained source stays owned there and is referenced only when
 all semantics and this source's own evidence agree. Any extra or conflicting
@@ -1169,6 +1190,7 @@ caller cannot do by combining the other two files alone:
   not be the same instrument, which is what its review item asks. The
   same-institution symbol rule does fill it, because an accepted match is
   precisely the case where the institution has vouched for both halves.
+
 - **Document splitting.** `ParsedRow.sourceDocument` tells the wiring layer
   which underlying document (a page of a paginated pull, or the one file for
   a statement, confirmation or tabular export) each row belongs to. A pull
@@ -2058,9 +2080,9 @@ one, in order, inside the same transaction and lock, and records each one.
 | 11  | finance read revision                   | Transactional revision epoch, counter, and reader-visible table triggers.                                                     |
 | 12  | account alias read revision             | Revision trigger for the existing alias table and one-time continuation invalidation.                                         |
 | 13  | instrument match audit                  | Closed mismatch reasons and retained identifier-source ownership.                                                             |
-| 14  | holding projection generations          | Immutable holding assertions, generation memberships and an active document pointer.                                         |
-| 15  | position scope observations             | Account/date completeness observations and exact semantic memberships.                                                       |
-| 16  | scoped holding correction audit         | Closed scoped candidate shape and generation approval checks.                                                                |
+| 14  | holding projection generations          | Immutable holding assertions, generation memberships and an active document pointer.                                          |
+| 15  | position scope observations             | Account/date completeness observations and exact semantic memberships.                                                        |
+| 16  | scoped holding correction audit         | Closed scoped candidate shape and generation approval checks.                                                                 |
 
 Migration 2 (F1-29,
 [`docs/plans/2026-09-11-structured-evidence.md`](../../docs/plans/2026-09-11-structured-evidence.md))

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  balanceHash,
   holdingScopedProjectionApprovalDigest,
   positionHash,
   prepareHoldingScopedPositionCorrection,
@@ -56,6 +57,48 @@ function hash(row) {
   });
 }
 
+function balance(accountId, totalValueText, sourceLocator) {
+  return {
+    accountId,
+    asOf: DATE,
+    totalValueText,
+    totalValueNote: null,
+    cash: "10",
+    currency: "USD",
+    periodStartValue: null,
+    periodEndValue: totalValueText,
+    sourceLocator,
+  };
+}
+
+function balanceRowHash(row) {
+  return balanceHash({
+    accountId: row.accountId,
+    asOf: row.asOf,
+    totalValue: row.totalValueText,
+    cash: row.cash,
+  });
+}
+
+function balanceScope(accountId, index) {
+  return {
+    accountId,
+    asOf: DATE,
+    proofVersion: "balance_scope_v1",
+    status: "complete",
+    emittedBalanceCount: 1,
+    gapCodes: [],
+    evidence: {
+      account: { source: "synthetic_statement", index },
+      header: { source: "synthetic_statement", index: index + 1 },
+      asOf: { source: "synthetic_statement", index: index + 2 },
+      row: { source: "synthetic_statement", index: index + 3 },
+      totalValue: { source: "synthetic_statement", index: index + 4 },
+      scopeEnd: { source: "synthetic_statement", index: index + 5 },
+    },
+  };
+}
+
 function evidence(index) {
   return {
     account: { source: "synthetic_statement", index },
@@ -81,7 +124,7 @@ function scope(accountId, status = "complete", index = 10) {
   };
 }
 
-function candidate(aPositions) {
+function candidate(aPositions, { balances = [], balanceScopes = [] } = {}) {
   const b = position(ACCOUNT_B, "instrument-b", "200", locator("b", 2));
   const c = position(ACCOUNT_C, "instrument-c", "300", locator("c", 3));
   return {
@@ -102,7 +145,7 @@ function candidate(aPositions) {
     reviewItems: [],
     parseNote: "neighbor account remains partial",
     positions: [...aPositions, b, c],
-    balances: [],
+    balances,
     liabilities: [],
     positionScopes: [
       {
@@ -121,6 +164,7 @@ function candidate(aPositions) {
       scope(ACCOUNT_B, "complete", 20),
       scope(ACCOUNT_C, "partial", 30),
     ],
+    balanceScopes,
   };
 }
 
@@ -148,6 +192,28 @@ async function insertPosition(client, id, documentId, row) {
       documentId,
       row.sourceLocator,
       hash(row),
+    ],
+  );
+}
+
+async function insertBalance(client, id, documentId, row) {
+  await client.query(
+    `INSERT INTO balances
+       (id, account_id, as_of, total_value, cash, currency, period_start_value,
+        period_end_value, source_document_id, source_locator, row_hash)
+     VALUES ($1, $2, $3::date, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    [
+      id,
+      row.accountId,
+      row.asOf,
+      row.totalValueText,
+      row.cash,
+      row.currency,
+      row.periodStartValue,
+      row.periodEndValue,
+      documentId,
+      row.sourceLocator,
+      balanceRowHash(row),
     ],
   );
 }
@@ -311,7 +377,18 @@ async function seed(client) {
   return { oldA, foreignA, b, c };
 }
 
-async function prepare(client, parsed) {
+async function prepare(
+  client,
+  parsed,
+  selectors = [
+    {
+      scopeKind: "positions",
+      accountId: ACCOUNT_A,
+      asOf: DATE,
+      proofVersion: "position_scope_v1",
+    },
+  ],
+) {
   const document = await one(
     client,
     `SELECT retained_sha256,
@@ -326,14 +403,7 @@ async function prepare(client, parsed) {
     expectedActiveGenerationId: document.active_generation_id,
     stored: await readStoredHoldingProjection(client, DOCUMENT),
     candidate: parsed,
-    selectors: [
-      {
-        scopeKind: "positions",
-        accountId: ACCOUNT_A,
-        asOf: DATE,
-        proofVersion: "position_scope_v1",
-      },
-    ],
+    selectors,
   });
 }
 
@@ -513,10 +583,9 @@ test(
   async (t) => {
     const client = await archive(t);
     await seed(client);
-    await client.query(
-      "DELETE FROM positions WHERE source_document_id = $1",
-      [FOREIGN_DOCUMENT],
-    );
+    await client.query("DELETE FROM positions WHERE source_document_id = $1", [
+      FOREIGN_DOCUMENT,
+    ]);
     const neighborBefore = await one(
       client,
       "SELECT to_jsonb(p) AS row FROM positions p WHERE id = 'position-b'",
@@ -568,6 +637,140 @@ test(
         [DOCUMENT, published.activeGenerationId, ACCOUNT_A],
       ),
       { status: "complete", count: "0", zero_basis: "source_stated_none" },
+    );
+  },
+);
+
+test(
+  "balance scopes replace only selected source balances and retain exact foreign ownership and position proofs",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const oldA = balance(ACCOUNT_A, "100", locator("balance-a-old", 1));
+    const replacementA = balance(ACCOUNT_A, "125", locator("balance-a-new", 2));
+    const replacementB = balance(
+      ACCOUNT_B,
+      "250",
+      locator("balance-b-foreign", 3),
+    );
+    await insertBalance(client, "balance-a-old", DOCUMENT, oldA);
+    await insertBalance(
+      client,
+      "balance-b-foreign",
+      FOREIGN_DOCUMENT,
+      replacementB,
+    );
+    await client.query(
+      `UPDATE balances
+          SET total_value = 250.00, cash = 10.000, period_end_value = 250.0
+        WHERE id = 'balance-b-foreign'`,
+    );
+    const preservedBefore = await one(
+      client,
+      `SELECT
+         (SELECT to_jsonb(p) FROM positions p WHERE id = 'position-b') AS position_b,
+         (SELECT to_jsonb(l) FROM liabilities l WHERE id = 'liability-c') AS liability_c`,
+    );
+    const parsed = candidate([], {
+      balances: [replacementA, replacementB],
+      balanceScopes: [balanceScope(ACCOUNT_A, 40), balanceScope(ACCOUNT_B, 50)],
+    });
+    const selectors = [
+      {
+        scopeKind: "balance",
+        accountId: ACCOUNT_A,
+        asOf: DATE,
+        proofVersion: "balance_scope_v1",
+      },
+      {
+        scopeKind: "balance",
+        accountId: ACCOUNT_B,
+        asOf: DATE,
+        proofVersion: "balance_scope_v1",
+      },
+    ];
+    const prepared = await prepare(client, parsed, selectors);
+    assert.deepEqual(
+      prepared.manifest.selectedScopes.map((scope) => ({
+        accountId: scope.accountId,
+        sourceOwnedRows: scope.sourceOwnedRows,
+        foreignReferencedRows: scope.foreignReferencedRows,
+      })),
+      [
+        { accountId: ACCOUNT_A, sourceOwnedRows: 1, foreignReferencedRows: 0 },
+        { accountId: ACCOUNT_B, sourceOwnedRows: 0, foreignReferencedRows: 1 },
+      ],
+    );
+    const published = await publishHoldingScopedPositionCorrection(
+      client,
+      { candidate: parsed, approval: approvalFor(prepared.manifest) },
+      NOW,
+    );
+
+    assert.equal(
+      await count(client, "balances", "WHERE id = 'balance-a-old'"),
+      0,
+    );
+    assert.equal(await count(client, "balances", "WHERE id = 'balance-b'"), 0);
+    assert.deepEqual(
+      await one(
+        client,
+        `SELECT source_document_id, total_value::text AS total_value
+           FROM balances WHERE id = 'balance-b-foreign'`,
+      ),
+      { source_document_id: FOREIGN_DOCUMENT, total_value: "250.00" },
+    );
+    assert.deepEqual(
+      await one(
+        client,
+        `SELECT source_document_id, total_value::text AS total_value
+           FROM balances
+          WHERE source_document_id = $1 AND account_id = $2`,
+        [DOCUMENT, ACCOUNT_A],
+      ),
+      { source_document_id: DOCUMENT, total_value: "125" },
+    );
+    assert.deepEqual(
+      await one(
+        client,
+        `SELECT
+           (SELECT to_jsonb(p) FROM positions p WHERE id = 'position-b') AS position_b,
+           (SELECT to_jsonb(l) FROM liabilities l WHERE id = 'liability-c') AS liability_c`,
+      ),
+      preservedBefore,
+    );
+    assert.equal(
+      await count(
+        client,
+        "holding_projection_assertions",
+        "WHERE assertion_kind = 'balance' AND record_id IN ('balance-a-old', 'balance-b')",
+      ),
+      2,
+    );
+    assert.equal(
+      await count(
+        client,
+        "position_reconciliations",
+        "WHERE id = 'stale-a-old-verdict'",
+      ),
+      1,
+    );
+    assert.equal(
+      await count(
+        client,
+        "position_scope_observations",
+        `WHERE source_document_id = '${DOCUMENT}' AND holding_projection_generation_id = '${published.activeGenerationId}'`,
+      ),
+      2,
+    );
+    assert.equal(
+      (
+        await one(client, "SELECT parsed_ok FROM documents WHERE id = $1", [
+          DOCUMENT,
+        ])
+      ).parsed_ok,
+      false,
     );
   },
 );
