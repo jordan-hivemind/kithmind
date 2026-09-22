@@ -1785,7 +1785,8 @@ async function listAccountInventory(
          FROM inventory_scope_verdicts s
          JOIN position_scope_observations observation ON observation.id = s.id
          JOIN documents current_document ON current_document.id = s.source_document_id
-        WHERE observation.holding_projection_generation_id
+        WHERE observation.retained_sha256 = current_document.retained_sha256
+          AND observation.holding_projection_generation_id
                 IS NOT DISTINCT FROM current_document.active_holding_projection_generation_id
           AND NOT EXISTS (
           SELECT 1 FROM inventory_observed_position_dates p

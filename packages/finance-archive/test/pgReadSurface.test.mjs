@@ -1783,6 +1783,20 @@ test(
     assert.equal(partialRow.latestHoldingsObservation.asOf, asOf);
     assert.equal(partialRow.latestHoldingsObservation.sourceComplete, false);
     assert.equal(partialRow.latestHoldingsObservation.fullyValued, false);
+    await owner.query(
+      "UPDATE documents SET retained_sha256 = $2 WHERE id = $1",
+      [partialDoc, "a".repeat(64)],
+    );
+    const mismatched = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 100,
+    });
+    assert.equal(
+      mismatched.items.find((item) => item.account.accountId === partialAccount)
+        .latestHoldingsObservation,
+      undefined,
+      "a partial proof from different retained bytes is not a current observation",
+    );
   },
 );
 
