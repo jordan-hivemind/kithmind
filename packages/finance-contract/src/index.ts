@@ -401,6 +401,17 @@ export type FinanceAggregateRecord = {
  * statements, enough to tell a monthly account from a quarterly one. */
 export const FINANCE_INVENTORY_BALANCE_DATES = 12;
 
+/** Diagnostic state of an actual observation, never financial eligibility. */
+export type FinanceHoldingsObservationAssessment = {
+  asOf: string;
+  sourceComplete: boolean;
+  fullyValued: boolean;
+  supportedValuationBasis: boolean;
+  hasBlockingReview: boolean;
+  /** Absence of a recorded issue is not a claim of complete trade history. */
+  reconciliation: "no_issue_recorded" | "failed" | "pending";
+};
+
 /**
  * ADM-2: one account's inventory, as counts over what the archive holds.
  *
@@ -424,6 +435,9 @@ export type FinanceAccountInventoryRecord = {
    * the dated snapshot exists without becoming a market-price current value.
    */
   latestSnapshotAsOf?: string;
+  /** Latest actual holdings observation, including incomplete observations.
+   * Never substitute its date for an eligible snapshot in financial reads. */
+  latestHoldingsObservation?: FinanceHoldingsObservationAssessment;
   /**
    * FIN-FRESHNESS-1. The account's most recent distinct `balances.as_of`
    * dates, newest first, at most `FINANCE_INVENTORY_BALANCE_DATES`. A
@@ -2526,6 +2540,7 @@ function accountInventoryRecord(value: unknown): FinanceAccountInventoryRecord {
       "activityFrom",
       "activityTo",
       "latestSnapshotAsOf",
+      "latestHoldingsObservation",
       "currentValue",
       "balanceDates",
       "latestBalanceHoldsSecurities",
@@ -2547,6 +2562,50 @@ function accountInventoryRecord(value: unknown): FinanceAccountInventoryRecord {
       ? undefined
       : isoDate(input.latestSnapshotAsOf, "invalid_response");
   const recordCount = count(input.recordCount);
+  let latestHoldingsObservation:
+    FinanceHoldingsObservationAssessment | undefined;
+  if (input.latestHoldingsObservation !== undefined) {
+    const raw = object(input.latestHoldingsObservation, "invalid_response");
+    exact(
+      raw,
+      [
+        "asOf",
+        "sourceComplete",
+        "fullyValued",
+        "supportedValuationBasis",
+        "hasBlockingReview",
+        "reconciliation",
+      ],
+      [],
+      "invalid_response",
+    );
+    for (const key of [
+      "sourceComplete",
+      "fullyValued",
+      "supportedValuationBasis",
+      "hasBlockingReview",
+    ] as const) {
+      if (typeof raw[key] !== "boolean") fail("invalid_response");
+    }
+    latestHoldingsObservation = {
+      asOf: isoDate(raw.asOf, "invalid_response"),
+      sourceComplete: raw.sourceComplete as boolean,
+      fullyValued: raw.fullyValued as boolean,
+      supportedValuationBasis: raw.supportedValuationBasis as boolean,
+      hasBlockingReview: raw.hasBlockingReview as boolean,
+      reconciliation: oneOf(
+        raw.reconciliation,
+        ["no_issue_recorded", "failed", "pending"] as const,
+        "invalid_response",
+      ),
+    };
+    if (
+      (activityFrom === undefined && recordCount !== 0) ||
+      (latestSnapshotAsOf !== undefined &&
+        latestSnapshotAsOf > latestHoldingsObservation.asOf)
+    )
+      fail("invalid_response");
+  }
   if (
     (activityFrom === undefined) !== (activityTo === undefined) ||
     (activityFrom !== undefined &&
@@ -2609,6 +2668,9 @@ function accountInventoryRecord(value: unknown): FinanceAccountInventoryRecord {
     ...(activityFrom === undefined ? {} : { activityFrom }),
     ...(activityTo === undefined ? {} : { activityTo }),
     ...(latestSnapshotAsOf === undefined ? {} : { latestSnapshotAsOf }),
+    ...(latestHoldingsObservation === undefined
+      ? {}
+      : { latestHoldingsObservation }),
     ...(balanceDates === undefined ? {} : { balanceDates }),
     ...(input.latestBalanceHoldsSecurities === undefined
       ? {}

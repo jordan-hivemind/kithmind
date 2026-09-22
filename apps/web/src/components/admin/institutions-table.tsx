@@ -35,6 +35,7 @@ import type { InstitutionRow } from "@/lib/kith/institutions";
 const TONE: Record<InstitutionRow["status"], "neutral" | "accent" | "warn"> = {
   fresh: "accent",
   stale: "warn",
+  needs_review: "warn",
   inactive: "neutral",
   empty: "neutral",
 };
@@ -202,21 +203,21 @@ export function InstitutionsTable({
       },
       {
         id: "latestSnapshotAsOf",
-        accessorKey: "latestSnapshotAsOf",
+        accessorFn: (row) => row.latestHoldingsObservedAsOf,
         size: 125,
-        header: "Latest snapshot",
+        header: "Holdings as of",
         meta: { nowrap: true, align: "right" },
-        cell: ({ row }) => date(row.original.latestSnapshotAsOf),
+        cell: ({ row }) => date(row.original.latestHoldingsObservedAsOf),
       },
       {
         id: "status",
-        accessorKey: "status",
-        size: 90,
+        accessorFn: (row) => row.status.replaceAll("_", " "),
+        size: 110,
         header: "Status",
         cell: ({ row }) => (
           <Tag tone={TONE[row.original.status]}>
             <Detail
-              label={row.original.status}
+              label={row.original.status.replaceAll("_", " ")}
               detail={row.original.statusDetail}
             />
           </Tag>

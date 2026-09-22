@@ -430,12 +430,7 @@ describe("identity and display never change freshness", () => {
       activityFrom: "2025-01-02",
       activityTo: "2026-06-30",
       latestSnapshotAsOf: "2026-06-30",
-      balanceDates: [
-        "2026-06-30",
-        "2026-03-31",
-        "2025-12-31",
-        "2025-09-30",
-      ],
+      balanceDates: ["2026-06-30", "2026-03-31", "2025-12-31", "2025-09-30"],
       latestBalanceHoldsSecurities: true,
       openReviewCount: 0,
     }) as never;
@@ -496,5 +491,137 @@ describe("identity and display never change freshness", () => {
       ]),
     )[0]!.children![0]!;
     expect(row.freshnessReason).toBe("balance_only");
+  });
+});
+
+describe("observed holdings quality stays separate from statement age", () => {
+  const observation = {
+    asOf: "2026-08-31",
+    sourceComplete: true,
+    fullyValued: true,
+    supportedValuationBasis: true,
+    hasBlockingReview: false,
+    reconciliation: "no_issue_recorded" as const,
+  };
+  test("current complete holdings with unreconciled trades need review, not an overdue label", () => {
+    const result = accountFreshness(
+      input({
+        latestSnapshotAsOf: "2025-12-31",
+        latestHoldingsObservation: { ...observation, reconciliation: "failed" },
+      }),
+      NOW,
+    );
+    expect(result.status).toBe("needs_review");
+    expect(result.reason).toBe("reconciliation_failed");
+    expect(result.statusDetail).toContain(
+      "historical trade quantities do not reconcile",
+    );
+    expect(result.statusDetail).toContain("last verified snapshot 2025-12-31");
+  });
+  test.each([
+    [{ sourceComplete: false }, "holdings_incomplete"],
+    [{ fullyValued: false, sourceComplete: false }, "valuation_incomplete"],
+    [{ supportedValuationBasis: false }, "valuation_unsupported"],
+    [{ hasBlockingReview: true }, "review_open"],
+    [{ reconciliation: "pending" as const }, "reconciliation_pending"],
+  ] as const)(
+    "current incomplete data never becomes fresh: %s",
+    (changed, reason) => {
+      const result = accountFreshness(
+        input({
+          latestSnapshotAsOf: null,
+          latestHoldingsObservation: { ...observation, ...changed },
+        }),
+        NOW,
+      );
+      expect(result.status).toBe("needs_review");
+      expect(result.reason).toBe(reason);
+    },
+  );
+  test("overdue statements remain stale even with quality diagnostics", () => {
+    const result = accountFreshness(
+      input({
+        latestSnapshotAsOf: "2026-05-31",
+        balanceDates: ["2026-06-30", "2026-05-31"],
+        latestHoldingsObservation: {
+          ...observation,
+          asOf: "2026-06-30",
+          fullyValued: false,
+        },
+      }),
+      NOW,
+    );
+    expect(result.status).toBe("stale");
+    expect(result.reason).toBe("statement_overdue");
+  });
+  test("an old partial holdings observation cannot hide missing newer holdings", () => {
+    const result = accountFreshness(
+      input({
+        latestSnapshotAsOf: null,
+        latestHoldingsObservation: {
+          ...observation,
+          asOf: "2026-04-30",
+          sourceComplete: false,
+        },
+      }),
+      NOW,
+    );
+    expect(result.status).toBe("stale");
+    expect(result.reason).toBe("holdings_behind");
+  });
+  test.each([
+    { accountType: "bank", latestBalanceHoldsSecurities: false },
+    { accountType: "brokerage", latestBalanceHoldsSecurities: false },
+    { accountType: "bank", balanceDates: [] },
+    { hasContent: false, activityTo: "2024-01-01", balanceDates: [] },
+  ])(
+    "a current partial observation remains visible despite cash type or old activity: %s",
+    (overrides) => {
+      const value = input({
+        ...overrides,
+        latestSnapshotAsOf: null,
+        latestHoldingsObservation: {
+          ...observation,
+          sourceComplete: false,
+          fullyValued: false,
+        },
+      });
+      expect(accountFreshness(value, NOW).status).toBe("needs_review");
+      expect(accountFreshness({ ...value, closed: true }, NOW).reason).toBe(
+        "closed",
+      );
+    },
+  );
+  test("a newer all-cash statement supersedes older partial holdings for cadence", () => {
+    const result = accountFreshness(
+      input({
+        latestBalanceHoldsSecurities: false,
+        latestHoldingsObservation: {
+          ...observation,
+          asOf: "2026-07-31",
+          fullyValued: false,
+        },
+      }),
+      NOW,
+    );
+    expect(result.status).toBe("fresh");
+    expect(result.reason).toBe("balance_only");
+  });
+  test("legacy rows keep their existing status when assessment is absent", () => {
+    expect(
+      accountFreshness(input({ latestSnapshotAsOf: "2025-12-31" }), NOW).status,
+    ).toBe("stale");
+  });
+  test("current holdings without a balance still retain their quality warning", () => {
+    const result = accountFreshness(
+      input({
+        balanceDates: [],
+        latestBalanceHoldsSecurities: null,
+        latestSnapshotAsOf: null,
+        latestHoldingsObservation: { ...observation, fullyValued: false },
+      }),
+      NOW,
+    );
+    expect(result.status).toBe("needs_review");
   });
 });

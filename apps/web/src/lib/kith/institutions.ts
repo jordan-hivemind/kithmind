@@ -58,6 +58,7 @@ export type InstitutionRow = {
   activityFrom: string | null;
   activityTo: string | null;
   latestSnapshotAsOf: string | null;
+  latestHoldingsObservedAsOf: string | null;
   /** The account's latest statement balance date. Never merged with
    * `latestSnapshotAsOf`: a balance says a statement arrived, a snapshot says
    * its holdings were recorded. On a group, the latest of its accounts'. */
@@ -124,7 +125,9 @@ function last4Reason(
   account: FinanceAccountInventoryRecord["account"],
 ): string | null {
   if (account.accountLast4 !== undefined) return null;
-  const found = account.disclosures.find((item) => item.field === "accountLast4");
+  const found = account.disclosures.find(
+    (item) => item.field === "accountLast4",
+  );
   return found === undefined ? null : LAST4_REASON[found.reason];
 }
 
@@ -156,7 +159,9 @@ export function groupInstitutions(
 ): InstitutionRow[] {
   const groups = new Map<string, InstitutionRow>();
   for (const record of records) {
-    const hasContent = record.statementCount + record.recordCount > 0;
+    const hasContent =
+      record.statementCount + record.recordCount > 0 ||
+      record.latestHoldingsObservation !== undefined;
     const override = overrides.get(record.account.accountId) ?? null;
     const shownAccount = mergeFinanceAccountOverride(
       record.account,
@@ -176,6 +181,7 @@ export function groupInstitutions(
         accountType: shownAccount.accountType ?? null,
         activityTo: record.activityTo ?? null,
         latestSnapshotAsOf: record.latestSnapshotAsOf ?? null,
+        latestHoldingsObservation: record.latestHoldingsObservation,
         balanceDates: record.balanceDates ?? [],
         latestBalanceHoldsSecurities:
           record.latestBalanceHoldsSecurities ?? null,
@@ -213,6 +219,10 @@ export function groupInstitutions(
       activityFrom: record.activityFrom ?? null,
       activityTo: record.activityTo ?? null,
       latestSnapshotAsOf: record.latestSnapshotAsOf ?? null,
+      latestHoldingsObservedAsOf:
+        record.latestHoldingsObservation?.asOf ??
+        record.latestSnapshotAsOf ??
+        null,
       latestBalanceAsOf: record.balanceDates?.[0] ?? null,
       cadence: judged.cadence,
       freshnessReason: judged.reason,
@@ -242,6 +252,7 @@ export function groupInstitutions(
       activityFrom: null,
       activityTo: null,
       latestSnapshotAsOf: null,
+      latestHoldingsObservedAsOf: null,
       latestBalanceAsOf: null,
       cadence: null,
       freshnessReason: null,
@@ -260,6 +271,10 @@ export function groupInstitutions(
     group.latestSnapshotAsOf = later(
       group.latestSnapshotAsOf,
       child.latestSnapshotAsOf,
+    );
+    group.latestHoldingsObservedAsOf = later(
+      group.latestHoldingsObservedAsOf,
+      child.latestHoldingsObservedAsOf,
     );
     group.latestBalanceAsOf = later(
       group.latestBalanceAsOf,
@@ -306,10 +321,19 @@ function groupFreshness(group: InstitutionRow): {
   statusDetail: string | null;
 } {
   const children = group.children ?? [];
+  const needingReview = children.filter(
+    (child) => child.status === "needs_review",
+  );
+  const reviewDetails = needingReview
+    .map(
+      (child) =>
+        `${child.name} (${child.statusDetail ?? "data verification incomplete"})`,
+    )
+    .join("; ");
   const staleDate = (child: InstitutionRow) =>
     child.freshnessReason === "statement_overdue"
       ? (child.latestBalanceAsOf ?? "")
-      : (child.latestSnapshotAsOf ?? "");
+      : (child.latestHoldingsObservedAsOf ?? "");
   const stale = children
     .filter((child) => child.status === "stale")
     .sort((left, right) => staleDate(left).localeCompare(staleDate(right)));
@@ -329,11 +353,18 @@ function groupFreshness(group: InstitutionRow): {
       status: "stale",
       statusDetail: `${stale.length} stale (${breakdown}), oldest ${oldest.name} (${
         oldest.statusDetail ?? ""
-      })`,
+      })${needingReview.length > 0 ? `; ${needingReview.length} accounts need review: ${reviewDetails}` : ""}`,
     };
   }
   if (children.every((child) => child.status === "empty")) {
     return { status: "empty", statusDetail: null };
+  }
+
+  if (needingReview.length > 0) {
+    return {
+      status: "needs_review",
+      statusDetail: `${needingReview.length} accounts need review: ${needingReview.map((child) => `${child.name} (${child.statusDetail ?? "data verification incomplete"})`).join("; ")}`,
+    };
   }
   if (children.every((child) => child.status !== "fresh")) {
     return { status: "inactive", statusDetail: "no recent activity" };
@@ -396,13 +427,15 @@ function groupValue(group: InstitutionRow): {
 } {
   const children = group.children ?? [];
   const live = children.filter(
-    (child) => child.status === "fresh" || child.status === "stale",
+    (child) =>
+      child.status === "fresh" ||
+      child.status === "stale" ||
+      child.status === "needs_review",
   );
   if (live.length === 0) return { ...NO_VALUE };
   if (
     live.some(
-      (child) =>
-        child.currentValue === null || child.currentValueAsOf === null,
+      (child) => child.currentValue === null || child.currentValueAsOf === null,
     )
   )
     return { ...NO_VALUE };
