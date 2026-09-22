@@ -53,6 +53,23 @@ work identity and a deterministic request ID, so retry after a lost response is
 idempotent. The command leaves the checkpoint byte-for-byte unchanged and does
 not persist native text or workbook names.
 
+Automatic two-pass routing uses the same preview store and archived discovery
+work. A locked adoption command binds a private deep-selection manifest to
+exact remaining source, observation, processing and content identities. The
+active item finishes unchanged. Selected priority items each receive their
+bounded preview and then enter the existing deep pipeline immediately, in
+queue order. Once selected work is exhausted, the worker previews the
+unselected suffix without capturing, archiving or parsing it deeply.
+
+The worker retains that suffix in an archived `metadata_only_deferred`
+checkpoint instead of claiming a complete pass or discarding the queue. A
+later locked selection may promote an unchanged identity already recorded in
+the checkpoint's previewed set. Promotion reuses its preview and enters deep
+work without a rescan, file reorder or repeated preview. New scans begin with
+an empty deep selection and stop at the same resumable metadata-only state.
+Existing active checkpoints keep their prior behavior until the supported
+adoption command records the routing policy.
+
 Preview execution reuses the existing parser sandbox boundary but grants no
 model-asset access and does not run Docling or OCR. A separate locked adoption
 command may change only the configured launcher digest, verifies the installed
