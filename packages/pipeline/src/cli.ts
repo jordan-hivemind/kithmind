@@ -27,6 +27,7 @@ import { previewSelectedFromPaths } from "./previewSelected.js";
 import { transitionPreviewLauncherFromPaths } from "./previewLauncherTransition.js";
 import { transitionProviderV2FromPaths } from "./providerV2Transition.js";
 import { reprioritizeFromPaths } from "./reprioritize.js";
+import { adoptMetadataFirstFromPaths } from "./metadataFirst.js";
 import type {
   PipelineConfig,
   PipelineRunResult,
@@ -37,7 +38,7 @@ import type { RunnerCheckpoint } from "./runnerState.js";
 
 function usage(): never {
   throw new Error(
-    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked [--operator-clear --max-clears <n>]] and [--accept-retirement <root_selection_would_retire_items|root_contents_collapsed|journal_behind_server>], or adopt-provider-v2|adopt-preview-launcher --previous-config <old-path> --config <new-path>, or reprioritize|preview-selected --config <path> --manifest <private-json>, or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
+    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked [--operator-clear --max-clears <n>]] and [--accept-retirement <root_selection_would_retire_items|root_contents_collapsed|journal_behind_server>], or adopt-provider-v2|adopt-preview-launcher --previous-config <old-path> --config <new-path>, or reprioritize|preview-selected|adopt-metadata-first --config <path> --manifest <private-json>, or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
   );
 }
 export function argumentsFor(argv: string[]):
@@ -53,6 +54,11 @@ export function argumentsFor(argv: string[]):
   | { command: "doctor"; configPath: string; json: boolean }
   | { command: "reprioritize"; configPath: string; manifestPath: string }
   | { command: "preview-selected"; configPath: string; manifestPath: string }
+  | {
+      command: "adopt-metadata-first";
+      configPath: string;
+      manifestPath: string;
+    }
   | {
       command: "adopt-provider-v2";
       previousConfigPath: string;
@@ -97,7 +103,11 @@ export function argumentsFor(argv: string[]):
     if (!previousConfigPath || !configPath) usage();
     return { command: forwarded[0], previousConfigPath, configPath };
   }
-  if (forwarded[0] === "reprioritize" || forwarded[0] === "preview-selected") {
+  if (
+    forwarded[0] === "reprioritize" ||
+    forwarded[0] === "preview-selected" ||
+    forwarded[0] === "adopt-metadata-first"
+  ) {
     const values = new Map<string, string>();
     for (let index = 1; index < forwarded.length; index += 1) {
       const flag = forwarded[index];
@@ -525,6 +535,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     );
     process.stdout.write(`${JSON.stringify(result)}\n`);
     if (result.state !== "previewed") process.exitCode = 1;
+    return;
+  }
+  if (command === "adopt-metadata-first") {
+    const result = await adoptMetadataFirstFromPaths(
+      configPath,
+      parsed.manifestPath,
+    );
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (result.state === "refused") process.exitCode = 1;
     return;
   }
   if (command === "forget-archive") {

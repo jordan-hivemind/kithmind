@@ -65,7 +65,7 @@ export type ReprioritizeResult =
       manifestSha256?: string;
     };
 
-class PriorityRefusal extends Error {
+export class PriorityRefusal extends Error {
   constructor(
     readonly code: Extract<ReprioritizeResult, { state: "refused" }>["code"],
   ) {

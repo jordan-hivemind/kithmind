@@ -42,6 +42,15 @@ that surfaced it.
 Never commit, publish, or ask contributors to supply `docs/private/`; use a
 public issue or plan for work that others can take on.
 
+### Ingestion depth and priority
+
+Follow the adopted
+[document triage and priority plan](docs/plans/2026-09-21-document-triage-and-priority.md).
+Depth and queue priority follow explicit owner goals and document value, not
+backlog completion or folder membership. Keep low-value bulk histories at
+metadata-only unless an explicit goal needs their contents. Preserve deferred
+items so a later exact-identity selection can promote them safely.
+
 ## Parallel lanes
 
 Several agents may work in this repository at once, each in its own worktree

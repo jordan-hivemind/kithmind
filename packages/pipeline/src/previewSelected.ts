@@ -6,7 +6,6 @@ import {
   BINARY_CLASSES,
   type ArchivedWorkIdentity,
 } from "@repo/worker-protocol";
-import type { TriagePreviewDeclaration } from "@repo/worker-protocol/request";
 
 import {
   journalBindingForConfig,
@@ -29,6 +28,10 @@ import {
   type DocumentPreviewResult,
   type PreviewWindow,
 } from "./parserProcess.js";
+import {
+  previewDeclaration,
+  stablePreviewRequestId,
+} from "./previewMetadata.js";
 import { initialCheckpoint, journalCodec } from "./runner.js";
 import type { PdfFilePlan, RunnerCheckpoint } from "./runnerState.js";
 import { HttpWorkerTransport } from "./transport.js";
@@ -259,57 +262,6 @@ function identity(
   };
 }
 
-function declaration(preview: DocumentPreviewResult): TriagePreviewDeclaration {
-  const uncertaintyCodes: Array<"image_only" | "insufficient_text"> = [];
-  if (preview.unitStates.includes("image_only"))
-    uncertaintyCodes.push("image_only");
-  if (
-    preview.unitStates.length > 0 &&
-    (!preview.unitStates.includes("text_available") ||
-      preview.unitStates.includes("unknown"))
-  )
-    uncertaintyCodes.push("insufficient_text");
-  return {
-    previewFingerprint: createHash("sha256")
-      .update("kithmind-triage-preview:v1\0")
-      .update(
-        JSON.stringify([
-          preview.method,
-          preview.methodFingerprint,
-          preview.inspectedOriginalUnits,
-        ]),
-      )
-      .digest("hex"),
-    previewMethod: preview.method,
-    sourceFormat:
-      preview.mediaType === "application/pdf" ? "pdf" : "spreadsheet",
-    sourceUnitCount: preview.sourceUnitCount,
-    inspectedOriginalUnits: preview.inspectedOriginalUnits,
-    provisionalMetadata: {
-      ...(preview.mediaType === "application/pdf"
-        ? {}
-        : { documentKind: "spreadsheet" as const }),
-      ...(uncertaintyCodes.length === 0 ? {} : { uncertaintyCodes }),
-    },
-    confidence: null,
-  };
-}
-
-function stableRequestId(
-  identityValue: ArchivedWorkIdentity,
-  preview: TriagePreviewDeclaration,
-): string {
-  const bytes = createHash("sha256")
-    .update("kithmind-selected-preview-request:v1\0")
-    .update(JSON.stringify([identityValue, preview]))
-    .digest()
-    .subarray(0, 16);
-  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
-  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
-  const hex = bytes.toString("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
-
 export async function previewSelectedJournal(args: {
   journal: Journal<RunnerCheckpoint, JsonValue>;
   config: PipelineConfig;
@@ -363,7 +315,7 @@ export async function previewSelectedJournal(args: {
     )
       throw new PreviewRefusal("source_changed", recordedCount);
     const archivedIdentity = identity(checkpoint, plan);
-    const triage = declaration(preview);
+    const triage = previewDeclaration(preview);
     let response;
     try {
       response = await args.transport.call({
@@ -371,7 +323,7 @@ export async function previewSelectedJournal(args: {
         operation: "discovery.recordPreview",
         spaceId: args.config.spaceId,
         sourceAccountId: args.config.sourceAccountId,
-        requestId: stableRequestId(archivedIdentity, triage),
+        requestId: stablePreviewRequestId(archivedIdentity, triage),
         identity: archivedIdentity,
         preview: triage,
       });

@@ -14,6 +14,7 @@ export const JOURNAL_OPERATIONS = [
   "processing.assessBegin",
   "processing.assessPage",
   "discovery.preflightArchived",
+  "discovery.recordPreview",
   "discovery.reserveArchived",
   "discovery.lookupArchivedAdmission",
   "discovery.admitArchived",

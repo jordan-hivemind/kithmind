@@ -65,10 +65,28 @@ The worker retains that suffix in an archived `metadata_only_deferred`
 checkpoint instead of claiming a complete pass or discarding the queue. A
 later locked selection may promote an unchanged identity already recorded in
 the checkpoint's previewed set. Promotion reuses its preview and enters deep
-work without a rescan, file reorder or repeated preview. New scans begin with
-an empty deep selection and stop at the same resumable metadata-only state.
-Existing active checkpoints keep their prior behavior until the supported
-adoption command records the routing policy.
+work without a rescan, file reorder or repeated preview. After reporting that
+deferred result once, the next watch pass opens a normal scan while carrying
+only exact selected and previewed revision identities. Reconcile keeps carry
+entries whose source item, observation epoch, processing epoch and content hash
+still match the sealed inventory. New and changed binaries receive previews;
+unchanged binaries reuse their recorded preview status. This keeps new files
+discoverable without turning deferred work into success or losing later
+promotion. Existing active checkpoints keep their prior behavior until the
+supported adoption command records the routing policy.
+
+The first automatic policy is deliberately narrow. A strong Form 1040, income
+tax return or Schedule K-1 heading adds that exact revision to the selected
+FIFO immediately after its own preview. Folder names and incidental form
+mentions do not select deep work. A Morgan Stanley bulk trade history needs a
+positive history or all-trades heading and remains metadata-only with generic
+provisional metadata. Individual trade confirmations also remain metadata-only
+and keep an accurate generic title. Account and portfolio statements, holdings
+or positions reports, annual Form 1099 material and tax-reporting summaries are
+never classified as low-value trade histories from those words alone. An
+explicit exact-identity selection can promote any still-current deferred item.
+The automatic policy records its version digest and selected identity digest in
+the journal; native preview text and private paths are not persisted.
 
 Preview execution reuses the existing parser sandbox boundary but grants no
 model-asset access and does not run Docling or OCR. A separate locked adoption
