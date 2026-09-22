@@ -13,9 +13,16 @@
 // process. Every other unexpected error also ends that item's pull and is
 // reported, but does not touch `needs_relink_at`.
 //
+// A single security or holding row's own upsert failing (for example a
+// value shaped in a way the schema still rejects) does not end the item's
+// pull either: it is counted in `rowFailures` and the rest of that item --
+// including transactions, fetched after holdings -- is still attempted and
+// still written.
+//
 // Nothing here prints a balance, a holding value, or a transaction amount --
-// only counts -- and the process exits non-zero when any item failed, which
-// is what makes a launchd job's exit status meaningful.
+// only counts -- and the process exits non-zero when any item failed or had
+// a row failure, which is what makes a launchd job's exit status
+// meaningful.
 
 import type { Pool } from "pg";
 import { Products, type PlaidApi } from "plaid";
@@ -66,6 +73,13 @@ export type ItemPullResult = {
   transactionsModified: number;
   transactionsRemoved: number;
   investmentTransactions: number;
+  /**
+   * Security or holding rows whose own upsert failed (for example the
+   * `plaid_securities_currency_check` violation a real pull hit) but did not
+   * abort the rest of this item's pull. Counts only -- never a security's
+   * name or values -- exactly like every other field here.
+   */
+  rowFailures: number;
   error: string | null;
 };
 
@@ -97,7 +111,13 @@ export async function pullAll(): Promise<{
     }
     return {
       results,
-      anyFailed: results.some((result) => result.status !== "ok"),
+      // A row-level failure keeps the item's own status "ok" (balances and
+      // transactions still wrote fine), but must still fail the process's
+      // exit code -- the same reason `status !== "ok"` does -- so a
+      // launchd job or any other monitor reading the exit status notices.
+      anyFailed: results.some(
+        (result) => result.status !== "ok" || result.rowFailures > 0,
+      ),
     };
   } finally {
     await pool.end();
@@ -116,6 +136,7 @@ function summaryLine(item: PlaidItemRow, result: ItemPullResult): string {
     `tx_modified=${result.transactionsModified}`,
     `tx_removed=${result.transactionsRemoved}`,
     `inv_tx=${result.investmentTransactions}`,
+    `row_failures=${result.rowFailures}`,
   ];
   if (result.error !== null) parts.push(`error=${JSON.stringify(result.error)}`);
   return parts.join(" ");
@@ -132,6 +153,7 @@ function emptyResult(item: PlaidItemRow): ItemPullResult {
     transactionsModified: 0,
     transactionsRemoved: 0,
     investmentTransactions: 0,
+    rowFailures: 0,
     error: null,
   };
 }
@@ -201,15 +223,28 @@ export async function pullItem(
       const response = await client.investmentsHoldingsGet({
         access_token: accessToken,
       });
+      // A single security or holding row failing its own upsert (for
+      // example the currency check a real pull hit) must not abort this
+      // item's pull: catch per row, count it, and keep going so the rest of
+      // this institution's securities/holdings, and everything after this
+      // block (transactions), still get written.
       for (const security of response.data.securities) {
-        await upsertSecurity(pool, mapSecurity(security));
+        try {
+          await upsertSecurity(pool, mapSecurity(security));
+        } catch {
+          result.rowFailures += 1;
+        }
       }
       for (const account of response.data.accounts) {
         await upsertAccount(pool, mapAccount(account, item.itemId));
       }
       for (const holding of response.data.holdings) {
-        await upsertHoldingSnapshot(pool, mapHoldingSnapshot(holding, asOf));
-        result.holdings += 1;
+        try {
+          await upsertHoldingSnapshot(pool, mapHoldingSnapshot(holding, asOf));
+          result.holdings += 1;
+        } catch {
+          result.rowFailures += 1;
+        }
       }
     } catch (error) {
       if (isItemLoginRequired(error)) return await failItem(pool, item, result, error);
@@ -275,8 +310,16 @@ export async function pullItem(
             offset,
           },
         });
+        // Same per-row isolation as the holdings block above: this page's
+        // securities are a cache refresh, not the point of this call, and
+        // one failing row must not cost the investment-transaction pages
+        // still to come.
         for (const security of response.data.securities) {
-          await upsertSecurity(pool, mapSecurity(security));
+          try {
+            await upsertSecurity(pool, mapSecurity(security));
+          } catch {
+            result.rowFailures += 1;
+          }
         }
         for (const transaction of response.data.investment_transactions) {
           await upsertInvestmentTransaction(

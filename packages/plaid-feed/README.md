@@ -121,17 +121,26 @@ instead. `ITEM_LOGIN_REQUIRED`, from any call, ends that item's pull
 immediately, sets `needs_relink_at` on the item row, and is **not** retried
 in this process; the owner re-runs `link` for that institution.
 
+A currency is recorded as Plaid's `iso_currency_code` when present,
+otherwise its `unofficial_currency_code` (a crypto ticker, or a code longer
+than three letters), trimmed and uppercased; migration `044_plaid_currency.sql`
+relaxed every `currency` CHECK to a bounded length so that value is never
+rejected. A single security or holding row whose own upsert still fails for
+some other reason does not end the item's pull: it is counted in
+`row_failures` and the rest of that item, including its balances and
+transactions, is still written.
+
 Prints one line per item, counts only, never a balance, holding value or
 transaction amount:
 
 ```
-plaid pull item=ins_... institution="Chase" status=ok accounts=2 balances=2 holdings=0 tx_added=14 tx_modified=1 tx_removed=0 inv_tx=0
+plaid pull item=ins_... institution="Chase" status=ok accounts=2 balances=2 holdings=0 tx_added=14 tx_modified=1 tx_removed=0 inv_tx=0 row_failures=0
 ```
 
-Exits non-zero if any item's status is not `ok`, so a launchd job's exit
-status is meaningful.
+Exits non-zero if any item's status is not `ok` or it had any `row_failures`,
+so a launchd job's exit status is meaningful.
 
-## Tables (migration `043_plaid_feed.sql`)
+## Tables (migrations `043_plaid_feed.sql`, `044_plaid_currency.sql`)
 
 `plaid_items`, `plaid_accounts`, `plaid_securities`,
 `plaid_balance_snapshots`, `plaid_holding_snapshots`, `plaid_transactions`,
