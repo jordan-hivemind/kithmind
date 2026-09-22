@@ -9048,6 +9048,108 @@ test("a targeted status from another source cannot complete or clean up the batc
   }
 });
 
+test("an answered targeted completion replays the same durable catalog timestamp", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const processingCatalogId = randomUUID();
+  const originalCatalogId = randomUUID();
+  const targetId = "target-replay";
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "targeted_status",
+    preflightAction: undefined,
+    originalCatalogId,
+    expectedOriginalRevision: 1,
+    processingCatalogId,
+    expectedProcessingRevision: 1,
+    targetedTaxRun: {
+      goalKind: "form_1040_totals_v1",
+      sourcePageCount: 2,
+      plannedPages: [1, 2],
+      requestedRegionsClosed: true,
+      continuationsClosed: true,
+      batchOrdinal: 0,
+      processingCatalogIds: [processingCatalogId],
+      targetId,
+      priorProcessingGenerationId: "generation-replay",
+    },
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const original = { originalCatalogId, rowRevision: 1 };
+  let processing = {
+    processingCatalogId,
+    originalCatalogId,
+    rowRevision: 1,
+    targetedBatch: { batchOrdinal: 0 },
+    cloud: {
+      sourceItemId: plan.sourceItemId,
+      sourceRevisionId: "revision-replay",
+    },
+  };
+  let transportCalls = 0;
+  let completionWrites = 0;
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call(request) {
+      transportCalls += 1;
+      return {
+        operation: request.operation,
+        targetId,
+        sourceItemId: processing.cloud.sourceItemId,
+        sourceRevisionId: processing.cloud.sourceRevisionId,
+        goalKind: checkpoint.targetedTaxRun.goalKind,
+        status: "complete",
+        inspectedOriginalPages: [1, 2],
+        unresolvedFields: [],
+        reused: false,
+      };
+    },
+  });
+  runner.archiveCatalog = {
+    listOriginals() {
+      return [original];
+    },
+    listProcessings() {
+      return [processing];
+    },
+    async recordTargetedCompletion(args) {
+      completionWrites += 1;
+      if (processing.targetedCompletion) {
+        assert.deepEqual(args.completion, processing.targetedCompletion);
+        return processing;
+      }
+      processing = {
+        ...processing,
+        rowRevision: processing.rowRevision + 1,
+        targetedCompletion: structuredClone(args.completion),
+      };
+      return processing;
+    },
+  };
+  const commit = journal.commitResult.bind(journal);
+  let interrupted = false;
+  journal.commitResult = async () => {
+    interrupted = true;
+    throw new Error("synthetic crash after catalog completion");
+  };
+  try {
+    await assert.rejects(
+      () => runner.driveTargetedStatus(),
+      /synthetic crash after catalog completion/,
+    );
+    assert.equal(interrupted, true);
+    assert.equal(journal.checkpoint.step, "targeted_status");
+    assert.equal(completionWrites, 1);
+    journal.commitResult = commit;
+    await runner.driveTargetedStatus();
+    assert.equal(journal.checkpoint.step, "cleanup");
+    assert.equal(completionWrites, 2);
+    assert.equal(transportCalls, 1, "the answered status is not sent again");
+  } finally {
+    journal.commitResult = commit;
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
 test("legacy future admission replays exactly, then renews and admits without repeating archive work", async () => {
   const setup = await fixture(0);
   const future = Date.UTC(2036, 0, 1);

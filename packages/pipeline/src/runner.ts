@@ -8449,7 +8449,7 @@ export class PipelineRunner {
           requestId: randomUUID(),
           targetId,
         }),
-      async (current, response) => {
+      async (current, response, pending) => {
         if (
           current.phase !== "archived" ||
           current.step !== "targeted_status" ||
@@ -8498,7 +8498,7 @@ export class PipelineRunner {
           completion: {
             targetId: current.targetedTaxRun.targetId,
             status: value.status,
-            completedAt: Date.now(),
+            completedAt: pending.receivedAt,
           },
         });
         return archivedBase(current, {
