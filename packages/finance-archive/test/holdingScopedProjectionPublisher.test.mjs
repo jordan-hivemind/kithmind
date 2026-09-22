@@ -9,6 +9,10 @@ import {
   publishHoldingScopedPositionCorrection,
 } from "../dist/index.js";
 import { readStoredHoldingProjection } from "../dist/holdingCorrectionCandidate.js";
+import {
+  valuationNotesEquivalent,
+  valuationNotesEquivalentSql,
+} from "../dist/valuationNote.js";
 
 import { archive, count, one, skip } from "./helpers/pgArchive.mjs";
 
@@ -442,6 +446,46 @@ function approvalFor(manifest) {
     approvalDigest: holdingScopedProjectionApprovalDigest(unsigned),
   };
 }
+
+test(
+  "TypeScript and PostgreSQL valuation-note comparison agree on the closed grammar",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    const bond = "Market Value column of the BONDS holdings table";
+    const government =
+      "Market Value column of the GOVERNMENT/SECURITIES holdings table";
+    const cases = [
+      [bond, government, true],
+      [
+        `${bond}; summed from 2 dated lots without a printed Total row`,
+        `${government}; summed from 2 dated lots without a printed Total row`,
+        true,
+      ],
+      [bond, `NAV column of the GOVERNMENT/SECURITIES holdings table`, false],
+      [
+        `${bond}; summed from 2 dated lots without a printed Total row`,
+        `${government}; summed from 3 dated lots without a printed Total row`,
+        false,
+      ],
+      [bond, `${government}\n`, false],
+      [bond, `${government}\r`, false],
+      [bond, `${government}\r\n`, false],
+      [bond, "Statement says market value is estimated.", false],
+      [null, null, true],
+      [null, bond, false],
+    ];
+    for (const [left, right, expected] of cases) {
+      const sql = await one(
+        client,
+        `SELECT ${valuationNotesEquivalentSql("$1::text", "$2::text")} AS equivalent`,
+        [left, right],
+      );
+      assert.equal(valuationNotesEquivalent(left, right), expected);
+      assert.equal(sql.equivalent, expected);
+    }
+  },
+);
 
 test(
   "scoped publication preserves neighbors, carries scope proofs and references exact foreign rows without rehoming",

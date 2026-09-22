@@ -13,7 +13,9 @@ function generatedValuationNoteParts(
   note: string,
 ): readonly [column: string, lotSuffix: string | null] | null {
   const match = GENERATED_VALUATION_NOTE.exec(note);
-  return match === null ? null : [match[1]!, match[3] ?? null];
+  return match === null || match[0] !== note
+    ? null
+    : [match[1]!, match[3] ?? null];
 }
 
 /**
@@ -56,10 +58,12 @@ export function valuationNotesEquivalentSql(
   rightExpression: string,
 ): string {
   return `(${leftExpression} IS NOT DISTINCT FROM ${rightExpression}
-    OR (${leftExpression} ~ ${GENERATED_SQL_PATTERN}
+    OR COALESCE((${leftExpression} ~ ${GENERATED_SQL_PATTERN}
       AND ${rightExpression} ~ ${GENERATED_SQL_PATTERN}
+      AND regexp_replace(${leftExpression}, ${GENERATED_SQL_PATTERN}, '') = ''
+      AND regexp_replace(${rightExpression}, ${GENERATED_SQL_PATTERN}, '') = ''
       AND substring(${leftExpression} FROM ${COLUMN_SQL_PATTERN})
           = substring(${rightExpression} FROM ${COLUMN_SQL_PATTERN})
       AND substring(${leftExpression} FROM ${LOT_SUFFIX_SQL_PATTERN})
-          IS NOT DISTINCT FROM substring(${rightExpression} FROM ${LOT_SUFFIX_SQL_PATTERN})))`;
+          IS NOT DISTINCT FROM substring(${rightExpression} FROM ${LOT_SUFFIX_SQL_PATTERN})), FALSE))`;
 }

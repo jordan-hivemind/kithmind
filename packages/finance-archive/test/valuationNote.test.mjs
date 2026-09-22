@@ -28,6 +28,9 @@ test("generated valuation note comparison removes only the section provenance", 
     `${GOVERNMENT}; summed from 2 dated lots without printed Total row`,
     "Statement says market value is estimated.",
     "Market Value column of the Mixed Case holdings table",
+    `${GOVERNMENT}\n`,
+    `${GOVERNMENT}\r`,
+    `${GOVERNMENT}\r\n`,
   ]) {
     assert.equal(valuationNotesEquivalent(BOND, other), false, String(other));
   }
