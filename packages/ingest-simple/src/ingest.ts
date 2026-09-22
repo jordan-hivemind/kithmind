@@ -394,7 +394,18 @@ export async function runIngest(
     }
   });
 
-  if (!options.dryRun && activatedThisRun > 0) {
+  // Not gated on `activatedThisRun > 0`: a document this run skipped as
+  // unchanged can still owe an embedding from an earlier run -- the provider
+  // was unconfigured when it was ingested (see README's "Running from a
+  // shell with no provider configured"), or the `embedding_fill` job
+  // `write.ts`'s `stageOneFile` schedules exhausted its retry budget and
+  // nothing since has re-touched that source item to schedule another one.
+  // Steady state (every file `skippedUnchanged`) is exactly the case that
+  // must still attempt the fill, or a backlog stays stuck until someone runs
+  // `--backfill-embeddings` by hand. The classification drain and the fill
+  // are both cheap page reads when nothing is owed, so running them
+  // unconditionally on a real (non-dry) run costs one query, not a scan.
+  if (!options.dryRun) {
     const postProcess = await runPostProcessing(
       pool,
       account.spaceId,

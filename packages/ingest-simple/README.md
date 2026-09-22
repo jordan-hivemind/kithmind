@@ -80,6 +80,24 @@ kith-ingest-simple --root <dir> --source-account <id> [--space <id>] \
 | `--pdf-password <value>` | Repeatable. Candidate passwords for an encrypted PDF, tried in order (after no password) via poppler's `-upw`. See "Encrypted PDFs" below. Never logged. |
 | `--env-from-keychain` | Reads the model-provider environment (`OPENAI_API_KEY`, `BRAIN_EMBED_MODEL`, `BRAIN_EMBED_MODEL_REVISION`) from the same macOS Keychain items the deferred-work daemon's wrapper script uses, for any of them left unset. See "Running from a shell with no provider configured" below. |
 
+Every run (other than `--dry-run`) also retries any of this source account's
+chunks that are registered as eligible for embedding but not yet covered by a
+vector -- see "Embedding" below.
+
+### One-off embedding backfill
+
+```
+kith-ingest-simple --backfill-embeddings --source-account <id> [--env-from-keychain]
+```
+
+Takes no `--root`: it walks nothing. For every source item on the account
+with an active generation, it re-registers that generation's chunks as
+embedding targets (a no-op for one already fully covered) and then runs the
+same inline fill an ordinary run does. Use it once after fixing a provider
+configuration issue to cover documents that were already ingested while the
+provider was unconfigured or unreachable -- see "Embedding" below for why a
+document can otherwise stay uncovered indefinitely.
+
 Every run prints a one-line-per-count summary to stdout (`seen`, `new`,
 `promoted`, `skipped-unchanged`, `failed`, `encrypted`, `ocr-skipped-pages`,
 `retried`, `revision-conflicts`, unsupported-extension counts, and counts by
@@ -322,6 +340,26 @@ the Keychain item was found. See
 `com.kithmind.ingest-simple.plist.example` for an hourly LaunchAgent using
 this flag.
 
+### Embedding
+
+`write.ts`'s `stageOneFile` marks every activated generation's chunks
+eligible for embedding in the same transaction as activation
+(`@repo/kith-store`'s `workers.touchWorkerPublicationEmbedding`, the same
+function every other publisher uses) -- but only once the space already has
+an active embedding generation/profile (its own doc comment calls this
+"counted"; a space reaches it once, through an operator bootstrap, before any
+publisher's touch does anything). Given that, `runIngest` retries the actual
+embedding fill (`providerBatchEmbedder` + `runEmbeddingFill`,
+`postProcess.ts`) on every non-dry run, not only a run that ingested
+something new: a chunk can be eligible but not yet covered by a vector from
+an earlier run (the provider was unconfigured then, as in the plain-shell run
+above, or its scheduled `embedding_fill` job for the space exhausted its
+retry budget) and a later, otherwise-uneventful run (every file
+`skippedUnchanged`) is exactly what has to retry it, or it stays uncovered
+until someone notices. `--backfill-embeddings` (see "Usage" above) is the
+explicit, one-off version of the same retry for a source account's entire
+already-ingested backlog.
+
 ## What one run does
 
 1. Resolve `--source-account` (and cross-check `--space` when given).
@@ -400,9 +438,19 @@ it to a new full generation on the same source item -- `ingest_metadata`
 updated in place, title unchanged -- while the glance generation becomes
 historical; the encrypted-PDF registration path end to end, with and without
 a working `--pdf-password`, through a fake `pdftotext`/`pdfinfo` on `PATH`
-(`ingest.ts`'s `encryptedFallback` handling); and write.ts's
+(`ingest.ts`'s `encryptedFallback` handling); write.ts's
 `RevisionConflictError` directly against real Postgres -- two `ingestFile`
 calls for the same source item whose extracted text matches but whose file
 facts (byte hash, `capturedAt`) do not, proving the store's own immutability
 check still refuses the write and that this package classifies the refusal
-distinctly rather than treating it as an ordinary failure.
+distinctly rather than treating it as an ordinary failure; and the "Embedding"
+section above end to end, against a fake OpenAI-compatible embeddings
+endpoint (a real `node:http` server, no network, no vendor SDK): a synthetic
+document's chunks get real `embedding_targets`/`embedding_vectors` rows once
+the space has an active embedding generation and the provider is configured;
+a steady-state re-run (no new files) still covers a chunk left uncovered by
+an earlier run once the provider becomes configured, proving `runIngest` no
+longer skips the fill just because nothing activated this run; and
+`--backfill-embeddings` covers a document ingested before the space had an
+embedding generation active, and is idempotent -- a second run embeds nothing
+and calls the provider zero more times.

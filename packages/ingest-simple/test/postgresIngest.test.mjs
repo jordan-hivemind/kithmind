@@ -10,16 +10,130 @@
 
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import test from "node:test";
 
-import { applyKithSchema, createKithPool, documents, newKithId, sha256 } from "@repo/kith-store";
+import {
+  applyKithSchema,
+  createKithPool,
+  documents,
+  embeddings,
+  newKithId,
+  sha256,
+  withKithTransaction,
+} from "@repo/kith-store";
 import { runIngest } from "../dist/ingest.js";
+import { backfillEmbeddings } from "../dist/postProcess.js";
 import { ingestFile, RevisionConflictError } from "../dist/write.js";
 
 import { acquirePostgres, skip } from "./helpers/pgServer.mjs";
 import { buildPdf } from "./helpers/pdf.mjs";
+
+/** A fake OpenAI-compatible embeddings endpoint: no network, no vendor SDK.
+ * Every call returns a distinct, non-zero 1536-dimension vector (real
+ * `parseEmbeddingResponse` in `@repo/kith-store`'s provider.ts refuses an
+ * all-zero one) and records the request bodies it received. */
+function startEmbeddingStub() {
+  let calls = 0;
+  const requestBodies = [];
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      requestBodies.push(Buffer.concat(chunks).toString("utf8"));
+      calls += 1;
+      const vector = Array.from(
+        { length: embeddings.BASELINE_EMBEDDING_DIMENSIONS },
+        (_, index) => ((calls * 31 + index) % 97) / 97 + 0.0001,
+      );
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ data: [{ embedding: vector }] }));
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      resolve({
+        url: `http://127.0.0.1:${port}/v1/embeddings`,
+        requestBodies,
+        callCount: () => calls,
+        async stop() {
+          await new Promise((done) => server.close(done));
+        },
+      });
+    });
+  });
+}
+
+/** A synthetic, non-default embedding profile pointed at `stub.url` --
+ * `loadEmbeddingConfig` requires `NODE_ENV` to be "development" or "test"
+ * before it allows a plain-http localhost endpoint (provider.ts's
+ * `parseEndpoint`), and requires an explicit provider id/model revision for
+ * any non-default endpoint. No API key is needed: `requestEmbedding` only
+ * requires one for the real OpenAI default endpoint. */
+function stubEmbeddingEnv(stub) {
+  return {
+    NODE_ENV: "test",
+    BRAIN_EMBED_ENDPOINT: stub.url,
+    BRAIN_EMBED_PROVIDER_ID: "test-stub",
+    BRAIN_EMBED_MODEL: "test-embedding-model",
+    BRAIN_EMBED_MODEL_REVISION: "test-v1",
+  };
+}
+
+/** Bootstraps and activates a space's first embedding generation against an
+ * empty catalog, exactly the whole-space manifest transition
+ * `embeddings/generations.ts` documents ("what lets an empty-space capture
+ * bootstrap ... leave behind a counted space without a separate backfill
+ * run"). Real production reaches this through an operator's own bootstrap
+ * (`kith-reembed`-adjacent tooling); this test reaches it directly because
+ * `ingest-simple` intentionally never does this itself -- see write.ts's
+ * `touchWorkerPublicationEmbedding` call, which requires an active
+ * generation/profile to already exist. Returns the profile's fingerprint,
+ * which must equal `kith.space_embedding_states.active_fingerprint`
+ * afterward for a later fill against the same env to be accepted. */
+async function activateEmptyEmbeddingGeneration(pool, spaceId, env) {
+  const config = embeddings.loadEmbeddingConfig(env);
+  const profile = embeddings.embeddingProfile(config);
+  const fingerprint = await embeddings.fingerprintEmbeddingConfig(profile);
+
+  const generation = await withKithTransaction(pool, (client) =>
+    embeddings.createEmbeddingGeneration(
+      { client, now: Date.now() },
+      { spaceId, profile, fingerprint },
+    ),
+  );
+  await withKithTransaction(pool, (client) =>
+    embeddings.stageEmbeddingGeneration(
+      { client, now: Date.now() },
+      { embeddingGenerationId: generation.id },
+    ),
+  );
+  await withKithTransaction(pool, (client) =>
+    embeddings.activateEmbeddingGeneration(
+      { client, now: Date.now() },
+      { embeddingGenerationId: generation.id },
+    ),
+  );
+  return { fingerprint };
+}
+
+/** Sets `process.env` entries for the test body and restores the prior
+ * values (or absence) afterward via `t.after` -- `ingest.ts`'s
+ * `runPostProcessing` call reads `process.env` directly (see ingest.ts), not
+ * an injectable environment, so this is the only way a test can steer it. */
+function withProcessEnv(t, overrides) {
+  const previous = new Map(Object.keys(overrides).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, overrides);
+  t.after(() => {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+}
 
 /** Boots a throwaway Postgres with the kith schema applied and one seeded
  * user/space/fs-source-account, shared by every test below. */
@@ -612,4 +726,217 @@ test("write.ts's ingestFile refuses a second write whose extracted text matches 
     [first.sourceItemId],
   );
   assert.equal(generationCount.rows[0].count, 1);
+});
+
+test("ingesting a synthetic document registers and embeds its chunks when the space has an active embedding generation and the provider is configured", { skip }, async (t) => {
+  const { pool, spaceId, accountId } = await bootstrapDatabase(t);
+
+  const stub = await startEmbeddingStub();
+  t.after(() => stub.stop());
+  const env = stubEmbeddingEnv(stub);
+  const { fingerprint } = await activateEmptyEmbeddingGeneration(pool, spaceId, env);
+  withProcessEnv(t, env);
+
+  const root = await mkdtemp(join(tmpdir(), "ingest-simple-embed-fixture-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pdf = buildPdf(["Statement page one.\nAccount ending 1234."]);
+  await writeFile(join(root, "statement.pdf"), pdf);
+
+  const log = () => {};
+  const summary = await runIngest(
+    pool,
+    { root, sourceAccountId: accountId, dryRun: false, concurrency: 1, depth: "full", fullMatchPatterns: [] },
+    log,
+  );
+  assert.equal(summary.failed, 0, `expected no failures: ${JSON.stringify(summary.failures)}`);
+  assert.equal(summary.newCount, 1);
+
+  const item = await pool.query(
+    `SELECT active_generation_id FROM kith.source_items WHERE source_account_id = $1`,
+    [accountId],
+  );
+  const generationId = item.rows[0].active_generation_id;
+  const chunkRows = await pool.query(
+    `SELECT id FROM kith.chunks WHERE processing_generation_id = $1`,
+    [generationId],
+  );
+  assert.ok(chunkRows.rows.length > 0, "expected at least one chunk for the ingested document");
+  const chunkIds = chunkRows.rows.map((row) => row.id);
+
+  const targetRows = await pool.query(
+    `SELECT target_id, state, covered_fingerprint FROM kith.embedding_targets
+      WHERE space_id = $1 AND target_kind = 'chunk' AND target_id = ANY($2::text[])`,
+    [spaceId, chunkIds],
+  );
+  assert.equal(targetRows.rows.length, chunkIds.length, "every chunk must have an embedding_targets row");
+  for (const target of targetRows.rows) {
+    assert.equal(target.state, "eligible");
+    assert.equal(target.covered_fingerprint, fingerprint, "the target must be covered by the active fingerprint");
+  }
+
+  const vectorRows = await pool.query(
+    `SELECT chunk_id, embedding_fingerprint FROM kith.embedding_vectors
+      WHERE space_id = $1 AND target_kind = 'chunk' AND chunk_id = ANY($2::text[])`,
+    [spaceId, chunkIds],
+  );
+  assert.equal(vectorRows.rows.length, chunkIds.length, "every chunk must have an embedding_vectors row");
+  for (const vector of vectorRows.rows) {
+    assert.equal(vector.embedding_fingerprint, fingerprint);
+  }
+  assert.ok(stub.callCount() >= chunkIds.length, "the stub provider must have been called at least once per chunk");
+});
+
+test("a steady-state re-run with no new files still retries an eligible-but-uncovered chunk once the provider is configured", { skip }, async (t) => {
+  const { pool, spaceId, accountId } = await bootstrapDatabase(t);
+
+  const stub = await startEmbeddingStub();
+  t.after(() => stub.stop());
+  const env = stubEmbeddingEnv(stub);
+  const { fingerprint } = await activateEmptyEmbeddingGeneration(pool, spaceId, env);
+
+  const root = await mkdtemp(join(tmpdir(), "ingest-simple-steady-state-fixture-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pdf = buildPdf(["Statement page one.\nAccount ending 4242."]);
+  await writeFile(join(root, "statement.pdf"), pdf);
+
+  const options = { root, sourceAccountId: accountId, dryRun: false, concurrency: 1, depth: "full", fullMatchPatterns: [] };
+  const log = () => {};
+
+  // First run: no provider configured in `process.env` yet. The document
+  // ingests and its chunk's target is registered but left uncovered -- same
+  // setup as the backfill test above.
+  const first = await runIngest(pool, options, log);
+  assert.equal(first.failed, 0);
+  assert.equal(first.newCount, 1);
+
+  const item = await pool.query(
+    `SELECT active_generation_id FROM kith.source_items WHERE source_account_id = $1`,
+    [accountId],
+  );
+  const generationId = item.rows[0].active_generation_id;
+  const chunkRows = await pool.query(`SELECT id FROM kith.chunks WHERE processing_generation_id = $1`, [generationId]);
+  const chunkIds = chunkRows.rows.map((row) => row.id);
+  assert.ok(chunkIds.length > 0);
+
+  const beforeVectors = await pool.query(
+    `SELECT count(*)::int AS count FROM kith.embedding_vectors WHERE space_id = $1 AND chunk_id = ANY($2::text[])`,
+    [spaceId, chunkIds],
+  );
+  assert.equal(beforeVectors.rows[0].count, 0, "no vector must exist before the provider is configured");
+
+  // The operator now fixes the provider configuration (e.g. re-runs with
+  // `--env-from-keychain`), but the file itself is unchanged: this second run
+  // ingests nothing new (`newCount` 0, `skippedUnchanged` 1). Before the
+  // `activatedThisRun > 0` gate was removed from ingest.ts, this run would
+  // never have called `runPostProcessing` at all, and the chunk registered by
+  // the first run would stay uncovered forever.
+  withProcessEnv(t, env);
+  const second = await runIngest(pool, options, log);
+  assert.equal(second.failed, 0);
+  assert.equal(second.newCount, 0, "the unchanged file must not be re-ingested");
+  assert.equal(second.skippedUnchanged, 1);
+
+  const afterVectors = await pool.query(
+    `SELECT chunk_id, embedding_fingerprint FROM kith.embedding_vectors
+      WHERE space_id = $1 AND target_kind = 'chunk' AND chunk_id = ANY($2::text[])`,
+    [spaceId, chunkIds],
+  );
+  assert.equal(
+    afterVectors.rows.length,
+    chunkIds.length,
+    "a steady-state run must still retry and cover a previously-uncovered chunk",
+  );
+  for (const vector of afterVectors.rows) {
+    assert.equal(vector.embedding_fingerprint, fingerprint);
+  }
+});
+
+test("--backfill-embeddings adds vectors for a generation that was activated before the document was embedded", { skip }, async (t) => {
+  const { pool, spaceId, accountId } = await bootstrapDatabase(t);
+
+  const stub = await startEmbeddingStub();
+  t.after(() => stub.stop());
+  const env = stubEmbeddingEnv(stub);
+  // The generation is active on an empty catalog *before* anything is
+  // ingested -- "a generation that was activated without them" (the task's
+  // own framing): the space is already counted and has an active
+  // fingerprint, same as the real deployment's one-time bootstrap, before
+  // this account's first document exists.
+  const { fingerprint } = await activateEmptyEmbeddingGeneration(pool, spaceId, env);
+
+  const root = await mkdtemp(join(tmpdir(), "ingest-simple-backfill-fixture-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pdf = buildPdf(["Statement page one.\nAccount ending 9999."]);
+  await writeFile(join(root, "statement.pdf"), pdf);
+
+  // Ingested with no provider configured in `process.env` (README's "Running
+  // from a shell with no provider configured"): the default OpenAI endpoint
+  // has no API key, so the inline fill fails with "provider unavailable" and
+  // the chunk's target is left eligible but uncovered -- registered, not
+  // embedded.
+  const log = () => {};
+  const summary = await runIngest(
+    pool,
+    { root, sourceAccountId: accountId, dryRun: false, concurrency: 1, depth: "full", fullMatchPatterns: [] },
+    log,
+  );
+  assert.equal(summary.failed, 0, `expected no failures: ${JSON.stringify(summary.failures)}`);
+
+  const item = await pool.query(
+    `SELECT active_generation_id FROM kith.source_items WHERE source_account_id = $1`,
+    [accountId],
+  );
+  const generationId = item.rows[0].active_generation_id;
+  const chunkRows = await pool.query(
+    `SELECT id FROM kith.chunks WHERE processing_generation_id = $1`,
+    [generationId],
+  );
+  assert.ok(chunkRows.rows.length > 0);
+  const chunkIds = chunkRows.rows.map((row) => row.id);
+
+  const beforeTargets = await pool.query(
+    `SELECT covered_fingerprint FROM kith.embedding_targets
+      WHERE space_id = $1 AND target_kind = 'chunk' AND target_id = ANY($2::text[])`,
+    [spaceId, chunkIds],
+  );
+  assert.equal(beforeTargets.rows.length, chunkIds.length, "the target must already be registered from ingest");
+  for (const target of beforeTargets.rows) {
+    assert.equal(target.covered_fingerprint, null, "the target must not be covered yet");
+  }
+  const beforeVectors = await pool.query(
+    `SELECT count(*)::int AS count FROM kith.embedding_vectors WHERE space_id = $1 AND chunk_id = ANY($2::text[])`,
+    [spaceId, chunkIds],
+  );
+  assert.equal(beforeVectors.rows[0].count, 0, "no vector must exist before the backfill runs");
+
+  const backfillLog = () => {};
+  const result = await backfillEmbeddings(pool, accountId, env, backfillLog);
+  assert.equal(result.embeddings.failed, false, "the backfill's embedding fill must not fail against the stub");
+  assert.ok(result.embeddings.embedded >= chunkIds.length, "the backfill must embed every owed chunk");
+
+  const afterVectors = await pool.query(
+    `SELECT chunk_id, embedding_fingerprint FROM kith.embedding_vectors
+      WHERE space_id = $1 AND target_kind = 'chunk' AND chunk_id = ANY($2::text[])`,
+    [spaceId, chunkIds],
+  );
+  assert.equal(afterVectors.rows.length, chunkIds.length, "every chunk must have a vector after the backfill");
+  for (const vector of afterVectors.rows) {
+    assert.equal(vector.embedding_fingerprint, fingerprint);
+  }
+
+  const afterTargets = await pool.query(
+    `SELECT covered_fingerprint FROM kith.embedding_targets
+      WHERE space_id = $1 AND target_kind = 'chunk' AND target_id = ANY($2::text[])`,
+    [spaceId, chunkIds],
+  );
+  for (const target of afterTargets.rows) {
+    assert.equal(target.covered_fingerprint, fingerprint);
+  }
+
+  // Re-running the backfill is idempotent: nothing left to embed, so the
+  // provider is not called again for these chunks.
+  const callsBeforeSecondRun = stub.callCount();
+  const second = await backfillEmbeddings(pool, accountId, env, backfillLog);
+  assert.equal(second.embeddings.embedded, 0, "a second backfill must not re-embed already-covered chunks");
+  assert.equal(stub.callCount(), callsBeforeSecondRun, "a second backfill must not call the provider again");
 });
