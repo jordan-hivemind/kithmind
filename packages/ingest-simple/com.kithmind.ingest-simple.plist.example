@@ -8,6 +8,14 @@
   clone -- DATABASE_URL comes from the environment or Keychain (see
   README.md), never from an argument or an env var written here.
 
+  --env-from-keychain: a LaunchAgent's environment does not inherit an
+  interactive shell's exported variables, so without this flag every OCR,
+  extraction and embedding call in this run would find no provider
+  configured (see README.md's "Required environment" and "--env-from-keychain
+  reads the model-provider environment from the Keychain"). It reads the same
+  Keychain items the deferred-work daemon's own wrapper script does
+  (docs/worker-service.md, "Deferred work daemon") and never logs a value.
+
   StartInterval, not KeepAlive: this CLI does one bounded pass and exits
   (`ingest --root ... --source-account ...`), so it should be launched once
   an hour and left to exit on its own, the same reasoning
@@ -38,6 +46,7 @@
     <string>SOURCE_ACCOUNT_ID</string>
     <string>--root-alias</string>
     <string>ROOT_ALIAS</string>
+    <string>--env-from-keychain</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/ABSOLUTE/PATH/TO/REPOSITORY</string>
