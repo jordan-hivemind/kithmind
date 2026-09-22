@@ -96,7 +96,44 @@ embedding targets (a no-op for one already fully covered) and then runs the
 same inline fill an ordinary run does. Use it once after fixing a provider
 configuration issue to cover documents that were already ingested while the
 provider was unconfigured or unreachable -- see "Embedding" below for why a
-document can otherwise stay uncovered indefinitely.
+document can otherwise stay uncovered indefinitely. It also prints the
+space's `eligible-*`/`covered-*` counts (by `thought`/`chunk`/`card`) after
+the fill, so a run that embeds zero chunks is explainable: `eligible-chunk 0`
+means the policy below excludes them, not that the fill failed.
+
+### Switching a space to embed every chunk
+
+```
+kith-ingest-simple --set-embedding-policy all_chunks --space <id> [--env-from-keychain]
+```
+
+A space's `kith.space_embedding_states.target_policy` decides which document
+chunks are even eligible for embedding: `all_chunks` (the default for a
+freshly-created state row) registers every active chunk;
+`cards_and_opted_in_chunks` registers a document's card but not its chunks
+unless the source item or account opted in
+(`embeddings.chunkTargetsOptedIn`). A space explicitly left at
+`cards_and_opted_in_chunks` will otherwise never surface an ingested
+document's contents in semantic search, no matter how many times
+`--backfill-embeddings` retries the fill -- retrying covers a target that
+exists but is uncovered, not a chunk that was never registered as a target at
+all.
+
+This subcommand takes `--space`, not `--source-account` (a policy is a
+space-wide setting), and walks nothing. It switches the policy through
+`@repo/kith-store`'s `embeddings.setSpaceEmbeddingTargetPolicy` -- the only
+supported way to change `target_policy`; nothing in this package writes it
+with raw SQL -- which bumps the space's `eligibility_epoch` and
+`last_eligibility_change_at` exactly the way any other eligibility-changing
+write does. It then re-registers every already-ingested document's chunks in
+the space under the new policy (the same per-item touch
+`--backfill-embeddings` runs for one account, scoped to the whole space
+instead) and runs the same inline fill, so an owner does not have to wait for
+the daemon's own build job to notice. Prints `policy-before`/`policy-after`,
+`policy-changed`, and the space's `eligible-*`/`covered-*` counts on both
+sides of the switch. Safe to run again with the same policy: the store
+function is a no-op on the row (`policy-changed false`), and the touch-and-fill
+pass still runs and stays idempotent.
 
 Every run prints a one-line-per-count summary to stdout (`seen`, `new`,
 `promoted`, `skipped-unchanged`, `failed`, `encrypted`, `ocr-skipped-pages`,
@@ -453,4 +490,10 @@ an earlier run once the provider becomes configured, proving `runIngest` no
 longer skips the fill just because nothing activated this run; and
 `--backfill-embeddings` covers a document ingested before the space had an
 embedding generation active, and is idempotent -- a second run embeds nothing
-and calls the provider zero more times.
+and calls the provider zero more times; and `--set-embedding-policy` end to
+end -- a document ingested while a space is at `cards_and_opted_in_chunks`
+gets no chunk targets at all, so `--backfill-embeddings` embeds nothing for
+it; switching the space to `all_chunks` registers and embeds that document's
+existing chunks in the same call, an ordinary backfill afterward converges
+and stays idempotent, and switching to the policy a space is already at is a
+no-op on the row but still re-runs the touch-and-fill.

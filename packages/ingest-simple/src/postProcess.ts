@@ -21,8 +21,17 @@
 // below is the explicit one-off version of the same idea, for a source
 // account whose documents were ingested before this package retried on every
 // run, or before the space had an active embedding generation/profile at all.
+//
+// A document can also stay uncovered because its chunks were never eligible
+// in the first place: a space whose `target_policy` is
+// `cards_and_opted_in_chunks` (migration 016; `embeddings.spaceEmbedsAllChunks`)
+// only registers a document's card, not its chunks, unless the source item or
+// account opted in (`chunkTargetsOptedIn`, `build.ts` line ~627). No amount of
+// retrying the fill covers a chunk that was never registered as a target.
+// `setEmbeddingPolicy` below is the supported way to flip a space to
+// `all_chunks` and catch up every already-ingested document in one call.
 
-import { deferred, embeddings, workers } from "@repo/kith-store";
+import { deferred, embeddings, withKithTransaction, workers } from "@repo/kith-store";
 import type { Pool } from "pg";
 
 import { resolveSourceAccount } from "./sourceAccount.js";
@@ -31,6 +40,121 @@ export type PostProcessResult = {
   extraction: { claimed: number; completed: number; failed: boolean };
   embeddings: { embedded: number; skipped: number; failed: boolean };
 };
+
+/** A space's chunk target policy plus its eligible/covered counters, read
+ * straight from `kith.space_embedding_states` (through the same store
+ * functions the read surfaces use) -- what `--set-embedding-policy` and
+ * `--backfill-embeddings` print so a zero-embedded result is explainable
+ * (eligible 0 means nothing was ever registered; eligible > covered means
+ * the fill has more to do, or failed). */
+export type EmbeddingCoverageSnapshot = {
+  policy: embeddings.EmbeddingTargetPolicy;
+  eligible: embeddings.EmbeddingKindCounts;
+  covered: embeddings.EmbeddingKindCounts;
+};
+
+async function embeddingCoverageSnapshot(
+  pool: Pool,
+  spaceId: string,
+): Promise<EmbeddingCoverageSnapshot> {
+  return withKithTransaction(pool, async (client) => {
+    const ctx = { client, now: Date.now() };
+    const state = await embeddings.ensureSpaceEmbeddingState(ctx, spaceId);
+    const counters = await embeddings.readSpaceCounters(ctx, spaceId);
+    return {
+      policy: (state.target_policy ?? "all_chunks") as embeddings.EmbeddingTargetPolicy,
+      eligible: counters.coverage.eligible ?? embeddings.ZERO_KIND_COUNTS,
+      covered: counters.coverage.covered ?? embeddings.ZERO_KIND_COUNTS,
+    };
+  });
+}
+
+type ActiveSourceItem = {
+  id: string;
+  sourceAccountId: string;
+  activeGenerationId: string;
+};
+
+async function activeSourceItemsForAccount(
+  pool: Pool,
+  sourceAccountId: string,
+): Promise<ActiveSourceItem[]> {
+  const { rows } = await pool.query<{ id: string; active_generation_id: string }>(
+    `SELECT id, active_generation_id FROM kith.source_items
+      WHERE source_account_id = $1 AND active_generation_id IS NOT NULL`,
+    [sourceAccountId],
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    sourceAccountId,
+    activeGenerationId: row.active_generation_id,
+  }));
+}
+
+/** Every already-ingested document across a whole space, regardless of which
+ * source account it came in through -- what `setEmbeddingPolicy` needs,
+ * since a policy switch is a space-level change, not an account-level one. */
+async function activeSourceItemsForSpace(
+  pool: Pool,
+  spaceId: string,
+): Promise<ActiveSourceItem[]> {
+  const { rows } = await pool.query<{
+    id: string;
+    source_account_id: string;
+    active_generation_id: string;
+  }>(
+    `SELECT id, source_account_id, active_generation_id FROM kith.source_items
+      WHERE space_id = $1 AND active_generation_id IS NOT NULL
+        AND source_account_id IS NOT NULL`,
+    [spaceId],
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    sourceAccountId: row.source_account_id,
+    activeGenerationId: row.active_generation_id,
+  }));
+}
+
+/** The same per-item eligibility touch `write.ts`'s `stageOneFile` runs on
+ * ingest (`workers.touchWorkerPublicationEmbedding`): re-registers or
+ * retires each item's active generation's chunk targets under whatever
+ * `target_policy` reads right now. Idempotent, see `backfillEmbeddings`'s own
+ * doc comment. */
+async function touchActiveSourceItems(
+  pool: Pool,
+  spaceId: string,
+  items: readonly ActiveSourceItem[],
+): Promise<void> {
+  for (const item of items) {
+    await workers.withWorkerTransaction(pool, (ctx) =>
+      workers.touchWorkerPublicationEmbedding(ctx, {
+        spaceId,
+        sourceItemId: item.id,
+        sourceAccountId: item.sourceAccountId,
+        processingGenerationId: item.activeGenerationId,
+      }),
+    );
+  }
+}
+
+async function runEmbeddingFillBestEffort(
+  pool: Pool,
+  spaceId: string,
+  env: Readonly<Record<string, string | undefined>>,
+  log: (message: string) => void,
+): Promise<PostProcessResult["embeddings"]> {
+  const result: PostProcessResult["embeddings"] = { embedded: 0, skipped: 0, failed: false };
+  try {
+    const embed = embeddings.providerBatchEmbedder(env);
+    const filled = await embeddings.runEmbeddingFill(pool, spaceId, embed, {});
+    result.embedded = filled.embedded;
+    result.skipped = filled.skipped;
+  } catch (error) {
+    result.failed = true;
+    log(`Embedding fill did not run: ${errorMessage(error)}`);
+  }
+  return result;
+}
 
 export async function runPostProcessing(
   pool: Pool,
@@ -56,15 +180,7 @@ export async function runPostProcessing(
     log(`Classification did not run: ${errorMessage(error)}`);
   }
 
-  try {
-    const embed = embeddings.providerBatchEmbedder(env);
-    const filled = await embeddings.runEmbeddingFill(pool, spaceId, embed, {});
-    result.embeddings.embedded = filled.embedded;
-    result.embeddings.skipped = filled.skipped;
-  } catch (error) {
-    result.embeddings.failed = true;
-    log(`Embedding fill did not run: ${errorMessage(error)}`);
-  }
+  result.embeddings = await runEmbeddingFillBestEffort(pool, spaceId, env, log);
 
   return result;
 }
@@ -77,6 +193,12 @@ export type BackfillEmbeddingsResult = {
    * needed nothing is a cheap no-op, not a correctness risk). */
   sourceItemsTouched: number;
   embeddings: PostProcessResult["embeddings"];
+  /** The account's space, read after the touch loop and the fill above, so a
+   * zero `embeddings.embedded` is explainable: `eligible` at zero means
+   * nothing was ever registered (the policy excludes these chunks, or the
+   * space is not counted yet); `eligible > covered` means the fill still has
+   * owed work or failed. */
+  coverage: EmbeddingCoverageSnapshot;
 };
 
 /**
@@ -105,39 +227,84 @@ export async function backfillEmbeddings(
   log: (message: string) => void,
 ): Promise<BackfillEmbeddingsResult> {
   const account = await resolveSourceAccount(pool, sourceAccountId);
-  const { rows: items } = await pool.query<{ id: string; active_generation_id: string }>(
-    `SELECT id, active_generation_id FROM kith.source_items
-      WHERE source_account_id = $1 AND active_generation_id IS NOT NULL`,
-    [sourceAccountId],
-  );
+  const items = await activeSourceItemsForAccount(pool, sourceAccountId);
 
-  for (const item of items) {
-    await workers.withWorkerTransaction(pool, (ctx) =>
-      workers.touchWorkerPublicationEmbedding(ctx, {
-        spaceId: account.spaceId,
-        sourceItemId: item.id,
-        sourceAccountId,
-        processingGenerationId: item.active_generation_id,
-      }),
-    );
-  }
+  await touchActiveSourceItems(pool, account.spaceId, items);
   log(
     `backfill: re-touched ${items.length} source item${items.length === 1 ? "" : "s"} ` +
       `on source account ${sourceAccountId} for embedding eligibility`,
   );
 
-  const result: PostProcessResult["embeddings"] = { embedded: 0, skipped: 0, failed: false };
-  try {
-    const embed = embeddings.providerBatchEmbedder(env);
-    const filled = await embeddings.runEmbeddingFill(pool, account.spaceId, embed, {});
-    result.embedded = filled.embedded;
-    result.skipped = filled.skipped;
-  } catch (error) {
-    result.failed = true;
-    log(`Embedding fill did not run: ${errorMessage(error)}`);
-  }
+  const result = await runEmbeddingFillBestEffort(pool, account.spaceId, env, log);
+  const coverage = await embeddingCoverageSnapshot(pool, account.spaceId);
 
-  return { sourceItemsTouched: items.length, embeddings: result };
+  return { sourceItemsTouched: items.length, embeddings: result, coverage };
+}
+
+export type SetEmbeddingPolicyResult = {
+  spaceId: string;
+  policy: embeddings.EmbeddingTargetPolicy;
+  changed: boolean;
+  before: EmbeddingCoverageSnapshot;
+  after: EmbeddingCoverageSnapshot;
+  sourceItemsTouched: number;
+  embeddings: PostProcessResult["embeddings"];
+};
+
+/**
+ * `--set-embedding-policy <policy> --space <id>` (cli.ts). Switches the
+ * space's `target_policy` through the store's own
+ * `embeddings.setSpaceEmbeddingTargetPolicy` (state.ts) -- never raw SQL --
+ * then, so an owner does not have to wait for the daemon's next build-job
+ * scan (`build.ts`'s `runScanPage`) to see an already-ingested document
+ * become searchable, re-runs the exact same per-item eligibility touch
+ * `backfillEmbeddings` above runs for one source account
+ * (`workers.touchWorkerPublicationEmbedding`), scoped to every source item
+ * in the space instead of one account's, and then the same inline fill.
+ *
+ * Safe to call when the policy is already the requested one: the store
+ * function is a no-op in that case (`changed: false`), and the touch-and-fill
+ * pass still runs, which is what covers a document ingested while the policy
+ * was already `all_chunks` but before a provider was configured, or before
+ * this package retried the fill on every run.
+ */
+export async function setEmbeddingPolicy(
+  pool: Pool,
+  spaceId: string,
+  policy: embeddings.EmbeddingTargetPolicy,
+  env: Readonly<Record<string, string | undefined>>,
+  log: (message: string) => void,
+): Promise<SetEmbeddingPolicyResult> {
+  const before = await embeddingCoverageSnapshot(pool, spaceId);
+
+  const change = await withKithTransaction(pool, (client) =>
+    embeddings.setSpaceEmbeddingTargetPolicy({ client, now: Date.now() }, spaceId, policy),
+  );
+  log(
+    change.changed
+      ? `embedding policy for space ${spaceId}: ${before.policy} -> ${policy}`
+      : `embedding policy for space ${spaceId} is already ${policy}; re-scanning anyway`,
+  );
+
+  const items = await activeSourceItemsForSpace(pool, spaceId);
+  await touchActiveSourceItems(pool, spaceId, items);
+  log(
+    `re-touched ${items.length} source item${items.length === 1 ? "" : "s"} ` +
+      `in space ${spaceId} for embedding eligibility`,
+  );
+
+  const embedResult = await runEmbeddingFillBestEffort(pool, spaceId, env, log);
+  const after = await embeddingCoverageSnapshot(pool, spaceId);
+
+  return {
+    spaceId,
+    policy,
+    changed: change.changed,
+    before,
+    after,
+    sourceItemsTouched: items.length,
+    embeddings: embedResult,
+  };
 }
 
 function errorMessage(error: unknown): string {
