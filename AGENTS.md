@@ -135,6 +135,15 @@ checkpoint. Give every active lane a concrete next action and resolve dependency
 waits directly. When work truly cannot continue, state the specific missing
 input rather than implying that a saved checkpoint is active progress.
 
+A final status reply ends the root orchestrator's current execution. It does
+not leave the model running, subscribe it to child-agent completions or cause it
+to consume later child replies automatically. While authorized work remains,
+keep the root execution active and integrate required child results before
+sending the final reply. If work will continue outside the model, name the
+actual background process and establish a real continuation mechanism before
+promising unattended progress. Distinguish that process from model
+orchestration; a running child lane or queued reply alone is not continuation.
+
 Before prioritizing a repair, trace its effect on the user-visible acceptance
 condition. For example, fixing one statement may clear no stale accounts if
 other incomplete sources contribute to the same snapshot. Count affected
