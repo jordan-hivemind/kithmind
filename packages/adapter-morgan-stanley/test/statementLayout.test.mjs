@@ -1041,6 +1041,109 @@ test("a consolidated statement attributes each balance to its own account", () =
   assert.equal(second.totalValue, "512340");
 });
 
+test("a consolidated statement proves each account balance from exact bounded source spans", () => {
+  const parsed = parseStatementLines(CONSOLIDATED_LAYOUT_TEXT, kind);
+  assert.deepEqual(
+    parsed.holdings.balanceScopes.map((scope) => ({
+      accountExternalKey: scope.accountExternalKey,
+      asOf: scope.asOf,
+      status: scope.status,
+      emittedBalanceCount: scope.emittedBalanceCount,
+      gapCodes: scope.gapCodes,
+      proofVersion: scope.proofVersion,
+    })),
+    [
+      {
+        accountExternalKey: CONSOLIDATED_ACCOUNT_ONE,
+        asOf: "2026-03-31",
+        status: "complete",
+        emittedBalanceCount: 1,
+        gapCodes: [],
+        proofVersion: "balance_scope_v1",
+      },
+      {
+        accountExternalKey: CONSOLIDATED_ACCOUNT_TWO,
+        asOf: "2026-03-31",
+        status: "complete",
+        emittedBalanceCount: 1,
+        gapCodes: [],
+        proofVersion: "balance_scope_v1",
+      },
+    ],
+  );
+  for (const scope of parsed.holdings.balanceScopes) {
+    for (const locator of Object.values(scope.evidence)) {
+      assert.equal(locator.binding.format, "retained_text_span_v1");
+      assert.equal(
+        CONSOLIDATED_LAYOUT_TEXT.slice(
+          locator.binding.start,
+          locator.binding.end,
+        ),
+        locator.binding.quote,
+      );
+    }
+    assert.match(scope.evidence.header.binding.quote, /BALANCE SHEET/);
+    assert.match(scope.evidence.row.binding.quote, /^TOTAL VALUE/);
+    assert.match(scope.evidence.scopeEnd.binding.quote, /^HOLDINGS/);
+  }
+});
+
+test("a balance block cannot borrow its date and total from the next account", () => {
+  const text = [
+    "        Page 1 of 1",
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+    CONSOLIDATED_ACCOUNT_ONE,
+    "        Account Synthetic Household",
+    "        BALANCE SHEET",
+    "        section intentionally has no date or total",
+    CONSOLIDATED_ACCOUNT_TWO,
+    "        Account Synthetic Household",
+    ...balanceSheetLines({ totalValueThis: "$512,340.00" }),
+    "        HOLDINGS",
+  ].join("\n");
+  const parsed = parseStatementLines(text, kind);
+  assert.deepEqual(
+    parsed.holdings.balances.map((balance) => ({
+      accountExternalKey: balance.accountExternalKey,
+      totalValue: balance.totalValue,
+    })),
+    [
+      {
+        accountExternalKey: CONSOLIDATED_ACCOUNT_TWO,
+        totalValue: "512340",
+      },
+    ],
+  );
+  assert.deepEqual(
+    parsed.holdings.balanceScopes.map((scope) => scope.accountExternalKey),
+    [CONSOLIDATED_ACCOUNT_TWO],
+  );
+});
+
+test("an unanchored printed page leaves balance output intact but makes its scope partial", () => {
+  const text = CONSOLIDATED_LAYOUT_TEXT.replace("Page 1 of 2", "Page 2 of 3");
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.balances.length, 2);
+  assert.equal(parsed.holdings.balanceScopes[0].status, "partial");
+  assert.deepEqual(parsed.holdings.balanceScopes[0].gapCodes, [
+    "page_sequence_gap",
+  ]);
+});
+
+test("two TOTAL VALUE rows never become a complete one-row balance proof", () => {
+  const totalRow = balanceSheetLines().at(-1);
+  const text = CONSOLIDATED_LAYOUT_TEXT.replace(
+    "        HOLDINGS",
+    `${totalRow}\n        HOLDINGS`,
+  );
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.balances.length, 2);
+  assert.equal(parsed.holdings.balanceScopes[0].status, "partial");
+  assert.deepEqual(parsed.holdings.balanceScopes[0].gapCodes, [
+    "multiple_balance_rows",
+  ]);
+});
+
 test("a consolidated statement attributes each position to the account whose pages it was printed under", () => {
   const parsed = parseStatementLines(CONSOLIDATED_LAYOUT_TEXT, kind);
   assert.equal(parsed.holdings.positions.length, 2);
@@ -1410,6 +1513,11 @@ test("a consolidated statement's roll-up BALANCE SHEET is recorded against no ac
     /^partially parsed: 1 BALANCE SHEET section\(s\) printed /,
   );
   assert.match(parsed.parseNote, /Consolidated Summary/);
+  assert.deepEqual(
+    parsed.holdings.balanceScopes.map((scope) => scope.accountExternalKey),
+    [CONSOLIDATED_ACCOUNT_ONE, CONSOLIDATED_ACCOUNT_TWO],
+    "the unattributed household roll-up has no positive account scope",
+  );
 });
 
 test("a single-account statement still omits accountExternalKey: this pull's own account, unchanged", () => {
@@ -1586,6 +1694,72 @@ test("the cover page's account total is read when there is no BALANCE SHEET bloc
   assert.equal(balance.periodStartValue, null);
   assert.deepEqual(parsed.holdings.liabilities, []);
   assert.match(balance.totalValueNote, /prints no BALANCE SHEET block/);
+});
+
+test("an explicitly account-bound cover total proves one complete balance", () => {
+  const text = COVER_TOTAL_LAYOUT_TEXT.replace(
+    "        Synthetic Active Assets Account    123-456789-012",
+    [
+      "        Synthetic Active Assets Account",
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Synthetic Household",
+    ].join("\n"),
+  );
+  const parsed = parseStatementLines(text, kind);
+  const [scope] = parsed.holdings.balanceScopes;
+  assert.deepEqual(
+    {
+      accountExternalKey: scope.accountExternalKey,
+      asOf: scope.asOf,
+      status: scope.status,
+      emittedBalanceCount: scope.emittedBalanceCount,
+      gapCodes: scope.gapCodes,
+      zeroBasis: scope.zeroBasis,
+    },
+    {
+      accountExternalKey: CONSOLIDATED_ACCOUNT_ONE,
+      asOf: "2026-03-31",
+      status: "complete",
+      emittedBalanceCount: 1,
+      gapCodes: [],
+      zeroBasis: undefined,
+    },
+  );
+  assert.equal(scope.evidence.account.binding.quote, CONSOLIDATED_ACCOUNT_ONE);
+  assert.equal(scope.evidence.totalValue.binding.quote, "$74,310.25");
+  assert.equal(scope.evidence.scopeEnd.binding.quote, "Account Summary");
+});
+
+test("an explicitly account-bound source statement of none proves a zero balance", () => {
+  const text = EMPTY_ACCOUNT_LAYOUT_TEXT.replace(
+    "        Synthetic Active Assets Account    123-456789-012",
+    [
+      "        Synthetic Active Assets Account",
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Synthetic Household",
+    ].join("\n"),
+  );
+  const parsed = parseStatementLines(text, kind);
+  assert.deepEqual(parsed.holdings.balances, []);
+  const [scope] = parsed.holdings.balanceScopes;
+  assert.deepEqual(
+    {
+      accountExternalKey: scope.accountExternalKey,
+      status: scope.status,
+      emittedBalanceCount: scope.emittedBalanceCount,
+      gapCodes: scope.gapCodes,
+      zeroBasis: scope.zeroBasis,
+    },
+    {
+      accountExternalKey: CONSOLIDATED_ACCOUNT_ONE,
+      status: "complete",
+      emittedBalanceCount: 0,
+      gapCodes: [],
+      zeroBasis: "source_stated_none",
+    },
+  );
+  assert.equal(scope.evidence.explicitNone.binding.quote, "—");
+  assert.equal(scope.evidence.scopeEnd.binding.quote, "Account Summary");
 });
 
 test("an account holding nothing says so, and is not a statement left unparsed", () => {

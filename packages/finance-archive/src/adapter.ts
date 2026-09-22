@@ -689,12 +689,52 @@ export type ParsedPositionScope = {
   readonly evidence: PositionScopeEvidence;
 };
 
+/** Why an account/date balance section is not a complete observation. */
+export type BalanceScopeGapCode =
+  | "unsupported_balance_header"
+  | "missing_total_value"
+  | "multiple_balance_rows"
+  | "page_sequence_gap"
+  | "unbounded_account_scope"
+  | "unproven_empty";
+
+/** Exact retained-text boundaries supporting one balance observation. */
+export type BalanceScopeEvidence = {
+  /** Required because this proof never falls back to the pull's account. */
+  readonly account: FieldLocator;
+  readonly header?: FieldLocator;
+  readonly row?: FieldLocator;
+  readonly totalValue?: FieldLocator;
+  readonly scopeEnd?: FieldLocator;
+  readonly explicitNone?: FieldLocator;
+};
+
+/**
+ * A positive parser observation for one document/account/date balance. A
+ * complete observation emits either the section's one account balance or a
+ * source-stated empty balance. Household roll-ups and inferred empty sections
+ * have no complete scope.
+ */
+export type ParsedBalanceScope = {
+  readonly sourceDocument: string;
+  readonly accountExternalKey: string;
+  readonly asOf: string;
+  readonly proofVersion: "balance_scope_v1";
+  readonly status: "complete" | "partial";
+  readonly emittedBalanceCount: 0 | 1;
+  readonly gapCodes: readonly BalanceScopeGapCode[];
+  readonly zeroBasis?: "source_stated_none";
+  readonly evidence: BalanceScopeEvidence;
+};
+
 export type ParsedHoldings = {
   readonly positions: readonly ParsedPosition[];
   readonly balances: readonly ParsedBalance[];
   readonly liabilities: readonly ParsedLiability[];
   /** Positive membership observations only; absence makes no completeness claim. */
   readonly positionScopes?: readonly ParsedPositionScope[];
+  /** Positive account-bound balance observations only. */
+  readonly balanceScopes?: readonly ParsedBalanceScope[];
 };
 
 /** What an activity-only source declines with: no positions, no invention. */
