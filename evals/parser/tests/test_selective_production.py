@@ -1,19 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import unittest
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
-
-import pytest
-from pypdf import PdfReader
-from reportlab.pdfgen.canvas import Canvas
 
 from parser_eval.production import ParentExecutionBoundary, ProductionFailure
 from parser_eval.selective_production import (
@@ -25,6 +23,8 @@ from parser_eval.selective_production import (
 
 
 def _pdf(page_count: int) -> bytes:
+    from reportlab.pdfgen.canvas import Canvas
+
     output = BytesIO()
     canvas = Canvas(output)
     for page in range(1, page_count + 1):
@@ -35,6 +35,8 @@ def _pdf(page_count: int) -> bytes:
 
 
 def _texts(data: bytes) -> list[str]:
+    from pypdf import PdfReader
+
     return [page.extract_text().strip() for page in PdfReader(BytesIO(data)).pages]
 
 
@@ -98,16 +100,15 @@ def test_document_id_stabilization_only_changes_the_final_trailer() -> None:
     assert len(stabilized) == len(value)
 
 
-@pytest.mark.parametrize(
-    "original_pages",
-    [(1, 1), (2, 1), (1, 3), (True,)],
-    ids=("duplicate", "reordered", "out-of-range", "boolean"),
-)
-def test_select_pdf_pages_rejects_invalid_page_boundaries(
-    original_pages: tuple[int, ...],
-) -> None:
-    with pytest.raises(ProductionFailure, match="invalid_input"):
-        select_pdf_pages(_pdf(2), original_pages)
+def test_select_pdf_pages_rejects_invalid_page_boundaries() -> None:
+    cases = ((1, 1), (2, 1), (1, 3), (True,))
+    for original_pages in cases:
+        try:
+            select_pdf_pages(_pdf(2), original_pages)
+        except ProductionFailure as exc:
+            assert exc.code == "invalid_input"
+        else:
+            raise AssertionError(f"accepted invalid pages: {original_pages!r}")
 
 
 def test_selective_conversion_rejects_a_source_hash_mismatch() -> None:
@@ -297,3 +298,33 @@ def convert_selective_captured_pdf(**arguments):
         assert json.loads(bundle_path.read_text())["artifactKind"] == (
             "selective_pdf_pages_v1"
         )
+
+
+@unittest.skipUnless(
+    all(
+        importlib.util.find_spec(name) is not None
+        for name in ("pypdf", "pypdfium2", "reportlab")
+    ),
+    "selective PDF fixture dependencies are unavailable",
+)
+class SelectiveProductionTest(unittest.TestCase):
+    def test_bounded_selection(self) -> None:
+        test_selected_work_is_bounded_when_appendix_grows_from_20_to_500_pages()
+
+    def test_deterministic_identity(self) -> None:
+        test_selected_pdf_and_coverage_are_deterministic_for_identical_requests()
+
+    def test_trailer_binding(self) -> None:
+        test_document_id_stabilization_only_changes_the_final_trailer()
+
+    def test_invalid_pages(self) -> None:
+        test_select_pdf_pages_rejects_invalid_page_boundaries()
+
+    def test_source_hash_mismatch(self) -> None:
+        test_selective_conversion_rejects_a_source_hash_mismatch()
+
+    def test_original_page_mapping(self) -> None:
+        test_original_pages_137_and_138_are_bound_to_the_original_source()
+
+    def test_launcher_boundary(self) -> None:
+        test_selective_launcher_writes_only_the_distinct_wrapper()

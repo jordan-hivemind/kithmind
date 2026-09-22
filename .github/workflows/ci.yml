@@ -24,6 +24,8 @@ jobs:
         with:
           version: "0.10.2"
       - run: PYTHONPATH=evals/parser/src python3 -m unittest discover -s evals/parser/tests -p 'test_*.py'
+      - run: uv run --frozen --only-group fixture --with pypdfium2==5.13.0 python -m unittest -v tests.test_selective_production
+        working-directory: evals/parser
       - run: uv run --frozen --only-group fixture python generate_fixtures.py
         working-directory: evals/parser
       - run: uv run --frozen --only-group fixture python test_fixtures.py
