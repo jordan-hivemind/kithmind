@@ -19,12 +19,13 @@ sensitivity ceilings continue to apply to the read services that support them.
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | Investments          | create, update, archive, restore                                                                                                                  | `admin.createInvestment`, `updateInvestment`, `archiveInvestment`                                                      |
 | Entries              | create, update, delete                                                                                                                            | `admin.createInvestmentEntry`, `updateInvestmentEntry`, `deleteInvestmentEntry`                                        |
+| Tax payments         | list one tax year with exact status/currency totals; create a manual payment; update settlement status with audited correction                    | `admin.listTaxPayments`, `createTaxPayment`, `setTaxPaymentStatus`                                                     |
 | Supporting documents | list, confirm, reject                                                                                                                             | `admin.listInvestmentDocumentLinks`, `confirmInvestmentDocumentLink`, `rejectInvestmentDocumentLink`                   |
 | Entities             | paged name and alias lookup, replace aliases                                                                                                      | `memory.listEntities`, `setEntityAliases`                                                                              |
 | Attention            | page, dismiss, reopen, snooze, bulk actions, mute, unmute                                                                                         | the existing `admin.attention` services                                                                                |
 | Memory               | fact update and retirement, thought update and retraction                                                                                         | the existing fact and thought lifecycle services                                                                       |
 | Finance accounts     | set or clear display overrides                                                                                                                    | `admin.setAccountOverride`                                                                                             |
-| Finance reviews      | page and inspect review evidence; confirm supported instrument matches, map account keys, acknowledge safeguards, dismiss with a note             | the financial archive's typed review management services                                                              |
+| Finance reviews      | page and inspect review evidence; confirm supported instrument matches, map account keys, acknowledge safeguards, dismiss with a note             | the financial archive's typed review management services                                                               |
 | Extraction           | list schemas, inspect stable source-item status, set or clear owner classification, reprocess selected ready items, correct one typed observation | the existing extraction services plus MCP-2's durable `source_items.owner_document_kind` and follow-up-aware scheduler |
 
 Entry deletion is the existing real delete. It also deletes dependent link
@@ -47,6 +48,7 @@ The help contract distinguishes these identities:
 | -------------- | ------------------------------------------------------------- |
 | `investmentId` | One outside position                                          |
 | `entryId`      | One dated investment money event                              |
+| `paymentId`    | One manual tax payment and its settlement history             |
 | `entityId`     | A person, organization, project, place or other named subject |
 | `accountId`    | An opaque account in the separate finance archive             |
 | `sourceItemId` | A stable ingested source item that survives re-extraction     |
@@ -72,6 +74,22 @@ separate overlay and do not participate in entity matching.
   correction is not always an immediate exact-record fix.
 - Search and exact-record results remain limited by reported source coverage.
   A missing result does not prove an event did not occur.
+
+## Tax-payment extension
+
+The additive MCP 1.1 surface exposes `list_tax_payments` and
+`manage_tax_payment`. It records manual payments as structured exact money,
+never as Thoughts. The current closed vocabulary is federal estimated income
+payments. Confirmation and EFT identities make capture retry-safe, and an
+identifier reused with different immutable details fails closed. Receipt
+evidence is optional because manual actor/time provenance is sufficient for
+capture.
+
+Settlement, rejection and reversal update the same payment and append an
+audited status event. Ordinary lifecycle transitions are guarded. An explicit
+correction with a reason can repair a mistaken terminal status without
+creating a duplicate payment. Year totals remain separated by currency and
+current status; this surface does not calculate liability or move money.
 
 ## MCP-2 extraction repair
 

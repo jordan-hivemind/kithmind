@@ -42,5 +42,10 @@ describe("MCP tool profile", () => {
       readOnlyHint: false,
       destructiveHint: true,
     });
+    expect(MCP_TOOL_ANNOTATIONS.manage_tax_payment).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+    });
   });
 });
