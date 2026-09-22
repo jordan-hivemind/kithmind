@@ -595,7 +595,7 @@ export function createMcpServer(
   const server = new McpServer(
     {
       name: "open-brain",
-      version: "1.2.0",
+      version: "1.2.1",
     },
     { instructions: SERVER_INSTRUCTIONS },
   );

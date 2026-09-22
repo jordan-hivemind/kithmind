@@ -282,6 +282,14 @@ balance record and evidence. Reconciliation uses the explicit formula
 with canonical decimal arithmetic. Missing or ambiguous totals and incomplete
 position coverage cannot produce a final reconciliation.
 
+The account/date safety assessment materializes the selected positions,
+attributed source documents, current exact-scope verdicts and relevant reviews
+once per read. Historical immutable scope generations remain auditable but are
+filtered before exact membership comparison. This query shape is required to
+stay within the reader's existing five-second statement limit; it does not
+raise that limit or weaken source completeness, open-review, value or
+reconciliation gates.
+
 All continuations are stateless HMAC-SHA256 tokens using a stable deployment
 secret of at least 32 bytes. The signed binding covers the authenticated
 principal, space, operation, normalized request and limit, dataset revision,
@@ -367,6 +375,11 @@ Compatibility rules for existing clients:
 - `resolvedInstrumentCount + institutionSymbolInstrumentCount` is the old
   `resolvedInstrumentCount` for a client that only wants "identities I can
   use".
+
+Known follow-up: the snapshot serializer currently labels any linked
+instrument `resolved`, including a name-only instrument. The contract reserves
+that state for CUSIP or ISIN evidence. Correct that identity classification in
+a separate change; do not treat a name-only link as identifier proof.
 
 The rule's evidence is `instrument_identifier_sources`: one row per
 (instrument, institution) whose parsed descriptor stated a cusip or isin. An
