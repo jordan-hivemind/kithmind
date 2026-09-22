@@ -616,6 +616,115 @@ export function prepareHoldingPositionScopes(input: {
     });
 }
 
+/**
+ * Prepares the exact emitted membership of explicitly selected partial
+ * position scopes. Unlike `prepareHoldingPositionScopes`, this function makes
+ * no completeness claim: every selected declaration must remain partial and
+ * retain at least one parser gap. Rows which cannot be represented in the
+ * typed candidate still refuse the scope rather than being silently omitted.
+ */
+export function prepareHoldingPartialPositionScopes(input: {
+  readonly documentId: string;
+  readonly retainedSha256: string;
+  readonly candidate: ImportDocument;
+  readonly selectors: readonly HoldingPositionScopeSelector[];
+}): readonly PreparedHoldingPositionScope[] {
+  validateIdentity(input.documentId, input.retainedSha256);
+  if (
+    input.candidate.retainedSha256 !== input.retainedSha256 ||
+    input.candidate.sha256 !== input.retainedSha256
+  ) {
+    fail("candidate is not bound to the selected retained bytes");
+  }
+  if (input.selectors.length === 0) fail("no position scopes were selected");
+
+  const selected = new Map<string, HoldingPositionScopeSelector>();
+  for (const selector of input.selectors) {
+    if (
+      selector === null ||
+      typeof selector !== "object" ||
+      canonical(Object.keys(selector).sort()) !==
+        canonical(["accountId", "asOf", "proofVersion"]) ||
+      typeof selector.accountId !== "string" ||
+      selector.accountId.length === 0 ||
+      !validDate(selector.asOf) ||
+      selector.proofVersion !== "position_scope_v1"
+    ) {
+      fail("position scope selector is invalid");
+    }
+    const key = selectorKey(selector);
+    if (selected.has(key)) fail("position scope selector is duplicated");
+    selected.set(key, selector);
+  }
+
+  const declarations = new Map<string, ImportPositionScope>();
+  for (const scope of input.candidate.positionScopes ?? []) {
+    const key = selectorKey(scope);
+    if (!selected.has(key)) continue;
+    if (declarations.has(key)) {
+      fail("selected position scope declaration is duplicated");
+    }
+    declarations.set(key, scope);
+  }
+
+  return [...selected.values()]
+    .sort((left, right) => selectorKey(left).localeCompare(selectorKey(right)))
+    .map((selector) => {
+      const declaration = declarations.get(selectorKey(selector));
+      if (declaration === undefined) {
+        fail("selected position scope was not declared by the adapter");
+      }
+      if (
+        declaration.status !== "partial" ||
+        declaration.gapCodes.length === 0 ||
+        declaration.zeroBasis !== undefined ||
+        !Number.isSafeInteger(declaration.emittedPositionCount) ||
+        declaration.emittedPositionCount < 0
+      ) {
+        fail("selected position scope is not a truthful partial scope");
+      }
+
+      let rejectedRows = 0;
+      const prepared: CandidateHoldingRow[] = [];
+      for (const row of input.candidate.positions ?? []) {
+        const account = row.accountId ?? input.candidate.accountId;
+        if (account !== selector.accountId || row.asOf !== selector.asOf) {
+          continue;
+        }
+        // Mapping gaps which retain a typed row remain part of a partial
+        // source proof. A row that cannot be typed at all cannot be omitted
+        // while retaining the declaration's emitted count.
+        const value = preparePosition(row, input.candidate, () => undefined);
+        if (value === null) rejectedRows += 1;
+        else prepared.push(value);
+      }
+      const positions = dedupeCandidateRows("positions", prepared);
+      if (
+        rejectedRows !== 0 ||
+        positions.length !== declaration.emittedPositionCount ||
+        new Set(positions.map((row) => row.rowHash)).size !== positions.length
+      ) {
+        fail("selected partial position scope does not exactly match its mapped members");
+      }
+      const scopeDigest = digest(
+        "kith-finance-partial-position-scope-candidate:v1",
+        {
+          selector,
+          status: declaration.status,
+          emittedPositionCount: declaration.emittedPositionCount,
+          gapCodes: [...declaration.gapCodes].sort(),
+          evidence: declaration.evidence,
+          positions: sortedRows(positions, (row) => [
+            row.rowHash,
+            row.sourceLocator,
+            row.semantic,
+          ]).map((row) => [row.rowHash, row.sourceLocator, row.semantic]),
+        },
+      );
+      return { selector, declaration, positions, scopeDigest };
+    });
+}
+
 function balanceSelectorKey(selector: HoldingBalanceScopeSelector): string {
   return `${selector.accountId}\u0000${selector.asOf}\u0000${selector.proofVersion}`;
 }

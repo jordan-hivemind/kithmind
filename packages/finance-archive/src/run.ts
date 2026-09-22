@@ -140,9 +140,14 @@ import {
   type HoldingCorrectionCandidateManifest,
 } from "./holdingCorrectionCandidate.js";
 import {
+  prepareHoldingAdditivePositionCorrection,
   prepareHoldingScopedPositionCorrection,
+  publishHoldingAdditivePositionCorrection,
   publishHoldingScopedPositionCorrection,
   publishHoldingProjectionReplacement,
+  type HoldingAdditiveCorrectionManifest,
+  type HoldingAdditivePositionSelection,
+  type HoldingAdditiveProjectionApproval,
   type HoldingScopedCorrectionManifest,
   type HoldingScopedCorrectionSelector,
   type HoldingScopedProjectionApproval,
@@ -1080,7 +1085,8 @@ class HoldingCorrectionCandidateRollback extends Error {
   constructor(
     readonly manifest:
       | HoldingCorrectionCandidateManifest
-      | HoldingScopedCorrectionManifest,
+      | HoldingScopedCorrectionManifest
+      | HoldingAdditiveCorrectionManifest,
   ) {
     super("holding correction candidate: rolled back, nothing committed");
   }
@@ -1157,20 +1163,43 @@ async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<v
     throw new Error("--retained-sha256 must be a lowercase sha256");
   }
   let scopeSelection: readonly HoldingScopedCorrectionSelector[] | null = null;
+  let additiveSelection: {
+    readonly scopes: readonly HoldingAdditivePositionSelection[];
+    readonly selectedRowHashes: readonly string[];
+  } | null = null;
   if (values["scope-selection"]) {
     try {
       const parsed = JSON.parse(
         readFileSync(resolve(values["scope-selection"]), "utf8"),
-      ) as { scopes?: unknown };
-      if (
-        parsed === null ||
-        typeof parsed !== "object" ||
-        Object.keys(parsed).length !== 1 ||
-        !Array.isArray(parsed.scopes)
-      ) {
-        throw new Error("invalid");
+      ) as {
+        kind?: unknown;
+        scopes?: unknown;
+        selectedRowHashes?: unknown;
+      };
+      if (parsed?.kind === "holding_additive_position_selection_v1") {
+        if (
+          Object.keys(parsed).sort().join(",") !==
+            "kind,scopes,selectedRowHashes" ||
+          !Array.isArray(parsed.scopes) ||
+          !Array.isArray(parsed.selectedRowHashes)
+        ) {
+          throw new Error("invalid");
+        }
+        additiveSelection = {
+          scopes: parsed.scopes as HoldingAdditivePositionSelection[],
+          selectedRowHashes: parsed.selectedRowHashes as string[],
+        };
+      } else {
+        if (
+          parsed === null ||
+          typeof parsed !== "object" ||
+          Object.keys(parsed).length !== 1 ||
+          !Array.isArray(parsed.scopes)
+        ) {
+          throw new Error("invalid");
+        }
+        scopeSelection = parsed.scopes as HoldingScopedCorrectionSelector[];
       }
-      scopeSelection = parsed.scopes as HoldingScopedCorrectionSelector[];
     } catch {
       throw new Error(
         "holding correction candidate failed: scope_selection_open",
@@ -1187,6 +1216,7 @@ async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<v
   let manifest:
     | HoldingCorrectionCandidateManifest
     | HoldingScopedCorrectionManifest
+    | HoldingAdditiveCorrectionManifest
     | undefined;
 
   try {
@@ -1298,7 +1328,7 @@ async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<v
 
       const holdingInstrumentIds = candidateHoldingInstrumentIds(
         candidate,
-        scopeSelection,
+        additiveSelection?.scopes ?? scopeSelection,
       );
       if (holdingInstrumentIds.length > 0) {
         const existing = await tx.query<{ id: string }>(
@@ -1313,7 +1343,28 @@ async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<v
       }
 
       const stored = await readStoredHoldingProjection(tx, doc.id);
-      if (scopeSelection === null) {
+      if (additiveSelection !== null) {
+        const active = await tx.query<{
+          active_holding_projection_generation_id: string | null;
+        }>(
+          `SELECT active_holding_projection_generation_id
+             FROM documents WHERE id = $1`,
+          [doc.id],
+        );
+        manifest = (
+          await prepareHoldingAdditivePositionCorrection({
+            client: tx,
+            documentId: doc.id,
+            retainedSha256: doc.retained_sha256,
+            expectedActiveGenerationId:
+              active.rows[0]?.active_holding_projection_generation_id ?? null,
+            stored,
+            candidate,
+            selectors: additiveSelection.scopes,
+            selectedRowHashes: additiveSelection.selectedRowHashes,
+          })
+        ).manifest;
+      } else if (scopeSelection === null) {
         await assertCandidateHashesOwnedByDocument(tx, doc.id, candidate);
         manifest = buildHoldingCorrectionCandidateManifest({
           documentId: doc.id,
@@ -1386,11 +1437,17 @@ async function runHoldingCorrectionPublish(
   if (!values.approval)
     throw new Error("--approval <private-json-path> is required");
 
-  let approval: HoldingProjectionApproval | HoldingScopedProjectionApproval;
+  let approval:
+    | HoldingProjectionApproval
+    | HoldingScopedProjectionApproval
+    | HoldingAdditiveProjectionApproval;
   try {
     approval = JSON.parse(
       readFileSync(resolve(values.approval), "utf8"),
-    ) as HoldingProjectionApproval | HoldingScopedProjectionApproval;
+    ) as
+      | HoldingProjectionApproval
+      | HoldingScopedProjectionApproval
+      | HoldingAdditiveProjectionApproval;
   } catch {
     throw new Error("holding correction publish failed: approval_open");
   }
@@ -1509,7 +1566,8 @@ async function runHoldingCorrectionPublish(
 
       const holdingInstrumentIds = candidateHoldingInstrumentIds(
         candidate,
-        approval.kind === "holding_scoped_projection_approval_v1"
+        approval.kind === "holding_scoped_projection_approval_v1" ||
+          approval.kind === "holding_additive_projection_approval_v1"
           ? approval.selectedScopes
           : null,
       );
@@ -1526,6 +1584,12 @@ async function runHoldingCorrectionPublish(
       }
       if (approval.kind === "holding_scoped_projection_approval_v1") {
         return publishHoldingScopedPositionCorrection(tx, {
+          candidate,
+          approval,
+        });
+      }
+      if (approval.kind === "holding_additive_projection_approval_v1") {
+        return publishHoldingAdditivePositionCorrection(tx, {
           candidate,
           approval,
         });

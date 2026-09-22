@@ -132,11 +132,17 @@ export {
   pgSchemaVersion,
 } from "./pgSchema.js";
 export {
+  holdingAdditiveProjectionApprovalDigest,
   holdingProjectionApprovalDigest,
   holdingScopedProjectionApprovalDigest,
+  prepareHoldingAdditivePositionCorrection,
   prepareHoldingScopedPositionCorrection,
+  publishHoldingAdditivePositionCorrection,
   publishHoldingProjectionReplacement,
   publishHoldingScopedPositionCorrection,
+  type HoldingAdditiveCorrectionManifest,
+  type HoldingAdditivePositionSelection,
+  type HoldingAdditiveProjectionApproval,
   type HoldingScopedCorrectionManifest,
   type HoldingScopedCorrectionSelector,
   type HoldingScopedProjectionApproval,
