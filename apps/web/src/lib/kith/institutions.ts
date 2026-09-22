@@ -159,7 +159,9 @@ export function groupInstitutions(
 ): InstitutionRow[] {
   const groups = new Map<string, InstitutionRow>();
   for (const record of records) {
-    const hasContent = record.statementCount + record.recordCount > 0;
+    const hasContent =
+      record.statementCount + record.recordCount > 0 ||
+      record.latestHoldingsObservation !== undefined;
     const override = overrides.get(record.account.accountId) ?? null;
     const shownAccount = mergeFinanceAccountOverride(
       record.account,
@@ -319,10 +321,19 @@ function groupFreshness(group: InstitutionRow): {
   statusDetail: string | null;
 } {
   const children = group.children ?? [];
+  const needingReview = children.filter(
+    (child) => child.status === "needs_review",
+  );
+  const reviewDetails = needingReview
+    .map(
+      (child) =>
+        `${child.name} (${child.statusDetail ?? "data verification incomplete"})`,
+    )
+    .join("; ");
   const staleDate = (child: InstitutionRow) =>
     child.freshnessReason === "statement_overdue"
       ? (child.latestBalanceAsOf ?? "")
-      : (child.latestSnapshotAsOf ?? "");
+      : (child.latestHoldingsObservedAsOf ?? "");
   const stale = children
     .filter((child) => child.status === "stale")
     .sort((left, right) => staleDate(left).localeCompare(staleDate(right)));
@@ -342,15 +353,13 @@ function groupFreshness(group: InstitutionRow): {
       status: "stale",
       statusDetail: `${stale.length} stale (${breakdown}), oldest ${oldest.name} (${
         oldest.statusDetail ?? ""
-      })`,
+      })${needingReview.length > 0 ? `; ${needingReview.length} accounts need review: ${reviewDetails}` : ""}`,
     };
   }
   if (children.every((child) => child.status === "empty")) {
     return { status: "empty", statusDetail: null };
   }
-  const needingReview = children.filter(
-    (child) => child.status === "needs_review",
-  );
+
   if (needingReview.length > 0) {
     return {
       status: "needs_review",

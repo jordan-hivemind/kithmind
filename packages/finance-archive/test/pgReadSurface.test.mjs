@@ -1721,6 +1721,14 @@ test(
       (item) => item.account.accountId === accountId,
     );
     assert.equal(inventoryRow.latestSnapshotAsOf, asOf);
+    assert.deepEqual(inventoryRow.latestHoldingsObservation, {
+      asOf,
+      sourceComplete: true,
+      fullyValued: true,
+      supportedValuationBasis: true,
+      hasBlockingReview: false,
+      reconciliation: "no_issue_recorded",
+    });
     assert.equal(inventoryRow.currentValue, undefined);
     assert.equal(inventoryRow.activityFrom, "2026-07-31");
     assert.equal(inventoryRow.activityTo, "2026-07-31");
@@ -1735,6 +1743,46 @@ test(
     });
     assert.deepEqual(aggregate.items, []);
     assert.equal(aggregate.coverage.reasons.includes("failed_import"), false);
+    // A separate source with only a partial zero-row proof must expose its
+    // observed date without inventing a snapshot or valuation.
+    const partialSource = await institution(owner, "zero-row-partial");
+    const partialAccount = partialSource.accountIds[0];
+    const partialDoc = await document(
+      owner,
+      partialSource.id,
+      partialAccount,
+      asOf,
+    );
+    await makeDocumentCitable(owner, partialDoc);
+    await owner.query("UPDATE documents SET parsed_ok = FALSE WHERE id = $1", [
+      partialDoc,
+    ]);
+    const partialRetained = (
+      await one(owner, "SELECT retained_sha256 FROM documents WHERE id = $1", [
+        partialDoc,
+      ])
+    ).retained_sha256;
+    await owner.query(
+      `INSERT INTO position_scope_observations
+      (id, source_document_id, retained_sha256, account_id, as_of, proof_version,
+       status, emitted_position_count, gap_codes, evidence, created_at)
+      VALUES ('zero-row-partial-scope', $1, $2, $3, $4::date, 'position_scope_v1',
+        'partial', 0, ARRAY['unresolved_lots'], '{"tables":[]}', now())`,
+      [partialDoc, partialRetained, partialAccount, asOf],
+    );
+    const partialInventory = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 100,
+    });
+    const partialRow = partialInventory.items.find(
+      (item) => item.account.accountId === partialAccount,
+    );
+    assert.equal(partialRow.recordCount, 0);
+    assert.equal(partialRow.latestSnapshotAsOf, undefined);
+    assert.equal(partialRow.currentValue, undefined);
+    assert.equal(partialRow.latestHoldingsObservation.asOf, asOf);
+    assert.equal(partialRow.latestHoldingsObservation.sourceComplete, false);
+    assert.equal(partialRow.latestHoldingsObservation.fullyValued, false);
   },
 );
 
@@ -1771,6 +1819,8 @@ test(
     assert.equal(inventoryRow.latestSnapshotAsOf, undefined);
     assert.equal(inventoryRow.currentValue, undefined);
 
+    assert.equal(inventoryRow.latestHoldingsObservation.asOf, "2026-06-30");
+    assert.equal(inventoryRow.latestHoldingsObservation.fullyValued, false);
     let snapshot = await serve(r, {
       operation: "get_holdings_snapshot",
       accountId,
@@ -2131,7 +2181,7 @@ test(
       ]);
       assert.deepEqual(client.getServerVersion(), {
         name: "kith-finance-archive",
-        version: "2.0.5",
+        version: "2.1.0",
       });
       const tools = await client.listTools();
       const financeRead = tools.tools.find(
@@ -4201,6 +4251,14 @@ test(
       source: "positions",
     });
     assert.equal(row.openReviewCount, 0);
+    assert.deepEqual(row.latestHoldingsObservation, {
+      asOf: "2026-04-30",
+      sourceComplete: false,
+      fullyValued: true,
+      supportedValuationBasis: true,
+      hasBlockingReview: false,
+      reconciliation: "no_issue_recorded",
+    });
 
     await owner.query(
       "UPDATE review_items SET status = 'dismissed' WHERE id = 'snapshot-review-latest'",
@@ -4278,6 +4336,21 @@ test(
       source: "positions",
     });
 
+    assert.deepEqual(row.latestHoldingsObservation, {
+      asOf: "2026-04-30",
+      sourceComplete: true,
+      fullyValued: true,
+      supportedValuationBasis: true,
+      hasBlockingReview: false,
+      reconciliation: "pending",
+    });
+    await owner.query(
+      "UPDATE position_reconciliations SET status = 'fail' WHERE id = 'snapshot-gate-unverified'",
+    );
+    row = await inventory();
+    assert.equal(row.latestHoldingsObservation.reconciliation, "failed");
+    assert.equal(row.latestSnapshotAsOf, "2026-03-31");
+    assert.equal(row.currentValue.asOf, "2026-03-31");
     await owner.query(
       "UPDATE position_reconciliations SET status = 'pass' WHERE id = 'snapshot-gate-unverified'",
     );

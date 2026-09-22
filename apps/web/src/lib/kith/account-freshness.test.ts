@@ -569,6 +569,44 @@ describe("observed holdings quality stays separate from statement age", () => {
     expect(result.status).toBe("stale");
     expect(result.reason).toBe("holdings_behind");
   });
+  test.each([
+    { accountType: "bank", latestBalanceHoldsSecurities: false },
+    { accountType: "brokerage", latestBalanceHoldsSecurities: false },
+    { accountType: "bank", balanceDates: [] },
+    { hasContent: false, activityTo: "2024-01-01", balanceDates: [] },
+  ])(
+    "a current partial observation remains visible despite cash type or old activity: %s",
+    (overrides) => {
+      const value = input({
+        ...overrides,
+        latestSnapshotAsOf: null,
+        latestHoldingsObservation: {
+          ...observation,
+          sourceComplete: false,
+          fullyValued: false,
+        },
+      });
+      expect(accountFreshness(value, NOW).status).toBe("needs_review");
+      expect(accountFreshness({ ...value, closed: true }, NOW).reason).toBe(
+        "closed",
+      );
+    },
+  );
+  test("a newer all-cash statement supersedes older partial holdings for cadence", () => {
+    const result = accountFreshness(
+      input({
+        latestBalanceHoldsSecurities: false,
+        latestHoldingsObservation: {
+          ...observation,
+          asOf: "2026-07-31",
+          fullyValued: false,
+        },
+      }),
+      NOW,
+    );
+    expect(result.status).toBe("fresh");
+    expect(result.reason).toBe("balance_only");
+  });
   test("legacy rows keep their existing status when assessment is absent", () => {
     expect(
       accountFreshness(input({ latestSnapshotAsOf: "2025-12-31" }), NOW).status,

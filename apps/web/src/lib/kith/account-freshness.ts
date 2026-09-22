@@ -254,17 +254,23 @@ export function accountFreshness(
     expectedBy: null,
     statusDetail,
   });
-  if (!input.hasContent) return none("empty", "empty", null);
+  if (!input.hasContent && input.latestHoldingsObservation === undefined)
+    return none("empty", "empty", null);
   if (input.closed) return none("inactive", "closed", "marked closed");
 
+  const observation = input.latestHoldingsObservation;
+  const lastObservedActivity = later(
+    input.activityTo,
+    observation?.asOf ?? null,
+  );
   const quietAfter = dormantAfterDays(cadence);
-  if (input.activityTo !== null) {
-    const quiet = ageDays(input.activityTo, now);
+  if (lastObservedActivity !== null) {
+    const quiet = ageDays(lastObservedActivity, now);
     if (quiet > quietAfter) {
       return none(
         "inactive",
         "dormant",
-        `no activity since ${input.activityTo}, ${quiet} days ago`,
+        `no activity since ${lastObservedActivity}, ${quiet} days ago`,
       );
     }
   }
@@ -273,17 +279,13 @@ export function accountFreshness(
   const dueAfter = (date: string) =>
     addDays(nextPeriodEnd(date, cadence), STATEMENT_GRACE_DAYS);
   const latestBalance = input.balanceDates[0] ?? null;
-  const observation = input.latestHoldingsObservation;
   // This date describes observed data, not permission to use it in totals.
   const observedAsOf = observation?.asOf ?? input.latestSnapshotAsOf;
   const qualityReview = (expectedBy: string): AccountFreshness | null => {
     if (observation === undefined) return null;
     const issues: Array<[FreshnessReason, string]> = [];
     if (!observation.fullyValued)
-      issues.push([
-        "valuation_incomplete",
-        "one or more holdings lack a stated value",
-      ]);
+      issues.push(["valuation_incomplete", "holdings valuation is incomplete"]);
     if (!observation.sourceComplete)
       issues.push(["holdings_incomplete", "holdings extraction is incomplete"]);
     if (!observation.supportedValuationBasis)
@@ -328,7 +330,10 @@ export function accountFreshness(
   if (latestBalance === null) {
     // No balance, so no statement cadence to hold the account to. Holdings
     // alone can still fall behind: judge the snapshot as monthly.
-    if (holdingsExpected && observedAsOf !== null) {
+    if (
+      (holdingsExpected || observation !== undefined) &&
+      observedAsOf !== null
+    ) {
       const due = dueAfter(observedAsOf);
       if (today > due) {
         return {
@@ -371,6 +376,11 @@ export function accountFreshness(
         `latest statement balance ${latestBalance}, ${ageDays(latestBalance, now)} days ago; ` +
         `next was expected by ${statementDue} (${cadenceLabel(cadence)})`,
     };
+  }
+
+  if (observation !== undefined && observation.asOf >= latestBalance) {
+    const review = qualityReview(statementDue);
+    if (review !== null) return review;
   }
 
   if (holdingsExpected) {
