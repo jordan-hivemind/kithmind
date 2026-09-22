@@ -17,7 +17,14 @@ import {
   readStoredHoldingProjection,
 } from "../dist/holdingCorrectionCandidate.js";
 
-import { archive, count, one, reader, skip } from "./helpers/pgArchive.mjs";
+import {
+  all,
+  archive,
+  count,
+  one,
+  reader,
+  skip,
+} from "./helpers/pgArchive.mjs";
 
 const SHA = "b".repeat(64);
 const NOW = new Date("2026-09-21T12:00:00.000Z");
@@ -487,6 +494,146 @@ test(
         "UPDATE holding_projection_assertions SET source_locator = source_locator WHERE record_id = 'position-removed'",
       ),
       /history is immutable/,
+    );
+  },
+);
+
+test(
+  "versioned replay scopes only semantic differences and falls back broadly for a null-account liability",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    await client.query(
+      `INSERT INTO accounts
+         (id, institution_id, acct_last4, display_name, account_type, base_currency)
+       VALUES ('acct-projection-neighbor', $1, '1002', 'Synthetic Neighbor',
+               'brokerage', 'USD')`,
+      [INSTITUTION],
+    );
+    await client.query(
+      `INSERT INTO instruments (id, symbol, name)
+       VALUES ('instrument-neighbor', 'NBR', 'Synthetic Neighbor Holding')`,
+    );
+    const neighbor = {
+      ...position({ instrumentId: "instrument-neighbor", marketValue: "60" }),
+      accountId: "acct-projection-neighbor",
+    };
+    const baseline = candidate({ positions: [position(), neighbor] });
+    const baselineManifest = await manifestFor(client, baseline);
+    await publishHoldingProjectionReplacement(
+      client,
+      {
+        candidate: baseline,
+        approval: approvalFor(baselineManifest, null),
+      },
+      NOW,
+    );
+
+    await publishImport(
+      client,
+      {
+        source: "synthetic-versioned-provenance-only",
+        documents: [
+          candidate({
+            positions: [
+              position({
+                locator: bindings("marketValue", "100").replace(
+                  "/synthetic/marketValue",
+                  "/synthetic/alternateMarketValue",
+                ),
+              }),
+              neighbor,
+            ],
+          }),
+        ],
+      },
+      new Date("2026-09-21T12:59:00.000Z"),
+      { authoritativeReparse: true },
+    );
+    assert.deepEqual(
+      await all(
+        client,
+        `SELECT account_id, projection_scope_kind
+           FROM review_items
+          WHERE kind = 'reparse_projection_mismatch' AND status = 'open'`,
+      ),
+      [{ account_id: null, projection_scope_kind: null }],
+      "a provenance-only digest change stays broad",
+    );
+
+    await publishImport(
+      client,
+      {
+        source: "synthetic-versioned-scope",
+        documents: [
+          candidate({
+            positions: [position({ marketValue: "105" }), neighbor],
+          }),
+        ],
+      },
+      new Date("2026-09-21T13:00:00.000Z"),
+      { authoritativeReparse: true },
+    );
+    assert.deepEqual(
+      await all(
+        client,
+        `SELECT account_id, projection_scope_kind,
+                projection_scope_as_of::text AS projection_scope_as_of
+           FROM review_items
+          WHERE kind = 'reparse_projection_mismatch'
+            AND status = 'open'
+          ORDER BY projection_scope_kind NULLS FIRST`,
+      ),
+      [
+        {
+          account_id: ACCOUNT,
+          projection_scope_kind: "positions",
+          projection_scope_as_of: "2026-06-30",
+        },
+      ],
+    );
+
+    await publishImport(
+      client,
+      {
+        source: "synthetic-versioned-broad-fallback",
+        documents: [
+          candidate({
+            accountId: null,
+            positions: [
+              { ...position({ marketValue: "110" }), accountId: ACCOUNT },
+              neighbor,
+            ],
+            balances: [{ ...balance(), accountId: ACCOUNT }],
+            liabilities: [{ ...liability("45"), accountId: null }],
+          }),
+        ],
+      },
+      new Date("2026-09-21T13:01:00.000Z"),
+      { authoritativeReparse: true },
+    );
+    assert.deepEqual(
+      await all(
+        client,
+        `SELECT account_id, status, projection_scope_kind
+          FROM review_items
+          WHERE kind = 'reparse_projection_mismatch'
+            AND id <> 'review-human'
+          ORDER BY projection_scope_kind NULLS FIRST`,
+      ),
+      [
+        {
+          account_id: null,
+          status: "open",
+          projection_scope_kind: null,
+        },
+        {
+          account_id: ACCOUNT,
+          status: "resolved",
+          projection_scope_kind: "positions",
+        },
+      ],
     );
   },
 );

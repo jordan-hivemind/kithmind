@@ -1341,6 +1341,9 @@ ALTER TABLE review_items
     )
     OR
     (
+      projection_scope_kind IS NOT NULL
+      AND projection_scope_as_of IS NOT NULL
+      AND
       (
         (
           kind = 'reparse_projection_mismatch'
@@ -1354,7 +1357,6 @@ ALTER TABLE review_items
         )
       )
       AND account_id IS NOT NULL
-      AND projection_scope_as_of IS NOT NULL
     )
   );
 

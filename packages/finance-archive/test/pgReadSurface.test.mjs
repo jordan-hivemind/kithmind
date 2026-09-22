@@ -1472,6 +1472,25 @@ test(
       false,
     );
 
+    // A genuinely un-attributable system mismatch uses a null account and
+    // stays document-wide. Even this exact complete account scope cannot
+    // reinterpret that unknown liability as belonging only to the document's
+    // nominal account.
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES ('scope-broad-projection-mismatch',
+               'reparse_projection_mismatch', NULL, $1, 'holdings',
+               'synthetic un-attributable liability mismatch', 'open')`,
+      [consolidatedDoc],
+    );
+    complete = await snapshot(completeAccount);
+    assert.equal(complete.summary.status, "unavailable");
+    assert.equal(complete.summary.reason, "incomplete_source");
+    await owner.query(
+      "DELETE FROM review_items WHERE id = 'scope-broad-projection-mismatch'",
+    );
+
     const partial = await snapshot(partialAccount);
     assert.equal(partial.summary.status, "unavailable");
     assert.equal(partial.summary.reason, "incomplete_source");

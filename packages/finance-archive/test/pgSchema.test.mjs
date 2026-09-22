@@ -1394,6 +1394,18 @@ test(
         client.query(
           `INSERT INTO review_items
              (id, kind, account_id, source_document_id, raw_value, reason,
+              projection_scope_as_of)
+           VALUES ('missing-projection-kind', 'reparse_projection_mismatch',
+                   $1, 'scope-doc', 'positions', 'system',
+                   DATE '2026-03-31')`,
+          [accountId],
+        ),
+        /review_items_projection_scope_shape/,
+      );
+      await assert.rejects(
+        client.query(
+          `INSERT INTO review_items
+             (id, kind, account_id, source_document_id, raw_value, reason,
               projection_scope_kind, projection_scope_as_of)
            VALUES ('wrong-kind', 'document_unparsed', $1, 'scope-doc',
                    'parser', 'system', 'positions', DATE '2026-03-31')`,

@@ -46,6 +46,9 @@ import {
   assertCandidateHashesOwnedByDocument,
   prepareHoldingCorrectionCandidate,
   readStoredHoldingProjection,
+  type CandidateHoldingProjection,
+  type HoldingProjectionTable,
+  type StoredHoldingProjection,
 } from "./holdingCorrectionCandidate.js";
 import {
   emptyInstrumentMatchSummary,
@@ -969,15 +972,26 @@ export async function importBatch(
     documentId: string,
     kind: string,
     rawValue: string,
+    reason: string,
   ): Promise<void> {
     const reopened = await client.query(
-      `UPDATE review_items SET status = 'open'
+      `UPDATE review_items SET status = 'open', account_id = NULL
         WHERE source_document_id = $1 AND kind = $2 AND raw_value = $3
+          AND reason = $4
           AND projection_scope_kind IS NULL
-          AND status = 'resolved'
-          AND resolution_note LIKE
-            'resolved on reimport: the authoritative % projection now safely restates every stored row (import_runs.id=%'`,
-      [documentId, kind, rawValue],
+          AND (
+            (status = 'open' AND account_id IS NOT NULL)
+            OR (
+              status = 'resolved'
+              AND (
+                resolution_note LIKE
+                  'resolved on reimport: the authoritative % projection now safely restates every stored row (import_runs.id=%'
+                OR resolution_note LIKE
+                  'resolved on reimport: superseded by exact account/date system mismatch reviews (import_runs.id=%'
+              )
+            )
+          )`,
+      [documentId, kind, rawValue, reason],
     );
     reviewItemsUpdated += reopened.rowCount ?? 0;
   }
@@ -1951,6 +1965,42 @@ export async function importBatch(
     };
   }
 
+  function versionedHoldingDifference(
+    table: HoldingProjectionTable,
+    stored: StoredHoldingProjection[HoldingProjectionTable],
+    candidate: CandidateHoldingProjection[HoldingProjectionTable],
+  ): ProjectionSafety {
+    const scope = mismatchScopeAccumulator(table);
+    const accountIndex = table === "liabilities" ? 1 : 0;
+    const asOfIndex = table === "liabilities" ? 7 : 1;
+    const key = (semantic: readonly (string | null)[]) =>
+      JSON.stringify(semantic);
+    const remaining = new Map<string, number>();
+    for (const row of candidate) {
+      const semanticKey = key(row.semantic);
+      remaining.set(semanticKey, (remaining.get(semanticKey) ?? 0) + 1);
+    }
+    let safe = true;
+    for (const row of stored) {
+      const semanticKey = key(row.semantic);
+      const count = remaining.get(semanticKey) ?? 0;
+      if (count === 0) {
+        safe = false;
+        scope.add(row.semantic[accountIndex], row.semantic[asOfIndex]);
+      } else {
+        remaining.set(semanticKey, count - 1);
+      }
+    }
+    for (const row of candidate) {
+      const semanticKey = key(row.semantic);
+      if ((remaining.get(semanticKey) ?? 0) === 0) continue;
+      safe = false;
+      scope.add(row.semantic[accountIndex], row.semantic[asOfIndex]);
+      remaining.set(semanticKey, remaining.get(semanticKey)! - 1);
+    }
+    return scope.result(safe);
+  }
+
   async function activityProjectionIsSafe(
     prepared: readonly PreparedTransaction[],
     documentId: string,
@@ -2002,6 +2052,7 @@ export async function importBatch(
     const candidatesByIdentity = new Map<string, PreparedTransaction[]>();
     const candidatesByHash = new Map<string, PreparedTransaction[]>();
     let safe = true;
+    let storedRowMissing = false;
     for (const candidate of prepared) {
       const key = keyFromValues(candidate.values);
       candidates.set(key, (candidates.get(key) ?? 0) + 1);
@@ -2041,9 +2092,18 @@ export async function importBatch(
       const remaining = candidates.get(key) ?? 0;
       if (remaining === 0) {
         safe = false;
+        storedRowMissing = true;
         scope.add(row.account_id, row.process_date);
       } else {
         candidates.set(key, remaining - 1);
+      }
+    }
+    if (storedRowMissing) {
+      for (const candidate of prepared) {
+        const key = keyFromValues(candidate.values);
+        if ((candidates.get(key) ?? 0) > 0) {
+          scope.add(candidate.row.accountId, candidate.row.processDate);
+        }
       }
     }
 
@@ -2771,6 +2831,7 @@ export async function importBatch(
     const semanticByHash = new Map<string, string>();
     const candidatesByHash = new Map<string, PreparedHolding[]>();
     let safe = true;
+    let storedRowMissing = false;
     for (const candidate of prepared) {
       const key = keyFromValues(candidate.values);
       candidates.set(key, (candidates.get(key) ?? 0) + 1);
@@ -2793,9 +2854,18 @@ export async function importBatch(
       const remaining = candidates.get(key) ?? 0;
       if (remaining === 0) {
         safe = false;
+        storedRowMissing = true;
         scope.add(row.account_id, row.as_of);
       } else {
         candidates.set(key, remaining - 1);
+      }
+    }
+    if (storedRowMissing) {
+      for (const candidate of prepared) {
+        const key = keyFromValues(candidate.values);
+        if ((candidates.get(key) ?? 0) > 0) {
+          scope.add(candidate.accountId, candidate.values[asOfIndex]);
+        }
       }
     }
 
@@ -3107,8 +3177,9 @@ export async function importBatch(
             documentId,
             "reparse_projection_mismatch",
             rawValue,
+            reason,
           );
-          openReview(document.accountId, documentId, null, {
+          openReview(null, documentId, null, {
             kind: "reparse_projection_mismatch",
             rawValue,
             reason,
@@ -3455,8 +3526,9 @@ export async function importBatch(
               documentId,
               "reparse_activity_projection_mismatch",
               "activity",
+              ACTIVITY_MISMATCH_REASON,
             );
-            openReview(document.accountId, documentId, null, {
+            openReview(null, documentId, null, {
               kind: "reparse_activity_projection_mismatch",
               rawValue: "activity",
               reason: ACTIVITY_MISMATCH_REASON,
@@ -3500,12 +3572,15 @@ export async function importBatch(
             WHERE document_id = $1 AND id = $2`,
           [documentId, versionedGenerationId],
         );
-        projectionSafe =
+        const activeGeneration = active.rows[0];
+        const attributionBaseIsExact =
           prepared.manifest.completeness.state === "unproven" &&
-          active.rows[0]?.retained_sha256 === document.retainedSha256 &&
-          active.rows[0]?.projection_digest ===
-            prepared.manifest.oldProjectionDigest &&
-          active.rows[0]?.candidate_projection_digest ===
+          activeGeneration?.retained_sha256 === document.retainedSha256 &&
+          activeGeneration?.projection_digest ===
+            prepared.manifest.oldProjectionDigest;
+        projectionSafe =
+          attributionBaseIsExact &&
+          activeGeneration?.candidate_projection_digest ===
             prepared.manifest.candidateProjectionDigest;
         if (projectionSafe) {
           await assertCandidateHashesOwnedByDocument(
@@ -3521,24 +3596,20 @@ export async function importBatch(
         } else {
           const versionedChecks = (
             ["positions", "balances", "liabilities"] as const
-          ).map((table) => {
-            const scope = mismatchScopeAccumulator(table);
-            const accountIndex = table === "liabilities" ? 1 : 0;
-            const asOfIndex = table === "liabilities" ? 7 : 1;
-            for (const row of [
-              ...stored[table],
-              ...prepared.projection[table],
-            ]) {
-              scope.add(row.semantic[accountIndex], row.semantic[asOfIndex]);
-            }
-            return scope.result(false);
-          });
-          const representedChecks = versionedChecks.filter(
-            (check) => check.scopes.length > 0,
+          ).map((table) =>
+            versionedHoldingDifference(
+              table,
+              stored[table],
+              prepared.projection[table],
+            ),
+          );
+          const unsafeVersionedChecks = versionedChecks.filter(
+            (check) => !check.safe,
           );
           if (
-            representedChecks.length > 0 &&
-            representedChecks.every((check) => check.attributionComplete)
+            attributionBaseIsExact &&
+            unsafeVersionedChecks.length > 0 &&
+            unsafeVersionedChecks.every((check) => check.attributionComplete)
           ) {
             await supersedeSystemGenericProjectionReviews(
               documentId,
@@ -3553,7 +3624,9 @@ export async function importBatch(
                 table,
                 "holdings",
                 VERSIONED_HOLDING_MISMATCH_REASON,
-                versionedChecks[index]!.scopes,
+                versionedChecks[index]!.safe
+                  ? []
+                  : versionedChecks[index]!.scopes,
               );
             }
           } else {
@@ -3575,8 +3648,9 @@ export async function importBatch(
               documentId,
               "reparse_projection_mismatch",
               "holdings",
+              VERSIONED_HOLDING_MISMATCH_REASON,
             );
-            openReview(document.accountId, documentId, null, {
+            openReview(null, documentId, null, {
               kind: "reparse_projection_mismatch",
               rawValue: "holdings",
               reason: VERSIONED_HOLDING_MISMATCH_REASON,
