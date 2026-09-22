@@ -11,11 +11,15 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
+  bestIdentifier,
+  buildHoldingsProfiles,
   earlierDate,
   isBeforeArchiveCutoff,
   mapArchiveActivityKind,
   matchArchiveAccount,
   matchArchiveInstrument,
+  matchByBalance,
+  matchByHoldingsOverlap,
   planArchiveAccountLink,
 } from "../dist/index.js";
 
@@ -27,8 +31,8 @@ test("matchArchiveAccount matches by institution and mask first", () => {
     name: "Individual Brokerage",
   };
   const candidates = [
-    { id: "fin-1", institutionName: "Morgan Stanley", mask: "4321", name: "Different name entirely" },
-    { id: "fin-2", institutionName: "Morgan Stanley", mask: "9999", name: "Individual Brokerage" },
+    { id: "fin-1", institutionName: "Morgan Stanley", mask: "4321", name: "Different name entirely", plaidAccountId: "plaid-1" },
+    { id: "fin-2", institutionName: "Morgan Stanley", mask: "9999", name: "Individual Brokerage", plaidAccountId: "plaid-2" },
   ];
   assert.deepEqual(matchArchiveAccount(archive, candidates), { id: "fin-1", method: "mask" });
 });
@@ -41,7 +45,7 @@ test("matchArchiveAccount falls back to institution and name when the mask does 
     name: "Individual Brokerage",
   };
   const candidates = [
-    { id: "fin-1", institutionName: "Morgan Stanley", mask: null, name: "individual brokerage" },
+    { id: "fin-1", institutionName: "Morgan Stanley", mask: null, name: "individual brokerage", plaidAccountId: "plaid-1" },
   ];
   assert.deepEqual(matchArchiveAccount(archive, candidates), { id: "fin-1", method: "name" });
 });
@@ -54,7 +58,7 @@ test("matchArchiveAccount never matches across institutions", () => {
     name: "Individual Brokerage",
   };
   const candidates = [
-    { id: "fin-1", institutionName: "Vanguard", mask: "4321", name: "Individual Brokerage" },
+    { id: "fin-1", institutionName: "Vanguard", mask: "4321", name: "Individual Brokerage", plaidAccountId: "plaid-1" },
   ];
   assert.equal(matchArchiveAccount(archive, candidates), null);
 });
@@ -67,6 +71,92 @@ test("matchArchiveAccount returns null when nothing matches, so the caller creat
     name: "Individual Brokerage",
   };
   assert.equal(matchArchiveAccount(archive, []), null);
+});
+
+// FIN-3 regression: the owner's live-database audit found 12 brokerage
+// archive accounts at one institution, all with a null display_name (so all
+// fall back to archiveReader's "Unlabeled account" placeholder), collapsed
+// onto one kith.fin_accounts row. matchArchiveAccount must never treat that
+// placeholder -- or any other archive-only row -- as real match evidence.
+test("matchArchiveAccount never matches on the null-display-name placeholder, even against an identical placeholder", () => {
+  const archive = {
+    id: "arch-2",
+    institutionName: "Morgan Stanley",
+    mask: "2222",
+    name: "Unlabeled account",
+  };
+  // An archive-only row a previous archive account's own "create" left
+  // behind: same placeholder name, no plaidAccountId. Before the fix, this
+  // is exactly the kind of row matchArchiveAccount's name check could
+  // collide two different archive accounts onto.
+  const candidates = [
+    { id: "fin-archive-only", institutionName: "Morgan Stanley", mask: "1111", name: "Unlabeled account", plaidAccountId: null },
+  ];
+  assert.equal(
+    matchArchiveAccount(archive, candidates),
+    null,
+    "a placeholder name must never match, and an archive-only row (no plaidAccountId) must never be a match target",
+  );
+});
+
+test("matchArchiveAccount never matches a real feed account by a placeholder name", () => {
+  const archive = {
+    id: "arch-3",
+    institutionName: "Morgan Stanley",
+    mask: null,
+    name: "Unlabeled account",
+  };
+  const candidates = [
+    { id: "fin-1", institutionName: "Morgan Stanley", mask: null, name: "Unlabeled account", plaidAccountId: "plaid-1" },
+  ];
+  assert.equal(matchArchiveAccount(archive, candidates), null, "neither side's placeholder name is usable evidence");
+});
+
+test("matchArchiveAccount ignores an archive-only candidate for mask matching too, not only name", () => {
+  const archive = {
+    id: "arch-4",
+    institutionName: "Morgan Stanley",
+    mask: "5555",
+    name: "Something Real",
+  };
+  const candidates = [
+    { id: "fin-archive-only", institutionName: "Morgan Stanley", mask: "5555", name: "Coincidence", plaidAccountId: null },
+  ];
+  assert.equal(matchArchiveAccount(archive, candidates), null);
+});
+
+// FIN-3 collapse repro: three archive accounts, same institution, same
+// account_type, all with a null display_name (so all three share the exact
+// same placeholder name), and no Plaid accounts to match against at all --
+// the shape the owner's audit reported for the 12-brokerage-accounts bucket.
+// Run purely through the two pure functions import-archive's per-account
+// loop actually calls, in sequence, updating the in-memory candidate list
+// exactly the way importArchive.ts does after each decision -- this must
+// produce three distinct fin_accounts rows, never a collapse.
+test("collapse repro: three same-institution, same-type archive accounts with a null display name each get their own row", () => {
+  const archives = [
+    { id: "arch-a", institutionName: "Morgan Stanley", mask: "1111", name: "Unlabeled account", accountType: "brokerage" },
+    { id: "arch-b", institutionName: "Morgan Stanley", mask: "2222", name: "Unlabeled account", accountType: "brokerage" },
+    { id: "arch-c", institutionName: "Morgan Stanley", mask: "3333", name: "Unlabeled account", accountType: "brokerage" },
+  ];
+  const candidates = [];
+  const finAccountIdByArchiveId = new Map();
+  let nextId = 0;
+  for (const archive of archives) {
+    const plan = planArchiveAccountLink(archive, candidates);
+    assert.equal(plan.kind, "create", `${archive.id} should find no valid match target`);
+    const id = `fin-${(nextId += 1)}`;
+    candidates.push({
+      id,
+      institutionName: archive.institutionName,
+      mask: archive.mask,
+      name: archive.name,
+      plaidAccountId: null,
+      archiveAccountId: archive.id,
+    });
+    finAccountIdByArchiveId.set(archive.id, id);
+  }
+  assert.equal(new Set(finAccountIdByArchiveId.values()).size, 3, "three archive accounts, three distinct fin_accounts rows");
 });
 
 test("matchArchiveInstrument matches by ticker, then CUSIP, then ISIN", () => {
@@ -150,6 +240,7 @@ test("planArchiveAccountLink: no existing link, matches an unclaimed feed row by
   assert.deepEqual(planArchiveAccountLink(archive1, candidates), {
     kind: "match",
     finAccountId: "fin-1",
+    method: "mask",
   });
 });
 
@@ -214,6 +305,7 @@ test("planArchiveAccountLink: already linked to an archive-only row, and a feed 
     kind: "merge",
     archiveOnlyFinAccountId: "fin-archive-only",
     feedFinAccountId: "fin-feed",
+    method: "mask",
   });
 });
 
@@ -236,6 +328,142 @@ test("planArchiveAccountLink: never re-matches by name onto a row already claime
     },
   ];
   assert.deepEqual(planArchiveAccountLink(archive2, candidates), { kind: "create" });
+});
+
+test("planArchiveAccountLink: a manual override wins even when mask/name would have picked a different row", () => {
+  const candidates = [
+    {
+      id: "fin-mask-match",
+      institutionName: "Morgan Stanley",
+      mask: "4321",
+      name: "Individual Brokerage",
+      plaidAccountId: "plaid-mask-match",
+      archiveAccountId: null,
+    },
+    {
+      id: "fin-manual-target",
+      institutionName: "Morgan Stanley",
+      mask: "9999",
+      name: "Something Else",
+      plaidAccountId: "plaid-manual-target",
+      archiveAccountId: null,
+    },
+  ];
+  const plan = planArchiveAccountLink(archive1, candidates, { manualTarget: "plaid-manual-target" });
+  assert.deepEqual(plan, { kind: "match", finAccountId: "fin-manual-target", method: "manual" });
+});
+
+test("planArchiveAccountLink: an explicit unlink (manualTarget null) never auto-matches", () => {
+  const candidates = [
+    {
+      id: "fin-1",
+      institutionName: "Morgan Stanley",
+      mask: "4321",
+      name: "Individual Brokerage",
+      plaidAccountId: "plaid-1",
+      archiveAccountId: null,
+    },
+  ];
+  assert.deepEqual(planArchiveAccountLink(archive1, candidates, { manualTarget: null }), { kind: "create" });
+});
+
+test("planArchiveAccountLink: a precomputed holdings/balance match is used before the mask/name fallback", () => {
+  const candidates = [
+    {
+      id: "fin-precomputed",
+      institutionName: "Morgan Stanley",
+      mask: "9999",
+      name: "Something Else",
+      plaidAccountId: "plaid-precomputed",
+      archiveAccountId: null,
+    },
+  ];
+  const plan = planArchiveAccountLink(archive1, candidates, {
+    precomputed: { finAccountId: "fin-precomputed", method: "holdings" },
+  });
+  assert.deepEqual(plan, { kind: "match", finAccountId: "fin-precomputed", method: "holdings" });
+});
+
+// -- Holdings-overlap and balance matching -----------------------------------
+
+test("bestIdentifier prefers CUSIP, then ISIN, then ticker, and prefixes each kind so they never collide", () => {
+  assert.equal(bestIdentifier("037833100", "US0378331005", "AAPL"), "cusip:037833100");
+  assert.equal(bestIdentifier(null, "US0378331005", "AAPL"), "isin:US0378331005");
+  assert.equal(bestIdentifier(null, null, "aapl"), "ticker:AAPL");
+  assert.equal(bestIdentifier(null, null, null), null);
+  assert.equal(bestIdentifier("", "", ""), null, "blank strings are not usable identifiers");
+});
+
+test("buildHoldingsProfiles keeps only each account's latest as_of and sums repeated identifiers there", () => {
+  const profiles = buildHoldingsProfiles([
+    { accountId: "a", asOf: "2024-01-01", identifier: "cusip:1", quantity: 100 },
+    { accountId: "a", asOf: "2024-06-01", identifier: "cusip:1", quantity: 5 },
+    { accountId: "a", asOf: "2024-06-01", identifier: "cusip:1", quantity: 3 },
+    { accountId: "a", asOf: "2024-06-01", identifier: "cusip:2", quantity: 10 },
+  ]);
+  assert.equal(profiles.length, 1);
+  assert.equal(profiles[0].accountId, "a");
+  assert.equal(profiles[0].identifiers.get("cusip:1"), 8, "the stale 2024-01-01 row is dropped, and the two latest-date rows for the same identifier are summed");
+  assert.equal(profiles[0].identifiers.get("cusip:2"), 10);
+});
+
+test("matchByHoldingsOverlap links each archive account to its correct Plaid account by shared holdings, even with masks that would suggest the opposite pairing", () => {
+  const archiveProfiles = [
+    { accountId: "arch-1", identifiers: new Map([["cusip:AAA", 10], ["cusip:BBB", 20], ["cusip:CCC", 30]]) },
+    { accountId: "arch-2", identifiers: new Map([["cusip:XXX", 5], ["cusip:YYY", 7]]) },
+  ];
+  const candidateProfiles = [
+    { accountId: "fin-1", identifiers: new Map([["cusip:XXX", 5], ["cusip:YYY", 7]]) },
+    { accountId: "fin-2", identifiers: new Map([["cusip:AAA", 10], ["cusip:BBB", 20], ["cusip:CCC", 30]]) },
+  ];
+  const matches = matchByHoldingsOverlap(archiveProfiles, candidateProfiles);
+  assert.deepEqual(
+    matches.sort((a, b) => a.archiveAccountId.localeCompare(b.archiveAccountId)),
+    [
+      { archiveAccountId: "arch-1", finAccountId: "fin-2", method: "holdings" },
+      { archiveAccountId: "arch-2", finAccountId: "fin-1", method: "holdings" },
+    ],
+  );
+});
+
+test("matchByHoldingsOverlap requires at least 2 shared identifiers and 0.6 Jaccard, and never double-books a candidate", () => {
+  const archiveProfiles = [
+    { accountId: "arch-1", identifiers: new Map([["cusip:AAA", 1]]) },
+    { accountId: "arch-2", identifiers: new Map([["cusip:BBB", 1], ["cusip:CCC", 1], ["cusip:DDD", 1], ["cusip:EEE", 1]]) },
+  ];
+  const candidateProfiles = [
+    { accountId: "fin-1", identifiers: new Map([["cusip:AAA", 1], ["cusip:BBB", 1]]) },
+    { accountId: "fin-2", identifiers: new Map([["cusip:BBB", 1], ["cusip:CCC", 1], ["cusip:DDD", 1]]) },
+  ];
+  const matches = matchByHoldingsOverlap(archiveProfiles, candidateProfiles);
+  // arch-1 shares only 1 identifier with fin-1 (below minShared) -- no match.
+  // arch-2 shares 3 of 4 with fin-2 (jaccard 3/5 = 0.6) -- matches, and fin-1
+  // (already not a candidate for arch-2) is left unused.
+  assert.deepEqual(matches, [{ archiveAccountId: "arch-2", finAccountId: "fin-2", method: "holdings" }]);
+});
+
+test("matchByBalance links a loan by balance equality within tolerance and a nearby date", () => {
+  const archiveProfiles = [{ accountId: "arch-loan", asOf: "2024-03-01", value: -12000 }];
+  const candidateProfiles = [
+    { accountId: "fin-unrelated", asOf: "2024-03-05", value: -500 },
+    { accountId: "fin-loan", asOf: "2024-03-10", value: -12050 },
+  ];
+  const matches = matchByBalance(archiveProfiles, candidateProfiles);
+  assert.deepEqual(matches, [{ archiveAccountId: "arch-loan", finAccountId: "fin-loan", method: "balance" }]);
+});
+
+test("matchByBalance rejects a match past the day-gap window or the tolerance", () => {
+  const tooFar = matchByBalance(
+    [{ accountId: "arch-1", asOf: "2024-01-01", value: 1000 }],
+    [{ accountId: "fin-1", asOf: "2024-04-01", value: 1000 }],
+  );
+  assert.deepEqual(tooFar, [], "91 days apart is outside the default 45-day window");
+
+  const tooDifferent = matchByBalance(
+    [{ accountId: "arch-2", asOf: "2024-01-01", value: 1000 }],
+    [{ accountId: "fin-2", asOf: "2024-01-10", value: 1200 }],
+  );
+  assert.deepEqual(tooDifferent, [], "20% apart is outside the default 1% tolerance");
 });
 
 // Regression guard: every archive query in `archiveReader` schema-qualifies

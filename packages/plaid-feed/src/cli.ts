@@ -13,6 +13,8 @@ import {
   archiveReader,
   assertArchiveSchemaReady,
   importArchive,
+  setManualLink,
+  setManualUnlink,
   summarizeImportArchive,
 } from "./importArchive.js";
 import { DEFAULT_LINK_TIMEOUT_MS, runLink } from "./link.js";
@@ -20,12 +22,45 @@ import { pullAll } from "./pull.js";
 
 function usage(): never {
   process.stderr.write(
-    "Usage: kith-plaid-feed link [--timeout MINUTES] | pull | import-archive\n",
+    "Usage: kith-plaid-feed link [--timeout MINUTES] | pull | " +
+      "import-archive [--link ARCHIVE_ACCOUNT_ID=PLAID_ACCOUNT_ID]... " +
+      "[--unlink ARCHIVE_ACCOUNT_ID]...\n",
   );
   process.exit(2);
 }
 
-async function importArchiveCommand(): Promise<void> {
+type ImportArchiveArgs = {
+  links: Array<{ archiveAccountId: string; plaidAccountId: string }>;
+  unlinks: string[];
+};
+
+function parseImportArchiveArgs(rest: string[]): ImportArchiveArgs {
+  const links: Array<{ archiveAccountId: string; plaidAccountId: string }> = [];
+  const unlinks: string[] = [];
+  for (let index = 0; index < rest.length; index += 1) {
+    const arg = rest[index];
+    if (arg === "--link") {
+      const value = rest[index + 1];
+      const separatorIndex = value?.indexOf("=") ?? -1;
+      if (value === undefined || separatorIndex <= 0 || separatorIndex === value.length - 1) usage();
+      links.push({
+        archiveAccountId: value.slice(0, separatorIndex),
+        plaidAccountId: value.slice(separatorIndex + 1),
+      });
+      index += 1;
+    } else if (arg === "--unlink") {
+      const value = rest[index + 1];
+      if (value === undefined || value === "") usage();
+      unlinks.push(value);
+      index += 1;
+    } else {
+      usage();
+    }
+  }
+  return { links, unlinks };
+}
+
+async function importArchiveCommand(args: ImportArchiveArgs): Promise<void> {
   const [archiveUrl, databaseUrl] = await Promise.all([
     Promise.resolve(loadArchiveReaderDatabaseUrl()),
     loadDatabaseUrl(),
@@ -38,6 +73,14 @@ async function importArchiveCommand(): Promise<void> {
   await archiveClient.connect();
   try {
     await assertArchiveSchemaReady(archiveClient);
+    // Manual overrides apply before the run they arrive in, and persist
+    // (kith.fin_account_link_overrides) past it -- see importArchive.ts.
+    for (const link of args.links) {
+      await setManualLink(pool, link.archiveAccountId, link.plaidAccountId);
+    }
+    for (const archiveAccountId of args.unlinks) {
+      await setManualUnlink(pool, archiveAccountId);
+    }
     const result = await importArchive(archiveReader(archiveClient), pool);
     process.stdout.write(`${summarizeImportArchive(result)}\n`);
   } finally {
@@ -71,8 +114,7 @@ async function main(argv: string[]): Promise<void> {
     return;
   }
   if (command === "import-archive") {
-    if (rest.length > 0) usage();
-    await importArchiveCommand();
+    await importArchiveCommand(parseImportArchiveArgs(rest));
     return;
   }
   usage();

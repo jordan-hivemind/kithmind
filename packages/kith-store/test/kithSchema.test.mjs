@@ -88,6 +88,9 @@ const KITH_TABLES = [
   "fin_transactions",
   "fin_holding_snapshots",
   "fin_balance_snapshots",
+  // FIN-3 (migration 050): an owner's persisted --link/--unlink override,
+  // read before any automatic (holdings/balance/mask/name) matching runs.
+  "fin_account_link_overrides",
 ];
 
 // P2-39d: retired by migration 005, so this build must never re-create them.
@@ -161,6 +164,19 @@ test(
     assert.ok(archiveCoverageColumn, "kith.fin_accounts.archive_coverage_through should exist");
     assert.equal(archiveCoverageColumn.data_type, "date");
     assert.equal(archiveCoverageColumn.is_nullable, "YES");
+
+    // Migration 050: how archive_account_id got set on a fin_accounts row --
+    // holdings/balance/mask/name/manual -- or null for an account with no
+    // link (or a Plaid-only row with no archive link at all).
+    const [matchMethodColumn] = await all(
+      client,
+      `SELECT data_type, is_nullable FROM information_schema.columns
+        WHERE table_schema = 'kith' AND table_name = 'fin_accounts'
+          AND column_name = 'match_method'`,
+    );
+    assert.ok(matchMethodColumn, "kith.fin_accounts.match_method should exist");
+    assert.equal(matchMethodColumn.data_type, "text");
+    assert.equal(matchMethodColumn.is_nullable, "YES");
 
     for (const table of RETIRED_PROOF_TABLES) {
       const [row] = await all(
