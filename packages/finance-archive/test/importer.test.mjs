@@ -1650,6 +1650,341 @@ test(
 );
 
 test(
+  "projection mismatches use the affected holding account and date instead of the document fallback",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const original = document("a51".padEnd(64, "0"), [], {
+      positions: [
+        position({ accountId: ACCOUNT.id, sourceLocator: "alpha" }),
+        position({
+          accountId: OTHER_ACCOUNT.id,
+          asOf: "2026-02-28",
+          sourceLocator: "beta",
+          marketValueText: "200",
+        }),
+      ],
+    });
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [original] },
+      NOW,
+    );
+    const sourceDocumentId = (
+      await one(client, "SELECT id FROM documents WHERE sha256 = $1", [
+        original.sha256,
+      ])
+    ).id;
+    await client.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES
+         ('legacy-system-holding-mismatch', 'reparse_projection_mismatch', $1,
+          $2, 'positions', $3, 'open'),
+         ('human-holding-mismatch', 'reparse_projection_mismatch', $1,
+          $2, 'manual', 'human-authored projection concern', 'open')`,
+      [
+        ACCOUNT.id,
+        sourceDocumentId,
+        "authoritative reparse did not exactly restate this document's stored " +
+          "positions projection, or matched a row owned by another document; " +
+          "old rows and evidence were preserved, no reparsed holdings were " +
+          "published, and the document remains partial pending a reviewed replacement",
+      ],
+    );
+
+    await authoritativeReparse(client, {
+      ...original,
+      positions: [
+        position({ accountId: ACCOUNT.id, sourceLocator: "alpha" }),
+        position({
+          accountId: OTHER_ACCOUNT.id,
+          asOf: "2026-01-31",
+          sourceLocator: "beta-changed",
+          marketValueText: "220",
+        }),
+      ],
+    });
+
+    assert.deepEqual(
+      await all(
+        client,
+        `SELECT account_id, projection_scope_kind,
+                projection_scope_as_of::text AS projection_scope_as_of
+          FROM review_items
+          WHERE kind = 'reparse_projection_mismatch'
+            AND projection_scope_kind IS NOT NULL
+          ORDER BY projection_scope_as_of`,
+      ),
+      [
+        {
+          account_id: OTHER_ACCOUNT.id,
+          projection_scope_kind: "positions",
+          projection_scope_as_of: "2026-01-31",
+        },
+        {
+          account_id: OTHER_ACCOUNT.id,
+          projection_scope_kind: "positions",
+          projection_scope_as_of: "2026-02-28",
+        },
+      ],
+    );
+    assert.deepEqual(
+      await all(
+        client,
+        `SELECT id, status FROM review_items
+          WHERE id IN ('legacy-system-holding-mismatch', 'human-holding-mismatch')
+          ORDER BY id`,
+      ),
+      [
+        { id: "human-holding-mismatch", status: "open" },
+        { id: "legacy-system-holding-mismatch", status: "resolved" },
+      ],
+    );
+  },
+);
+
+test(
+  "activity mismatches retain their actual account and process date",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const original = document("a52".padEnd(64, "0"), [
+      row({
+        accountId: ACCOUNT.id,
+        providerTxnId: "alpha",
+        sourceLocator: "a",
+      }),
+      row({
+        accountId: OTHER_ACCOUNT.id,
+        processDate: "2026-02-20",
+        providerTxnId: "beta",
+        sourceLocator: "b",
+        amountText: "-20",
+      }),
+    ]);
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [original] },
+      NOW,
+    );
+
+    await authoritativeReparse(client, {
+      ...original,
+      rows: [
+        row({
+          accountId: ACCOUNT.id,
+          providerTxnId: "alpha",
+          sourceLocator: "a-replayed",
+        }),
+        row({
+          accountId: OTHER_ACCOUNT.id,
+          processDate: "2026-02-20",
+          providerTxnId: "beta",
+          sourceLocator: "b-changed",
+          amountText: "-25",
+        }),
+      ],
+    });
+
+    assert.deepEqual(
+      await all(
+        client,
+        `SELECT account_id, projection_scope_kind,
+                projection_scope_as_of::text AS projection_scope_as_of
+           FROM review_items
+          WHERE kind = 'reparse_activity_projection_mismatch'`,
+      ),
+      [
+        {
+          account_id: OTHER_ACCOUNT.id,
+          projection_scope_kind: "activity",
+          projection_scope_as_of: "2026-02-20",
+        },
+      ],
+    );
+  },
+);
+
+test(
+  "an un-attributable institution liability mismatch remains document-wide",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const liability = {
+      kind: "line_of_credit",
+      displayName: "Synthetic institution facility",
+      balanceText: "100",
+      balanceNote: null,
+      currency: "USD",
+      rate: null,
+      asOf: "2026-03-31",
+      collateralNote: null,
+      sourceLocator: "liability:institution",
+    };
+    const original = document("a53".padEnd(64, "0"), [], {
+      accountId: null,
+      liabilities: [liability],
+    });
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [original] },
+      NOW,
+    );
+    await authoritativeReparse(client, {
+      ...original,
+      liabilities: [{ ...liability, balanceText: "120" }],
+    });
+
+    assert.deepEqual(
+      await all(
+        client,
+        `SELECT account_id, projection_scope_kind, projection_scope_as_of
+           FROM review_items
+          WHERE kind = 'reparse_projection_mismatch'`,
+      ),
+      [
+        {
+          account_id: null,
+          projection_scope_kind: null,
+          projection_scope_as_of: null,
+        },
+      ],
+    );
+  },
+);
+
+test(
+  "an importer generic mismatch reopens when a later replay loses scoped attribution",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const originalLiability = {
+      accountId: OTHER_ACCOUNT.id,
+      kind: "line_of_credit",
+      displayName: "Synthetic attributed facility",
+      balanceText: "100",
+      balanceNote: null,
+      currency: "USD",
+      rate: null,
+      asOf: "2026-02-28",
+      collateralNote: null,
+      sourceLocator: "liability:attributed",
+    };
+    const original = document("a54".padEnd(64, "0"), [], {
+      accountId: null,
+      positions: [
+        position({
+          accountId: OTHER_ACCOUNT.id,
+          asOf: "2026-02-28",
+          marketValueText: "200",
+        }),
+      ],
+      liabilities: [originalLiability],
+    });
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [original] },
+      NOW,
+    );
+    const sourceDocumentId = (
+      await one(client, "SELECT id FROM documents WHERE sha256 = $1", [
+        original.sha256,
+      ])
+    ).id;
+    const systemReason =
+      "authoritative reparse did not exactly restate this document's stored " +
+      "positions,liabilities projection, or matched a row owned by another " +
+      "document; old rows and evidence were preserved, no reparsed holdings " +
+      "were published, and the document remains partial pending a reviewed replacement";
+    await client.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES ('generic-transition', 'reparse_projection_mismatch', $1, $2,
+               'positions,liabilities', $3, 'open')`,
+      [ACCOUNT.id, sourceDocumentId, systemReason],
+    );
+
+    await authoritativeReparse(client, {
+      ...original,
+      positions: [
+        position({
+          accountId: OTHER_ACCOUNT.id,
+          asOf: "2026-02-28",
+          marketValueText: "220",
+        }),
+      ],
+      liabilities: [{ ...originalLiability, balanceText: "120" }],
+    });
+    assert.equal(
+      (
+        await one(
+          client,
+          "SELECT status FROM review_items WHERE id = 'generic-transition'",
+        )
+      ).status,
+      "resolved",
+    );
+    assert.equal(
+      await count(
+        client,
+        "review_items",
+        "WHERE projection_scope_kind IS NOT NULL AND status = 'open'",
+      ),
+      2,
+    );
+
+    await authoritativeReparse(client, {
+      ...original,
+      positions: [
+        position({
+          accountId: OTHER_ACCOUNT.id,
+          asOf: "2026-02-28",
+          marketValueText: "230",
+        }),
+      ],
+      liabilities: [
+        {
+          ...originalLiability,
+          accountId: null,
+          balanceText: "130",
+        },
+      ],
+    });
+    assert.deepEqual(
+      await all(
+        client,
+        `SELECT account_id, status, projection_scope_kind
+           FROM review_items
+          WHERE kind = 'reparse_projection_mismatch'
+          ORDER BY projection_scope_kind NULLS FIRST`,
+      ),
+      [
+        {
+          account_id: null,
+          status: "open",
+          projection_scope_kind: null,
+        },
+        {
+          account_id: OTHER_ACCOUNT.id,
+          status: "resolved",
+          projection_scope_kind: "liabilities",
+        },
+        {
+          account_id: OTHER_ACCOUNT.id,
+          status: "resolved",
+          projection_scope_kind: "positions",
+        },
+      ],
+    );
+  },
+);
+
+test(
   "authoritative reparse rejects non-hash corrections without moving old evidence",
   { skip },
   async (t) => {
@@ -1921,7 +2256,10 @@ test(
       reopened.resolved_at,
       "prior recovery timestamp remains auditable",
     );
-    assert.match(reopened.resolution_note, /authoritative holdings projection/);
+    assert.match(
+      reopened.resolution_note,
+      /this exact system projection mismatch no longer applies/,
+    );
     const repeatedRegression = await authoritativeReparse(client, {
       ...original,
       positions: [
@@ -2165,11 +2503,27 @@ test(
     assert.equal(await count(client, "positions"), 1);
     assert.equal(await count(client, "balances"), 1);
     assert.equal(await count(client, "liabilities"), 1);
-    const [review] = await all(
+    const reviews = await all(
       client,
-      "SELECT raw_value FROM review_items WHERE kind = 'reparse_projection_mismatch'",
+      `SELECT raw_value, projection_scope_kind
+         FROM review_items
+        WHERE kind = 'reparse_projection_mismatch'
+        ORDER BY projection_scope_kind`,
     );
-    assert.equal(review.raw_value, "positions,balances,liabilities");
+    assert.deepEqual(reviews, [
+      {
+        raw_value: "positions,balances,liabilities",
+        projection_scope_kind: "balances",
+      },
+      {
+        raw_value: "positions,balances,liabilities",
+        projection_scope_kind: "liabilities",
+      },
+      {
+        raw_value: "positions,balances,liabilities",
+        projection_scope_kind: "positions",
+      },
+    ]);
     assert.equal(
       (
         await one(client, "SELECT parsed_ok FROM documents WHERE sha256 = $1", [
