@@ -301,6 +301,160 @@ test("an asset-class heading is not read as a security", () => {
 
 // --- review routing ---------------------------------------------------------
 
+const TEST_EQUITY_COLUMNS = {
+  description: { start: 8 },
+  tradeDate: { end: 62 },
+  quantity: { end: 92 },
+  unitCost: { end: 104 },
+  price: { end: 120 },
+  costBasis: { end: 134 },
+  marketValue: { end: 150 },
+  unrealized: { end: 164 },
+};
+
+function syntheticEquityRow({
+  description = null,
+  tradeDate = null,
+  quantity = null,
+  unitCost = null,
+  price = null,
+  costBasis = null,
+  marketValue = null,
+  unrealized = null,
+  conflictingQuantity = false,
+} = {}) {
+  return place([
+    ...(description === null
+      ? []
+      : [{ text: description, ...TEST_EQUITY_COLUMNS.description }]),
+    ...(tradeDate === null
+      ? []
+      : [{ text: tradeDate, ...TEST_EQUITY_COLUMNS.tradeDate }]),
+    ...(conflictingQuantity
+      ? [
+          { text: "5", end: 90 },
+          { text: "6", end: 94 },
+        ]
+      : quantity === null
+        ? []
+        : [{ text: quantity, ...TEST_EQUITY_COLUMNS.quantity }]),
+    ...(unitCost === null
+      ? []
+      : [{ text: unitCost, ...TEST_EQUITY_COLUMNS.unitCost }]),
+    ...(price === null ? [] : [{ text: price, ...TEST_EQUITY_COLUMNS.price }]),
+    ...(costBasis === null
+      ? []
+      : [{ text: costBasis, ...TEST_EQUITY_COLUMNS.costBasis }]),
+    ...(marketValue === null
+      ? []
+      : [{ text: marketValue, ...TEST_EQUITY_COLUMNS.marketValue }]),
+    ...(unrealized === null
+      ? []
+      : [{ text: unrealized, ...TEST_EQUITY_COLUMNS.unrealized }]),
+  ]);
+}
+
+const unpricedHoldingRow = (overrides = {}) =>
+  syntheticEquityRow({
+    description: "SYNTHETIC UNPRICED FUND (SUPF)",
+    tradeDate: "03/15/26",
+    quantity: "5.000",
+    unitCost: "$10.000",
+    price: "—",
+    costBasis: "$50.00",
+    marketValue: "N/A",
+    unrealized: "Footnote A",
+    ...overrides,
+  });
+
+function singleHoldingStatement(rows) {
+  return [
+    "        Page 1 of 1",
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+    "        Synthetic Active Assets Account    123-456789-012",
+    "        COMMON STOCKS",
+    EQUITY_HEADER,
+    ...rows,
+    "        Page 1 of 1",
+  ].join("\n");
+}
+
+test("an exact dated single row retains its printed no-value market evidence without proving freshness", () => {
+  const text = singleHoldingStatement([unpricedHoldingRow()]);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [position] = parsed.holdings.positions;
+  assert.equal(position.instrument.symbol, "SUPF");
+  assert.equal(position.quantity, "5");
+  assert.equal(position.costBasis, "50");
+  assert.equal(position.price, null);
+  assert.equal(position.marketValue, null);
+  assert.equal(position.unrealized, null);
+  assert.match(position.marketValueNote, /no value stated \("N\/A"\)/);
+  assert.equal(position.locators.price.binding.quote, "—");
+  assert.equal(position.locators.marketValue.binding.quote, "N/A");
+  assert.equal(
+    text.slice(
+      position.locators.marketValue.binding.start,
+      position.locators.marketValue.binding.end,
+    ),
+    "N/A",
+  );
+  assert.notEqual(position.marketValue, "0");
+  assert.match(parsed.parseNote, /retained holding.*readable market value/);
+  assert.doesNotMatch(parsed.parseNote, /holdings block.*left unparsed/);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.emittedPositionCount, 1);
+  assert.equal(scope.status, "partial");
+  assert.deepEqual(scope.gapCodes, ["unresolved_lots"]);
+});
+
+test("unpriced row retention refuses multirow, mixed, conflicting, undated and unreadable shapes", () => {
+  const cases = [
+    {
+      name: "continuation row",
+      rows: [
+        unpricedHoldingRow(),
+        unpricedHoldingRow({ description: null, tradeDate: "03/16/26" }),
+      ],
+    },
+    {
+      name: "mixed no-value and unreadable tokens",
+      rows: [unpricedHoldingRow({ marketValue: "unknown" })],
+    },
+    {
+      name: "conflicting quantity cells",
+      rows: [unpricedHoldingRow({ conflictingQuantity: true })],
+    },
+    {
+      name: "undated row",
+      rows: [unpricedHoldingRow({ tradeDate: "pending" })],
+    },
+    {
+      name: "unreadable quantity",
+      rows: [unpricedHoldingRow({ quantity: "5O0" })],
+    },
+    {
+      name: "missing unit cost",
+      rows: [unpricedHoldingRow({ unitCost: null })],
+    },
+    {
+      name: "footnoted no-value token",
+      rows: [unpricedHoldingRow({ marketValue: "N/A A" })],
+    },
+  ];
+  for (const { name, rows } of cases) {
+    const parsed = parseStatementLines(singleHoldingStatement(rows), kind);
+    assert.deepEqual(parsed.holdings.positions, [], name);
+    assert.ok(
+      parsed.holdings.positionScopes[0].gapCodes.some((code) =>
+        ["missing_security_start", "unresolved_lots"].includes(code),
+      ),
+      name,
+    );
+  }
+});
+
 function noTotalStatement(options = {}, trailing = []) {
   return [
     "        Page 1 of 1",
@@ -1142,6 +1296,65 @@ test("a printed Total continues across a shifted semantic header", () => {
   assert.equal(parsed.holdings.positions[0].marketValue, "4776");
 });
 
+test("a TOTAL-prefixed dated security name crosses an anchored page before its printed Total", () => {
+  const lot = (number, description = null) =>
+    syntheticEquityRow({
+      description,
+      tradeDate: `01/${String(number).padStart(2, "0")}/26`,
+      quantity: `${number}.000`,
+      unitCost: "10.000",
+      price: "11.000",
+      costBasis: `${number * 10}.00`,
+      marketValue: `${number * 11}.00`,
+      unrealized: `${number}.00`,
+    });
+  const pages = [
+    [
+      "        Page 1 of 2",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      "        Synthetic Active Assets Account    123-456789-012",
+      "        COMMON STOCKS",
+      EQUITY_HEADER,
+      lot(1, "TOTALSYNTHETIC DATED FUND (TSYN)"),
+      lot(2),
+      lot(3),
+      "        Page 1 of 2",
+    ],
+    [
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      "        Synthetic Active Assets Account    123-456789-012",
+      EQUITY_HEADER,
+      lot(4),
+      lot(5),
+      lot(6),
+      syntheticEquityRow({
+        tradeDate: "Total",
+        quantity: "21.000",
+        costBasis: "210.00",
+        marketValue: "231.00",
+        unrealized: "21.00",
+      }),
+      "        Next Dividend Payable 04/2026; Asset Class: Equities",
+      "        Page 2 of 2",
+    ],
+  ];
+  const text = pages
+    .map((page) => page.join("\n"))
+    .join(`\n${PAGE_SEPARATOR}\n`);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [position] = parsed.holdings.positions;
+  assert.equal(position.instrument.symbol, "TSYN");
+  assert.equal(position.quantity, "21");
+  assert.equal(position.price, "11");
+  assert.equal(position.costBasis, "210");
+  assert.equal(position.marketValue, "231");
+  assert.equal(position.locators.quantity.binding.quote, "21.000");
+  assert.equal(position.locators.marketValue.binding.quote, "231.00");
+  assert.equal(parsed.holdings.positionScopes[0].status, "complete");
+  assert.deepEqual(parsed.holdings.positionScopes[0].gapCodes, []);
+});
+
 test("leading and trailing printed-page furniture preserve identical holdings", () => {
   const footerBottom = pageSplitEquityPages();
   const headerTop = footerBottom.map((page) => [...page]);
@@ -1522,10 +1735,16 @@ test("an unreadable market value is null with a note and a marketValue locator",
     "        HOLDINGS",
     ...equityBlockLines({ marketValue: "3,184.OO" }),
   ].join("\n");
-  const [position] = parseStatementLines(text, kind).holdings.positions;
+  const parsed = parseStatementLines(text, kind);
+  const [position] = parsed.holdings.positions;
   assert.equal(position.marketValue, null);
   assert.match(position.marketValueNote, /unparseable amount/);
   assert.equal(position.locators.marketValue.source, kind);
+  assert.match(parsed.parseNote, /retained holding.*readable market value/);
+  assert.equal(parsed.holdings.positionScopes[0].status, "partial");
+  assert.deepEqual(parsed.holdings.positionScopes[0].gapCodes, [
+    "unresolved_lots",
+  ]);
 });
 
 // F1-76. Three different reasons a position has no market value used to share
