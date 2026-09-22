@@ -16,14 +16,22 @@ import type { Pool } from "pg";
 import { sha256 } from "@repo/kith-store";
 
 import { detectKind, detectTaxYear, type DocumentKind } from "./classify.js";
-import { convertFile, convertFilePage1 } from "./convert.js";
+import { convertFile, convertFilePage1, EncryptedPdfError, PDF_MEDIA_TYPE } from "./convert.js";
 import { decideDepth, withDepthFingerprint, type Depth, type DepthOverride } from "./depthPolicy.js";
 import { toFsUri } from "./fsUri.js";
 import { runPostProcessing } from "./postProcess.js";
+import { withSerializationRetry } from "./retry.js";
 import { resolveSourceAccount, resolveUserId } from "./sourceAccount.js";
 import { buildTitle } from "./title.js";
-import { ingestFile, isUpToDate, readActiveIngestState } from "./write.js";
+import { ingestFile, isUpToDate, readActiveIngestState, RevisionConflictError } from "./write.js";
 import { walkRoot } from "./walk.js";
+
+/** Marks an encrypted PDF's `converter` in `ingest_metadata` and feeds the
+ * extraction fingerprint (folded with the depth the same way every other
+ * converter identity is -- see `depthPolicy.ts`'s `withDepthFingerprint`).
+ * Stable and distinct from a real `pdftotext-poppler@...` fingerprint so a
+ * later run with a working password never looks like "unchanged". */
+const ENCRYPTED_PDF_CONVERTER = "encrypted-pdf-unreadable-v1";
 
 export type IngestOptions = {
   root: string;
@@ -60,6 +68,10 @@ export type IngestOptions = {
    * ingested in full, same as a `tax_return`/`k1` kind or the
    * `dropbox-inbox` root alias -- see `decideDepth`. */
   fullMatchPatterns: readonly RegExp[];
+  /** `--pdf-password`, repeatable. Candidate passwords for an encrypted PDF,
+   * tried in order (after no password) via poppler's `-upw` -- see
+   * convert.ts. Never logged. */
+  pdfPasswords: readonly string[];
 };
 
 export type IngestSummary = {
@@ -76,6 +88,27 @@ export type IngestSummary = {
   skippedExtension: Map<string, number>;
   failed: number;
   failures: Array<{ path: string; error: string }>;
+  /** Password-protected PDFs registered at glance depth with no page text
+   * (item 2): no configured `--pdf-password` opened them. Counted here, not
+   * in `failed` -- see write.ts's `ingestFile`/`ingest.ts` below. Also
+   * reflected in `newCount`/`promoted`/`byKind`/`byDepth` like any other
+   * ingested file, since a real document (metadata only) was created. */
+  encrypted: number;
+  /** Pages this run needed OCR for but had no extraction provider configured
+   * to attempt it (a page stayed at whatever low-text pdftotext extracted).
+   * Counts pages, not files -- see convert.ts's `onOcrSkippedPage`. */
+  ocrSkippedPages: number;
+  /** Files whose per-file transaction hit a `40001`/`40P01` serialization
+   * failure at least once and was retried (see retry.ts); includes files
+   * that eventually succeeded and ones that still exhausted the retry budget
+   * and were counted as `failed`. */
+  retried: number;
+  /** Files skipped because their extracted text collided with an existing,
+   * immutable source revision under different file facts (a different byte
+   * hash or modified time) -- see write.ts's `RevisionConflictError`. Not
+   * counted in `failed`: the store's immutability check is working as
+   * intended, not misbehaving. */
+  revisionConflicts: number;
   extension: Map<string, { seen: number; newCount: number }>;
   /** Of `seen`, how many resolved an `externalId` from `externalIdBindings`
    * rather than falling back to their `relativePath`. */
@@ -139,6 +172,10 @@ export async function runIngest(
     skippedExtension: walked.skippedExtension,
     failed: 0,
     failures: [],
+    encrypted: 0,
+    ocrSkippedPages: 0,
+    retried: 0,
+    revisionConflicts: 0,
     extension: new Map(),
     matchedByBinding: 0,
     usingPathId: 0,
@@ -154,6 +191,7 @@ export async function runIngest(
     if (bound !== undefined) summary.matchedByBinding += 1;
     else summary.usingPathId += 1;
     const externalId = bound ?? file.relativePath;
+    let retriedThisFile = false;
     try {
       const bytes = await readFile(file.absolutePath);
       const fileByteHash = sha256(bytes);
@@ -193,26 +231,56 @@ export async function runIngest(
       }
 
       let ocrWarned = false;
-      const page1 = await convertFilePage1(file.absolutePath, file.extension, {
-        onOcrUnconfigured: () => {
-          if (!ocrWarned) {
-            log(`${file.relativePath}: a page needs OCR but no extraction provider is configured`);
-            ocrWarned = true;
-          }
-        },
-        onOcrFailed: (error) => {
-          log(`${file.relativePath}: OCR request failed: ${errorMessage(error)}`);
-        },
-      });
+      const onOcrSkippedPage = () => {
+        summary.ocrSkippedPages += 1;
+      };
+      const onOcrUnconfigured = () => {
+        if (!ocrWarned) {
+          log(`${file.relativePath}: a page needs OCR but no extraction provider is configured`);
+          ocrWarned = true;
+        }
+        onOcrSkippedPage();
+      };
+      const onOcrFailed = (error: unknown) => {
+        log(`${file.relativePath}: OCR request failed: ${errorMessage(error)}`);
+      };
+
+      // A password-protected PDF that no configured `--pdf-password` opened
+      // (item 2 of the ingester triage): register it at glance depth with no
+      // page text rather than failing the run. `kind`/`taxYear` fall back to
+      // the filename alone (page1.pageText is ""), matching how a low-text
+      // OCR-less page already degrades. See convert.ts's `EncryptedPdfError`
+      // and write.ts's `SourceItemIngestMetadata.encrypted`.
+      let encryptedFallback = false;
+      let page1: {
+        pageText: string;
+        totalPageCount: number | null;
+        converterFingerprint: string;
+        mediaType: string;
+        ocrPagesUsed: number;
+      };
+      try {
+        page1 = await convertFilePage1(file.absolutePath, file.extension, {
+          pdfPasswords: options.pdfPasswords,
+          onOcrUnconfigured,
+          onOcrFailed,
+        });
+      } catch (error) {
+        if (!(error instanceof EncryptedPdfError)) throw error;
+        encryptedFallback = true;
+        page1 = { pageText: "", totalPageCount: null as number | null, converterFingerprint: ENCRYPTED_PDF_CONVERTER, mediaType: PDF_MEDIA_TYPE, ocrPagesUsed: 0 };
+      }
       const kind = detectKind(file.relativePath, page1.pageText);
       const taxYear = detectTaxYear(file.relativePath, page1.pageText);
-      const decision = decideDepth({
-        kind,
-        relativePath: file.relativePath,
-        ...(options.rootAlias !== undefined ? { rootAlias: options.rootAlias } : {}),
-        fullMatchPatterns: options.fullMatchPatterns,
-        override: options.depth,
-      });
+      const decision = encryptedFallback
+        ? { depth: "glance" as Depth, reason: "encrypted PDF, no password opened it" }
+        : decideDepth({
+            kind,
+            relativePath: file.relativePath,
+            ...(options.rootAlias !== undefined ? { rootAlias: options.rootAlias } : {}),
+            fullMatchPatterns: options.fullMatchPatterns,
+            override: options.depth,
+          });
       const desiredDepth = decision.depth;
 
       if (isUpToDate(state, fileByteHash, desiredDepth)) {
@@ -225,8 +293,14 @@ export async function runIngest(
       let pages: string[];
       let rawConverterFingerprint: string;
       let mediaType: string;
-      let totalPageCount: number;
-      if (desiredDepth === "glance") {
+      let totalPageCount: number | null;
+      if (encryptedFallback) {
+        pages = [""];
+        rawConverterFingerprint = ENCRYPTED_PDF_CONVERTER;
+        mediaType = PDF_MEDIA_TYPE;
+        totalPageCount = null;
+        log(`${file.relativePath}: encrypted, registered at glance depth with metadata only (kind ${kind})`);
+      } else if (desiredDepth === "glance") {
         pages = [page1.pageText];
         rawConverterFingerprint = page1.converterFingerprint;
         mediaType = page1.mediaType;
@@ -238,15 +312,9 @@ export async function runIngest(
         );
       } else {
         const converted = await convertFile(file.absolutePath, file.extension, {
-          onOcrUnconfigured: () => {
-            if (!ocrWarned) {
-              log(`${file.relativePath}: a page needs OCR but no extraction provider is configured`);
-              ocrWarned = true;
-            }
-          },
-          onOcrFailed: (error) => {
-            log(`${file.relativePath}: OCR request failed: ${errorMessage(error)}`);
-          },
+          pdfPasswords: options.pdfPasswords,
+          onOcrUnconfigured,
+          onOcrFailed,
         });
         pages = converted.pages;
         rawConverterFingerprint = converted.converterFingerprint;
@@ -259,36 +327,51 @@ export async function runIngest(
       const converterFingerprint = withDepthFingerprint(rawConverterFingerprint, desiredDepth);
 
       const fileStat = await stat(file.absolutePath);
-      await ingestFile(pool, {
-        spaceId: account.spaceId,
-        sourceAccountId: account.id,
-        externalId,
-        title: buildTitle(file.relativePath, kind, taxYear),
-        docType: kind,
-        ...(options.rootAlias !== undefined
-          ? { uri: toFsUri(options.rootAlias, file.relativePath) }
-          : {}),
-        capturedAt: fileStat.mtime,
-        userId: userId!,
-        fileByteHash,
-        pages,
-        converterFingerprint,
-        mediaType,
-        // Persisted to `kith.source_items.ingest_metadata` (migration 046)
-        // so the MCP can find a glance-depth document's real page count, tax
-        // year and how it was ingested without a schema change to the read
-        // path -- see write.ts's `setSourceItemIngestMetadata` and README.md's
-        // "Depth policy". Updated in place on every ingest and promotion.
-        ingestMetadata: {
-          pageCount: totalPageCount,
-          byteLength: bytes.length,
-          taxYear: taxYear ?? null,
-          kind,
-          depth: desiredDepth,
-          converter: rawConverterFingerprint,
+      await withSerializationRetry(
+        () =>
+          ingestFile(pool, {
+            spaceId: account.spaceId,
+            sourceAccountId: account.id,
+            externalId,
+            title: buildTitle(file.relativePath, kind, taxYear),
+            docType: kind,
+            ...(options.rootAlias !== undefined
+              ? { uri: toFsUri(options.rootAlias, file.relativePath) }
+              : {}),
+            capturedAt: fileStat.mtime,
+            userId: userId!,
+            fileByteHash,
+            pages,
+            converterFingerprint,
+            mediaType,
+            // Persisted to `kith.source_items.ingest_metadata` (migration
+            // 046) so the MCP can find a glance-depth document's real page
+            // count, tax year and how it was ingested without a schema
+            // change to the read path -- see write.ts's
+            // `setSourceItemIngestMetadata` and README.md's "Depth policy".
+            // Updated in place on every ingest and promotion.
+            ingestMetadata: {
+              pageCount: totalPageCount,
+              byteLength: bytes.length,
+              taxYear: taxYear ?? null,
+              kind,
+              depth: desiredDepth,
+              converter: rawConverterFingerprint,
+              ...(encryptedFallback ? { encrypted: true } : {}),
+            },
+          }),
+        {
+          onRetry: (attempt) => {
+            retriedThisFile = true;
+            log(
+              `${file.relativePath}: retrying after a database serialization conflict (attempt ${attempt + 1})`,
+            );
+          },
         },
-      });
+      );
 
+      if (retriedThisFile) summary.retried += 1;
+      if (encryptedFallback) summary.encrypted += 1;
       if (promoted) {
         summary.promoted += 1;
       } else {
@@ -299,6 +382,12 @@ export async function runIngest(
       bumpCount(summary.byKind, kind);
       bumpCount(summary.byDepth, desiredDepth);
     } catch (error) {
+      if (retriedThisFile) summary.retried += 1;
+      if (error instanceof RevisionConflictError) {
+        summary.revisionConflicts += 1;
+        log(`${file.relativePath}: ${errorMessage(error)}`);
+        return;
+      }
       summary.failed += 1;
       summary.failures.push({ path: file.relativePath, error: errorMessage(error) });
       log(`${file.relativePath}: ${errorMessage(error)}`);

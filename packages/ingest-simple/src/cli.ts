@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // `kith-ingest-simple --root <dir> --source-account <id> [--space <id>] [--limit N]
 // [--dry-run] [--concurrency N] [--root-alias <alias>] [--bindings <path>]
-// [--depth full|glance|auto] [--full-match <regex>]...`. `--bindings` requires
-// `--root-alias`; `--root-alias` is otherwise optional on its own. See README.md.
+// [--depth full|glance|auto] [--full-match <regex>]... [--pdf-password <value>]...
+// [--env-from-keychain]`. `--bindings` requires `--root-alias`; `--root-alias`
+// is otherwise optional on its own. See README.md.
 
 import process from "node:process";
 
@@ -12,6 +13,7 @@ import { loadBindings } from "./bindings.js";
 import { loadDatabaseUrl } from "./config.js";
 import type { DepthOverride } from "./depthPolicy.js";
 import { runIngest, type IngestOptions } from "./ingest.js";
+import { applyProviderEnvFromKeychain } from "./providerEnv.js";
 
 const DEFAULT_CONCURRENCY = 2;
 const DEPTH_OVERRIDES: readonly DepthOverride[] = ["auto", "full", "glance"];
@@ -21,14 +23,17 @@ function usage(): never {
     "Usage: kith-ingest-simple --root <dir> --source-account <id> " +
       "[--space <id>] [--limit N] [--dry-run] [--concurrency N] " +
       "[--root-alias <alias>] [--bindings <path>] " +
-      "[--depth full|glance|auto] [--full-match <regex>]...\n",
+      "[--depth full|glance|auto] [--full-match <regex>]... " +
+      "[--pdf-password <value>]... [--env-from-keychain]\n",
   );
   process.exit(2);
 }
 
-type ParsedArgs = Omit<IngestOptions, "externalIdBindings" | "fullMatchPatterns"> & {
+type ParsedArgs = Omit<IngestOptions, "externalIdBindings" | "fullMatchPatterns" | "pdfPasswords"> & {
   bindingsPath?: string;
   fullMatchSources: string[];
+  pdfPasswords: string[];
+  envFromKeychain: boolean;
 };
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -41,7 +46,9 @@ function parseArgs(argv: string[]): ParsedArgs {
   let bindingsPath: string | undefined;
   let rootAlias: string | undefined;
   let depth: DepthOverride = "auto";
+  let envFromKeychain = false;
   const fullMatchSources: string[] = [];
+  const pdfPasswords: string[] = [];
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     switch (arg) {
@@ -87,6 +94,15 @@ function parseArgs(argv: string[]): ParsedArgs {
         fullMatchSources.push(value);
         break;
       }
+      case "--pdf-password": {
+        const value = argv[++index];
+        if (value === undefined) usage();
+        pdfPasswords.push(value);
+        break;
+      }
+      case "--env-from-keychain":
+        envFromKeychain = true;
+        break;
       default:
         usage();
     }
@@ -107,6 +123,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     concurrency,
     depth,
     fullMatchSources,
+    pdfPasswords,
+    envFromKeychain,
     ...(bindingsPath !== undefined ? { bindingsPath } : {}),
     ...(rootAlias !== undefined ? { rootAlias } : {}),
   };
@@ -114,6 +132,19 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 async function main(argv: string[]): Promise<void> {
   const args = parseArgs(argv);
+
+  // Never logs a value -- only whether the Keychain item was found (below).
+  // See providerEnv.ts: this must run before anything reads
+  // `process.env.OPENAI_API_KEY`/`BRAIN_EMBED_*`, which is every OCR,
+  // extraction and embedding call this run makes (they all default to
+  // `process.env` when not given an explicit environment).
+  if (args.envFromKeychain) {
+    const result = await applyProviderEnvFromKeychain(process.env);
+    process.stderr.write(
+      `kith-ingest-simple: --env-from-keychain ${result.loadedApiKey ? "found" : "did not find"} the provider key in the Keychain\n`,
+    );
+  }
+
   let externalIdBindings: Map<string, string> | undefined;
   let bindingsLoaded = 0;
   if (args.bindingsPath !== undefined && args.rootAlias !== undefined) {
@@ -138,6 +169,7 @@ async function main(argv: string[]): Promise<void> {
     concurrency: args.concurrency,
     depth: args.depth,
     fullMatchPatterns,
+    pdfPasswords: args.pdfPasswords,
     ...(args.rootAlias !== undefined ? { rootAlias: args.rootAlias } : {}),
     ...(externalIdBindings ? { externalIdBindings } : {}),
   };
@@ -164,6 +196,10 @@ async function main(argv: string[]): Promise<void> {
         `skipped-unchanged ${summary.skippedUnchanged}`,
         `skipped-dot-or-archive ${summary.skippedDotOrArchive}`,
         `failed ${summary.failed}`,
+        `encrypted ${summary.encrypted}`,
+        `ocr-skipped-pages ${summary.ocrSkippedPages}`,
+        `retried ${summary.retried}`,
+        `revision-conflicts ${summary.revisionConflicts}`,
         externalIdBindings ? `bindings loaded ${bindingsLoaded}` : undefined,
         externalIdBindings ? `files matched by binding ${summary.matchedByBinding}` : undefined,
         externalIdBindings ? `files using path IDs ${summary.usingPathId}` : undefined,

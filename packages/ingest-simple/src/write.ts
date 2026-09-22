@@ -64,12 +64,21 @@ const CORRECTION_REVISION = "ingest-simple-v1";
  * as the provenance rows around it, and updated in place by a plain `UPDATE`
  * outside their immutability rules; see `setSourceItemIngestMetadata`. */
 export type SourceItemIngestMetadata = {
-  pageCount: number;
+  /** `null` when the real page count could not be determined without
+   * opening the document -- currently only an encrypted PDF no configured
+   * `--pdf-password` could open (see `encrypted` below). */
+  pageCount: number | null;
   byteLength: number;
   taxYear: number | null;
   kind: string;
   depth: string;
   converter: string;
+  /** `true` when this file is a password-protected PDF that no configured
+   * `--pdf-password` opened: `pages` is `[""]` (metadata only, no page
+   * text), `kind`/`taxYear` came from the filename alone, and `pageCount` is
+   * unknown. Omitted (not `false`) for every ordinary document, so an
+   * existing reader that does not know this field sees nothing new. */
+  encrypted?: boolean;
 };
 
 export type IngestFileInput = {
@@ -103,6 +112,42 @@ export type IngestFileResult = {
   chunkCount: number;
   reused: boolean;
 };
+
+/**
+ * Thrown when `provenance.createOrGetRevision` refuses this file with its own
+ * "Conflicting immutable source revision" error: the source item already has
+ * a revision whose `content_hash` (`sha256(extracted text)`) matches this
+ * file's extracted text, but some other immutable field on it -- most often
+ * `archive_ref` (the raw file byte hash) or `captured_at` (the file's mtime)
+ * -- does not. In practice this is a file re-saved with different bytes (a
+ * metadata-only PDF rewrite, a linearization pass, permissions added or
+ * removed) that happens to extract to the exact same text: this package's own
+ * `isUpToDate` pre-check only compares the *file* byte hash, so it cannot see
+ * this coming, and the store is correctly refusing to let a second, different
+ * set of file facts overwrite an existing immutable revision row.
+ *
+ * The store's own immutability check is not weakened by this: nothing here
+ * retries the write with different data or coerces the conflict away.
+ * `ingest.ts` catches this specifically and counts the file as a distinct,
+ * clearly-labeled `revisionConflicts` outcome rather than a generic failure,
+ * so a document whose logical content is already safely stored under a
+ * different byte/mtime fact does not read as this run being broken.
+ */
+export class RevisionConflictError extends Error {
+  constructor(relativePathOrExternalId: string, cause: unknown) {
+    super(
+      `Source revision conflicts with an existing immutable revision for the same document ` +
+        `(${relativePathOrExternalId}): the extracted text is unchanged but the file's own ` +
+        `bytes or modified time differ from what was previously recorded.`,
+    );
+    this.name = "RevisionConflictError";
+    this.cause = cause;
+  }
+}
+
+function isConflictingImmutableSourceRevision(error: unknown): boolean {
+  return error instanceof Error && error.message === "Conflicting immutable source revision";
+}
 
 /** What this source item's *active* generation carries right now, read
  * before conversion so the caller can decide whether to skip it entirely.
@@ -262,15 +307,23 @@ async function stageOneFile(
     ...(input.uri === undefined ? {} : { uri: input.uri }),
   });
   const { fullText, sourcePages } = buildPageInputs(input.pages);
-  const revision = await provenance.createOrGetRevision(client, {
-    spaceId,
-    sourceItemId: item.id,
-    mediaType: input.mediaType,
-    inlineText: fullText,
-    capturedAt: input.capturedAt,
-    userId: input.userId,
-    archiveRef: input.fileByteHash,
-  });
+  let revision: provenance.SourceRevisionRow;
+  try {
+    revision = await provenance.createOrGetRevision(client, {
+      spaceId,
+      sourceItemId: item.id,
+      mediaType: input.mediaType,
+      inlineText: fullText,
+      capturedAt: input.capturedAt,
+      userId: input.userId,
+      archiveRef: input.fileByteHash,
+    });
+  } catch (error) {
+    if (isConflictingImmutableSourceRevision(error)) {
+      throw new RevisionConflictError(input.externalId, error);
+    }
+    throw error;
+  }
 
   const desiredProcessingEpoch =
     item.desiredRevisionId === revision.id
