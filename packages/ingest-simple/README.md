@@ -25,6 +25,26 @@ against the same source account. Both write into the same `kith.source_items`
 / `kith.processing_generations` rows; running both against the same root at
 once is two writers racing the same identity, not two independent ingesters.
 
+## Reusing the old worker's file identities
+
+Without `--bindings`, this package uses each file's `relativePath` (relative
+to `--root`) as its `kith.source_items.external_id`. The old filesystem
+worker instead gave every file a random UUID `external_id`
+(`packages/pipeline/src/runnerState.ts`'s `IdentityBinding`, journaled in its
+`state.json`). Those two identities never match, so a first dry run against a
+folder the old worker already indexed reports every file as new: running it
+for real would create a second `kith.source_items` row per file instead of
+picking up the existing one. `--bindings <state.json> --root-alias <alias>`
+avoids that: it reads the old worker's journal (read-only -- this package
+never writes to it), keeps the identity bindings for `<alias>`, and uses each
+one's `externalId` in place of `relativePath` for the matching file, so the
+transition reuses the existing source item and its history instead of
+duplicating it. A file the old worker never saw still falls back to its
+`relativePath`, exactly as before. Every run prints how many bindings loaded,
+how many files matched one, and how many fell back to a path-derived id, so a
+mismatched `--root-alias` (zero matches) or a stale journal is visible
+immediately rather than discovered as duplicate source items later.
+
 ## Prerequisites
 
 - Node 26+, this monorepo's usual toolchain (`pnpm install`, `pnpm --filter
@@ -39,7 +59,8 @@ once is two writers racing the same identity, not two independent ingesters.
 
 ```
 kith-ingest-simple --root <dir> --source-account <id> [--space <id>] \
-  [--limit N] [--dry-run] [--concurrency 2]
+  [--limit N] [--dry-run] [--concurrency 2] \
+  [--bindings <state.json> --root-alias <alias>]
 ```
 
 | Flag                | Meaning                                                                                     |
@@ -47,6 +68,7 @@ kith-ingest-simple --root <dir> --source-account <id> [--space <id>] \
 | `--root <dir>`       | The Dropbox-style folder to walk. Required.                                                   |
 | `--source-account <id>` | The `kith.source_accounts` row (connector `fs`) every write attributes to. Required.       |
 | `--space <id>`       | Optional. Cross-checked against the source account's own `space_id`; a mismatch is a hard error, not a silent override. |
+| `--bindings <path>` / `--root-alias <alias>` | Optional, and must be given together. Reuses the old filesystem worker's file identities for `<alias>` so a first run against a folder it already indexed does not register every file as new. See "Reusing the old worker's file identities" below. |
 | `--limit N`          | Ingest at most N files this run (useful for a first, bounded pass over a large folder).       |
 | `--dry-run`          | Walk and hash only. Prints what would be ingested; writes nothing, converts nothing.          |
 | `--concurrency N`    | Files processed in parallel. Default 2.                                                       |
@@ -126,13 +148,18 @@ template; only the loaded copy on the owner's own machine names them.
 
 ```
 pnpm --filter @repo/ingest-simple build
-pnpm --filter @repo/ingest-simple exec node --test test/walk.test.mjs test/chunker.test.mjs test/convert.test.mjs
-pnpm --filter @repo/ingest-simple exec node --test test/postgresIngest.test.mjs
+pnpm --filter @repo/ingest-simple exec node --test test/walk.test.mjs test/chunker.test.mjs test/convert.test.mjs test/bindings.test.mjs
+pnpm --filter @repo/ingest-simple exec node --test test/postgresIngest.test.mjs test/bindingsTransition.test.mjs
 ```
 
-The first three files are synthetic-fixture unit tests (no database, no
-network, no real vendor SDK: OCR's `fetchImpl` is stubbed). The last starts
-and stops its own throwaway local Postgres cluster (`initdb`/`pg_ctl`, under
-a scratch temp directory, deleted when the test ends) and requires `initdb`
-and `pg_ctl` on `PATH` with the `pgvector` extension available (the same
-requirement `kith` migration 015 has everywhere else in this repo).
+The first four files are synthetic-fixture unit tests (no database, no
+network, no real vendor SDK: OCR's `fetchImpl` is stubbed; `bindings.test.mjs`
+covers `--bindings` parsing/validation against synthetic journal JSON). The
+last two start and stop their own throwaway local Postgres cluster
+(`initdb`/`pg_ctl`, under a scratch temp directory, deleted when the test
+ends) and require `initdb` and `pg_ctl` on `PATH` with the `pgvector`
+extension available (the same requirement `kith` migration 015 has everywhere
+else in this repo). `bindingsTransition.test.mjs` proves the `--bindings`
+transition end to end: a source item registered the old worker's way (a UUID
+external id, an archived revision) reuses that same item, not a second one,
+when this package's `ingestFile` runs with that UUID bound.

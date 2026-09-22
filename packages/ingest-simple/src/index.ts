@@ -1,6 +1,7 @@
 // Programmatic surface, for tests: lets `test/*.test.mjs` import the walker,
 // chunker, converter and write path directly. `cli.ts` is the product.
 
+export * from "./bindings.js";
 export * from "./chunker.js";
 export * from "./config.js";
 export * from "./convert.js";
