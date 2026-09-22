@@ -288,6 +288,67 @@ test("the transactions-sync cursor is threaded through a second page", async () 
   assert.ok(success, "the final cursor from the second page was persisted");
 });
 
+// A real pull for a newly linked item (730-day window, first sync) reported
+// exactly tx_added=5000 -- a fixed 50-page cap combined with Plaid's default
+// 100-per-page `/transactions/sync` size, not the item's real total. The
+// sync loop must keep paging for as long as Plaid's own `has_more` says
+// there is more, with no fixed cap of its own, and persist the cursor only
+// once, after the whole run -- not per page.
+test("the transactions-sync loop pages for as long as has_more says, with no fixed cap, over three pages", async () => {
+  const pool = fakePool();
+  const client = happyClient();
+  const pageTransactions = (pageNumber) =>
+    Array.from({ length: 3 }, (_unused, index) => ({
+      transaction_id: `tx-page${pageNumber}-${index}`,
+      account_id: "acc-1",
+      date: "2026-09-20",
+      authorized_date: "2026-09-19",
+      name: "Coffee",
+      merchant_name: "Cafe",
+      amount: 5,
+      iso_currency_code: "USD",
+      unofficial_currency_code: null,
+      pending: false,
+      personal_finance_category: { primary: "FOOD_AND_DRINK" },
+    }));
+  const pages = [
+    { added: pageTransactions(1), next_cursor: "page-2-cursor", has_more: true },
+    { added: pageTransactions(2), next_cursor: "page-3-cursor", has_more: true },
+    { added: pageTransactions(3), next_cursor: "final-cursor", has_more: false },
+  ];
+  let calls = 0;
+  client.transactionsSync = async ({ cursor }) => {
+    const page = pages[calls];
+    calls += 1;
+    if (calls === 1) assert.equal(cursor, undefined, "the first call has no cursor");
+    else assert.equal(cursor, pages[calls - 2].next_cursor);
+    return {
+      data: {
+        accounts: [],
+        added: page.added,
+        modified: [],
+        removed: [],
+        next_cursor: page.next_cursor,
+        has_more: page.has_more,
+      },
+    };
+  };
+
+  const result = await pullItem(client, pool, item, "access-token-1");
+  assert.equal(result.status, "ok");
+  assert.equal(calls, 3, "all three pages were fetched, not capped short");
+  assert.equal(result.transactionsAdded, 9, "every page's transactions were written, 3 per page over 3 pages");
+
+  // The cursor was persisted exactly once, with the final page's value --
+  // not once per page.
+  const cursorUpdates = pool.calls.filter(
+    (call) =>
+      call.text.includes("transactions_cursor = COALESCE($2, transactions_cursor)"),
+  );
+  assert.equal(cursorUpdates.length, 1);
+  assert.deepEqual(cursorUpdates[0].params, ["item-1", "final-cursor"]);
+});
+
 test("an item whose consented products exclude investments skips the investments calls without failing", async () => {
   const pool = fakePool();
   const client = happyClient();
@@ -340,7 +401,7 @@ test("an item with no product list on its Item still attempts investments (toler
 // so the rest of that item -- including transactions fetched afterward --
 // still gets written, while the item's exit is still non-zero overall.
 test("a security row upsert failure is counted, not thrown, and the rest of the item still writes", async () => {
-  const pool = fakePool((text) => text.startsWith("INSERT INTO kith.plaid_securities"));
+  const pool = fakePool((text) => text.startsWith("INSERT INTO kith.fin_securities"));
   const client = happyClient();
 
   const result = await pullItem(client, pool, item, "access-token-1");
@@ -363,7 +424,7 @@ test("a security row upsert failure is counted, not thrown, and the rest of the 
 });
 
 test("a holding row upsert failure is counted, not thrown, and the rest of the item still writes", async () => {
-  const pool = fakePool((text) => text.startsWith("INSERT INTO kith.plaid_holding_snapshots"));
+  const pool = fakePool((text) => text.startsWith("INSERT INTO kith.fin_holding_snapshots"));
   const client = happyClient();
 
   const result = await pullItem(client, pool, item, "access-token-1");
@@ -375,7 +436,7 @@ test("a holding row upsert failure is counted, not thrown, and the rest of the i
 });
 
 test("a row failure with no other error still makes the caller's process exit non-zero", async () => {
-  const pool = fakePool((text) => text.startsWith("INSERT INTO kith.plaid_securities"));
+  const pool = fakePool((text) => text.startsWith("INSERT INTO kith.fin_securities"));
   const client = happyClient();
 
   const result = await pullItem(client, pool, item, "access-token-1");
@@ -396,7 +457,14 @@ test("a row failure with no other error still makes the caller's process exit no
 // the failed row again instead of skipping past it.
 
 test("an added-transaction row upsert failure is counted and withholds the cursor advance", async () => {
-  const pool = fakePool((text) => text.startsWith("INSERT INTO kith.plaid_transactions"));
+  // Banking and investment transactions both insert into kith.fin_transactions
+  // now (migration 048), so the failure predicate has to tell them apart by
+  // shape: only the banking upsert's column list has posted_date.
+  const pool = fakePool(
+    (text) =>
+      text.startsWith("INSERT INTO kith.fin_transactions") &&
+      text.includes("posted_date"),
+  );
   const client = happyClient();
 
   const result = await pullItem(client, pool, item, "access-token-1");
@@ -419,7 +487,7 @@ test("an added-transaction row upsert failure is counted and withholds the curso
 });
 
 test("a removed-transaction row failure is counted and withholds the cursor advance", async () => {
-  const pool = fakePool((text) => text.startsWith("UPDATE kith.plaid_transactions"));
+  const pool = fakePool((text) => text.startsWith("DELETE FROM kith.fin_transactions"));
   const client = happyClient();
   client.transactionsSync = async () => ({
     data: {
@@ -444,7 +512,11 @@ test("a removed-transaction row failure is counted and withholds the cursor adva
 });
 
 test("a resumed item's cursor stays at its own stored value when a row fails, rather than advancing", async () => {
-  const pool = fakePool((text) => text.startsWith("INSERT INTO kith.plaid_transactions"));
+  const pool = fakePool(
+    (text) =>
+      text.startsWith("INSERT INTO kith.fin_transactions") &&
+      text.includes("posted_date"),
+  );
   const client = happyClient();
   // happyClient's default transactionsSync asserts the first call's cursor
   // is undefined (the "first pull" shape every other test in this file
@@ -490,8 +562,10 @@ test("a resumed item's cursor stays at its own stored value when a row fails, ra
 });
 
 test("an investment-transaction row upsert failure is counted and withholds the watermark advance", async () => {
-  const pool = fakePool((text) =>
-    text.startsWith("INSERT INTO kith.plaid_investment_transactions"),
+  const pool = fakePool(
+    (text) =>
+      text.startsWith("INSERT INTO kith.fin_transactions") &&
+      text.includes("security_id"),
   );
   const client = happyClient();
 
@@ -609,6 +683,28 @@ test("an item with a stored investment-transactions watermark requests from that
 test("investmentTransactionsStartDate: first pull is 24 months before today, incremental is 7 days before the watermark", () => {
   assert.equal(investmentTransactionsStartDate(null, "2026-09-22"), "2024-09-22");
   assert.equal(investmentTransactionsStartDate("2026-09-10", "2026-09-22"), "2026-09-03");
+});
+
+test("investmentTransactionsStartDate accepts a JS Date the same way it accepts a YYYY-MM-DD string", () => {
+  // node-postgres's default type parser for a `date` column (OID 1082)
+  // returns a `Date`, not a string, unless the caller read it `::text` --
+  // db.ts now does, but this is the defense-in-depth half of that fix: a
+  // live pull after PR 428 failed with "Invalid time value" for every item
+  // that already had a watermark, because the old code built
+  // `` `${pulledThrough}T00:00:00Z` `` on a Date's default `toString()`.
+  const watermark = new Date(Date.UTC(2026, 8, 10)); // 2026-09-10, UTC midnight
+  assert.equal(
+    investmentTransactionsStartDate(watermark, "2026-09-22"),
+    investmentTransactionsStartDate("2026-09-10", "2026-09-22"),
+  );
+  assert.equal(investmentTransactionsStartDate(watermark, "2026-09-22"), "2026-09-03");
+});
+
+test("investmentTransactionsStartDate accepts a date string with a time component, taking only the date part", () => {
+  assert.equal(
+    investmentTransactionsStartDate("2026-09-10T00:00:00.000Z", "2026-09-22"),
+    "2026-09-03",
+  );
 });
 
 test("a page that fails partway through an investment-transactions pull does not advance the watermark", async () => {

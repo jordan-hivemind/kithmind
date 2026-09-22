@@ -41,10 +41,11 @@ const account = {
 };
 
 test("mapAccount carries the account's identity and type, not its balance", () => {
-  const row = mapAccount(account, "item-1");
+  const row = mapAccount(account, "item-1", "Chase");
   assert.deepEqual(row, {
     accountId: "acc-1",
     itemId: "item-1",
+    institutionName: "Chase",
     name: "Brokerage",
     officialName: "Individual Brokerage Account",
     mask: "1234",
@@ -61,12 +62,13 @@ test("mapAccount falls back to the unofficial currency code when there is no ISO
       balances: { ...account.balances, iso_currency_code: null, unofficial_currency_code: "XYZ" },
     },
     "item-1",
+    "Chase",
   );
   assert.equal(row.currency, "XYZ");
 });
 
 test("mapAccount handles a null subtype", () => {
-  const row = mapAccount({ ...account, subtype: null }, "item-1");
+  const row = mapAccount({ ...account, subtype: null }, "item-1", "Chase");
   assert.equal(row.subtype, null);
 });
 
@@ -282,6 +284,7 @@ test("mapAccount normalizes an empty official_name, mask and subtype to null", (
   const row = mapAccount(
     { ...account, official_name: "", mask: "", subtype: "" },
     "item-1",
+    "Chase",
   );
   assert.equal(row.officialName, null);
   assert.equal(row.mask, null);

@@ -65,8 +65,6 @@ import {
 } from "./mapping.js";
 import { createPlaidClient } from "./plaidClient.js";
 
-/** Guards against an unbounded loop if Plaid's pagination never terminates. */
-const MAX_SYNC_PAGES = 50;
 /**
  * A first pull's full 24-month window can need more pages than an
  * incremental one; generous enough for 50,000 investment transactions at
@@ -208,7 +206,7 @@ export async function pullItem(
       access_token: accessToken,
     });
     for (const account of response.data.accounts) {
-      await upsertAccount(pool, mapAccount(account, item.itemId));
+      await upsertAccount(pool, mapAccount(account, item.itemId, item.institutionName));
       await upsertBalanceSnapshot(pool, mapBalanceSnapshot(account, asOf));
       result.accounts += 1;
       result.balances += 1;
@@ -249,7 +247,7 @@ export async function pullItem(
         }
       }
       for (const account of response.data.accounts) {
-        await upsertAccount(pool, mapAccount(account, item.itemId));
+        await upsertAccount(pool, mapAccount(account, item.itemId, item.institutionName));
       }
       for (const holding of response.data.holdings) {
         try {
@@ -277,15 +275,21 @@ export async function pullItem(
   let transactionsRowFailure = false;
   try {
     let hasMore = true;
-    let pages = 0;
-    while (hasMore && pages < MAX_SYNC_PAGES) {
-      pages += 1;
+    // No page cap: a real pull for a newly linked item with a 730-day
+    // window hit a fixed 50-page cap here (Plaid's own default page size of
+    // 100 per `/transactions/sync` call meant that stopped at exactly
+    // tx_added=5000, not the item's real total). `has_more` is Plaid's own
+    // signal that the sync is done; the cursor is still only persisted once,
+    // after this whole loop finishes (see `recordPullSuccess` below), so a
+    // page that fails partway through still withholds the cursor advance the
+    // same way it always did.
+    while (hasMore) {
       const response = await client.transactionsSync({
         access_token: accessToken,
         cursor,
       });
       for (const account of response.data.accounts) {
-        await upsertAccount(pool, mapAccount(account, item.itemId));
+        await upsertAccount(pool, mapAccount(account, item.itemId, item.institutionName));
       }
       for (const transaction of response.data.added) {
         try {

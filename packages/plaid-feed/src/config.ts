@@ -62,6 +62,25 @@ export async function loadDatabaseUrl(): Promise<string> {
   );
 }
 
+/**
+ * The finance archive's reader-role connection string, for `import-archive`.
+ * Env only, no Keychain fallback: this is the same
+ * `FINANCE_ARCHIVE_READER_DATABASE_URL` `apps/web/src/lib/mcp/finance.ts`
+ * already requires, and `import-archive` is read-only against the archive
+ * with the same reader credential, never the writer one.
+ */
+export function loadArchiveReaderDatabaseUrl(): string {
+  const url = process.env.FINANCE_ARCHIVE_READER_DATABASE_URL;
+  if (url === undefined || url === "") {
+    throw new Error(
+      "FINANCE_ARCHIVE_READER_DATABASE_URL is not set. import-archive reads " +
+        "the finance archive read-only with the archive's own reader-role " +
+        "connection string, the same one the MCP gateway uses.",
+    );
+  }
+  return url;
+}
+
 /** `com.kithmind.plaid.item.<institution_slug>`, this item's Keychain service. */
 export function itemKeychainService(institutionName: string): string {
   return `com.kithmind.plaid.item.${institutionSlug(institutionName)}`;

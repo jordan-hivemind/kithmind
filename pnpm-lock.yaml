@@ -322,6 +322,9 @@ importers:
 
   packages/plaid-feed:
     dependencies:
+      '@repo/finance-archive':
+        specifier: workspace:*
+        version: link:../finance-archive
       '@repo/kith-store':
         specifier: workspace:*
         version: link:../kith-store

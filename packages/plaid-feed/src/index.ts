@@ -4,6 +4,7 @@
 
 export * from "./config.js";
 export * from "./db.js";
+export * from "./importArchive.js";
 export * from "./keychain.js";
 export * from "./mapping.js";
 export {

@@ -23,6 +23,7 @@
     "test:once": "node ../../scripts/run-package-task.mjs test node --test test/*.test.mjs"
   },
   "dependencies": {
+    "@repo/finance-archive": "workspace:*",
     "@repo/kith-store": "workspace:*",
     "@repo/pg": "workspace:*",
     "pg": "^8.16.3",
