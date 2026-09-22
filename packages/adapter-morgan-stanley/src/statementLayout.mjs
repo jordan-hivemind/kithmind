@@ -931,6 +931,7 @@ function observedHoldingsHeader(text) {
 const TOTAL_ROW = /^Total\b/;
 /** Ends a holdings table. */
 const TABLE_END = /^(TOTAL|Total Value|HOLDINGS|CASH FLOW|ACTIVITY|Page \d)/;
+const ACTIVITY_SECTION = /^ACTIVITY\b/;
 /**
  * F1-61. The page footer, the one `TABLE_END` that does not end the table:
  * a security's lots run past the bottom of a page and the rest of them,
@@ -1897,6 +1898,48 @@ function parseHoldings(
   // with the carried block, so a continuation cannot look like two complete
   // tables and a missing successor cannot look complete at all.
   let carried = null;
+  const activityBoundaryAfterCarried = (pending) => {
+    if (pending.footerPage !== pending.page + 1) return null;
+    if (
+      !printedPageRunContinuesThrough(
+        pending.page,
+        pending.footerPage,
+        printedByPage,
+        populatedPages,
+      )
+    ) {
+      return null;
+    }
+    for (let i = pending.footerIndex + 1; i < lines.length; i += 1) {
+      const line = lines[i];
+      if (line.page !== pending.footerPage) return null;
+      const trimmed = line.text.trim();
+      if (ACTIVITY_SECTION.test(trimmed)) {
+        if (accountKeys[i] !== pending.context.accountKey) return null;
+        return {
+          lineIndex: i,
+          locator: lineSpanLocator(
+            line,
+            kind,
+            "activity section boundary",
+            textMeta,
+          ),
+        };
+      }
+      // Only the provider's repeated page/account furniture may intervene.
+      // Any source content or a new table keeps the carry unresolved.
+      if (
+        PAGE_FOOTER.test(trimmed) ||
+        /^CLIENT STATEMENT\b/.test(trimmed) ||
+        BARE_ACCOUNT_LINE.test(line.text) ||
+        /^Account\b/.test(trimmed)
+      ) {
+        continue;
+      }
+      return null;
+    }
+    return null;
+  };
   const flushCarried = (
     nextAccountKey = null,
     nextMarker = null,
@@ -1908,6 +1951,9 @@ function parseHoldings(
         ...carried.context,
         allowLotAggregation: false,
       }).position !== null;
+    const activityBoundary = independentlyComplete
+      ? activityBoundaryAfterCarried(carried)
+      : null;
     if (nextMarker !== null && nextAccountKey !== carried.context.accountKey) {
       carried.table.end = lineSpanLocator(
         lines[nextMarker],
@@ -1952,6 +1998,9 @@ function parseHoldings(
       } else {
         carried.table.gapCodes.add("page_sequence_gap");
       }
+    } else if (activityBoundary !== null) {
+      carried.table.end = activityBoundary.locator;
+      carried.table.lastLineIndex = activityBoundary.lineIndex;
     } else if (
       carried.finalPageFooter &&
       !lines.some(
@@ -2064,6 +2113,8 @@ function parseHoldings(
     let interruptedByPageFooter = false;
     let finalPageFooter = false;
     let terminalIndex = null;
+    let summaryBoundaryIndex = null;
+    let summaryHasUnresolvedSecurity = false;
     for (let j = i + 1; j < lines.length; j += 1) {
       const text = lines[j].text;
       const trimmed = text.trim();
@@ -2076,6 +2127,8 @@ function parseHoldings(
       if (SECTION_SUMMARY.test(trimmed)) {
         flush();
         inSummary = true;
+        summaryBoundaryIndex = j;
+        summaryHasUnresolvedSecurity = false;
         i = j;
         table.lastLineIndex = j;
         continue;
@@ -2088,12 +2141,19 @@ function parseHoldings(
         bound.has("tradeDate") &&
         (!inSummary || TRADE_DATE_CELL.test(bound.get("tradeDate").text));
       if (inSummary && !startsSecurity) {
+        if (
+          bound.has("tradeDate") &&
+          TRADE_DATE_CELL.test(bound.get("tradeDate").text)
+        ) {
+          summaryHasUnresolvedSecurity = true;
+        }
         i = j;
         table.lastLineIndex = j;
         continue;
       }
       if (startsSecurity) {
         inSummary = false;
+        summaryBoundaryIndex = null;
         flush();
         description = bound.get("description").text;
       }
@@ -2105,6 +2165,20 @@ function parseHoldings(
       });
       i = j;
       table.lastLineIndex = j;
+    }
+    if (
+      interruptedByPageFooter &&
+      inSummary &&
+      block.length === 0 &&
+      summaryBoundaryIndex !== null &&
+      !summaryHasUnresolvedSecurity
+    ) {
+      // The provider's own Percentage/of Holdings summary positively closes
+      // the preceding security table. A leading Page line on the following
+      // page is therefore furniture after a closed table, not an interrupted
+      // empty security block waiting for a new header.
+      interruptedByPageFooter = false;
+      terminalIndex = summaryBoundaryIndex;
     }
     if (terminalIndex !== null) table.lastLineIndex = terminalIndex;
     if (interruptedByPageFooter) {

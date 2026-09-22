@@ -1221,6 +1221,144 @@ test("a consolidated statement proves each account position scope from bounded t
   }
 });
 
+test("a source section summary closes a table before next-page furniture", () => {
+  const text = [
+    [
+      "        Page 1 of 2",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Synthetic Household",
+      "        HOLDINGS",
+      ...equityBlockLines(),
+      ...sectionSummaryLines(),
+    ].join("\n"),
+    [
+      "        Page 2 of 2",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Synthetic Household",
+      "        ACTIVITY",
+    ].join("\n"),
+  ].join(`\n${PAGE_SEPARATOR}\n`);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+  assert.match(
+    scope.evidence.tables[0].end.binding.quote,
+    /^(Percentage|of Holdings)/,
+  );
+});
+
+test("a dated row without a security description after a summary remains partial", () => {
+  const described = equityBlockLines()[2];
+  const name = "WIDGET NEUTRAL FUND (WNDF)";
+  const missingDescription = described.replace(name, " ".repeat(name.length));
+  const text = [
+    [
+      "        Page 1 of 2",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Synthetic Household",
+      "        HOLDINGS",
+      ...equityBlockLines(),
+      ...sectionSummaryLines(),
+      missingDescription,
+    ].join("\n"),
+    [
+      "        Page 2 of 2",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Synthetic Household",
+      "        ACTIVITY",
+    ].join("\n"),
+  ].join(`\n${PAGE_SEPARATOR}\n`);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "partial");
+  assert.ok(scope.gapCodes.includes("page_sequence_gap"));
+});
+
+test("an adjacent anchored ACTIVITY section closes an independently complete carried position", () => {
+  const text = [
+    [
+      "        Page 1 of 2",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Synthetic Household",
+      "        HOLDINGS",
+      ...equityBlockLines(),
+    ].join("\n"),
+    [
+      "        Page 2 of 2",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Synthetic Household",
+      "        ACTIVITY",
+    ].join("\n"),
+  ].join(`\n${PAGE_SEPARATOR}\n`);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+  assert.equal(scope.evidence.tables[0].end.binding.quote, "ACTIVITY");
+});
+
+test("an ACTIVITY marker after a printed-page gap cannot close a carried table", () => {
+  const text = [
+    [
+      "        Page 1 of 3",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Synthetic Household",
+      "        HOLDINGS",
+      ...equityBlockLines(),
+    ].join("\n"),
+    [
+      "        Page 3 of 3",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Synthetic Household",
+      "        ACTIVITY",
+    ].join("\n"),
+  ].join(`\n${PAGE_SEPARATOR}\n`);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "partial");
+  assert.ok(scope.gapCodes.includes("page_sequence_gap"));
+});
+
+test("another account's ACTIVITY marker cannot close a carried table", () => {
+  const text = [
+    [
+      "        Page 1 of 2",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Synthetic Household",
+      "        HOLDINGS",
+      ...equityBlockLines(),
+    ].join("\n"),
+    [
+      "        Page 2 of 2",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      CONSOLIDATED_ACCOUNT_TWO,
+      "        Account Synthetic Household",
+      "        ACTIVITY",
+    ].join("\n"),
+  ].join(`\n${PAGE_SEPARATOR}\n`);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const firstScope = parsed.holdings.positionScopes.find(
+    (scope) => scope.accountExternalKey === CONSOLIDATED_ACCOUNT_ONE,
+  );
+  assert.equal(firstScope.status, "partial");
+  assert.ok(firstScope.gapCodes.includes("page_sequence_gap"));
+});
+
 test("a new account page-one reset cannot hide the prior account's missing page", () => {
   const [firstPage, secondPage] = CONSOLIDATED_LAYOUT_TEXT.split(
     `\n${PAGE_SEPARATOR}\n`,
