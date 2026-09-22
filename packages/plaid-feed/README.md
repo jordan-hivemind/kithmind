@@ -207,9 +207,39 @@ so a same-named table earlier on the connection's `search_path` can never be
 read by mistake. A startup guard (`assertArchiveSchemaReady`) confirms
 `${schema}.accounts` is actually reachable before any real reading starts,
 failing with a clear message rather than a bare "relation does not exist"
-(or, worse, silently reading the wrong table) if it is not. An archive
-instrument is matched onto `kith.fin_securities` by ticker, then CUSIP, then
-ISIN.
+(or, worse, silently reading the wrong table) if it is not.
+
+### Instrument matching (FIN-4)
+
+An archive instrument is not one to one with a `kith.fin_securities` row: two
+archive instrument ids can resolve to one existing security (the same CUSIP,
+ISIN or ticker recorded twice under different archive instrument ids), and an
+instrument can turn out to be re-matched onto a row that already carries a
+different archive instrument's id. PR 435's first real production run
+assumed the 1:1 shape migration 048's `archive_instrument_id text UNIQUE`
+encoded and aborted with a unique-constraint violation the moment that
+assumption turned out to be false, before any account repair ran at all.
+
+Migration `051_fin_security_links.sql` drops that UNIQUE constraint (keeping
+a plain index) and adds `kith.fin_security_links`, an archive-instrument-id
+to `fin_securities`-id map: every archive instrument that is *not* the one
+whose "no match yet" case originally created a security gets a row here.
+`resolveArchiveInstrument` resolves each archive instrument, in order: a
+security this exact instrument already created (its own
+`fin_securities.archive_instrument_id`); an existing `fin_security_links`
+row for it (authoritative, never re-matched); a match against the run's
+current candidates by CUSIP, then ISIN, then ticker
+(`matchArchiveInstrumentByIdentifierStrength` -- CUSIP and ISIN are less
+ambiguous than a ticker, which a fund family can reuse across share classes),
+recorded as a new `fin_security_links` row; or, with no match at all, a
+brand-new security. A single instrument's own resolution failing is counted
+under `instrument_conflicts` and skipped rather than aborting every
+instrument after it -- its own transactions and positions still import, with
+a `null` `security_id`.
+
+`matchArchiveInstrument` (ticker, then CUSIP, then ISIN) is unchanged and
+still used for its own callers; the CUSIP-first order above applies only to
+what `resolveArchiveInstrument` persists as a link.
 
 ### Account matching (FIN-3)
 
@@ -327,10 +357,20 @@ account, `null` when the account has no Plaid data yet.
 Prints counts only, the same rule `pull` follows:
 
 ```
-plaid import-archive accounts_matched=3 links_set=1 links_holdings=2 links_balance=0 links_mask=0 links_name=0 links_manual=1 archive_only_accounts=1 rows_inserted=4108 rows_reattributed=0 rows_deleted_as_overlap=6 empty_accounts_removed=0 boundary_date_count=2 accounts_created=1 accounts_merged=0 instruments_matched=12 instruments_created=2 transactions_imported=4094 transactions_skipped_past_boundary=214 positions_imported=340 positions_skipped_no_instrument=0 positions_skipped_past_boundary=5 balances_imported=48 balances_skipped_past_boundary=2
+plaid import-archive accounts_matched=3 links_set=1 links_holdings=2 links_balance=0 links_mask=0 links_name=0 links_manual=1 archive_only_accounts=1 rows_inserted=4108 rows_reattributed=0 rows_deleted_as_overlap=6 empty_accounts_removed=0 boundary_date_count=2 accounts_created=1 accounts_merged=0 instruments_matched=12 instruments_created=2 instrument_conflicts=0 transactions_imported=4094 transactions_skipped_past_boundary=214 positions_imported=340 positions_skipped_no_instrument=0 positions_skipped_past_boundary=5 balances_imported=48 balances_skipped_past_boundary=2
 ```
 
-## Tables (migrations `043_plaid_feed.sql`, `044_plaid_currency.sql`, `045_plaid_history.sql`, `047_plaid_strings.sql`, `048_finance_unify.sql`, `049_fin_archive_coverage.sql`, `050_fin_account_matching.sql`)
+### Phased, so a failure never discards what already ran (FIN-4)
+
+`import-archive` runs in phases -- setup, instruments, accounts, self-repair,
+boundary, rows -- each wrapped so a failure partway through still returns the
+counts every completed phase produced, rather than throwing the whole run's
+counts away the way PR 435's first real run did. A failed phase's name is
+printed as `phase_failed=<phase>` on the summary line above (the phase name
+only; the underlying error goes to stderr, since it may not be counts-only),
+and the CLI exits non-zero.
+
+## Tables (migrations `043_plaid_feed.sql`, `044_plaid_currency.sql`, `045_plaid_history.sql`, `047_plaid_strings.sql`, `048_finance_unify.sql`, `049_fin_archive_coverage.sql`, `050_fin_account_matching.sql`, `051_fin_security_links.sql`)
 
 `kith.plaid_items` is Plaid item state only -- the Keychain pointer, the
 `/transactions/sync` cursor, the investment-transaction watermark,
@@ -357,6 +397,10 @@ Migration `050_fin_account_matching.sql` adds `kith.fin_accounts.match_method`
 (`holdings`/`balance`/`mask`/`name`/`manual`, nullable -- see "Account
 matching (FIN-3)" above) and `kith.fin_account_link_overrides`, an owner's
 persisted `--link`/`--unlink`.
+
+Migration `051_fin_security_links.sql` drops the UNIQUE constraint on
+`kith.fin_securities.archive_instrument_id` (kept as a plain index) and adds
+`kith.fin_security_links` -- see "Instrument matching (FIN-4)" above.
 
 All in the `kith` schema and all owner-global (no `space_id`), matching
 every existing finance table in this codebase. No triggers, no change-feed
@@ -437,7 +481,7 @@ node --test packages/plaid-feed/test/*.test.mjs
 linking, boundary rule and FIN-3 self-repair reconciling archive-style
 accounts against Plaid-style ones, end to end against a real throwaway
 Postgres (its own database on whatever server `KITH_STORE_DATABASE_URL`
-points at, created and dropped by the test). Eight scenarios: a straight
+points at, created and dropped by the test). Ten scenarios: a straight
 mask match with the boundary rule and a second, idempotent run; an
 archive-only account merging into a feed account that shows up later, with
 self-repair deleting the now-past-boundary archive row that an earlier,
@@ -448,9 +492,14 @@ same-type archive accounts with a null display name each getting their own
 row); holdings-overlap linking two investment accounts to their correct
 Plaid accounts when masks disagree; balance matching a credit-line/loan
 account with no holdings; a persisted `--link` override taking precedence
-over mask matching; and self-repair moving a misattributed transaction from
-a wrong bucket account to the correct one, with a second, idempotent run.
-Skips cleanly without `KITH_STORE_DATABASE_URL` set, and runs as part of the
+over mask matching; self-repair moving a misattributed transaction from
+a wrong bucket account to the correct one, with a second, idempotent run;
+the FIN-4 instrument repro (two archive instruments sharing one CUSIP plus a
+third already resolved by an earlier run's `fin_security_links` row,
+resolving without a unique violation across two runs, with transactions
+attributed to the right security); and a synthetic rows-phase failure
+proving the instruments and accounts phases' counts survive on the returned
+result. Skips cleanly without `KITH_STORE_DATABASE_URL` set, and runs as part of the
 same `node --test packages/plaid-feed/test/*.test.mjs` command above.
 `test/importArchive.test.mjs` additionally covers the pure matching
 functions with no database at all, including the placeholder-name and

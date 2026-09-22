@@ -31,6 +31,7 @@ import {
   mapTransaction,
   openPool,
   setManualLink,
+  summarizeImportArchive,
   upsertAccount,
   upsertPlaidItem,
   upsertTransaction,
@@ -845,6 +846,212 @@ test(
       assert.equal(bucketRowsAgain.length, 1);
     } finally {
       await pool.end();
+      await archiveClient.end();
+      await kithClient.end();
+    }
+  },
+);
+
+// FIN-4 (migration 051_fin_security_links.sql): archive instruments are not
+// one to one with kith.fin_securities rows. PR 435's first real run aborted
+// on "duplicate key value violates unique constraint
+// \"fin_securities_archive_instrument_id_key\"" the moment two archive
+// instruments turned out to share one CUSIP. This scenario reproduces
+// exactly that shape -- two archive instruments sharing a CUSIP, plus a
+// third instrument already resolved by an earlier run's fin_security_links
+// row -- and proves both resolve without a unique violation, on this run
+// and a second, idempotent one, with every transaction attributed to the
+// right security.
+test(
+  "FIN-4: two archive instruments sharing a CUSIP, plus one already-linked instrument, resolve without a unique violation and attribute transactions to the right security",
+  { skip },
+  async (t) => {
+    const dbUrl = await throwawayDatabase(t);
+    const kithClient = new pg.Client({ connectionString: dbUrl });
+    const archiveClient = createArchiveClient(dbUrl, "finance");
+    const pool = openPool(dbUrl);
+    try {
+      await kithClient.connect();
+      await applyKithSchema(kithClient);
+      await archiveClient.connect();
+      await applyPgSchema(archiveClient, "finance");
+
+      await archiveClient.query(
+        `INSERT INTO institutions (id, name, slug) VALUES ('arch-inst-fin4', 'Schwab', 'schwab-fin4')`,
+      );
+      await archiveClient.query(
+        `INSERT INTO accounts (id, institution_id, acct_last4, display_name, account_type, base_currency)
+         VALUES ('arch-fin4-1', 'arch-inst-fin4', '6001', NULL, 'brokerage', 'USD')`,
+      );
+      // instr-dup-a and instr-dup-b share one CUSIP -- two different archive
+      // instrument ids that resolve to one real security, the exact shape
+      // the owner's database hit. instr-linked has its own, different CUSIP.
+      await archiveClient.query(
+        `INSERT INTO instruments (id, symbol, cusip, isin, name, instrument_kind)
+         VALUES
+           ('instr-dup-a', 'DUPA', 'CUSIPDUP000', NULL, 'Fund Dup A', 'fund'),
+           ('instr-dup-b', 'DUPB', 'CUSIPDUP000', NULL, 'Fund Dup B', 'fund'),
+           ('instr-linked', 'LNK', 'CUSIPLINK00', NULL, 'Fund Linked', 'fund')`,
+      );
+      await archiveClient.query(
+        `INSERT INTO transactions
+           (id, account_id, process_date, activity_type, description, amount, currency, instrument_id, row_hash, imported_at)
+         VALUES
+           ('arch-fin4-txn-a', 'arch-fin4-1', '2020-01-01', 'Buy', 'Buy Dup A', -100, 'USD', 'instr-dup-a', 'hash-fin4-a', now()),
+           ('arch-fin4-txn-b', 'arch-fin4-1', '2020-01-02', 'Buy', 'Buy Dup B', -200, 'USD', 'instr-dup-b', 'hash-fin4-b', now()),
+           ('arch-fin4-txn-linked', 'arch-fin4-1', '2020-01-03', 'Dividend', 'Dividend Linked', 12.5, 'USD', 'instr-linked', 'hash-fin4-linked', now())`,
+      );
+
+      // instr-linked is already resolved from an earlier run: a
+      // fin_security_links row points it at an existing security whose own
+      // CUSIP does *not* match the archive instrument's -- proving the
+      // existing link wins outright rather than being re-derived by
+      // CUSIP/ISIN/ticker (which would otherwise find no match at all here).
+      const preLinkedSecurityId = newKithId();
+      await kithClient.query(
+        `INSERT INTO kith.fin_securities (id, name, ticker, cusip, isin, type, plaid_security_id)
+         VALUES ($1, 'Fund Linked (Plaid)', 'LNK', 'UNRELATEDCUSIP', NULL, 'fund', 'plaid-sec-linked')`,
+        [preLinkedSecurityId],
+      );
+      await kithClient.query(
+        `INSERT INTO kith.fin_security_links (id, archive_instrument_id, security_id, match_method)
+         VALUES ($1, 'instr-linked', $2, 'ticker')`,
+        [newKithId(), preLinkedSecurityId],
+      );
+
+      const first = await importArchive(archiveReader(archiveClient), pool);
+      assert.equal(first.phaseFailure, undefined, "no phase should fail");
+      assert.equal(first.instrumentConflicts, 0);
+      // One of the two CUSIP-duplicate instruments creates a security (no
+      // match yet); the other matches it by CUSIP -- never a second
+      // fin_securities insert for the same archive instrument id, and never
+      // a unique-constraint violation now that migration 051 dropped it.
+      assert.equal(first.instrumentsCreated, 1);
+      assert.equal(first.instrumentsMatched, 1);
+
+      const { rows: txnRows } = await kithClient.query(
+        `SELECT source_ref, security_id FROM kith.fin_transactions
+          WHERE source_ref = ANY($1) ORDER BY source_ref`,
+        [["arch-fin4-txn-a", "arch-fin4-txn-b", "arch-fin4-txn-linked"]],
+      );
+      assert.equal(txnRows.length, 3);
+      const securityIdByRef = Object.fromEntries(txnRows.map((r) => [r.source_ref, r.security_id]));
+      assert.equal(
+        securityIdByRef["arch-fin4-txn-a"],
+        securityIdByRef["arch-fin4-txn-b"],
+        "both CUSIP-duplicate instruments' transactions attribute to the same security",
+      );
+      assert.equal(
+        securityIdByRef["arch-fin4-txn-linked"],
+        preLinkedSecurityId,
+        "the already-linked instrument's transaction attributes to the pre-linked security, never re-derived",
+      );
+
+      const { rows: linkRows } = await kithClient.query(
+        `SELECT archive_instrument_id, security_id FROM kith.fin_security_links
+          WHERE archive_instrument_id IN ('instr-dup-a', 'instr-dup-b')`,
+      );
+      assert.equal(linkRows.length, 1, "only the non-creating duplicate instrument gets a fin_security_links row");
+      assert.equal(linkRows[0].security_id, securityIdByRef["arch-fin4-txn-a"]);
+
+      // Idempotent: a second run resolves every instrument through a fast
+      // path (its own archive_instrument_id, or an existing link) and never
+      // attempts a second fin_securities insert for the same archive
+      // instrument id.
+      const second = await importArchive(archiveReader(archiveClient), pool);
+      assert.equal(second.phaseFailure, undefined);
+      assert.equal(second.instrumentConflicts, 0);
+      assert.equal(second.instrumentsCreated, 0);
+      assert.equal(second.instrumentsMatched, 0, "both duplicate instruments now resolve through a fast path, no re-match");
+
+      const { rows: txnRowsAgain } = await kithClient.query(
+        `SELECT source_ref, security_id FROM kith.fin_transactions
+          WHERE source_ref = ANY($1) ORDER BY source_ref`,
+        [["arch-fin4-txn-a", "arch-fin4-txn-b", "arch-fin4-txn-linked"]],
+      );
+      assert.equal(txnRowsAgain.length, 3, "no duplicate rows from the second run");
+      const securityIdByRefAgain = Object.fromEntries(txnRowsAgain.map((r) => [r.source_ref, r.security_id]));
+      assert.deepEqual(securityIdByRefAgain, securityIdByRef, "attribution is unchanged by the second run");
+    } finally {
+      await pool.end();
+      await archiveClient.end();
+      await kithClient.end();
+    }
+  },
+);
+
+// FIN-4: a phase failure must never discard the counts of the phases that
+// already ran -- PR 435's first real run threw out of importArchive
+// entirely, so the CLI printed nothing at all, not even for the accounts
+// phase that had not even started yet. A synthetic failure is injected into
+// the first `fin_transactions` insert (the rows phase) via a pool proxy, so
+// the instruments and accounts phases -- which have already run to
+// completion by then -- prove their counts survive on the returned result.
+test(
+  "FIN-4: a failure in the rows phase still returns the counts from the phases that ran",
+  { skip },
+  async (t) => {
+    const dbUrl = await throwawayDatabase(t);
+    const kithClient = new pg.Client({ connectionString: dbUrl });
+    const archiveClient = createArchiveClient(dbUrl, "finance");
+    const realPool = openPool(dbUrl);
+    try {
+      await kithClient.connect();
+      await applyKithSchema(kithClient);
+      await archiveClient.connect();
+      await applyPgSchema(archiveClient, "finance");
+
+      await archiveClient.query(
+        `INSERT INTO institutions (id, name, slug) VALUES ('arch-inst-fail', 'Ally', 'ally-fail')`,
+      );
+      await archiveClient.query(
+        `INSERT INTO accounts (id, institution_id, acct_last4, display_name, account_type, base_currency)
+         VALUES ('arch-fail-1', 'arch-inst-fail', '9001', NULL, 'brokerage', 'USD')`,
+      );
+      await archiveClient.query(
+        `INSERT INTO instruments (id, symbol, cusip, isin, name, instrument_kind)
+         VALUES ('instr-fail-1', 'FAIL', 'CUSIPFAIL00', NULL, 'Fund Fail', 'fund')`,
+      );
+      await archiveClient.query(
+        `INSERT INTO transactions
+           (id, account_id, process_date, activity_type, description, amount, currency, instrument_id, row_hash, imported_at)
+         VALUES ('arch-fail-txn-1', 'arch-fail-1', '2020-01-01', 'Buy', 'Buy Fail', -50, 'USD', 'instr-fail-1', 'hash-fail-1', now())`,
+      );
+
+      // A pool proxy that behaves exactly like the real one, except the
+      // rows phase's first write throws synthetically -- proving
+      // importArchive returns (rather than throws) with the earlier
+      // phases' counts intact.
+      let failed = false;
+      const failingPool = {
+        query: (...args) => {
+          const [sql] = args;
+          if (!failed && typeof sql === "string" && sql.includes("INSERT INTO kith.fin_transactions")) {
+            failed = true;
+            throw new Error("synthetic rows-phase failure");
+          }
+          return realPool.query(...args);
+        },
+      };
+
+      const result = await importArchive(archiveReader(archiveClient), failingPool);
+
+      assert.ok(result.phaseFailure, "a phase failure should be recorded rather than thrown");
+      assert.equal(result.phaseFailure.phase, "rows");
+      assert.equal(result.phaseFailure.message, "synthetic rows-phase failure");
+
+      // The instruments and accounts phases ran to completion before the
+      // rows phase failed -- their counts are still on the returned result.
+      assert.equal(result.instrumentsCreated, 1, "the instruments phase completed and its count is preserved");
+      assert.equal(result.accountsCreated, 1, "the accounts phase completed and its count is preserved");
+      assert.equal(result.transactionsImported, 0, "the rows phase failed before any transaction insert succeeded");
+
+      const summary = summarizeImportArchive(result);
+      assert.match(summary, /phase_failed=rows/);
+      assert.match(summary, /instruments_created=1/);
+      assert.match(summary, /accounts_created=1/);
+    } finally {
+      await realPool.end();
       await archiveClient.end();
       await kithClient.end();
     }
