@@ -148,3 +148,22 @@ test("loadBindings fails with a clear message when the file does not exist", asy
     /Cannot read bindings file/,
   );
 });
+
+test("loadBindings reads identities from a scan-phase checkpoint's files[] entries", async (t) => {
+  const id = "0f1e2d3c-4b5a-4c6d-8e7f-9a0b1c2d3e4f";
+  const path = await tempJson(t, {
+    version: 1,
+    checkpoint: {
+      version: 1,
+      phase: "scan",
+      files: [
+        { rootAlias: "dropbox", relativePath: "a.pdf", externalId: id, providerFileId: "id:x", sourceItemId: "s1", sha256: "ab", byteLength: 3, kind: "pdf" },
+        { rootAlias: "other", relativePath: "b.pdf", externalId: "1f1e2d3c-4b5a-4c6d-8e7f-9a0b1c2d3e4f", sourceItemId: "s2" },
+      ],
+      missingBindings: [],
+    },
+  });
+  const result = await loadBindings(path, "dropbox");
+  assert.equal(result.map.get("a.pdf"), id);
+  assert.equal(result.map.size, 1);
+});
