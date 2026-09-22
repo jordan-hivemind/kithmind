@@ -24,6 +24,7 @@ import {
   SPREADSHEET_V1_BOUNDS,
   type BinaryParserOutputMediaType,
   type BinaryParserProfileId,
+  type BinaryMediaType,
 } from "@repo/worker-protocol";
 
 import { inspectCapturedPdf, type CapturedPdf } from "./captureStore.js";
@@ -74,6 +75,15 @@ export const DEFAULT_PARSER_PROCESS_LIMITS: ParserProcessLimits = {
   maxOpenFiles: 256,
 };
 
+export const DEFAULT_DOCUMENT_PREVIEW_LIMITS: ParserProcessLimits = {
+  ...DEFAULT_PARSER_PROCESS_LIMITS,
+  wallDeadlineMs: 45_000,
+  cpuSeconds: 30,
+  maxRssBytes: 1024 * 1024 * 1024,
+  maxProcessCount: 4,
+  maxStderrBytes: 16 * 1024,
+};
+
 export type ParserProcessFailureCode =
   | "unsupported_platform"
   | "invalid_input"
@@ -109,6 +119,33 @@ export type ParserProcessFailureCode =
   | "workbook_encrypted"
   | "workbook_unsupported"
   | "workbook_oversized";
+
+export type PreviewWindow = { startPage: number; pageCount: number };
+
+export type DocumentPreviewResult = {
+  sourceSha256: string;
+  mediaType: BinaryMediaType;
+  sourceUnitCount: number;
+  inspectedOriginalUnits: number[];
+  unitStates: Array<"text_available" | "image_only" | "unknown">;
+  method: "pdf_native_text_v1" | "spreadsheet_manifest_v1";
+  methodFingerprint: string;
+};
+
+export type RunDocumentPreviewInput = {
+  sourcePath: string;
+  expectedSha256: string;
+  mediaType: BinaryMediaType;
+  windows: PreviewWindow[];
+  pythonExecutable: string;
+  expectedPythonSha256: string;
+  launcherPath: string;
+  expectedLauncherSha256: string;
+  packageRoot: string;
+  work: ParserProfileWorkIntent;
+  workRoot: string;
+  limits?: ParserProcessLimits;
+};
 
 const LAUNCHER_FAILURE_CODES = [
   "execution_prerequisite_missing",
@@ -655,13 +692,13 @@ function sandboxProfile(paths: {
   pythonEnvironmentRoot: string;
   pythonRuntimeRoot: string;
   packageRoot: string;
-  modelAssets: string;
-  modelLock: string;
+  modelAssets?: string;
+  modelLock?: string;
   capture?: string;
   output: string;
 }): string {
   const literalReads = [
-    paths.modelLock,
+    ...(paths.modelLock === undefined ? [] : [paths.modelLock]),
     ...(paths.capture === undefined ? [] : [paths.capture]),
     "/",
     "/dev/urandom",
@@ -680,7 +717,7 @@ function sandboxProfile(paths: {
     paths.pythonEnvironmentRoot,
     paths.pythonRuntimeRoot,
     paths.packageRoot,
-    paths.modelAssets,
+    ...(paths.modelAssets === undefined ? [] : [paths.modelAssets]),
     paths.output,
   ];
   const metadataReads = new Set<string>(["/etc", "/tmp", "/var"]);
@@ -3322,6 +3359,384 @@ export async function preparePdfDocQaProfile(
       monitorCommandTimeoutMs: PROCESS_MONITOR_TIMEOUT_MS,
     },
   };
+}
+
+function previewMethod(
+  value: unknown,
+  expected: DocumentPreviewResult["method"],
+): string {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    fail("output_invalid", "preview method is invalid");
+  const method = value as Record<string, unknown>;
+  if (
+    !exactKeys(method, [
+      "schemaVersion",
+      "name",
+      "implementationSha256",
+      "dependencies",
+      "fingerprint",
+    ]) ||
+    method.schemaVersion !== 1 ||
+    method.name !== expected ||
+    !SHA256.test(String(method.implementationSha256 ?? "")) ||
+    !SHA256.test(String(method.fingerprint ?? "")) ||
+    !method.dependencies ||
+    typeof method.dependencies !== "object" ||
+    Array.isArray(method.dependencies) ||
+    Object.keys(method.dependencies).length > 8 ||
+    Object.values(method.dependencies).some(
+      (item) => typeof item !== "string" || item.length > 64,
+    )
+  )
+    fail("output_invalid", "preview method is invalid");
+  return method.fingerprint as string;
+}
+
+function previewInteger(value: unknown, maximum: number): number {
+  if (
+    !Number.isSafeInteger(value) ||
+    (value as number) < 0 ||
+    (value as number) > maximum
+  )
+    fail("output_invalid", "preview count is invalid");
+  return value as number;
+}
+
+function validateDocumentPreviewResult(
+  value: Record<string, unknown>,
+  input: Pick<
+    RunDocumentPreviewInput,
+    "expectedSha256" | "mediaType" | "windows"
+  >,
+): DocumentPreviewResult {
+  if (
+    value.state !== "complete" ||
+    value.schemaVersion !== 1 ||
+    value.provisional !== true ||
+    value.sourceSha256 !== input.expectedSha256 ||
+    value.mediaType !== input.mediaType
+  )
+    fail("output_invalid", "preview identity is invalid");
+  if (input.mediaType === "application/pdf") {
+    if (
+      !exactKeys(value, [
+        "state",
+        "schemaVersion",
+        "provisional",
+        "sourceSha256",
+        "mediaType",
+        "pageCount",
+        "inspectedPageNumbers",
+        "units",
+        "method",
+      ]) ||
+      !Array.isArray(value.inspectedPageNumbers) ||
+      !Array.isArray(value.units) ||
+      value.inspectedPageNumbers.length === 0 ||
+      value.inspectedPageNumbers.length > 8 ||
+      value.units.length !== value.inspectedPageNumbers.length
+    )
+      fail("output_invalid", "PDF preview shape is invalid");
+    const pageCount = previewInteger(value.pageCount, Number.MAX_SAFE_INTEGER);
+    const requested = input.windows.flatMap(({ startPage, pageCount }) =>
+      Array.from({ length: pageCount }, (_, index) => startPage + index),
+    );
+    const inspected = value.inspectedPageNumbers.map((item) =>
+      previewInteger(item, pageCount),
+    );
+    if (JSON.stringify(inspected) !== JSON.stringify(requested))
+      fail("output_invalid", "PDF preview units do not match the request");
+    let textCharacters = 0;
+    let textBytes = 0;
+    const unitStates = value.units.map((item, index) => {
+      if (!item || typeof item !== "object" || Array.isArray(item))
+        fail("output_invalid", "PDF preview unit is invalid");
+      const unit = item as Record<string, unknown>;
+      if (
+        !exactKeys(unit, ["pageNumber", "state", "text", "textTruncated"]) ||
+        unit.pageNumber !== inspected[index] ||
+        (unit.state !== "text_available" &&
+          unit.state !== "image_only" &&
+          unit.state !== "unknown") ||
+        typeof unit.text !== "string" ||
+        unit.text.length > 96 ||
+        Buffer.byteLength(unit.text, "utf8") > 512 ||
+        typeof unit.textTruncated !== "boolean" ||
+        (unit.state !== "text_available" && unit.text !== "")
+      )
+        fail("output_invalid", "PDF preview unit is invalid");
+      textCharacters += unit.text.length;
+      textBytes += Buffer.byteLength(unit.text, "utf8");
+      return unit.state;
+    });
+    if (textCharacters > 768 || textBytes > 4 * 1024)
+      fail("output_invalid", "PDF preview text exceeded its bound");
+    return {
+      sourceSha256: input.expectedSha256,
+      mediaType: input.mediaType,
+      sourceUnitCount: pageCount,
+      inspectedOriginalUnits: inspected,
+      unitStates,
+      method: "pdf_native_text_v1",
+      methodFingerprint: previewMethod(value.method, "pdf_native_text_v1"),
+    };
+  }
+  if (
+    !exactKeys(value, [
+      "state",
+      "schemaVersion",
+      "provisional",
+      "sourceSha256",
+      "mediaType",
+      "sheetCount",
+      "sheets",
+      "method",
+    ]) ||
+    input.windows.length !== 0 ||
+    !Array.isArray(value.sheets)
+  )
+    fail("output_invalid", "spreadsheet preview shape is invalid");
+  const sheetCount = previewInteger(value.sheetCount, 32);
+  if (value.sheets.length !== sheetCount)
+    fail("output_invalid", "spreadsheet preview count is invalid");
+  for (const item of value.sheets) {
+    if (!item || typeof item !== "object" || Array.isArray(item))
+      fail("output_invalid", "spreadsheet preview sheet is invalid");
+    const sheet = item as Record<string, unknown>;
+    if (
+      !exactKeys(sheet, ["name", "visibility"]) ||
+      typeof sheet.name !== "string" ||
+      sheet.name.length === 0 ||
+      sheet.name.length > 31 ||
+      (sheet.visibility !== "visible" &&
+        sheet.visibility !== "hidden" &&
+        sheet.visibility !== "veryHidden")
+    )
+      fail("output_invalid", "spreadsheet preview sheet is invalid");
+  }
+  return {
+    sourceSha256: input.expectedSha256,
+    mediaType: input.mediaType,
+    sourceUnitCount: sheetCount,
+    inspectedOriginalUnits: Array.from(
+      { length: sheetCount },
+      (_, index) => index + 1,
+    ),
+    unitStates: [],
+    method: "spreadsheet_manifest_v1",
+    methodFingerprint: previewMethod(value.method, "spreadsheet_manifest_v1"),
+  };
+}
+
+/** Runs the bounded preview launcher without granting access to model assets. */
+export async function runDocumentPreview(
+  input: RunDocumentPreviewInput,
+): Promise<DocumentPreviewResult> {
+  requiredPlatform();
+  const limits = validateLimits(
+    input.limits ?? DEFAULT_DOCUMENT_PREVIEW_LIMITS,
+  );
+  if (
+    !SHA256.test(input.expectedSha256) ||
+    !SHA256.test(input.expectedPythonSha256) ||
+    !SHA256.test(input.expectedLauncherSha256) ||
+    !isAbsolute(input.sourcePath) ||
+    input.windows.length > 4
+  )
+    fail("invalid_input", "preview identity input is invalid");
+  let previousPage = 0;
+  const unitCount = input.windows.reduce((count, window) => {
+    if (
+      !exactKeys(window, ["startPage", "pageCount"]) ||
+      !Number.isSafeInteger(window.startPage) ||
+      !Number.isSafeInteger(window.pageCount) ||
+      window.startPage < 1 ||
+      window.pageCount < 1 ||
+      window.pageCount > 8 ||
+      window.startPage <= previousPage ||
+      !Number.isSafeInteger(window.startPage + window.pageCount - 1)
+    )
+      fail("invalid_input", "preview windows are invalid");
+    previousPage = window.startPage + window.pageCount - 1;
+    return count + window.pageCount;
+  }, 0);
+  if (
+    input.mediaType === "application/pdf"
+      ? unitCount < 1 || unitCount > 8
+      : input.windows.length !== 0
+  )
+    fail("invalid_input", "preview windows are invalid");
+  const sandboxTool = await boundedFile(
+    "/usr/bin/sandbox-exec",
+    "macOS sandbox tool",
+    16 * 1024 * 1024,
+    { executable: true },
+  );
+  const processTool = await boundedFile(
+    "/bin/ps",
+    "macOS process monitor",
+    16 * 1024 * 1024,
+    { executable: true },
+  );
+  if (
+    (await lstat(sandboxTool.canonical)).uid !== 0 ||
+    (await lstat(processTool.canonical)).uid !== 0
+  )
+    fail("unsafe_path", "required macOS tools are not system owned");
+  const source = await lstat(input.sourcePath).catch(() =>
+    fail("unsafe_path", "preview source is unavailable"),
+  );
+  if (!source.isFile() || source.isSymbolicLink())
+    fail("unsafe_path", "preview source is unsafe");
+  const canonicalSource = await realpath(input.sourcePath).catch(() =>
+    fail("unsafe_path", "preview source is unavailable"),
+  );
+  if (canonicalSource !== input.sourcePath)
+    fail("unsafe_path", "preview source is not canonical");
+  const work = await trustedDirectory(
+    input.work.path,
+    "preview work directory",
+    {
+      private: true,
+      rejectBroad: true,
+    },
+  );
+  const workRoot = await trustedDirectory(input.workRoot, "preview work root", {
+    private: true,
+    rejectBroad: true,
+  });
+  if (
+    dirname(work.path) !== workRoot.path ||
+    basename(work.path) !== input.work.workId ||
+    work.device !== input.work.workDirectory.device ||
+    work.inode !== input.work.workDirectory.inode ||
+    workRoot.device !== input.work.workRoot.device ||
+    workRoot.inode !== input.work.workRoot.inode
+  )
+    fail("unsafe_path", "preview work identity changed");
+  const entries = await opendir(work.path);
+  try {
+    if ((await entries.read()) !== null)
+      fail("destination_exists", "preview work directory is not empty");
+  } finally {
+    await entries.close().catch(() => undefined);
+  }
+  const packageRoot = await trustedDirectory(
+    input.packageRoot,
+    "parser package root",
+    { private: false, rejectBroad: true },
+  );
+  const launcher = await boundedFile(
+    input.launcherPath,
+    "parser launcher",
+    1024 * 1024,
+  );
+  if (
+    !contains(packageRoot.path, launcher.canonical) ||
+    digest(launcher.bytes) !== input.expectedLauncherSha256
+  )
+    fail(
+      "executable_mismatch",
+      "parser launcher identity does not match configuration",
+    );
+  const python = await boundedFile(
+    input.pythonExecutable,
+    "Python executable",
+    128 * 1024 * 1024,
+    { executable: true, allowSymlink: true },
+  );
+  if (digest(python.bytes) !== input.expectedPythonSha256)
+    fail(
+      "executable_mismatch",
+      "Python executable identity does not match configuration",
+    );
+  const pythonEnvironmentRoot = resolve(dirname(input.pythonExecutable), "..");
+  const pythonRuntimeRoot = resolve(dirname(python.canonical), "..");
+  await trustedDirectory(pythonEnvironmentRoot, "Python environment root", {
+    private: false,
+    rejectBroad: true,
+  });
+  await trustedDirectory(pythonRuntimeRoot, "Python runtime root", {
+    private: false,
+    rejectBroad: true,
+  });
+  if (
+    [packageRoot.path, pythonEnvironmentRoot, pythonRuntimeRoot].some(
+      (path) => contains(path, work.path) || contains(work.path, path),
+    ) ||
+    contains(work.path, canonicalSource) ||
+    contains(dirname(canonicalSource), work.path)
+  )
+    fail("unsafe_path", "preview read and write roots overlap");
+  const profile = sandboxProfile({
+    pythonExecutable: python.requested,
+    pythonTarget: python.canonical,
+    pythonEnvironmentRoot,
+    pythonRuntimeRoot,
+    packageRoot: packageRoot.path,
+    capture: canonicalSource,
+    output: work.path,
+  });
+  const environment: NodeJS.ProcessEnv = {
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
+    PATH: "/usr/bin:/bin",
+    HOME: work.path,
+    TMPDIR: work.path,
+    PYTHONPATH: packageRoot.path,
+    VIRTUAL_ENV: pythonEnvironmentRoot,
+    PYTHONUTF8: "1",
+    PYTHONNOUSERSITE: "1",
+    PYTHONDONTWRITEBYTECODE: "1",
+  };
+  const common = [
+    "--cpu-seconds",
+    String(limits.cpuSeconds),
+    "--file-bytes",
+    String(
+      BINARY_CLASSES[
+        input.mediaType === "application/pdf"
+          ? "pdf_docqa_v1"
+          : "spreadsheet_v1"
+      ].maxOriginalBytes,
+    ),
+    "--open-files",
+    String(limits.maxOpenFiles),
+  ];
+  await requireSandboxIsolation({
+    profile,
+    python: python.requested,
+    launcher: launcher.requested,
+    environment,
+    common,
+    limits,
+  });
+  const execution = await runSandboxed(
+    profile,
+    python.requested,
+    launcher.requested,
+    [
+      "--mode",
+      "preview",
+      ...common,
+      "--input",
+      canonicalSource,
+      "--expected-sha256",
+      input.expectedSha256,
+      "--media-type",
+      input.mediaType,
+      "--preview-windows",
+      JSON.stringify(input.windows),
+      "--preview-timeout-seconds",
+      "30",
+    ],
+    environment,
+    limits,
+    true,
+  );
+  const result = parseLauncherResult(execution.stdout);
+  throwLauncherFailure(result, execution.launcherFailure);
+  return validateDocumentPreviewResult(result, input);
 }
 
 export async function runCapturedPdfParser(

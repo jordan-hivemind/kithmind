@@ -31,6 +31,7 @@ import {
   reclaimStaleParserOutputDirectory,
   removeParserProfileWorkDirectoryExact,
   removeParserOutputExact,
+  runDocumentPreview,
   resolveRawLocators,
   runCapturedPdfParser,
 } from "../dist/parserProcess.js";
@@ -193,8 +194,46 @@ async function fixture(pdfName = "lab-report-unicode.pdf") {
     modelLockPath,
     expectedModelLockSha256: sha256(modelLockBytes),
   };
-  return { base, outputRoot, common };
+  return { base, outputRoot, sourcePath, common };
 }
+
+test(
+  "runs bounded preview directly from a stable source without model assets",
+  { skip: !hasPythonRuntime },
+  async () => {
+    const setup = await fixture();
+    const work = await createParserProfileWorkDirectory({
+      workRoot: setup.outputRoot,
+      workId: randomUUID(),
+    });
+    try {
+      const result = await runDocumentPreview({
+        sourcePath: setup.sourcePath,
+        expectedSha256: setup.common.capture.sha256,
+        mediaType: "application/pdf",
+        windows: [{ startPage: 1, pageCount: 1 }],
+        pythonExecutable: setup.common.pythonExecutable,
+        expectedPythonSha256: setup.common.expectedPythonSha256,
+        launcherPath: setup.common.launcherPath,
+        expectedLauncherSha256: setup.common.expectedLauncherSha256,
+        packageRoot: setup.common.packageRoot,
+        work,
+        workRoot: setup.outputRoot,
+      });
+      assert.equal(result.sourceSha256, setup.common.capture.sha256);
+      assert.equal(result.mediaType, "application/pdf");
+      assert.equal(result.method, "pdf_native_text_v1");
+      assert.deepEqual(result.inspectedOriginalUnits, [1]);
+      assert.ok(result.sourceUnitCount >= 1);
+    } finally {
+      await removeParserProfileWorkDirectoryExact({
+        workRoot: setup.outputRoot,
+        intent: work,
+      });
+      await rm(setup.base, { recursive: true, force: true });
+    }
+  },
+);
 
 async function outputDirectory(fixture, outputId) {
   const path = join(fixture.outputRoot, outputId);

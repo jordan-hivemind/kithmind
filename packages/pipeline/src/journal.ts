@@ -292,11 +292,7 @@ function authorityOf(binding: JournalBinding): Record<string, unknown> {
  * endpoint, space, account and credential slot, so a journal pointed at a
  * different account is a different watcher.
  */
-function mintWatcherId(
-  domain: string,
-  salt: string,
-  payload: unknown,
-): string {
+function mintWatcherId(domain: string, salt: string, payload: unknown): string {
   const bytes = createHash("sha256")
     .update(domain)
     .update(salt, "utf8")
@@ -1666,12 +1662,12 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
     this.parsedResult = undefined;
   }
   /**
-   * One bounded active-pass config transition for provider-original v2. The
-   * caller validates the allowed config delta and exact archived checkpoint.
-   * This method makes clearing the already-answered request, advancing its
-   * checkpoint, and adopting the proposed config binding one durable write.
+   * One bounded active-pass config transition. The caller owns the exact
+   * allowed config delta and checkpoint policy. This method makes any
+   * answered-request settlement, checkpoint transition, and binding adoption
+   * one durable write.
    */
-  async commitProviderV2Transition(args: {
+  async commitActiveConfigTransition(args: {
     previousBinding: JournalBinding;
     proposedBinding: JournalBinding;
     checkpoint: C;
@@ -1686,12 +1682,12 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
       (this.state.pending !== undefined &&
         (!this.state.pending.result || this.parsedResult === undefined))
     )
-      fail("provider v2 transition state is invalid");
+      fail("active config transition state is invalid");
     let checkpoint: C;
     try {
       checkpoint = this.codec.parseCheckpoint(args.checkpoint);
     } catch {
-      fail("provider v2 transition checkpoint is invalid");
+      fail("active config transition checkpoint is invalid");
     }
     const { pending: _completed, ...retained } = this.state;
     const next: StoredState = {
@@ -1702,11 +1698,12 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
     };
     await this.persistCandidate(next);
     const storedAfter = await readStoredState(this.statePath);
-    if (storedAfter === undefined) fail("provider v2 transition journal is missing");
+    if (storedAfter === undefined)
+      fail("active config transition journal is missing");
     const parsedAfter = parseState(storedAfter, this.codec);
     if (serializeState(parsedAfter.state) !== serializeState(next)) {
       this.poisoned = true;
-      fail("provider v2 transition journal readback changed");
+      fail("active config transition journal readback changed");
     }
     const transferredLocks = this.locks;
     this.locks = [];

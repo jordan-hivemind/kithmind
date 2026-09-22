@@ -196,7 +196,7 @@ export async function transitionProviderV2FromPaths(args: {
         transitionedAt: Date.now(),
       },
     };
-    const rebound = await journal.commitProviderV2Transition({
+    const rebound = await journal.commitActiveConfigTransition({
       previousBinding,
       proposedBinding,
       checkpoint,

@@ -19,11 +19,11 @@ Do not discard originals or erase already indexed content during this change.
 
 ## Processing policy
 
-| Pass | Work | Honest result |
-| --- | --- | --- |
-| Discovery and triage | Reuse source identity, location, hash and observed metadata. Inspect a bounded opening-page preview, using existing text where available. Record provisional type, title/date when supported, preview coverage, method/version and confidence or uncertainty. | Discoverable metadata and explicit processing depth. No claim that uninspected pages were searched or understood. |
-| Targeted ingestion | Extract pages and fields relevant to the selected goal, preserving original page numbers and evidence. | Queryable fields with stated coverage. Preview absence is never evidence that a field or document section does not exist. |
-| Full ingestion when warranted | Convert and index the document when whole-document retrieval, a supported extractor or a user request needs it. | Full declared processing coverage, subject to explicit failures. |
+| Pass                          | Work                                                                                                                                                                                                                                                          | Honest result                                                                                                             |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Discovery and triage          | Reuse source identity, location, hash and observed metadata. Inspect a bounded opening-page preview, using existing text where available. Record provisional type, title/date when supported, preview coverage, method/version and confidence or uncertainty. | Discoverable metadata and explicit processing depth. No claim that uninspected pages were searched or understood.         |
+| Targeted ingestion            | Extract pages and fields relevant to the selected goal, preserving original page numbers and evidence.                                                                                                                                                        | Queryable fields with stated coverage. Preview absence is never evidence that a field or document section does not exist. |
+| Full ingestion when warranted | Convert and index the document when whole-document retrieval, a supported extractor or a user request needs it.                                                                                                                                               | Full declared processing coverage, subject to explicit failures.                                                          |
 
 A first-page preview is a classification aid, not a financial completeness
 proof. A cover letter may precede a return, and a bundle may contain several
@@ -43,6 +43,22 @@ fingerprint. It remains provisional until the same bytes receive a retained
 source revision, and it cannot create facts, evidence or citations. The worker
 rejects a preview recorded against a stale observation. Later retention may
 link the immutable preview to the matching source revision exactly once.
+
+The first supported worker entry point is an explicit selected-item command.
+It accepts a private manifest containing exact root alias, relative path,
+content hash and bounded original-page windows. It runs only for revision-bound
+binary items after the active archived item, under the normal exclusive journal
+lock and with no pending request. Each server write uses the complete archived
+work identity and a deterministic request ID, so retry after a lost response is
+idempotent. The command leaves the checkpoint byte-for-byte unchanged and does
+not persist native text or workbook names.
+
+Preview execution reuses the existing parser sandbox boundary but grants no
+model-asset access and does not run Docling or OCR. A separate locked adoption
+command may change only the configured launcher digest, verifies the installed
+launcher bytes and requires an archived checkpoint with no pending request.
+This makes the preview-capable launcher an intentional dependency transition
+rather than an incidental consequence of changing a checkout.
 
 ## Goal-aware stopping for tax bundles
 

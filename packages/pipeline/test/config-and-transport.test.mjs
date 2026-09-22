@@ -311,9 +311,7 @@ test("provider v2 config transition accepts only the exact credential move and b
   ]) {
     const changed = structuredClone(proposed);
     mutate(changed);
-    assert.throws(() =>
-      validateProviderV2ConfigTransition(previous, changed),
-    );
+    assert.throws(() => validateProviderV2ConfigTransition(previous, changed));
   }
 });
 
@@ -695,6 +693,32 @@ test("transport response parser rejects extra and malformed success fields", () 
       "scan.begin",
     ),
   );
+});
+
+test("preview persistence responses are closed and identity-bound", () => {
+  const response = {
+    operation: "discovery.recordPreview",
+    previewId: "preview_1",
+    sourceItemId: "source_1",
+    observedContentHash: "a".repeat(64),
+    previewFingerprint: "b".repeat(64),
+    sourceRevisionId: "revision_1",
+    state: "retained",
+    reused: false,
+  };
+  assert.deepEqual(
+    parseWorkerResponse(JSON.stringify(response), response.operation),
+    response,
+  );
+  for (const invalid of [
+    { ...response, observedContentHash: "short" },
+    { ...response, state: "complete" },
+    { ...response, state: "provisional" },
+    { ...response, extra: true },
+  ])
+    assert.throws(() =>
+      parseWorkerResponse(JSON.stringify(invalid), response.operation),
+    );
 });
 
 test("scan append accepts optional epochs on needs_review and ignored_forgotten entries", () => {
