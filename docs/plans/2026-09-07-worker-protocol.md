@@ -97,7 +97,7 @@ staging additions are specified in the related original-byte contract.
 | `jobs.activate`          | Publish the staged generation.                       | Current source observation and lease must still match.                                                                                                                             |
 | `jobs.fail`              | Record a bounded worker failure.                     | Four published failure codes; server chooses retry policy.                                                                                                                         |
 | `processing.assessBegin` | Start an assessment of one terminal scan.            | One live assessment per source; current inventory and manifest required.                                                                                                           |
-| `processing.assessPage`  | Advance the server-owned assessment cursor.          | `maxItems` is exactly 1; only the latest committed page can replay.                                                                                                                |
+| `processing.assessPage`  | Advance the server-owned assessment cursor.          | `maxItems` is 1-8; only the latest committed page can replay.                                                                                                                      |
 
 All commands require `protocolVersion: 1`. Envelopes use exact fields: unknown,
 missing, malformed, empty, or invalid-Unicode values are rejected as
@@ -168,7 +168,7 @@ The assessment commands use these request and result fields:
 | Operation                | Additional request fields                                                | Result fields                                                                                                                           |
 | ------------------------ | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `processing.assessBegin` | `{ requestId, scanId, expectedInventoryEpoch, expectedManifestVersion }` | `{ operation, assessmentId, scanId, inventoryEpoch, manifestVersion, state, nextOrdinal, counts?, completedAt?, reused, staleReason? }` |
-| `processing.assessPage`  | `{ requestId, assessmentId, ordinal, maxItems: 1 }`                      | `{ operation, assessmentId, state, phase, ordinal, inspected, nextOrdinal, counts?, completedAt?, reused, staleReason? }`               |
+| `processing.assessPage`  | `{ requestId, assessmentId, ordinal, maxItems }`                         | `{ operation, assessmentId, state, phase, ordinal, inspected, nextOrdinal, counts?, completedAt?, reused, staleReason? }`               |
 
 Assessment states are `running`, `complete`, `incomplete`, or `stale`. Page
 phases are `items`, `unresolved_entries`, or `done`. Only complete or incomplete
@@ -313,17 +313,24 @@ request cannot replace an unexpired running assessment. An exact start retry
 returns the same assessment under the original live credential.
 
 Call `processing.assessPage` with `requestId`, `assessmentId`, `ordinal`, and
-`maxItems: 1`. The server owns the cursor and performs two walks: source items,
-then unresolved scan entries. The result contains `assessmentId`, `state`,
-`phase`, `ordinal`, `inspected`, `nextOrdinal`, and `reused`. Terminal results
-include counts; running results do not expose partial counts. The client cannot
-supply a cursor, timestamps, counters, or classification.
+`maxItems` from 1 through 8. The server owns the cursor and performs two walks:
+source items, then unresolved scan entries. One page stays within one walk; a
+later page advances the next phase. The result contains `assessmentId`,
+`state`, `phase`, `ordinal`, `inspected`, `nextOrdinal`, and `reused`. Terminal
+results include counts; running results do not expose partial counts. The client
+cannot supply a cursor, timestamps, counters, or classification.
 
 Only the most recently committed page request has a replay guarantee. Retry
 that exact request after a lost response. Once the next page commits, an older
 page cannot replay or advance the assessment. The terminal page remains
 replayable while its assessment and source state remain valid. A new assessment
 recounts the source from the beginning.
+
+The bounded page size reduces transport, transaction setup, and pacing overhead
+without skipping unchanged items. Every item in the batch still receives the
+same revision, generation, archive, receipt, and sealed-payload checks. Treat
+parser duration and assessment duration as separate measurements: completing
+PDF conversion does not complete the full-catalog processing assessment.
 
 A source change during either walk invalidates the assessment. The server also
 checks generic revision admissions and availability changes, so a document

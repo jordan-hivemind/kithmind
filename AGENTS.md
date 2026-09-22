@@ -64,6 +64,9 @@ For a capability rollout, also test the actual pass-ending checkpoint, its
 configuration rebind boundary, and the next scan with previously exhausted
 selected work. A mid-state handler test can pass while an earlier eligibility
 gate still filters the capability out.
+When diagnosing ingestion latency, separate parser or model time from worker
+request overhead. Record the number and batch size of assessment calls; a
+finished parse can still be followed by a full-catalog assessment walk.
 Before a finance repair, inspect both legacy unversioned scope proofs and the
 active generation's versioned proofs. They are immutable and require a new
 generation when corrected source evidence changes their payload or membership.
