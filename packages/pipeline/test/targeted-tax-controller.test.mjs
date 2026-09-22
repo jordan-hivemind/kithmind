@@ -13,7 +13,8 @@ function pages(count, overrides = new Map()) {
     const originalPage = index + 1;
     return {
       originalPage,
-      text: overrides.get(originalPage) ?? `Supporting appendix ${originalPage}`,
+      text:
+        overrides.get(originalPage) ?? `Supporting appendix ${originalPage}`,
     };
   });
 }
@@ -56,7 +57,10 @@ test("K-1 navigation keeps original page numbers and batches beyond twelve", () 
   const planned = planTargetedTaxPages("schedule_k1_key_fields_v1", headers);
   assert.deepEqual(planned.slice(0, 2), [137, 138]);
   assert.equal(planned.length, 15);
-  assert.deepEqual(planned.slice(0, 12), Array.from({ length: 12 }, (_, i) => 137 + i));
+  assert.deepEqual(
+    planned.slice(0, 12),
+    Array.from({ length: 12 }, (_, i) => 137 + i),
+  );
   assert.deepEqual(planned.slice(12), [149, 150, 151]);
   assert.equal(
     targetedTaxNavigationClosed("schedule_k1_key_fields_v1", headers, 152),
@@ -87,7 +91,10 @@ test("missing pages, identity-only K-1s, and unknown continuation drift stay inc
     targetedTaxNavigationClosed(
       "form_1040_totals_v1",
       [
-        { originalPage: 1, text: "Form 1040 U.S. Individual Income Tax Return" },
+        {
+          originalPage: 1,
+          text: "Form 1040 U.S. Individual Income Tax Return",
+        },
         { originalPage: 2, text: "Form W-2 Wage and Tax Statement" },
       ],
       2,
@@ -139,6 +146,16 @@ test("unsupported K-1 families do not masquerade as 1065", () => {
     planTargetedTaxPages("schedule_k1_key_fields_v1", [
       { originalPage: 1, text: "Schedule K-1 (Form 1041)" },
       { originalPage: 2, text: "Beneficiary's Share" },
+    ]),
+    [],
+  );
+  assert.deepEqual(
+    planTargetedTaxPages("form_1040_totals_v1", [
+      {
+        originalPage: 1,
+        text: "Contents: see Form 1040 on page 8 and Schedule 1 on page 10",
+      },
+      { originalPage: 2, text: "General filing instructions for Form 1040" },
     ]),
     [],
   );

@@ -8439,6 +8439,9 @@ export class PipelineRunner {
     )
       throw new PipelineWorkerError("journal_phase_conflict");
     const targetId = checkpoint.targetedTaxRun.targetId;
+    const { processing: admittedProcessing } = this.archivedRows(checkpoint);
+    if (!admittedProcessing.cloud)
+      throw new PipelineWorkerError("targeted_tax_admission_missing");
     const result = await this.mutation(
       "extraction.targetedTaxStatus",
       () =>
@@ -8459,6 +8462,9 @@ export class PipelineRunner {
         if (
           value.targetId !== current.targetedTaxRun.targetId ||
           value.goalKind !== current.targetedTaxRun.goalKind ||
+          value.sourceItemId !== admittedProcessing.cloud!.sourceItemId ||
+          value.sourceRevisionId !==
+            admittedProcessing.cloud!.sourceRevisionId ||
           !Array.isArray(value.inspectedOriginalPages) ||
           !Array.isArray(value.unresolvedFields)
         )

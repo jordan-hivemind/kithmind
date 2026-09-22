@@ -186,20 +186,21 @@ export type TargetedTaxPagePlan = {
   continuationsClosed: boolean;
 };
 
-const FORM_1040 = /\bform\s+1040(?:-sr)?\b|individual\s+income\s+tax\s+return/i;
+const FORM_1040 =
+  /(?:^|\n)\s*(?:(?:u\.?s\.?\s+)?form\s+1040(?:-sr)?\b|u\.?s\.?\s+individual\s+income\s+tax\s+return\b)/im;
 const FRONT_SCHEDULE =
-  /\bschedule\s+(?:1|2|3|a|d|e)\b[\s\S]{0,80}(?:form\s+1040|additional|itemized|capital|supplemental)/i;
-const K1_1065 = /\bschedule\s+k-?1\s*\(\s*form\s+1065\s*\)/i;
+  /(?:^|\n)\s*schedule\s+(?:1|2|3|a|d|e)\b[^\n]{0,80}(?:form\s+1040|additional|itemized|capital|supplemental)/im;
+const K1_1065 = /(?:^|\n)\s*schedule\s+k-?1\s*\(\s*form\s+1065\s*\)/im;
 const SUPPORTING =
-  /\b(?:form\s+w-?2|form\s+1099|consolidated\s+1099|brokerage\s+(?:statement|account)|schedule\s+k-?1)\b/i;
+  /(?:^|\n)\s*(?:form\s+w-?2|form\s+1099|consolidated\s+1099|brokerage\s+(?:statement|account)|schedule\s+k-?1)\b/im;
 const OTHER_TAX_FORM =
-  /\b(?:form\s+(?:1040|1041|1065|1120)|schedule\s+k-?1)\b/i;
+  /(?:^|\n)\s*(?:form\s+(?:1040|1041|1065|1120)|schedule\s+k-?1)\b/im;
 const K1_KEY_REGION =
   /\b(?:box\s*(?:[1-9]|1\d|20)\b|ordinary\s+business\s+income|rental\s+real\s+estate\s+income|self-employment\s+earnings|partner(?:'s)?\s+share\s+of\s+(?:income|deductions|credits))\b/i;
 const CONTINUATION_REFERENCE =
   /\b(?:see\s+(?:attached|statement)|attached\s+statement|statement\s+(?:attached|required))\b/i;
 const STATEMENT_PAGE =
-  /\b(?:schedule\s+k-?1\s+statement|statement\s+(?:for|continuation|detail))\b/i;
+  /(?:^|\n)\s*(?:schedule\s+k-?1\s+statement|statement\s+(?:for|continuation|detail))\b/im;
 
 function reachedSourceEnd(
   sorted: readonly TargetedTaxHeaderPage[],

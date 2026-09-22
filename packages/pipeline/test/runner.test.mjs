@@ -8971,6 +8971,83 @@ test("a sparse target begins, appends its first batch, and plans only the missin
   }
 });
 
+test("a targeted status from another source cannot complete or clean up the batch", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const processingCatalogId = randomUUID();
+  const originalCatalogId = randomUUID();
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "targeted_status",
+    preflightAction: undefined,
+    originalCatalogId,
+    expectedOriginalRevision: 1,
+    processingCatalogId,
+    expectedProcessingRevision: 1,
+    targetedTaxRun: {
+      goalKind: "form_1040_totals_v1",
+      sourcePageCount: 2,
+      plannedPages: [1, 2],
+      requestedRegionsClosed: true,
+      continuationsClosed: true,
+      batchOrdinal: 0,
+      processingCatalogIds: [processingCatalogId],
+      targetId: "target-synthetic",
+      priorProcessingGenerationId: "generation-synthetic",
+    },
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const original = { originalCatalogId, rowRevision: 1 };
+  const processing = {
+    processingCatalogId,
+    originalCatalogId,
+    rowRevision: 1,
+    cloud: {
+      sourceItemId: plan.sourceItemId,
+      sourceRevisionId: "revision-synthetic",
+    },
+  };
+  let completed = false;
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call(request) {
+      assert.equal(request.operation, "extraction.targetedTaxStatus");
+      return {
+        operation: request.operation,
+        targetId: checkpoint.targetedTaxRun.targetId,
+        sourceItemId: "another-source",
+        sourceRevisionId: "another-revision",
+        goalKind: checkpoint.targetedTaxRun.goalKind,
+        status: "complete",
+        inspectedOriginalPages: [1, 2],
+        unresolvedFields: [],
+        reused: true,
+      };
+    },
+  });
+  runner.archiveCatalog = {
+    listOriginals() {
+      return [original];
+    },
+    listProcessings() {
+      return [processing];
+    },
+    async recordTargetedCompletion() {
+      completed = true;
+      assert.fail("a foreign status must not be persisted");
+    },
+  };
+  try {
+    await assert.rejects(
+      () => runner.driveTargetedStatus(),
+      (error) => error.code === "targeted_tax_parent_conflict",
+    );
+    assert.equal(journal.checkpoint.step, "targeted_status");
+    assert.equal(completed, false);
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
 test("legacy future admission replays exactly, then renews and admits without repeating archive work", async () => {
   const setup = await fixture(0);
   const future = Date.UTC(2036, 0, 1);
