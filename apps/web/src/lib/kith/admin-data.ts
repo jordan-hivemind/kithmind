@@ -25,8 +25,8 @@ import type { IdentityCtx, Principal } from "@repo/kith-store/identity";
 
 import {
   groupInstitutions,
-  mergeLiveAccounts,
   type InstitutionRow,
+  mergeLiveAccounts,
 } from "@/lib/kith/institutions";
 import { loadAuthenticatedPage } from "@/lib/kith/page-session";
 import {
@@ -300,7 +300,7 @@ export async function loadInstitutions(
         )
       : [];
   return {
-    institutions: mergeLiveAccounts(archiveGroups, loaded.finAccounts),
+    institutions: mergeLiveAccounts(archiveGroups, loaded.finAccounts, now),
     state: inventory.state,
     reason: inventory.state === "unavailable" ? inventory.reason : null,
     truncated: inventory.state === "read" && inventory.truncated,

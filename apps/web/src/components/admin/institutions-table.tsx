@@ -35,9 +35,9 @@ import type { InstitutionRow } from "@/lib/kith/institutions";
 const TONE: Record<InstitutionRow["status"], "neutral" | "accent" | "warn"> = {
   fresh: "accent",
   stale: "warn",
-  needs_review: "warn",
+  needs_relink: "warn",
   inactive: "neutral",
-  empty: "neutral",
+  no_feed: "neutral",
 };
 
 const EMPTY: Record<InstitutionsPageData["state"], string> = {
@@ -80,9 +80,7 @@ export function InstitutionsTable({
     () =>
       hideEmpty
         ? data.institutions.flatMap((group) => {
-            const children = group.children?.filter(
-              (child) => child.status !== "empty",
-            );
+            const children = group.children?.filter((child) => !child.empty);
             return children?.length === 0 ? [] : [{ ...group, children }];
           })
         : data.institutions,
@@ -125,6 +123,13 @@ export function InstitutionsTable({
             : label(row.original.accountType),
       },
       {
+        // FIN-STATUS-1: the account's current value, from the feed
+        // (`kith.fin_accounts`, migration 048_finance_unify.sql) when the
+        // account is linked to a live Plaid account, otherwise the
+        // archive's own parsed statement figure. `valueSource` (a "feed" or
+        // "statement" muted tag in the tooltip) says which, since the same
+        // column can no longer be told apart by which of two columns it sat
+        // in the way PR 430's separate "Live value" did.
         id: "currentValue",
         accessorKey: "currentValue",
         header: "Current value",
@@ -153,7 +158,11 @@ export function InstitutionsTable({
                   </span>
                 </span>
               }
-              detail={`as of ${archiveDate(row.original.currentValueAsOf)}`}
+              detail={`as of ${archiveDate(row.original.currentValueAsOf)}${
+                row.original.valueSource === null
+                  ? ""
+                  : ` (${row.original.valueSource})`
+              }`}
             />
           ),
       },
@@ -184,35 +193,6 @@ export function InstitutionsTable({
             </Tooltip>
           );
         },
-      },
-      {
-        // FIN-1: the account's latest Plaid balance or holdings snapshot
-        // (`kith.fin_accounts`, migration 048_finance_unify.sql), separate
-        // from the archive's own "Current value" column above -- one comes
-        // from a statement, the other from this morning's feed, and neither
-        // should read as the other.
-        id: "liveValue",
-        accessorKey: "liveValue",
-        header: "Live value",
-        size: 132,
-        meta: { nowrap: true, align: "right" },
-        cell: ({ row }) =>
-          row.original.liveValue === null ||
-          row.original.liveValueCurrency === null ? (
-            ""
-          ) : (
-            <span className="tabular-nums">
-              {tableMoney(row.original.liveValue, row.original.liveValueCurrency)}
-            </span>
-          ),
-      },
-      {
-        id: "liveAsOf",
-        accessorKey: "liveAsOf",
-        header: "Live as of",
-        size: 110,
-        meta: { nowrap: true, align: "right" },
-        cell: ({ row }) => date(row.original.liveAsOf),
       },
       {
         id: "activityFrom",

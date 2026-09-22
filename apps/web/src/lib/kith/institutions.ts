@@ -17,18 +17,27 @@ import type { admin } from "@repo/kith-store";
 import {
   accountFreshness,
   type FreshnessReason,
-  type FreshnessStatus,
   type StatementCadence,
   valueIsStale,
 } from "@/lib/kith/account-freshness";
+import {
+  aggregateFeedStatusDetail,
+  type FeedStatus,
+  feedStatus,
+  feedStatusDetail,
+  type FeedStatusInput,
+  worstFeedStatus,
+} from "@/lib/kith/feed-status";
 import { mergeFinanceAccountOverride } from "@/lib/kith/finance-account-overrides";
 
 /**
- * What a statement archive can be: holding nothing, gone quiet (closed or
- * dormant, nothing to file), live but behind on statements or holdings, or
- * current. The rule is `accountFreshness` in `account-freshness.ts`.
+ * What the Status column can say, from the Plaid feed alone
+ * (`feed-status.ts`): fresh, stale, needing a relink, inactive, or archived
+ * with no feed link. `accountFreshness`'s own statement/holdings freshness
+ * (`FreshnessReason` below) still describes the archive's own cadence for
+ * the account drawer; it no longer decides this column.
  */
-export type InstitutionStatus = FreshnessStatus;
+export type InstitutionStatus = FeedStatus;
 
 /** The owner's own values for an account, from `kith.finance_account_overrides`. */
 export type AccountOverrideValues = {
@@ -80,20 +89,18 @@ export type InstitutionRow = {
   currentValueCurrency: string | null;
   currentValueAsOf: string | null;
   /** The figure is older than the account's dormancy threshold for its
-   * cadence, so the screen shows its date beside it and mutes it rather than
-   * letting it read as today's. See `valueIsStale`. */
+   * cadence (an archive value), or older than the feed's own 2-day freshness
+   * window (a feed value), so the screen shows its date beside it and mutes
+   * it rather than letting it read as today's. See `valueIsStale`. */
   currentValueStale: boolean;
   /**
-   * FIN-1: the account's latest value from `kith.fin_accounts` -- the
-   * latest Plaid balance snapshot, or (for a depository account Plaid never
-   * reports a balance for, only holdings) the latest holdings snapshot
-   * total -- for whichever of this account's rows is linked to a Plaid
-   * account. `null` for an archive-only account nothing links to yet. See
+   * FIN-1: whether `currentValue` (and `latestHoldingsObservedAsOf`, when it
+   * came from the same place) is a `kith.fin_accounts` reading or the
+   * archive's own parsed statement figure -- the small source indicator
+   * beside the value. Null when there is no value at all. See
    * `mergeLiveAccounts`.
    */
-  liveValue: number | null;
-  liveValueCurrency: string | null;
-  liveAsOf: string | null;
+  valueSource: "feed" | "statement" | null;
   /** What the archive itself says, and the owner's override of it. On an
    * account row only: the edit panel shows the first as what clearing the
    * second returns to. */
@@ -106,8 +113,19 @@ export type InstitutionRow = {
   /** Why the last four are missing, in the reader's words. Null when shown,
    * and on a group row. */
   last4Reason: string | null;
+  /** The archive's own closed flag (the owner's override, or the archive's
+   * record when there is none), carried separately from `status` so a feed
+   * merge can tell "closed" apart from every other reason an unlinked
+   * account reads `inactive`. False on a group and on a Plaid-only child,
+   * which have no archive record to be closed in. */
+  archiveClosed: boolean;
+  /** No archive content and no feed value at all -- the row the "Hide empty
+   * accounts" toggle removes. Never true for a Plaid-only child: that row is
+   * the one place the owner sees a feed-only account at all. */
+  empty: boolean;
   status: InstitutionStatus;
-  /** The age behind the status, for the tooltip. Null when there is none. */
+  /** The reasoning behind the status, for the tooltip. Null only when there
+   * are no accounts to report on (an institution header with none). */
   statusDetail: string | null;
   children?: InstitutionRow[];
 };
@@ -186,6 +204,15 @@ export function groupInstitutions(
       shownAccount.ownerOverride?.displayName ??
       friendlyAccountName(record.account);
     const accountLast4 = shownAccount.accountLast4 ?? null;
+    // Still computed for `cadence`/`freshnessReason`/`expectedBy`, which the
+    // account drawer shows as the archive's own statement rhythm. Its
+    // `status`/`statusDetail` are not read below: that is the one place this
+    // function can report an unpriced holding or a failed reconciliation,
+    // and the Status column no longer reads either from the archive at all
+    // (`feedStatus` below). A `needs_review` reason code can still land in
+    // `freshnessReason`, so it is blanked rather than passed through -- nothing
+    // on this screen renders that field today, but nothing should ever have to
+    // remember that rule to stay compliant.
     const judged = accountFreshness(
       {
         hasContent,
@@ -197,6 +224,35 @@ export function groupInstitutions(
         balanceDates: record.balanceDates ?? [],
         latestBalanceHoldsSecurities:
           record.latestBalanceHoldsSecurities ?? null,
+      },
+      now,
+    );
+    const archiveClosed = shownAccount.closed === true;
+    const archiveCurrentValue =
+      record.currentValue === undefined
+        ? null
+        : Number(record.currentValue.value.decimal);
+    const archiveCurrentValueAsOf = record.currentValue?.asOf ?? null;
+    const latestHoldingsObservedAsOf =
+      record.latestHoldingsObservation?.asOf ??
+      record.latestSnapshotAsOf ??
+      null;
+    const latestBalanceAsOf = record.balanceDates?.[0] ?? null;
+    // The archive's own last record of any kind, for the "no feed link, no
+    // record in 12 months" branch of `feedStatus` -- read only when there is
+    // no feed link at all, so a linked account's freshness never depends on
+    // this.
+    const archiveLastRecordAsOf = later(
+      later(record.activityTo ?? null, latestBalanceAsOf),
+      latestHoldingsObservedAsOf,
+    );
+    const status = feedStatus(
+      {
+        archiveClosed,
+        archiveLastRecordAsOf,
+        feedLinked: false,
+        needsRelinkAt: null,
+        latestFeedSnapshotAsOf: null,
       },
       now,
     );
@@ -213,22 +269,15 @@ export function groupInstitutions(
       },
       override,
       last4Reason: accountLast4 === null ? last4Reason(record.account) : null,
-      currentValue:
-        record.currentValue === undefined
-          ? null
-          : Number(record.currentValue.value.decimal),
+      currentValue: archiveCurrentValue,
       currentValueCurrency: record.currentValue?.value.currency ?? null,
-      currentValueAsOf: record.currentValue?.asOf ?? null,
+      currentValueAsOf: archiveCurrentValueAsOf,
       currentValueStale: valueIsStale(
-        record.currentValue?.asOf ?? null,
+        archiveCurrentValueAsOf,
         now,
         judged.cadence,
       ),
-      // Filled in by `mergeLiveAccounts` for an account a `kith.fin_accounts`
-      // row links to; every archive account starts with none.
-      liveValue: null,
-      liveValueCurrency: null,
-      liveAsOf: null,
+      valueSource: archiveCurrentValue === null ? null : "statement",
       accountType: shownAccount.accountType ?? null,
       accounts: null,
       statements: record.statementCount,
@@ -236,17 +285,26 @@ export function groupInstitutions(
       activityFrom: record.activityFrom ?? null,
       activityTo: record.activityTo ?? null,
       latestSnapshotAsOf: record.latestSnapshotAsOf ?? null,
-      latestHoldingsObservedAsOf:
-        record.latestHoldingsObservation?.asOf ??
-        record.latestSnapshotAsOf ??
-        null,
-      latestBalanceAsOf: record.balanceDates?.[0] ?? null,
+      latestHoldingsObservedAsOf,
+      latestBalanceAsOf,
       cadence: judged.cadence,
-      freshnessReason: judged.reason,
+      freshnessReason: judged.status === "needs_review" ? null : judged.reason,
       expectedBy: judged.expectedBy,
       openReviews: record.openReviewCount,
-      status: judged.status,
-      statusDetail: judged.statusDetail,
+      archiveClosed,
+      empty: !hasContent && archiveCurrentValue === null,
+      status,
+      statusDetail: feedStatusDetail(
+        status,
+        {
+          archiveClosed,
+          archiveLastRecordAsOf,
+          feedLinked: false,
+          needsRelinkAt: null,
+          latestFeedSnapshotAsOf: null,
+        },
+        now,
+      ),
     };
     const name = record.account.institutionName;
     const group = groups.get(name) ?? {
@@ -262,9 +320,7 @@ export function groupInstitutions(
       currentValueStale: false,
       currentValueCurrency: null,
       currentValueAsOf: null,
-      liveValue: null,
-      liveValueCurrency: null,
-      liveAsOf: null,
+      valueSource: null,
       accountType: null,
       accounts: 0,
       statements: 0,
@@ -278,7 +334,9 @@ export function groupInstitutions(
       freshnessReason: null,
       expectedBy: null,
       openReviews: 0,
-      status: "empty" as InstitutionStatus,
+      archiveClosed: false,
+      empty: false,
+      status: "no_feed" as InstitutionStatus,
       statusDetail: null,
       children: [],
     };
@@ -306,94 +364,29 @@ export function groupInstitutions(
   return [...groups.values()]
     .map((group) => ({
       ...group,
-      ...groupFreshness(group),
       ...groupValue(group),
+      ...groupStatus(group),
     }))
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
 /**
- * A group's tag is the worst of its accounts', derived from the *oldest*
- * account snapshot rather than the latest one the group's own column shows.
- *
- * Those are different questions and the distinction matters: an institution
- * whose brokerage account was updated last week and whose IRA was last updated
- * two years ago has a recent latest snapshot and a missing statement, and a
- * tag built on the latest would report the first and hide the second. The
- * tooltip names the account behind the tag.
- *
- * The stale accounts are counted by reason, because "statement overdue" and
- * "holdings behind" call for different actions (fetch a statement, or repair
- * what reads one), and a group that said only "2 stale" would hide which.
- *
- * No `now` of its own: each child already carries the tag `accountFreshness`
- * gave it against the same clock, so re-deriving here could only disagree
- * with the row beneath it.
+ * An institution header's Status: the worst of its accounts' (item 4,
+ * `worstFeedStatus` in `feed-status.ts`), and a tooltip counting how many
+ * sit at each one. Called both here (the archive-only baseline, before any
+ * feed is merged in) and again by `mergeLiveAccounts` once a linked
+ * account's status can change -- a group built before the merge is not
+ * re-read afterward, so its own status has to be recomputed, not carried
+ * over from a `groupInstitutions` call that ran first.
  */
-const STALE_REASON_LABEL: Partial<Record<FreshnessReason, string>> = {
-  statement_overdue: "statement overdue",
-  holdings_behind: "holdings behind",
-  holdings_missing: "holdings missing",
-};
-
-function groupFreshness(group: InstitutionRow): {
+function groupStatus(group: InstitutionRow): {
   status: InstitutionStatus;
   statusDetail: string | null;
 } {
-  const children = group.children ?? [];
-  const needingReview = children.filter(
-    (child) => child.status === "needs_review",
-  );
-  const reviewDetails = needingReview
-    .map(
-      (child) =>
-        `${child.name} (${child.statusDetail ?? "data verification incomplete"})`,
-    )
-    .join("; ");
-  const staleDate = (child: InstitutionRow) =>
-    child.freshnessReason === "statement_overdue"
-      ? (child.latestBalanceAsOf ?? "")
-      : (child.latestHoldingsObservedAsOf ?? "");
-  const stale = children
-    .filter((child) => child.status === "stale")
-    .sort((left, right) => staleDate(left).localeCompare(staleDate(right)));
-  if (stale.length > 0) {
-    // Always in the label table's order, so the same accounts read the same.
-    const breakdown = Object.entries(STALE_REASON_LABEL)
-      .map(([reason, label]) => {
-        const count = stale.filter(
-          (child) => child.freshnessReason === reason,
-        ).length;
-        return count === 0 ? null : `${count} ${label}`;
-      })
-      .filter((part) => part !== null)
-      .join(", ");
-    const oldest = stale[0]!;
-    return {
-      status: "stale",
-      statusDetail: `${stale.length} stale (${breakdown}), oldest ${oldest.name} (${
-        oldest.statusDetail ?? ""
-      })${needingReview.length > 0 ? `; ${needingReview.length} accounts need review: ${reviewDetails}` : ""}`,
-    };
-  }
-  if (children.every((child) => child.status === "empty")) {
-    return { status: "empty", statusDetail: null };
-  }
-
-  if (needingReview.length > 0) {
-    return {
-      status: "needs_review",
-      statusDetail: `${needingReview.length} accounts need review: ${needingReview.map((child) => `${child.name} (${child.statusDetail ?? "data verification incomplete"})`).join("; ")}`,
-    };
-  }
-  if (children.every((child) => child.status !== "fresh")) {
-    return { status: "inactive", statusDetail: "no recent activity" };
-  }
-  const fresh = children.filter((child) => child.status === "fresh").length;
-  const quiet = children.filter((child) => child.status === "inactive").length;
+  const statuses = (group.children ?? []).map((child) => child.status);
   return {
-    status: "fresh",
-    statusDetail: `${fresh} current${quiet > 0 ? `, ${quiet} inactive` : ""}`,
+    status: worstFeedStatus(statuses),
+    statusDetail: aggregateFeedStatusDetail(statuses),
   };
 }
 
@@ -414,9 +407,11 @@ const NO_VALUE = {
  * this figure as what the institution holds, and a total quietly missing an
  * account is worse than an empty cell that makes him open the rows.
  *
- * Live means `fresh` or `stale`. An `inactive` account -- closed, or quiet
- * past the threshold -- is not in the sum: its last figure is the day it went
- * quiet, which is not what the institution is worth now, and its own row still
+ * Live means every status but `inactive` -- `fresh`, `stale`, `needs_relink`
+ * and `no_feed` all still describe an account the archive or the feed holds
+ * a current figure for. An `inactive` account -- closed, or quiet past the
+ * threshold -- is not in the sum: its last figure is the day it went quiet,
+ * which is not what the institution is worth now, and its own row still
  * shows that figure, dated.
  *
  * But leaving it out of the sum is only honest while it holds nothing. An
@@ -428,9 +423,9 @@ const NO_VALUE = {
  * total instead. A zero and an unvalued excluded account block nothing: there
  * is nothing to have dropped.
  *
- * `empty` accounts never block. The archive holds no statement and no record
- * for them, so there is no value to have left out, and the table hides them by
- * default for the same reason.
+ * An account with no archive content and no feed link (`empty`) never blocks:
+ * it has no record at all, so `feedStatus` reads it `inactive` -- nothing to
+ * have left out -- and the table hides it by default for the same reason.
  *
  * The date is the OLDEST component's, never the newest. A total dated by its
  * newest part claims every other part was still true that day. The oldest is
@@ -446,12 +441,7 @@ function groupValue(group: InstitutionRow): {
   currentValueStale: boolean;
 } {
   const children = group.children ?? [];
-  const live = children.filter(
-    (child) =>
-      child.status === "fresh" ||
-      child.status === "stale" ||
-      child.status === "needs_review",
-  );
+  const live = children.filter((child) => child.status !== "inactive");
   if (live.length === 0) return { ...NO_VALUE };
   if (
     live.some(
@@ -478,31 +468,131 @@ function groupValue(group: InstitutionRow): {
 }
 
 // ---------------------------------------------------------------------------
-// FIN-1: live values and Plaid-only accounts (migration 048_finance_unify.sql)
+// FIN-1/FIN-STATUS-1: feed values, feed status and Plaid-only accounts
+// (migration 048_finance_unify.sql, docs/plans/2026-09-22-simplification-
+// and-feeds.md)
 // ---------------------------------------------------------------------------
 
-/** An account row's live figure: its latest balance snapshot, or (a
+/** An account row's merged latest figure: its latest balance snapshot, or (a
  * depository-style account Plaid never balances, only holdings) its latest
- * holdings snapshot total. Neither present is "no live figure yet". */
-function liveValueOf(row: admin.FinAccountRow): {
+ * holdings snapshot total -- across both sources `kith.fin_accounts` can
+ * carry (`import-archive`'s statement backfill and `pull`'s daily feed), so
+ * this can be the more recent of the two whichever it is. Neither present is
+ * "no figure yet". `source` is the source that won, for the value's own
+ * feed/statement indicator. */
+function mergedValueOf(row: admin.FinAccountRow): {
   value: number | null;
   currency: string | null;
   asOf: string | null;
+  source: "archive" | "plaid" | null;
 } {
   if (row.currentBalance !== null) {
-    return { value: row.currentBalance, currency: row.currency, asOf: row.balanceAsOf };
+    return {
+      value: row.currentBalance,
+      currency: row.currency,
+      asOf: row.balanceAsOf,
+      source: row.balanceSource,
+    };
   }
   if (row.holdingsValue !== null) {
-    return { value: row.holdingsValue, currency: row.currency, asOf: row.holdingsAsOf };
+    return {
+      value: row.holdingsValue,
+      currency: row.currency,
+      asOf: row.holdingsAsOf,
+      source: row.holdingsSource,
+    };
   }
-  return { value: null, currency: null, asOf: null };
+  return { value: null, currency: null, asOf: null, source: null };
+}
+
+/** The latest balance or holdings snapshot the Plaid feed itself reported
+ * for this account -- `source = 'plaid'` rows only. An `import-archive`
+ * backfill can be the newer row in `mergedValueOf` above without the feed
+ * having reported anything recently, and Status must judge the feed's own
+ * freshness, not the ledger's newest row regardless of source. */
+function latestPlaidSnapshotAsOf(row: admin.FinAccountRow): string | null {
+  const dates = [
+    row.balanceSource === "plaid" ? row.balanceAsOf : null,
+    row.holdingsSource === "plaid" ? row.holdingsAsOf : null,
+  ].filter((date): date is string => date !== null);
+  return dates.length === 0 ? null : dates.sort().at(-1)!;
+}
+
+/** A linked child's Status inputs, from the `fin_accounts` row its archive
+ * account matched (or none, for a not-yet-merged baseline). */
+function feedStatusInputFor(
+  fin: admin.FinAccountRow | undefined,
+  archiveClosed: boolean,
+  archiveLastRecordAsOf: string | null,
+): FeedStatusInput {
+  const feedLinked = fin !== undefined && fin.plaidAccountId !== null;
+  return {
+    archiveClosed,
+    archiveLastRecordAsOf,
+    feedLinked,
+    needsRelinkAt: feedLinked ? fin!.needsRelinkAt : null,
+    latestFeedSnapshotAsOf: feedLinked ? latestPlaidSnapshotAsOf(fin!) : null,
+  };
+}
+
+/** The archive's own last record for `child` -- its most recent activity,
+ * statement balance or holdings observation date, from the fields
+ * `groupInstitutions` already set on it (never a merged-in feed date). Read
+ * only for the "no feed link" branch of `feedStatus`. */
+function archiveLastRecordOf(child: InstitutionRow): string | null {
+  return later(
+    later(child.activityTo, child.latestBalanceAsOf),
+    child.latestHoldingsObservedAsOf,
+  );
+}
+
+/** `child` with a matched `kith.fin_accounts` row's feed folded in: Status
+ * from the feed (item 2), and Current value/Holdings as of from the feed
+ * when the row carries an active Plaid link (item 1) -- otherwise `child`'s
+ * own archive value stands, since a `fin_accounts` row `import-archive`
+ * alone created is not "linked to a feed account". */
+function withFeedAccount(
+  child: InstitutionRow,
+  fin: admin.FinAccountRow,
+  now: number,
+): InstitutionRow {
+  const input = feedStatusInputFor(fin, child.archiveClosed, archiveLastRecordOf(child));
+  const status = feedStatus(input, now);
+  const statusDetail = feedStatusDetail(status, input, now);
+  const feedLinked = fin.plaidAccountId !== null;
+  const merged = mergedValueOf(fin);
+  const hasFeedValue = feedLinked && merged.value !== null;
+  return {
+    ...child,
+    status,
+    statusDetail,
+    currentValue: hasFeedValue ? merged.value : child.currentValue,
+    currentValueCurrency: hasFeedValue ? merged.currency : child.currentValueCurrency,
+    currentValueAsOf: hasFeedValue ? merged.asOf : child.currentValueAsOf,
+    currentValueStale: hasFeedValue ? status !== "fresh" : child.currentValueStale,
+    valueSource: hasFeedValue
+      ? merged.source === "plaid"
+        ? "feed"
+        : "statement"
+      : child.valueSource,
+    latestHoldingsObservedAsOf:
+      feedLinked && fin.holdingsAsOf !== null
+        ? fin.holdingsAsOf
+        : child.latestHoldingsObservedAsOf,
+    empty: hasFeedValue ? false : child.empty,
+  };
 }
 
 /** A `kith.fin_accounts` row with no archive counterpart yet, as its own
  * account row under its institution's group -- a new group when the
- * institution has no archive presence at all (Vanguard, Fidelity, Chase). */
-function plaidOnlyChild(row: admin.FinAccountRow): InstitutionRow {
-  const live = liveValueOf(row);
+ * institution has no archive presence at all (Vanguard, Fidelity, Chase).
+ * Always feed-linked by construction (the caller filters to
+ * `plaidAccountId !== null`), so every value and every snapshot date on it
+ * is the feed's own. */
+function plaidOnlyChild(row: admin.FinAccountRow, now: number): InstitutionRow {
+  const input = feedStatusInputFor(row, false, null);
+  const status = feedStatus(input, now);
+  const merged = mergedValueOf(row);
   return {
     id: `plaid:${row.accountId}`,
     name: row.accountName,
@@ -522,22 +612,22 @@ function plaidOnlyChild(row: admin.FinAccountRow): InstitutionRow {
     freshnessReason: null,
     expectedBy: null,
     openReviews: 0,
-    currentValue: null,
-    currentValueCurrency: null,
-    currentValueAsOf: null,
-    currentValueStale: false,
-    liveValue: live.value,
-    liveValueCurrency: live.currency,
-    liveAsOf: live.asOf,
+    currentValue: merged.value,
+    currentValueCurrency: merged.currency,
+    currentValueAsOf: merged.asOf,
+    currentValueStale: status !== "fresh",
+    valueSource: merged.value === null ? null : "feed",
     archive: null,
     override: null,
     last4Reason: null,
-    // "fresh" rather than "empty": an "empty" account is hidden by the
-    // screen's default "Hide empty accounts" toggle, and a Plaid-only
-    // account is exactly the row that toggle must not hide -- it is the one
-    // place the owner sees it at all.
-    status: "fresh",
-    statusDetail: "Plaid feed only; no statement archive account yet",
+    archiveClosed: false,
+    // Never true: an "empty" account is hidden by the screen's default "Hide
+    // empty accounts" toggle, and a Plaid-only account is exactly the row
+    // that toggle must not hide -- it is the one place the owner sees it at
+    // all, whatever its feed status is.
+    empty: false,
+    status,
+    statusDetail: feedStatusDetail(status, input, now),
   };
 }
 
@@ -555,9 +645,7 @@ function emptyPlaidOnlyGroup(institutionName: string): InstitutionRow {
     currentValueStale: false,
     currentValueCurrency: null,
     currentValueAsOf: null,
-    liveValue: null,
-    liveValueCurrency: null,
-    liveAsOf: null,
+    valueSource: null,
     accountType: null,
     accounts: 0,
     statements: 0,
@@ -571,6 +659,8 @@ function emptyPlaidOnlyGroup(institutionName: string): InstitutionRow {
     freshnessReason: null,
     expectedBy: null,
     openReviews: 0,
+    archiveClosed: false,
+    empty: false,
     status: "fresh",
     statusDetail: null,
     children: [],
@@ -579,43 +669,43 @@ function emptyPlaidOnlyGroup(institutionName: string): InstitutionRow {
 
 /**
  * The archive's institution groups (`groupInstitutions`'s own result), with
- * `kith.fin_accounts`' live figures folded in.
+ * `kith.fin_accounts`' feed folded in.
  *
- * Two things happen here, both keyed off `admin.listFinAccounts`' rows:
+ * Three things happen here, all keyed off `admin.listFinAccounts`' rows:
  *
- *   - An account linked to the archive (`archiveAccountId` set) fills in
- *     that same child row's `liveValue`/`liveValueCurrency`/`liveAsOf`.
+ *   - An account linked to the archive (`archiveAccountId` set) gets its
+ *     Status recomputed from the feed, and its Current value/Holdings as of
+ *     replaced by the feed's own reading when the row is also Plaid-linked
+ *     (`withFeedAccount`).
  *   - An account with no archive counterpart (`archiveAccountId === null`,
  *     Plaid-only) becomes its own child row, under its institution's
  *     existing group when there is one or a new group when there is not --
  *     so the owner sees every linked account in one table, not two.
+ *   - Every institution header is recomputed from its final children (value
+ *     sum, latest as-of, worst status, item 4): a header built by
+ *     `groupInstitutions` before this function ran does not know about any
+ *     feed yet, and a child's status or value can change above.
  *
  * Pure, like the rest of this file: a function of `groupInstitutions`'s
- * output and the read `finAccounts` rows, nothing else.
+ * output, the read `finAccounts` rows and `now`, nothing else.
  */
 export function mergeLiveAccounts(
   groups: readonly InstitutionRow[],
   finAccounts: readonly admin.FinAccountRow[],
+  now: number,
 ): InstitutionRow[] {
   const liveByArchiveId = new Map(
     finAccounts
       .filter((row) => row.archiveAccountId !== null)
       .map((row) => [row.archiveAccountId!, row]),
   );
-  const merged: InstitutionRow[] = groups.map((group) => {
-    const children = (group.children ?? []).map((child) => {
+  const merged: InstitutionRow[] = groups.map((group) => ({
+    ...group,
+    children: (group.children ?? []).map((child) => {
       const fin = liveByArchiveId.get(child.id);
-      if (fin === undefined) return child;
-      const live = liveValueOf(fin);
-      return {
-        ...child,
-        liveValue: live.value,
-        liveValueCurrency: live.currency,
-        liveAsOf: live.asOf,
-      };
-    });
-    return { ...group, children };
-  });
+      return fin === undefined ? child : withFeedAccount(child, fin, now);
+    }),
+  }));
 
   const byInstitution = new Map<string, InstitutionRow>(
     merged.map((group) => [group.name, group]),
@@ -629,8 +719,23 @@ export function mergeLiveAccounts(
       merged.push(group);
     }
     group.accounts = (group.accounts ?? 0) + 1;
-    group.children = [...(group.children ?? []), plaidOnlyChild(fin)];
+    group.children = [...(group.children ?? []), plaidOnlyChild(fin, now)];
   }
 
-  return merged.sort((left, right) => left.name.localeCompare(right.name));
+  return merged
+    .map((group) => {
+      const withLatestHoldings = {
+        ...group,
+        latestHoldingsObservedAsOf: (group.children ?? []).reduce(
+          (asOf, child) => later(asOf, child.latestHoldingsObservedAsOf),
+          null as string | null,
+        ),
+      };
+      return {
+        ...withLatestHoldings,
+        ...groupValue(withLatestHoldings),
+        ...groupStatus(withLatestHoldings),
+      };
+    })
+    .sort((left, right) => left.name.localeCompare(right.name));
 }
