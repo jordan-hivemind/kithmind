@@ -19,7 +19,6 @@ import {
   mapSecurity,
   mapTransaction,
   plaidErrorCode,
-  redirectUri,
   todayIsoDate,
 } from "../dist/index.js";
 
@@ -225,9 +224,4 @@ test("itemKeychainService namespaces the slug under the fixed Keychain prefix", 
     itemKeychainService("Morgan Stanley"),
     "com.kithmind.plaid.item.morgan-stanley",
   );
-});
-
-test("redirectUri points at the fixed local OAuth callback path", () => {
-  assert.equal(redirectUri(8765), "http://localhost:8765/oauth");
-  assert.equal(redirectUri(9999), "http://localhost:9999/oauth");
 });

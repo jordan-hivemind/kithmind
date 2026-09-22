@@ -5,13 +5,12 @@
 
 import process from "node:process";
 
-import { DEFAULT_LINK_PORT } from "./config.js";
-import { runLinkServer } from "./link.js";
+import { DEFAULT_LINK_TIMEOUT_MS, runLink } from "./link.js";
 import { pullAll } from "./pull.js";
 
 function usage(): never {
   process.stderr.write(
-    "Usage: kith-plaid-feed link [--port N] | pull\n",
+    "Usage: kith-plaid-feed link [--timeout MINUTES] | pull\n",
   );
   process.exit(2);
 }
@@ -19,18 +18,19 @@ function usage(): never {
 async function main(argv: string[]): Promise<void> {
   const [command, ...rest] = argv;
   if (command === "link") {
-    let port = DEFAULT_LINK_PORT;
+    let timeoutMs = DEFAULT_LINK_TIMEOUT_MS;
     for (let index = 0; index < rest.length; index += 1) {
-      if (rest[index] === "--port") {
-        const value = Number(rest[index + 1]);
-        if (!Number.isInteger(value) || value <= 0) usage();
-        port = value;
+      if (rest[index] === "--timeout") {
+        const minutes = Number(rest[index + 1]);
+        if (!Number.isFinite(minutes) || minutes <= 0) usage();
+        timeoutMs = minutes * 60_000;
         index += 1;
       } else {
         usage();
       }
     }
-    await runLinkServer(port);
+    const outcome = await runLink(timeoutMs);
+    if (outcome.status !== "linked") process.exitCode = 1;
     return;
   }
   if (command === "pull") {

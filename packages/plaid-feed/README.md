@@ -11,7 +11,7 @@ Two commands:
 
 | Command                    | What it does                                                                                                    |
 | --------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `kith-plaid-feed link`      | Starts a local server (fixed port, default 8765) serving one page that runs Plaid Link, so the owner can add institutions one at a time. |
+| `kith-plaid-feed link`      | Creates a Plaid Hosted Link session, prints a URL to open in any browser, and waits for that one institution to finish linking. |
 | `kith-plaid-feed pull`      | For every linked institution, pulls current balances, holdings and recent transactions and upserts them.          |
 
 ## One-time setup
@@ -51,56 +51,51 @@ Two commands:
    or run it however the rest of the `kith` schema is normally migrated in
    this deployment.
 
-4. **Register the OAuth redirect URI.** Morgan Stanley uses Plaid's OAuth
-   flow, which requires the redirect URI to be registered in advance. In the
-   [Plaid dashboard](https://dashboard.plaid.com), go to **Developers > API >
-   Allowed redirect URIs** and add exactly:
-
-   ```
-   http://localhost:8765/oauth
-   ```
-
-   (or `http://localhost:<port>/oauth` if `link --port` overrides the
-   default). This must match byte-for-byte what `link` sends as
-   `redirect_uri`.
-
-   Plaid's own API documentation for `redirect_uri` says: "When used in
-   Production, must be an https URI." This package still uses
-   `http://localhost:8765/oauth` because `link` only ever runs as a local
-   loopback server the owner opens by hand -- there is no HTTPS endpoint to
-   put there. If Plaid's dashboard refuses to register a `http://localhost`
-   redirect URI in Production, or refuses to complete Morgan Stanley's OAuth
-   handoff at that URI at run time, this needs a follow-up (an `ngrok`-style
-   HTTPS tunnel, or Plaid's Hosted Link, in front of the same local server)
-   that is out of scope here. Run `link` once against Morgan Stanley and
-   confirm the OAuth round trip completes before relying on it.
+No dashboard step is required beyond the client id and secret above: Hosted
+Link (below) needs no registered redirect URI. Confirm Hosted Link is
+enabled for the Plaid account if `link` reports that Plaid did not return a
+`hosted_link_url`.
 
 ## `link`
 
 ```sh
 pnpm --filter @repo/plaid-feed build
-node packages/plaid-feed/dist/cli.js link
-# or, once installed as a bin: kith-plaid-feed link [--port 8765]
+node packages/plaid-feed/dist/cli.js link [--timeout MINUTES]
+# or, once installed as a bin: kith-plaid-feed link
 ```
 
-Open `http://localhost:8765` in a browser on the same machine, click "Link an
-institution", and sign in through Plaid's own UI (never this page). Repeat for
-each institution; the page lists what is already linked and shows a "needs
-relink" note next to anything `pull` has reported as
-`ITEM_LOGIN_REQUIRED`. Products requested are `investments` and
-`transactions`, which restricts Link to institutions that support both --
-if an institution the owner wants is not offered, that is the product list to
-revisit (Plaid's `optional_products`/`required_if_supported_products` are the
-usual fix, not attempted here).
+Run `link` on the mini, open the URL it prints in any browser (this machine
+or another device), finish the bank's own sign-in there, then come back --
+`link` finishes on its own once Plaid reports the session done. One
+institution per run; run it again for the next one.
 
-On success, `link`:
+Why this way rather than a local server: Plaid confirms `http://localhost`
+redirect URIs work only in Sandbox, so a locally-hosted Link page cannot
+complete Morgan Stanley's OAuth handoff in Production. Plaid's own Hosted
+Link instead serves the whole flow -- OAuth included -- from Plaid's `https`
+URL, so there is no redirect URI to register and no dashboard step at all.
 
-1. Exchanges the `public_token` for an access token server-side.
-2. Writes the access token to the Keychain:
+Products requested are `transactions` (required) and `investments`
+(optional), so an institution with no investment accounts -- Chase -- is
+still offered by Link; `pull` skips the investments calls for an item that
+did not end up consenting to `investments`.
+
+Under the hood, `link`:
+
+1. Creates a `link_token` configured for Hosted Link and prints the URL.
+2. Polls `/link/token/get` every few seconds (default timeout 15 minutes,
+   `--timeout` overrides) until that session finishes.
+3. Reads the `public_token` out of the finished session's own results and
+   exchanges it for an access token server-side.
+4. Writes the access token to the Keychain:
    `security add-generic-password -U -a "$USER" -s com.kithmind.plaid.item.<institution_slug> -w <token>`.
    The token is never printed or logged.
-3. Upserts a `kith.plaid_items` row (`item_id`, `institution_id`,
+5. Upserts a `kith.plaid_items` row (`item_id`, `institution_id`,
    `institution_name`, `keychain_service`, `linked_at`).
+
+If the owner closes the window without finishing, `link` reports that and
+exits non-zero without writing anything. If the timeout passes first, it
+reports a timeout and exits non-zero; run it again.
 
 ## `pull`
 
@@ -117,12 +112,14 @@ One dated snapshot per account per day is written to
 `kith.plaid_balance_snapshots` and `kith.plaid_holding_snapshots` (unique per
 account per `as_of`, so a same-day re-run overwrites rather than duplicates).
 
-A product an institution does not support (Chase has no investment accounts;
-some brokerages support no transactions) is not a failure -- it reports zero
-for that product and moves on. `ITEM_LOGIN_REQUIRED`, from any call, ends that
-item's pull immediately, sets `needs_relink_at` on the item row, and is
-**not** retried in this process; the owner re-runs `link` for that
-institution.
+An item whose consented products do not include `investments` (Chase) has
+the holdings and investment-transactions calls skipped outright, not
+attempted and not treated as a failure. An item that did consent to
+`investments` but still turns out to have no investment accounts gets the
+same zero result by tolerating Plaid's `PRODUCTS_NOT_SUPPORTED` response
+instead. `ITEM_LOGIN_REQUIRED`, from any call, ends that item's pull
+immediately, sets `needs_relink_at` on the item row, and is **not** retried
+in this process; the owner re-runs `link` for that institution.
 
 Prints one line per item, counts only, never a balance, holding value or
 transaction amount:
@@ -202,9 +199,11 @@ monitoring reading `StandardErrorPath`) show a failed run.
 
 ## Tests
 
-`test/mapping.test.mjs` and `test/pull.test.mjs` are unit tests against a
-mocked Plaid client and a fake `pg.Pool` (an object recording `.query()`
-calls) -- no network, no database. Run them against the built package:
+`test/mapping.test.mjs`, `test/pull.test.mjs` and `test/link.test.mjs` are
+unit tests against a mocked Plaid client and a fake `pg.Pool` (an object
+recording `.query()` calls) -- no network, no database, and (for the
+Hosted Link polling flow) no real waiting, since the clock and Keychain
+writer are injected. Run them against the built package:
 
 ```sh
 pnpm --filter @repo/plaid-feed build

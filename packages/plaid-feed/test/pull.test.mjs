@@ -83,7 +83,12 @@ function axiosError(errorCode) {
 function happyClient() {
   return {
     async accountsBalanceGet() {
-      return { data: { accounts: [account] } };
+      return {
+        data: {
+          accounts: [account],
+          item: { consented_products: ["transactions", "investments"] },
+        },
+      };
     },
     async investmentsHoldingsGet() {
       return {
@@ -270,4 +275,50 @@ test("the transactions-sync cursor is threaded through a second page", async () 
 
   const success = pool.calls.find((call) => call.params?.[0] === "item-1" && call.params?.[1] === "final-cursor");
   assert.ok(success, "the final cursor from the second page was persisted");
+});
+
+test("an item whose consented products exclude investments skips the investments calls without failing", async () => {
+  const pool = fakePool();
+  const client = happyClient();
+  client.accountsBalanceGet = async () => ({
+    data: {
+      accounts: [account],
+      item: { consented_products: ["transactions"] },
+    },
+  });
+  let holdingsCalled = false;
+  let investmentTransactionsCalled = false;
+  client.investmentsHoldingsGet = async () => {
+    holdingsCalled = true;
+    return { data: { accounts: [], holdings: [], securities: [] } };
+  };
+  client.investmentsTransactionsGet = async () => {
+    investmentTransactionsCalled = true;
+    return { data: { securities: [], investment_transactions: [], total_investment_transactions: 0 } };
+  };
+
+  const result = await pullItem(client, pool, item, "access-token-1");
+  assert.equal(result.status, "ok");
+  assert.equal(holdingsCalled, false, "Chase-shaped item: never asks for holdings");
+  assert.equal(investmentTransactionsCalled, false);
+  assert.equal(result.holdings, 0);
+  assert.equal(result.investmentTransactions, 0);
+  // The required product (transactions) still ran normally.
+  assert.equal(result.transactionsAdded, 1);
+});
+
+test("an item with no product list on its Item still attempts investments (tolerating PRODUCTS_NOT_SUPPORTED)", async () => {
+  const pool = fakePool();
+  const client = happyClient();
+  client.accountsBalanceGet = async () => ({ data: { accounts: [account] } });
+  let holdingsCalled = false;
+  client.investmentsHoldingsGet = async () => {
+    holdingsCalled = true;
+    throw axiosError("PRODUCTS_NOT_SUPPORTED");
+  };
+
+  const result = await pullItem(client, pool, item, "access-token-1");
+  assert.equal(result.status, "ok");
+  assert.equal(holdingsCalled, true, "an unknown product list is not treated as 'no investments'");
+  assert.equal(result.holdings, 0);
 });

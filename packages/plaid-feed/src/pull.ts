@@ -1,20 +1,24 @@
 // `kith-plaid-feed pull`: one round over every linked item.
 //
 // For each item: read its access token from the Keychain, fetch balances
-// (required), then best-effort fetch holdings, a transactions-sync page and
-// 30 days of investment transactions -- a product an institution does not
-// support (Chase has no investments; some brokerages have no transactions)
-// is reported as zero for that product, not a failure. `ITEM_LOGIN_REQUIRED`,
-// from any call, ends that item's pull immediately, marks `needs_relink_at`,
-// and is never retried in this process. Every other unexpected error also
-// ends that item's pull and is reported, but does not touch `needs_relink_at`.
+// (required), then fetch holdings, a transactions-sync page and 30 days of
+// investment transactions. `link` only requires the `transactions` product
+// (`investments` is optional there, so depository-only institutions like
+// Chase are still offered), so the holdings and investment-transactions
+// calls are skipped outright -- not a failure -- for an item whose consented
+// products do not include `investments`; an item that did consent but still
+// has no investment accounts reports PRODUCTS_NOT_SUPPORTED, which is also
+// not a failure. `ITEM_LOGIN_REQUIRED`, from any call, ends that item's pull
+// immediately, marks `needs_relink_at`, and is never retried in this
+// process. Every other unexpected error also ends that item's pull and is
+// reported, but does not touch `needs_relink_at`.
 //
 // Nothing here prints a balance, a holding value, or a transaction amount --
 // only counts -- and the process exits non-zero when any item failed, which
 // is what makes a launchd job's exit status meaningful.
 
 import type { Pool } from "pg";
-import type { PlaidApi } from "plaid";
+import { Products, type PlaidApi } from "plaid";
 
 import { loadDatabaseUrl, loadPlaidCredentials } from "./config.js";
 import {
@@ -158,7 +162,12 @@ export async function pullItem(
   const asOf = todayIsoDate();
 
   // Balances: required. A failure here (including ITEM_LOGIN_REQUIRED) ends
-  // the item's pull.
+  // the item's pull. `link` only requires `transactions` and offers
+  // `investments` as optional (PLAID-1's product change: requiring both
+  // excluded depository-only institutions like Chase from Link's picker), so
+  // an item's own consented products decide whether the investments calls
+  // below are worth attempting at all.
+  let investmentsConsented = true;
   try {
     const response = await client.accountsBalanceGet({
       access_token: accessToken,
@@ -169,29 +178,43 @@ export async function pullItem(
       result.accounts += 1;
       result.balances += 1;
     }
+    const products =
+      response.data.item?.consented_products ?? response.data.item?.products;
+    // `undefined` (an older item Plaid reports no product list for) leaves
+    // `investmentsConsented` at its default of `true`: attempt the call and
+    // let the existing PRODUCTS_NOT_SUPPORTED tolerance below cover it,
+    // rather than guessing the item has no holdings.
+    if (products !== undefined) {
+      investmentsConsented = products.includes(Products.Investments);
+    }
   } catch (error) {
     return await failItem(pool, item, result, error);
   }
 
-  // Holdings: best-effort. Institutions with no investment accounts (Chase)
-  // report PRODUCTS_NOT_SUPPORTED here, which is not a failure.
-  try {
-    const response = await client.investmentsHoldingsGet({
-      access_token: accessToken,
-    });
-    for (const security of response.data.securities) {
-      await upsertSecurity(pool, mapSecurity(security));
+  // Holdings: skipped outright for an item that never consented to
+  // `investments` (expected for Chase) -- not a failure. Otherwise
+  // best-effort: an item that did consent but simply has no investment
+  // accounts still reports PRODUCTS_NOT_SUPPORTED here, which is also not a
+  // failure.
+  if (investmentsConsented) {
+    try {
+      const response = await client.investmentsHoldingsGet({
+        access_token: accessToken,
+      });
+      for (const security of response.data.securities) {
+        await upsertSecurity(pool, mapSecurity(security));
+      }
+      for (const account of response.data.accounts) {
+        await upsertAccount(pool, mapAccount(account, item.itemId));
+      }
+      for (const holding of response.data.holdings) {
+        await upsertHoldingSnapshot(pool, mapHoldingSnapshot(holding, asOf));
+        result.holdings += 1;
+      }
+    } catch (error) {
+      if (isItemLoginRequired(error)) return await failItem(pool, item, result, error);
+      if (!isProductNotSupported(error)) return await failItem(pool, item, result, error);
     }
-    for (const account of response.data.accounts) {
-      await upsertAccount(pool, mapAccount(account, item.itemId));
-    }
-    for (const holding of response.data.holdings) {
-      await upsertHoldingSnapshot(pool, mapHoldingSnapshot(holding, asOf));
-      result.holdings += 1;
-    }
-  } catch (error) {
-    if (isItemLoginRequired(error)) return await failItem(pool, item, result, error);
-    if (!isProductNotSupported(error)) return await failItem(pool, item, result, error);
   }
 
   // Transactions sync: best-effort, cursor persisted per item.
@@ -228,43 +251,48 @@ export async function pullItem(
     if (!isProductNotSupported(error)) return await failItem(pool, item, result, error);
   }
 
-  // Investment transactions for the last 30 days: best-effort, paginated.
-  try {
-    const end = asOf;
-    const start = new Date(Date.parse(`${asOf}T00:00:00Z`));
-    start.setUTCDate(start.getUTCDate() - INVESTMENT_TRANSACTIONS_LOOKBACK_DAYS);
-    const startDate = start.toISOString().slice(0, 10);
-    let offset = 0;
-    let total = Infinity;
-    let pages = 0;
-    while (offset < total && pages < MAX_INVESTMENT_TRANSACTION_PAGES) {
-      pages += 1;
-      const response = await client.investmentsTransactionsGet({
-        access_token: accessToken,
-        start_date: startDate,
-        end_date: end,
-        options: {
-          count: INVESTMENT_TRANSACTIONS_PAGE_SIZE,
-          offset,
-        },
-      });
-      for (const security of response.data.securities) {
-        await upsertSecurity(pool, mapSecurity(security));
+  // Investment transactions for the last 30 days: skipped for the same
+  // reason holdings is, otherwise best-effort and paginated.
+  if (investmentsConsented) {
+    try {
+      const end = asOf;
+      const start = new Date(Date.parse(`${asOf}T00:00:00Z`));
+      start.setUTCDate(
+        start.getUTCDate() - INVESTMENT_TRANSACTIONS_LOOKBACK_DAYS,
+      );
+      const startDate = start.toISOString().slice(0, 10);
+      let offset = 0;
+      let total = Infinity;
+      let pages = 0;
+      while (offset < total && pages < MAX_INVESTMENT_TRANSACTION_PAGES) {
+        pages += 1;
+        const response = await client.investmentsTransactionsGet({
+          access_token: accessToken,
+          start_date: startDate,
+          end_date: end,
+          options: {
+            count: INVESTMENT_TRANSACTIONS_PAGE_SIZE,
+            offset,
+          },
+        });
+        for (const security of response.data.securities) {
+          await upsertSecurity(pool, mapSecurity(security));
+        }
+        for (const transaction of response.data.investment_transactions) {
+          await upsertInvestmentTransaction(
+            pool,
+            mapInvestmentTransaction(transaction, item.itemId),
+          );
+          result.investmentTransactions += 1;
+        }
+        total = response.data.total_investment_transactions;
+        offset += response.data.investment_transactions.length;
+        if (response.data.investment_transactions.length === 0) break;
       }
-      for (const transaction of response.data.investment_transactions) {
-        await upsertInvestmentTransaction(
-          pool,
-          mapInvestmentTransaction(transaction, item.itemId),
-        );
-        result.investmentTransactions += 1;
-      }
-      total = response.data.total_investment_transactions;
-      offset += response.data.investment_transactions.length;
-      if (response.data.investment_transactions.length === 0) break;
+    } catch (error) {
+      if (isItemLoginRequired(error)) return await failItem(pool, item, result, error);
+      if (!isProductNotSupported(error)) return await failItem(pool, item, result, error);
     }
-  } catch (error) {
-    if (isItemLoginRequired(error)) return await failItem(pool, item, result, error);
-    if (!isProductNotSupported(error)) return await failItem(pool, item, result, error);
   }
 
   await recordPullSuccess(pool, item.itemId, cursor ?? null);

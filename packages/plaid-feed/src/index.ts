@@ -6,4 +6,12 @@ export * from "./config.js";
 export * from "./db.js";
 export * from "./keychain.js";
 export * from "./mapping.js";
+export {
+  DEFAULT_LINK_TIMEOUT_MS,
+  DEFAULT_POLL_INTERVAL_MS,
+  runHostedLink,
+  runLink,
+  type LinkDeps,
+  type LinkOutcome,
+} from "./link.js";
 export { pullAll, pullItem, type ItemPullResult } from "./pull.js";

@@ -62,14 +62,6 @@ export async function loadDatabaseUrl(): Promise<string> {
   );
 }
 
-/** The fixed local port `link` serves on, unless overridden. */
-export const DEFAULT_LINK_PORT = 8765;
-
-/** The OAuth redirect URI `link` registers with Plaid Link. */
-export function redirectUri(port: number = DEFAULT_LINK_PORT): string {
-  return `http://localhost:${port}/oauth`;
-}
-
 /** `com.kithmind.plaid.item.<institution_slug>`, this item's Keychain service. */
 export function itemKeychainService(institutionName: string): string {
   return `com.kithmind.plaid.item.${institutionSlug(institutionName)}`;
