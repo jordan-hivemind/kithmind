@@ -128,12 +128,15 @@ function scope(accountId, status = "complete", index = 10) {
   };
 }
 
-function candidate(aPositions, { balances = [], balanceScopes = [] } = {}) {
+function candidate(
+  aPositions,
+  { balances = [], balanceScopes = [], sha = SHA } = {},
+) {
   const b = position(ACCOUNT_B, "instrument-b", "200", locator("b", 2));
   const c = position(ACCOUNT_C, "instrument-c", "300", locator("c", 3));
   return {
-    sha256: SHA,
-    retainedSha256: SHA,
+    sha256: sha,
+    retainedSha256: sha,
     retainedByteLength: 2048,
     mediaType: "application/pdf",
     captureId: "capture-scoped",
@@ -393,20 +396,21 @@ async function prepare(
       proofVersion: "position_scope_v1",
     },
   ],
+  documentId = DOCUMENT,
 ) {
   const document = await one(
     client,
     `SELECT retained_sha256,
             active_holding_projection_generation_id AS active_generation_id
        FROM documents WHERE id = $1`,
-    [DOCUMENT],
+    [documentId],
   );
   return prepareHoldingScopedPositionCorrection({
     client,
-    documentId: DOCUMENT,
+    documentId,
     retainedSha256: document.retained_sha256,
     expectedActiveGenerationId: document.active_generation_id,
-    stored: await readStoredHoldingProjection(client, DOCUMENT),
+    stored: await readStoredHoldingProjection(client, documentId),
     candidate: parsed,
     selectors,
   });
@@ -416,8 +420,8 @@ function approvalFor(manifest) {
   const unsigned = {
     schemaVersion: 1,
     kind: "holding_scoped_projection_approval_v1",
-    documentId: DOCUMENT,
-    retainedSha256: SHA,
+    documentId: manifest.documentId,
+    retainedSha256: manifest.retainedSha256,
     expectedActiveGenerationId: manifest.expectedActiveGenerationId,
     oldProjectionDigest: manifest.oldProjectionDigest,
     candidateProjectionDigest: manifest.candidateProjectionDigest,
@@ -445,6 +449,58 @@ function approvalFor(manifest) {
     ...unsigned,
     approvalDigest: holdingScopedProjectionApprovalDigest(unsigned),
   };
+}
+
+async function currentPositionScopeVerdicts(client) {
+  return (
+    await client.query(
+      `SELECT o.source_document_id,
+              NOT EXISTS (
+                SELECT 1 FROM position_scope_memberships m
+                LEFT JOIN positions p
+                  ON p.row_hash = m.position_row_hash
+                 AND p.account_id = m.account_id
+                 AND p.as_of = m.as_of
+                 AND p.instrument_id IS NOT DISTINCT FROM m.instrument_id
+                 AND p.quantity IS NOT DISTINCT FROM m.quantity
+                 AND p.price IS NOT DISTINCT FROM m.price
+                 AND p.market_value IS NOT DISTINCT FROM m.market_value
+                 AND p.cost_basis IS NOT DISTINCT FROM m.cost_basis
+                 AND p.unrealized IS NOT DISTINCT FROM m.unrealized
+                 AND p.currency = m.currency
+                 AND p.valuation_basis IS NOT DISTINCT FROM m.valuation_basis
+                 AND ${valuationNotesEquivalentSql("p.valuation_note", "m.valuation_note")}
+               WHERE m.scope_id = o.id AND p.id IS NULL
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM positions p
+                 WHERE p.account_id = o.account_id AND p.as_of = o.as_of
+                   AND NOT EXISTS (
+                     SELECT 1 FROM position_scope_memberships m
+                      WHERE m.scope_id = o.id
+                        AND p.row_hash = m.position_row_hash
+                        AND p.account_id = m.account_id
+                        AND p.as_of = m.as_of
+                        AND p.instrument_id IS NOT DISTINCT FROM m.instrument_id
+                        AND p.quantity IS NOT DISTINCT FROM m.quantity
+                        AND p.price IS NOT DISTINCT FROM m.price
+                        AND p.market_value IS NOT DISTINCT FROM m.market_value
+                        AND p.cost_basis IS NOT DISTINCT FROM m.cost_basis
+                        AND p.unrealized IS NOT DISTINCT FROM m.unrealized
+                        AND p.currency = m.currency
+                        AND p.valuation_basis IS NOT DISTINCT FROM m.valuation_basis
+                        AND ${valuationNotesEquivalentSql("p.valuation_note", "m.valuation_note")}
+                   )
+              ) AS exact
+         FROM position_scope_observations o
+         JOIN documents d ON d.id = o.source_document_id
+        WHERE o.account_id = $1 AND o.as_of = $2::date
+          AND o.holding_projection_generation_id
+                IS NOT DISTINCT FROM d.active_holding_projection_generation_id
+        ORDER BY o.source_document_id`,
+      [ACCOUNT_A, DATE],
+    )
+  ).rows;
 }
 
 test(
@@ -649,6 +705,154 @@ test(
 );
 
 test(
+  "two source-owned corrections preserve foreign extras until both immutable scopes converge",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    const seeded = await seed(client);
+    await client.query(
+      "INSERT INTO instruments (id, symbol, name) VALUES ('instrument-b-obsolete', 'BOBS', 'B obsolete')",
+    );
+    const desiredA = position(
+      ACCOUNT_A,
+      "instrument-a-new",
+      "125",
+      locator("a-desired", 10),
+    );
+    const obsoleteB = position(
+      ACCOUNT_A,
+      "instrument-b-obsolete",
+      "75",
+      locator("b-obsolete", 11),
+    );
+    await insertPosition(client, "position-a-desired", DOCUMENT, desiredA);
+    await insertPosition(
+      client,
+      "position-b-obsolete",
+      FOREIGN_DOCUMENT,
+      obsoleteB,
+    );
+    await client.query(
+      `INSERT INTO review_items
+         (id, kind, source_document_id, account_id, raw_value, reason, status)
+       VALUES ('review-b-scope', 'position_scope_mismatch', $1, $2, $3,
+               'synthetic second-source mismatch', 'open')`,
+      [FOREIGN_DOCUMENT, ACCOUNT_A, `${ACCOUNT_A}:${DATE}:position_scope_v1`],
+    );
+    await client.query(
+      `UPDATE review_items
+          SET status = 'resolved', resolved_at = $1,
+              resolution_note = $2
+        WHERE id = 'review-a-scope'`,
+      [
+        NOW.toISOString(),
+        "resolved on scoped projection publication: the selected complete position scope exactly matches the canonical account/date set",
+      ],
+    );
+
+    const aWitnessOfB = {
+      ...seeded.foreignA,
+      sourceLocator: locator("a-witness-b", 12),
+      valuationNote:
+        "Market Value column of the GOVERNMENT/SECURITIES holdings table",
+    };
+    const firstCandidate = candidate([desiredA, aWitnessOfB]);
+    const firstPrepared = await prepare(client, firstCandidate);
+    assert.equal(
+      firstPrepared.manifest.rows.positions.preservedForeignExtraRows,
+      1,
+    );
+    await publishHoldingScopedPositionCorrection(
+      client,
+      {
+        candidate: firstCandidate,
+        approval: approvalFor(firstPrepared.manifest),
+      },
+      NOW,
+    );
+
+    assert.deepEqual(await currentPositionScopeVerdicts(client), [
+      { source_document_id: DOCUMENT, exact: false },
+    ]);
+    assert.deepEqual(
+      await one(
+        client,
+        `SELECT source_document_id,
+                (SELECT status FROM review_items WHERE id = 'review-a-scope') AS a_review
+           FROM positions WHERE id = 'position-b-obsolete'`,
+      ),
+      { source_document_id: FOREIGN_DOCUMENT, a_review: "open" },
+    );
+
+    const bWitnessOfA = {
+      ...desiredA,
+      sourceLocator: locator("b-witness-a", 13),
+    };
+    const secondCandidate = candidate([bWitnessOfA, seeded.foreignA], {
+      sha: "f".repeat(64),
+    });
+    const secondPrepared = await prepare(
+      client,
+      secondCandidate,
+      [
+        {
+          scopeKind: "positions",
+          accountId: ACCOUNT_A,
+          asOf: DATE,
+          proofVersion: "position_scope_v1",
+        },
+      ],
+      FOREIGN_DOCUMENT,
+    );
+    await publishHoldingScopedPositionCorrection(
+      client,
+      {
+        candidate: secondCandidate,
+        approval: approvalFor(secondPrepared.manifest),
+      },
+      new Date("2026-09-21T19:01:00.000Z"),
+    );
+
+    assert.equal(
+      await count(client, "positions", "WHERE id = 'position-b-obsolete'"),
+      0,
+    );
+    assert.deepEqual(await currentPositionScopeVerdicts(client), [
+      { source_document_id: FOREIGN_DOCUMENT, exact: true },
+      { source_document_id: DOCUMENT, exact: true },
+    ]);
+    assert.deepEqual(
+      (
+        await client.query(
+          `SELECT id, status FROM review_items
+            WHERE id IN ('review-a-scope', 'review-b-scope') ORDER BY id`,
+        )
+      ).rows,
+      [
+        { id: "review-a-scope", status: "resolved" },
+        { id: "review-b-scope", status: "resolved" },
+      ],
+    );
+    assert.deepEqual(
+      (
+        await client.query(
+          `SELECT id, source_document_id FROM positions
+            WHERE account_id = $1 AND as_of = $2::date ORDER BY id`,
+          [ACCOUNT_A, DATE],
+        )
+      ).rows,
+      [
+        { id: "position-a-desired", source_document_id: DOCUMENT },
+        {
+          id: "position-a-foreign",
+          source_document_id: FOREIGN_DOCUMENT,
+        },
+      ],
+    );
+  },
+);
+
+test(
   "a positively empty selected scope removes its last owned position and stale instrument verdict while preserving its neighbor",
   { skip },
   async (t) => {
@@ -847,7 +1051,7 @@ test(
 );
 
 test(
-  "scoped candidate refuses unrepresented or semantically conflicting foreign rows without writes",
+  "scoped candidate preserves unrepresented foreign rows but refuses a cited foreign hash with different semantics",
   { skip },
   async (t) => {
     const client = await archive(t);
@@ -858,33 +1062,16 @@ test(
       "125",
       locator("a-new", 4),
     );
-    await assert.rejects(
-      prepare(client, candidate([newA])),
-      /does not represent every foreign-owned row/,
-    );
+    const prepared = await prepare(client, candidate([newA]));
+    assert.equal(prepared.manifest.selectedScopes[0].sourceOwnedRows, 1);
+    assert.equal(prepared.manifest.selectedScopes[0].foreignReferencedRows, 0);
+    assert.equal(prepared.manifest.rows.positions.preservedForeignExtraRows, 1);
 
     const conflict = { ...seeded.foreignA, price: "51" };
     await assert.rejects(
       prepare(client, candidate([newA, conflict])),
       /foreign-owned selected position has different semantics/,
     );
-    for (const financialConflict of [
-      {
-        ...seeded.foreignA,
-        marketValueText: "51",
-        price: "51",
-      },
-      {
-        ...seeded.foreignA,
-        valuationBasis: "reported_nav",
-        valuationNote: "NAV column of the BONDS holdings table",
-      },
-    ]) {
-      await assert.rejects(
-        prepare(client, candidate([newA, financialConflict])),
-        /does not represent every foreign-owned row/,
-      );
-    }
     for (const valuationNote of [
       "NAV column of the GOVERNMENT/SECURITIES holdings table",
       "Statement says market value is estimated.",

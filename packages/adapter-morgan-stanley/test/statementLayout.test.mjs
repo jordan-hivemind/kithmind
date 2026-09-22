@@ -19,6 +19,7 @@ import { buildMinimalPdf } from "../fixtures/pdf.mjs";
 import { STATEMENT_LINES } from "../fixtures/statementLines.mjs";
 import {
   ACTIVITY_SUMMARY_TEXT,
+  BOND_HEADER,
   lotsWithoutTotalLines,
   balanceSheetLines,
   bondBlockLines,
@@ -29,9 +30,11 @@ import {
   COVER_TOTAL_LAYOUT_TEXT,
   CROSS_MONTH_LAYOUT_TEXT,
   EMPTY_ACCOUNT_LAYOUT_TEXT,
+  EQUITY_HEADER,
   equityBlockLines,
   navFundBlockLines,
   pageSplitEquityPages,
+  place,
   privateHoldingsBlockLines,
   sectionSummaryLines,
   SHORT_CASH_LAYOUT_TEXT,
@@ -440,6 +443,639 @@ test("an undated extra value row cannot silently enter a lot sum", () => {
   const parsed = parseStatementLines(noTotalStatement({}, [extraRow]), kind);
   assert.deepEqual(parsed.holdings.positions, []);
   assert.match(parsed.parseNote, /holdings block\(s\) left unparsed/);
+});
+
+const purchasesEstimatedValueSummary = (label) =>
+  place([
+    { text: label, start: 8 },
+    { text: "$100.00", end: 134 },
+    { text: "$120.00", end: 150 },
+  ]);
+
+function purchasesSummaryStatement(
+  label = "Total Purchases vs Estimated Value",
+) {
+  const [section, header, datedRow] = lotsWithoutTotalLines();
+  return [
+    "        Page 1 of 1",
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+    "        Synthetic Active Assets Account    123-456789-012",
+    "        HOLDINGS",
+    section,
+    header,
+    datedRow,
+    purchasesEstimatedValueSummary(label),
+    place([{ text: "$6.00", end: 134 }]),
+    place([{ text: "$7.00", end: 150 }]),
+  ].join("\n");
+}
+
+test("the exact purchases-versus-estimated-value summary closes the final security", () => {
+  const text = purchasesSummaryStatement();
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [position] = parsed.holdings.positions;
+  assert.equal(position.instrument.name, "CAIRN SYNTHETIC HOLDINGS");
+  assert.equal(position.quantity, "5");
+  assert.equal(position.marketValue, "100");
+  assert.equal(position.locators.marketValue.binding.quote, "$100.00");
+  assert.equal(
+    text.slice(
+      position.locators.marketValue.binding.start,
+      position.locators.marketValue.binding.end,
+    ),
+    "$100.00",
+  );
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+  assert.equal(
+    scope.evidence.tables[0].end.binding.quote,
+    purchasesEstimatedValueSummary("Total Purchases vs Estimated Value").trim(),
+  );
+});
+
+test("similar totals, ordinary Total rows, TOTAL-named securities and true lots remain rows", () => {
+  const unknown = parseStatementLines(
+    purchasesSummaryStatement("Total Purchases and Estimated Value"),
+    kind,
+  );
+  assert.deepEqual(unknown.holdings.positions, []);
+  assert.ok(
+    unknown.holdings.positionScopes[0].gapCodes.includes("unresolved_lots"),
+  );
+
+  const ordinaryTotal = parseStatementLines(
+    purchasesSummaryStatement().replace(
+      lotsWithoutTotalLines()[2],
+      equityBlockLines().slice(2, 5).join("\n"),
+    ),
+    kind,
+  );
+  assert.equal(ordinaryTotal.holdings.positions.length, 1);
+  assert.equal(ordinaryTotal.holdings.positions[0].marketValue, "3184");
+
+  const datedTotalName = parseStatementLines(
+    purchasesSummaryStatement().replace(
+      "CAIRN SYNTHETIC HOLDINGS (CSHZ)",
+      "TOTAL RETURN FUND (TRNF)".padEnd(
+        "CAIRN SYNTHETIC HOLDINGS (CSHZ)".length,
+      ),
+    ),
+    kind,
+  );
+  assert.equal(datedTotalName.holdings.positions.length, 1);
+  assert.equal(datedTotalName.holdings.positions[0].instrument.symbol, "TRNF");
+
+  const completeLots = parseStatementLines(noTotalStatement(), kind);
+  assert.equal(completeLots.holdings.positions.length, 1);
+  assert.equal(completeLots.holdings.positions[0].marketValue, "240");
+});
+
+const sameSectionSubtotal = ({
+  label = "COMMON STOCKS",
+  tradeDate = null,
+} = {}) =>
+  place([
+    { text: label, start: 8 },
+    ...(tradeDate === null ? [] : [{ text: tradeDate, end: 62 }]),
+    { text: "$100.00", end: 134 },
+    { text: "$120.00", end: 150 },
+    { text: "$20.00", end: 164 },
+    { text: "$3.00", end: 180 },
+    { text: "2.5%", end: 188 },
+  ]);
+
+function sameSectionSubtotalStatement({
+  includeAssetClass = true,
+  label,
+  tradeDate,
+  marketValue = "$100.00",
+} = {}) {
+  const [section, header, datedRow] = lotsWithoutTotalLines({
+    first: { marketValue },
+  });
+  return [
+    "        Page 1 of 1",
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+    "        Synthetic Active Assets Account    123-456789-012",
+    "        HOLDINGS",
+    section,
+    header,
+    datedRow,
+    ...(includeAssetClass
+      ? ["        Next Dividend Payable 04/2026; Asset Class: Equities"]
+      : []),
+    sameSectionSubtotal({ label, tradeDate }),
+    place([{ text: "$6.00 ST", end: 164 }]),
+    place([{ text: "$7.00 ST", end: 164 }]),
+    place([
+      { text: "Unrealized", end: 164 },
+      { text: "Current", end: 180 },
+    ]),
+  ].join("\n");
+}
+
+test("an exact same-section subtotal after Asset Class closes a complete security", () => {
+  const text = sameSectionSubtotalStatement();
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [position] = parsed.holdings.positions;
+  assert.equal(position.instrument.symbol, "CSHZ");
+  assert.equal(position.marketValue, "100");
+  assert.equal(position.locators.marketValue.binding.quote, "$100.00");
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+  assert.equal(
+    scope.evidence.tables[0].end.binding.quote,
+    sameSectionSubtotal().trim(),
+  );
+});
+
+test("same-section subtotal recognition requires its marker, section, undated shape and complete predecessor", () => {
+  for (const [name, options] of [
+    ["no Asset Class marker", { includeAssetClass: false }],
+    ["mismatched section", { label: "CORPORATE FIXED INCOME" }],
+  ]) {
+    const parsed = parseStatementLines(
+      sameSectionSubtotalStatement(options),
+      kind,
+    );
+    assert.deepEqual(parsed.holdings.positions, [], name);
+    assert.ok(
+      parsed.holdings.positionScopes[0].gapCodes.includes("unresolved_lots"),
+      name,
+    );
+  }
+
+  const dated = parseStatementLines(
+    sameSectionSubtotalStatement({ tradeDate: "03/01/26" }),
+    kind,
+  );
+  assert.equal(dated.holdings.positions.length, 2);
+  assert.equal(dated.holdings.positions[1].instrument.name, "COMMON STOCKS");
+
+  const incomplete = parseStatementLines(
+    sameSectionSubtotalStatement({ marketValue: "" }),
+    kind,
+  );
+  assert.notEqual(
+    incomplete.holdings.positionScopes[0].evidence.tables[0].end.binding.quote,
+    sameSectionSubtotal().trim(),
+  );
+});
+
+const EQUITY_TEST_COLUMNS = {
+  description: { start: 8 },
+  tradeDate: { end: 62 },
+  quantity: { end: 92 },
+  price: { end: 120 },
+  costBasis: { end: 134 },
+  marketValue: { end: 150 },
+  unrealized: { end: 164 },
+};
+
+function undatedTickerRow({
+  description,
+  quantity = "5.000",
+  price = "$20.000",
+  costBasis = "$90.00",
+  marketValue = "$100.00",
+  unrealized = "$10.00",
+}) {
+  return place([
+    { text: description, ...EQUITY_TEST_COLUMNS.description },
+    { text: quantity, ...EQUITY_TEST_COLUMNS.quantity },
+    { text: price, ...EQUITY_TEST_COLUMNS.price },
+    { text: costBasis, ...EQUITY_TEST_COLUMNS.costBasis },
+    { text: marketValue, ...EQUITY_TEST_COLUMNS.marketValue },
+    { text: unrealized, ...EQUITY_TEST_COLUMNS.unrealized },
+  ]);
+}
+
+function equityTotalRow({
+  quantity = "5.000",
+  costBasis = "90.00",
+  marketValue = "100.00",
+  unrealized = "10.00",
+} = {}) {
+  return place([
+    { text: "Total", ...EQUITY_TEST_COLUMNS.tradeDate },
+    { text: quantity, ...EQUITY_TEST_COLUMNS.quantity },
+    { text: costBasis, ...EQUITY_TEST_COLUMNS.costBasis },
+    { text: marketValue, ...EQUITY_TEST_COLUMNS.marketValue },
+    { text: unrealized, ...EQUITY_TEST_COLUMNS.unrealized },
+  ]);
+}
+
+function identifierStartStatement(rows, header = EQUITY_HEADER) {
+  return [
+    "        Page 1 of 1",
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+    `        ${CONSOLIDATED_ACCOUNT_ONE}`,
+    "        Account Synthetic Household",
+    "        HOLDINGS",
+    "        COMMON STOCKS",
+    header,
+    ...rows,
+    "        TOTAL",
+  ].join("\n");
+}
+
+function positiveCents(value) {
+  const [whole, fraction = ""] = value.replace(/[$,]/g, "").split(".");
+  return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, "0"));
+}
+
+test("a distinct parenthesized ticker starts an undated security with exact totals and locators", () => {
+  const first = equityBlockLines().slice(2, 5);
+  const second = undatedTickerRow({
+    description: "SYNTHETIC SECOND FUND (SNDF)",
+  });
+  const text = identifierStartStatement([...first, second, equityTotalRow()]);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 2);
+  const [dated, undated] = parsed.holdings.positions;
+  assert.equal(dated.instrument.symbol, "WNDF");
+  assert.equal(dated.marketValue, "3184");
+  assert.equal(
+    positiveCents("1910.40") + positiveCents("1273.60"),
+    positiveCents(dated.marketValue),
+  );
+  assert.equal(undated.instrument.symbol, "SNDF");
+  assert.equal(undated.quantity, "5");
+  assert.equal(undated.price, "20");
+  assert.equal(undated.marketValue, "100");
+  assert.equal(
+    resolveStatementMoney("$100.00").value,
+    resolveStatementMoney(undated.locators.marketValue.binding.quote).value,
+  );
+  assert.equal(
+    parsed.holdings.positions.reduce(
+      (sum, position) => sum + positiveCents(position.marketValue),
+      0n,
+    ),
+    328400n,
+  );
+  for (const [field, quote] of [
+    ["quantity", "5.000"],
+    ["price", "$20.000"],
+    ["marketValue", "100.00"],
+  ]) {
+    const binding = undated.locators[field].binding;
+    assert.equal(binding.quote, quote);
+    assert.equal(text.slice(binding.start, binding.end), quote);
+  }
+});
+
+test("one adjacent same-page CUSIP detail row can identify an undated priced bond", () => {
+  const block = bondBlockLines();
+  const undated = block[2].replace("05/18/25", " ".repeat("05/18/25".length));
+  const text = identifierStartStatement([undated, block[3]], block[1]).replace(
+    "        COMMON STOCKS",
+    block[0],
+  );
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [bond] = parsed.holdings.positions;
+  assert.equal(bond.instrument.cusip, "00000WNF1");
+  assert.equal(bond.quantity, "25000");
+  assert.equal(bond.price, "99.5");
+  assert.equal(bond.marketValue, "24875");
+  for (const field of ["quantity", "price", "marketValue"]) {
+    const binding = bond.locators[field].binding;
+    assert.equal(text.slice(binding.start, binding.end), binding.quote);
+  }
+});
+
+test("repeated undated identity stays unresolved even when a Total follows", () => {
+  const repeated = undatedTickerRow({
+    description: "SYNTHETIC REPEATED FUND (RPTD)",
+  });
+  const second = repeated.replace("$100.00", "$120.00");
+  const conflicting = `${second.slice(0, 83)}1   ${second.slice(87)}`;
+  for (const [name, repeatedRow] of [
+    ["readable repeated row", second],
+    ["unreadable repeated price", second.replace("$20.000", "$2O.000")],
+    ["conflicting repeated quantity cells", conflicting],
+  ]) {
+    const text = identifierStartStatement([
+      repeated,
+      repeatedRow,
+      equityTotalRow({
+        quantity: "10.000",
+        costBasis: "180.00",
+        marketValue: "220.00",
+        unrealized: "20.00",
+      }),
+    ]);
+    const parsed = parseStatementLines(text, kind);
+    assert.deepEqual(parsed.holdings.positions, [], name);
+    assert.ok(
+      parsed.holdings.positionScopes[0].gapCodes.includes("unresolved_lots"),
+      name,
+    );
+  }
+
+  const bond = bondBlockLines();
+  const undatedBond = bond[2].replace(
+    "05/18/25",
+    " ".repeat("05/18/25".length),
+  );
+  const repeatedCusip = identifierStartStatement(
+    [undatedBond, bond[3], undatedBond, bond[3]],
+    bond[1],
+  ).replace("        COMMON STOCKS", bond[0]);
+  const parsedCusip = parseStatementLines(repeatedCusip, kind);
+  assert.deepEqual(parsedCusip.holdings.positions, []);
+  assert.ok(
+    parsedCusip.holdings.positionScopes[0].gapCodes.includes("unresolved_lots"),
+  );
+});
+
+test("identifier-backed starts refuse generic names, unreadable prices and weak CUSIP detail", () => {
+  const bond = bondBlockLines();
+  const undatedBond = bond[2].replace(
+    "05/18/25",
+    " ".repeat("05/18/25".length),
+  );
+  const bondDetailDescription =
+    "Coupon Rate 4.250%; Matures 06/01/2031; CUSIP 00000WNF1";
+  const duplicateCusips = "CUSIP 00000WNF1; CUSIP 00000WNF2".padEnd(
+    bondDetailDescription.length,
+  );
+  const cases = [
+    {
+      name: "generic description",
+      text: identifierStartStatement([
+        undatedTickerRow({ description: "SYNTHETIC UNIDENTIFIED FUND" }),
+        equityTotalRow(),
+      ]),
+    },
+    {
+      name: "unreadable price",
+      text: identifierStartStatement([
+        undatedTickerRow({
+          description: "SYNTHETIC IDENTIFIED FUND (SIDF)",
+          price: "$2O.000",
+        }),
+        equityTotalRow(),
+      ]),
+    },
+    {
+      name: "two CUSIPs",
+      text: identifierStartStatement(
+        [undatedBond, bond[3].replace(bondDetailDescription, duplicateCusips)],
+        bond[1],
+      ).replace("        COMMON STOCKS", bond[0]),
+    },
+    {
+      name: "description-only CUSIP",
+      text: identifierStartStatement(
+        [
+          undatedBond,
+          place([
+            { text: "CUSIP 00000WNF1", ...EQUITY_TEST_COLUMNS.description },
+          ]),
+        ],
+        bond[1],
+      ).replace("        COMMON STOCKS", bond[0]),
+    },
+    {
+      name: "CUSIP on another physical page",
+      text: identifierStartStatement(
+        [undatedBond, PAGE_SEPARATOR, bond[3]],
+        bond[1],
+      ).replace("        COMMON STOCKS", bond[0]),
+    },
+  ];
+  for (const { name, text } of cases) {
+    const parsed = parseStatementLines(text, kind);
+    assert.deepEqual(parsed.holdings.positions, [], name);
+    assert.ok(
+      parsed.holdings.positionScopes[0].gapCodes.some((code) =>
+        ["missing_security_start", "unresolved_lots"].includes(code),
+      ),
+      name,
+    );
+  }
+});
+
+test("an identifier-shaped undated row cannot leave a section summary", () => {
+  const text = identifierStartStatement([
+    ...equityBlockLines().slice(2, 5),
+    ...sectionSummaryLines(),
+    undatedTickerRow({ description: "SUMMARY LOOKALIKE FUND (SLKF)" }),
+  ]);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  assert.equal(parsed.holdings.positions[0].instrument.symbol, "WNDF");
+  assert.equal(
+    parsed.holdings.positions.some(
+      (position) => position.instrument?.symbol === "SLKF",
+    ),
+    false,
+  );
+});
+
+const BOND_TEST_COLUMNS = {
+  description: { start: 8 },
+  tradeDate: { end: 62 },
+  quantity: { end: 92 },
+  unitCost: { end: 106 },
+  price: { end: 120 },
+  costBasis: { end: 136 },
+  marketValue: { end: 152 },
+  unrealized: { end: 166 },
+};
+
+function wrappedBondRows({
+  startDescription = "SYNTHETIC FLOATING NOTE VAR 06/15/26",
+  percentage = "4.250%",
+  descriptor = "Coupon Rate 4.250%; Perpetual Maturity; CUSIP 00000WNF1 06/15/26 1,234.56 99.500",
+  startPrice = "$99.500",
+  detailPrice = "99.500",
+  firstMarket = "$100.00",
+  secondMarket = "200.00",
+  totalMarket = "300.00",
+  includeTotal = true,
+} = {}) {
+  const rows = [
+    place([
+      { text: startDescription, ...BOND_TEST_COLUMNS.description },
+      { text: "100.000", ...BOND_TEST_COLUMNS.quantity },
+      { text: "$98.000", ...BOND_TEST_COLUMNS.unitCost },
+      { text: startPrice, ...BOND_TEST_COLUMNS.price },
+      { text: "$90.00", ...BOND_TEST_COLUMNS.costBasis },
+    ]),
+    place([
+      { text: percentage, ...BOND_TEST_COLUMNS.description },
+      { text: "98.000", ...BOND_TEST_COLUMNS.unitCost },
+      { text: "90.00", ...BOND_TEST_COLUMNS.costBasis },
+      { text: firstMarket, ...BOND_TEST_COLUMNS.marketValue },
+      { text: "$10.00", ...BOND_TEST_COLUMNS.unrealized },
+    ]),
+    place([
+      { text: descriptor, ...BOND_TEST_COLUMNS.description },
+      { text: detailPrice, ...BOND_TEST_COLUMNS.price },
+      { text: "180.00", ...BOND_TEST_COLUMNS.costBasis },
+    ]),
+    place([
+      { text: "98.000", ...BOND_TEST_COLUMNS.unitCost },
+      { text: "180.00", ...BOND_TEST_COLUMNS.costBasis },
+      { text: secondMarket, ...BOND_TEST_COLUMNS.marketValue },
+      { text: "20.00", ...BOND_TEST_COLUMNS.unrealized },
+    ]),
+  ];
+  if (!includeTotal) return rows;
+  return rows.concat(
+    place([
+      { text: "Total", ...BOND_TEST_COLUMNS.tradeDate },
+      { text: "300.000", ...BOND_TEST_COLUMNS.quantity },
+      { text: "270.00", ...BOND_TEST_COLUMNS.costBasis },
+    ]),
+    place([
+      { text: "270.00", ...BOND_TEST_COLUMNS.costBasis },
+      { text: totalMarket, ...BOND_TEST_COLUMNS.marketValue },
+      { text: "30.00", ...BOND_TEST_COLUMNS.unrealized },
+    ]),
+  );
+}
+
+function wrappedBondStatement(rows = wrappedBondRows()) {
+  return identifierStartStatement(rows, BOND_HEADER).replace(
+    "        COMMON STOCKS",
+    "        CORPORATE FIXED INCOME",
+  );
+}
+
+test("the exact six-row wrapped bond uses its paired printed Total and exact evidence", () => {
+  const text = wrappedBondStatement();
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [position] = parsed.holdings.positions;
+  assert.equal(position.instrument.cusip, "00000WNF1");
+  assert.equal(
+    position.instrument.name,
+    "SYNTHETIC FLOATING NOTE VAR 06/15/26",
+  );
+  assert.equal(position.quantity, "300");
+  assert.equal(position.price, "99.5");
+  assert.equal(position.costBasis, "270");
+  assert.equal(position.marketValue, "300");
+  assert.equal(position.unrealized, "30");
+  assert.equal(
+    positiveCents("100") + positiveCents("200"),
+    positiveCents(position.marketValue),
+  );
+  for (const [field, quote] of [
+    ["quantity", "300.000"],
+    ["price", "$99.500"],
+    ["costBasis", "270.00"],
+    ["marketValue", "300.00"],
+  ]) {
+    const binding = position.locators[field].binding;
+    assert.equal(binding.quote, quote);
+    assert.equal(text.slice(binding.start, binding.end), quote);
+  }
+  assert.equal(position.locators.marketValue.calculation, undefined);
+  assert.equal(
+    Object.keys(position.locators).some((key) => key.includes(".lot.")),
+    false,
+  );
+  assert.doesNotMatch(position.valuationNote, /summed from/);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+});
+
+test("wrapped bond proof rejects descriptor, identity, topology, numeric and Total defects", () => {
+  const base = wrappedBondRows();
+  const cases = [
+    {
+      name: "arbitrary percentage continuation",
+      rows: wrappedBondRows({ percentage: "Synthetic continuation" }),
+    },
+    {
+      name: "different detail price",
+      rows: wrappedBondRows({ detailPrice: "98.500" }),
+    },
+    {
+      name: "dated-maturity descriptor instead of the proven perpetual form",
+      rows: wrappedBondRows({
+        descriptor: "Coupon Rate 4.250%; Maturity 06/15/31; CUSIP 00000WNF1",
+      }),
+    },
+    {
+      name: "unreadable descriptor suffix",
+      rows: wrappedBondRows({
+        descriptor:
+          "Coupon Rate 4.250%; Perpetual Maturity; CUSIP 00000WNF1 06/15/26 1,23O.56 99.500",
+      }),
+    },
+    {
+      name: "duplicate CUSIP",
+      rows: wrappedBondRows({
+        descriptor:
+          "Coupon Rate 4.250%; Perpetual Maturity; CUSIP 00000WNF1 CUSIP 00000WNF2 06/15/26 1,234.56 99.500",
+      }),
+    },
+    {
+      name: "competing CUSIP on the start row",
+      rows: wrappedBondRows({
+        startDescription: "NOTE VAR 06/15/26 CUSIP 111111111",
+      }),
+    },
+    {
+      name: "competing ticker identity on the start row",
+      rows: wrappedBondRows({
+        startDescription: "NOTE VAR 06/15/26 (BOND)",
+      }),
+    },
+    {
+      name: "competing security description",
+      rows: wrappedBondRows({ percentage: "OTHER FUND (OTHR)" }),
+    },
+    {
+      name: "physical page crossing",
+      rows: [...base.slice(0, 2), PAGE_SEPARATOR, ...base.slice(2)],
+    },
+    {
+      name: "header crossing",
+      rows: [...base.slice(0, 2), BOND_HEADER, ...base.slice(2)],
+    },
+    {
+      name: "account crossing",
+      rows: [
+        ...base.slice(0, 2),
+        `        ${CONSOLIDATED_ACCOUNT_TWO}`,
+        ...base.slice(2),
+      ],
+    },
+    {
+      name: "missing paired Total",
+      rows: wrappedBondRows({ includeTotal: false }),
+    },
+    {
+      name: "unreadable market amount",
+      rows: wrappedBondRows({ firstMarket: "$1O0.00" }),
+    },
+    {
+      name: "market sum disagreement",
+      rows: wrappedBondRows({ totalMarket: "301.00" }),
+    },
+  ];
+  for (const { name, rows } of cases) {
+    const parsed = parseStatementLines(wrappedBondStatement(rows), kind);
+    assert.deepEqual(parsed.holdings.positions, [], name);
+    assert.ok(
+      parsed.holdings.positionScopes[0].gapCodes.some((code) =>
+        ["missing_security_start", "unresolved_lots"].includes(code),
+      ),
+      name,
+    );
+  }
 });
 
 test("two cells bound to one lot column are refused instead of choosing the first", () => {

@@ -58,6 +58,8 @@ checks and review evidence, and start final CI only after the review head is
 stable. For scheduler changes, test the affected end-to-end state transitions
 across mixed document types, queued work, legacy resume and deferred refresh.
 Do not substitute helper-only checks or unrelated suites for those transitions.
+Exercise newly queued selected items through publication, cleanup, next-item
+selection and restart. Publication alone does not prove scheduler acceptance.
 
 ## Parallel lanes
 
@@ -114,6 +116,9 @@ commit does not invalidate code evidence; a rebase requires checking what
 changed in the base and rerunning checks affected by it. Required final-head
 CI and branch protection must still pass. Never relabel earlier evidence as
 having run against a later commit.
+
+Copy a full commit hash for a handoff only from `git rev-parse HEAD` or
+structured GitHub output. Never expand a short hash manually.
 
 Use one accountable release owner. For code requiring independent review, use
 one reviewer per risk area; prose-only edits do not need a new review lane.

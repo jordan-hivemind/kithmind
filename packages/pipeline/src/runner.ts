@@ -2113,9 +2113,25 @@ export class PipelineRunner {
     // A `queued` entry is the server saying it has not settled this failure
     // yet, and the only thing that settles it is one more report carrying
     // `exhausted`, so going quiet here would strand the work row as retryable
-    // forever. One more parse settles it; every pass after that arrives here
-    // as `unchanged` and is skipped by the bound below.
-    if (plan.discoveryState === "queued") return true;
+    // forever. One more parse settles it. The exception is an exact processing
+    // identity that this runner has already activated: retained local
+    // artifacts mean cleanup must resume, while no artifacts means activation
+    // and cleanup already completed even if this scan's discovery disposition
+    // remains the original `queued` value. The processing match below binds
+    // the source bytes, processing epoch and full parser fingerprint tuple, so
+    // it cannot consume a changed or newly requested revision.
+    if (plan.discoveryState === "queued") {
+      const matches = this.matchingProcessingRows(plan);
+      const original = this.matchingOriginal(plan);
+      const reusable = this.reusableProcessingRow(matches, original);
+      if (reusable?.activation) {
+        return await this.processingArtifactsPresent(
+          reusable,
+          planMediaType(plan),
+        );
+      }
+      return true;
+    }
     if (plan.discoveryState !== "unchanged") return false;
     const matches = this.matchingProcessingRows(plan);
     // A document that has already exhausted its bounded local parser attempts
@@ -2216,6 +2232,32 @@ export class PipelineRunner {
   ): Promise<RunnerCheckpoint> {
     const previewed = new Set(routing.previewed.map(metadataIdentityKey));
     const gapped = new Set(routing.previewGaps.map(metadataIdentityKey));
+    const nextStep = async (
+      plan: PdfFilePlan,
+      alreadyPreviewed: boolean,
+    ): Promise<"preview" | "intent" | null> => {
+      try {
+        if (!(await this.pdfNeedsArchivedWork(plan))) return null;
+        const reusable = this.reusableProcessingRow(
+          this.matchingProcessingRows(plan),
+          this.matchingOriginal(plan),
+        );
+        // An activated prior-scan row with retained local artifacts needs the
+        // existing intent -> cleanup recovery path. It has no current-scan
+        // discovery work row, so recordPreview would correctly be refused as
+        // stale_observation. A cleaned activation returned null above.
+        return reusable?.activation || alreadyPreviewed ? "intent" : "preview";
+      } catch (error) {
+        const code = parkable(error);
+        if (code === undefined) throw error;
+        try {
+          await this.parkPlan(plan, code);
+        } catch {
+          throw error;
+        }
+        return null;
+      }
+    };
     for (const selected of routing.selected) {
       const selectedKey = metadataIdentityKey(selected);
       if (gapped.has(selectedKey)) continue;
@@ -2228,25 +2270,13 @@ export class PipelineRunner {
         throw new PipelineWorkerError("metadata_first_identity_conflict");
       }
       const plan = checkpoint.files[index]! as PdfFilePlan;
-      let needsWork: boolean;
-      try {
-        needsWork = await this.pdfNeedsArchivedWork(plan);
-      } catch (error) {
-        const code = parkable(error);
-        if (code === undefined) throw error;
-        try {
-          await this.parkPlan(plan, code);
-        } catch {
-          throw error;
-        }
-        continue;
-      }
-      if (!needsWork) continue;
+      const step = await nextStep(plan, previewed.has(selectedKey));
+      if (step === null) continue;
       return this.metadataArchivedCheckpoint(
         checkpoint,
         routing,
         index,
-        previewed.has(selectedKey) ? "intent" : "preview",
+        step,
         archivedPublished,
       );
     }
@@ -2262,11 +2292,13 @@ export class PipelineRunner {
         !previewed.has(metadataIdentityKey(metadataIdentity(plan))) &&
         !gapped.has(metadataIdentityKey(metadataIdentity(plan)))
       ) {
+        const step = await nextStep(plan, false);
+        if (step === null) continue;
         return this.metadataArchivedCheckpoint(
           checkpoint,
           routing,
           index,
-          "preview",
+          step,
           archivedPublished,
         );
       }

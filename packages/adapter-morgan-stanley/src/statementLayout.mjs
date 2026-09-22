@@ -931,6 +931,58 @@ function observedHoldingsHeader(text) {
 const TOTAL_ROW = /^Total\b/;
 /** Ends a holdings table. */
 const TABLE_END = /^(TOTAL|Total Value|HOLDINGS|CASH FLOW|ACTIVITY|Page \d)/;
+/**
+ * The provider's purchases-versus-estimated-value summary. It is printed
+ * immediately after the final security as one label cell and two money cells,
+ * followed by numeric-only detail lines. The title-case `Total` must not be
+ * folded into `TABLE_END`: a security's own aggregate row uses that spelling,
+ * and a dated security name may begin with TOTAL. Require the exact provider
+ * label and the complete three-cell summary shape instead.
+ */
+const PURCHASES_VS_ESTIMATED_VALUE = "Total Purchases vs Estimated Value";
+function purchasesVsEstimatedValueSummary(text) {
+  const cells = splitCells(text);
+  return (
+    cells.length === 3 &&
+    cells[0].text === PURCHASES_VS_ESTIMATED_VALUE &&
+    cells
+      .slice(1)
+      .every(
+        (cell) =>
+          statesValue(cell) && resolveStatementMoney(cell.text).value !== null,
+      )
+  );
+}
+
+/** A section subtotal printed after the final security's Asset Class marker.
+ * Its description repeats the active table section and its remaining cells
+ * are four numeric values plus one percentage. Bind the row as well as
+ * checking its physical cells: an undated security-shaped row must not become
+ * a boundary merely because it happens to have six values. */
+function sameSectionSubtotalSummary(text, columns, section) {
+  if (explicitHoldingsSection(section) === null) return false;
+  const cells = splitCells(text);
+  if (
+    cells.length !== 6 ||
+    cells[0].text.replace(/\s+/g, " ").toUpperCase() !==
+      section.replace(/\s+/g, " ").toUpperCase() ||
+    cells
+      .slice(1, 5)
+      .some(
+        (cell) =>
+          !statesValue(cell) || resolveStatementMoney(cell.text).value === null,
+      ) ||
+    !/^\d+(?:\.\d+)?%$/.test(cells[5].text)
+  ) {
+    return false;
+  }
+  const { bound, conflictingCells } = bindRow(text, columns);
+  return (
+    !conflictingCells &&
+    JSON.stringify([...bound.keys()].sort()) ===
+      JSON.stringify(["costBasis", "description", "marketValue", "unrealized"])
+  );
+}
 const ACTIVITY_SECTION = /^ACTIVITY\b/;
 /**
  * F1-61. The page footer, the one `TABLE_END` that does not end the table:
@@ -1200,6 +1252,150 @@ function explicitHoldingsSection(text) {
 /** "CUSIP 00000WNF1" on a bond's detail line. */
 const CUSIP_LABEL = /\bCUSIP\s+([A-Z0-9]{9})\b/;
 
+function parenthesizedSecurityIdentity(description) {
+  const match = NAME_AND_SYMBOL.exec(description ?? "");
+  return match === null ? null : `symbol:${match[2]}`;
+}
+
+/** One adjacent bond-detail description cell may prove the undated row above
+ * starts a security. Require exactly one labelled CUSIP in that bound cell;
+ * a second identifier-looking description is another possible security, not
+ * detail evidence that can be borrowed by its predecessor. */
+function adjacentCusipIdentity(text, columns) {
+  const { bound, conflictingCells } = bindRow(text, columns);
+  const description = bound.get("description")?.text;
+  if (
+    conflictingCells ||
+    description === undefined ||
+    NAME_AND_SYMBOL.test(description) ||
+    bound.has("tradeDate") ||
+    ![...bound].some(
+      ([name, cell]) => name !== "description" && statesValue(cell),
+    )
+  ) {
+    return null;
+  }
+  const identifiers = [...description.matchAll(/\bCUSIP\s+([A-Z0-9]{9})\b/g)];
+  return identifiers.length === 1 ? `cusip:${identifiers[0][1]}` : null;
+}
+
+function hasExactlyFields(bound, expected) {
+  return (
+    JSON.stringify([...bound.keys()].sort()) ===
+    JSON.stringify([...expected].sort())
+  );
+}
+
+/**
+ * One provider fixed-income layout wraps a variable-rate security over six
+ * physical lines. Its identifier is two lines below the security start, after
+ * a percentage-only description continuation. This is deliberately a proof of
+ * that whole printed shape, not generic CUSIP lookahead.
+ */
+function wrappedBondSecurityProof({
+  lines,
+  index,
+  columns,
+  accountKeys,
+  headerPage,
+  accountKey,
+}) {
+  const source = lines.slice(index, index + 6);
+  if (
+    source.length !== 6 ||
+    source.some(
+      (line, offset) =>
+        line.page !== headerPage ||
+        accountKeys[index + offset] !== accountKey ||
+        (offset > 0 &&
+          (HOLDINGS_HEADER.test(line.text) ||
+            TABLE_END.test(line.text.trim()) ||
+            ASSET_CLASS.test(line.text.trim()))),
+    )
+  ) {
+    return null;
+  }
+  const rows = source.map((line) => bindRow(line.text, columns));
+  if (rows.some((row) => row.conflictingCells)) return null;
+  const [start, percentage, descriptor, secondValue, total, totalValue] = rows;
+  const shapes = [
+    [start, ["description", "quantity", "unitCost", "price", "costBasis"]],
+    [
+      percentage,
+      ["description", "unitCost", "costBasis", "marketValue", "unrealized"],
+    ],
+    [descriptor, ["description", "price", "costBasis"]],
+    [secondValue, ["unitCost", "costBasis", "marketValue", "unrealized"]],
+    [total, ["tradeDate", "quantity", "costBasis"]],
+    [totalValue, ["costBasis", "marketValue", "unrealized"]],
+  ];
+  if (shapes.some(([row, fields]) => !hasExactlyFields(row.bound, fields))) {
+    return null;
+  }
+
+  const startDescription = start.bound.get("description").text;
+  if (
+    !/\bVAR\b/.test(startDescription) ||
+    !/\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/.test(startDescription)
+  ) {
+    return null;
+  }
+  const printedPercentage = percentage.bound.get("description").text;
+  const detail =
+    /^Coupon Rate (\d+(?:\.\d+)?)%; Perpetual Maturity; CUSIP ([A-Z0-9]{9}) (\d{1,2}\/\d{1,2}\/\d{2,4}) (\d{1,3}(?:,\d{3})+\.\d+) (\d+\.\d+)$/.exec(
+      descriptor.bound.get("description").text,
+    );
+  if (
+    detail === null ||
+    printedPercentage !== `${detail[1]}%` ||
+    !TRADE_DATE_CELL.test(detail[3]) ||
+    resolveStatementMoney(detail[4]).value === null ||
+    resolveStatementMoney(detail[5]).value === null ||
+    total.bound.get("tradeDate").text !== "Total"
+  ) {
+    return null;
+  }
+
+  const numericCells = rows.flatMap(({ bound }) =>
+    [...bound].flatMap(([name, cell]) =>
+      name === "description" || name === "tradeDate" ? [] : [cell],
+    ),
+  );
+  if (
+    numericCells.some((cell) => resolveStatementMoney(cell.text).value === null)
+  ) {
+    return null;
+  }
+  const startPrice = resolveStatementMoney(start.bound.get("price").text).value;
+  const detailPrice = resolveStatementMoney(
+    descriptor.bound.get("price").text,
+  ).value;
+  const firstMarket = resolveStatementMoney(
+    percentage.bound.get("marketValue").text,
+  ).value;
+  const secondMarket = resolveStatementMoney(
+    secondValue.bound.get("marketValue").text,
+  ).value;
+  const printedTotal = resolveStatementMoney(
+    totalValue.bound.get("marketValue").text,
+  ).value;
+  if (
+    startPrice !== detailPrice ||
+    addDecimal(firstMarket, secondMarket) !== printedTotal
+  ) {
+    return null;
+  }
+  return {
+    identity: `cusip:${detail[2]}`,
+    lineStarts: source.map((line) => line.start),
+    conflictingIdentity:
+      parenthesizedSecurityIdentity(startDescription) !== null ||
+      source.flatMap((line) => [
+        ...line.text.matchAll(/\bCUSIP\s+[A-Z0-9]{9}\b/g),
+      ]).length !== 1,
+  };
+}
+
 function resolveInstrument(description, detailText) {
   const labelled = CUSIP_LABEL.exec(detailText ?? "");
   const cusip = labelled === null ? null : labelled[1];
@@ -1236,6 +1432,41 @@ function resolveInstrument(description, detailText) {
  * summed; undated value rows and interrupted blocks remain ambiguous.
  */
 function positionCells(block, context) {
+  // Two undated rows carrying the same explicit identifier do not prove two
+  // securities or a set of lots. A later Total cannot make that ambiguity go
+  // away, so refuse the whole block before choosing an aggregate row.
+  if (block.some((row) => row.ambiguousUndatedIdentity)) return null;
+  const wrappedProof = block[0]?.wrappedBondProof;
+  if (wrappedProof !== undefined) {
+    if (
+      block.length !== 6 ||
+      block.some((row, index) => row.start !== wrappedProof.lineStarts[index])
+    ) {
+      return null;
+    }
+    const [start, , , , total, totalValue] = block;
+    const withLine = (cell, row) => ({
+      ...cell,
+      lineStart: row.start,
+      page: row.page,
+    });
+    return {
+      row: total,
+      merged: new Map([
+        ["quantity", withLine(total.bound.get("quantity"), total)],
+        ["price", withLine(start.bound.get("price"), start)],
+        ["costBasis", withLine(total.bound.get("costBasis"), total)],
+        [
+          "marketValue",
+          withLine(totalValue.bound.get("marketValue"), totalValue),
+        ],
+        [
+          "unrealized",
+          withLine(totalValue.bound.get("unrealized"), totalValue),
+        ],
+      ]),
+    };
+  }
   const totalRow = block.find(
     ({ bound }) =>
       bound.has("description") === false &&
@@ -2213,10 +2444,12 @@ function parseHoldings(
 
     let block = [];
     let description = null;
+    let securityIdentities = [];
     let table;
     if (continues) {
       block = carried.block;
       description = carried.description;
+      securityIdentities = carried.securityIdentities;
       section = carried.context.section;
       table = carried.table;
       table.headers.push(
@@ -2265,17 +2498,63 @@ function parseHoldings(
     let terminalIndex = null;
     let summaryBoundaryIndex = null;
     let summaryHasUnresolvedSecurity = false;
+    let assetClassIndex = null;
     for (let j = i + 1; j < lines.length; j += 1) {
       const text = lines[j].text;
       const trimmed = text.trim();
-      if (TABLE_END.test(trimmed) || HOLDINGS_HEADER.test(text)) {
+      const purchasesSummaryBoundary =
+        lines[j].page === lines[headerIndex].page &&
+        accountKeys[j] === accountKey &&
+        purchasesVsEstimatedValueSummary(text);
+      const tableEndCandidate = TABLE_END.test(trimmed);
+      const wrappedBondContinuation =
+        block[0]?.wrappedBondProof !== undefined &&
+        block.length < block[0].wrappedBondProof.lineStarts.length &&
+        block[0].wrappedBondProof.lineStarts[block.length] === lines[j].start;
+      const tableEndBound = tableEndCandidate
+        ? bindRow(text, columns)
+        : { bound: new Map(), conflictingCells: false };
+      const datedTotalSecurity =
+        tableEndCandidate &&
+        !tableEndBound.conflictingCells &&
+        /^TOTAL\b/.test(tableEndBound.bound.get("description")?.text ?? "") &&
+        TRADE_DATE_CELL.test(tableEndBound.bound.get("tradeDate")?.text ?? "");
+      if (
+        (tableEndCandidate &&
+          !datedTotalSecurity &&
+          !wrappedBondContinuation) ||
+        purchasesSummaryBoundary ||
+        HOLDINGS_HEADER.test(text)
+      ) {
         terminalIndex = j;
         interruptedByPageFooter = PAGE_FOOTER.test(trimmed);
         break;
       }
-      if (ASSET_CLASS.test(trimmed)) continue;
+      if (ASSET_CLASS.test(trimmed)) {
+        assetClassIndex = j;
+        continue;
+      }
+      const sameSectionSubtotalBoundary =
+        assetClassIndex === j - 1 &&
+        lines[assetClassIndex].page === lines[headerIndex].page &&
+        lines[j].page === lines[headerIndex].page &&
+        accountKeys[assetClassIndex] === accountKey &&
+        accountKeys[j] === accountKey &&
+        sameSectionSubtotalSummary(text, columns, section) &&
+        block.length > 0 &&
+        positionFromBlock(block, columns, {
+          ...context,
+          section,
+          description,
+        }).position !== null;
+      assetClassIndex = null;
+      if (sameSectionSubtotalBoundary) {
+        terminalIndex = j;
+        break;
+      }
       if (SECTION_SUMMARY.test(trimmed)) {
         flush();
+        securityIdentities = [];
         inSummary = true;
         summaryBoundaryIndex = j;
         i = j;
@@ -2285,10 +2564,56 @@ function parseHoldings(
       const { bound, conflictingCells } = bindRow(text, columns);
       if (bound.size === 0) continue;
       if (bound.size === 1 && bound.has("description")) continue;
-      const startsSecurity =
+      const datedSecurityStart =
         bound.has("description") &&
         bound.has("tradeDate") &&
         (!inSummary || TRADE_DATE_CELL.test(bound.get("tradeDate").text));
+      const nextLine = lines[j + 1];
+      const adjacentCusip =
+        nextLine !== undefined &&
+        nextLine.page === lines[j].page &&
+        accountKeys[j + 1] === accountKeys[j]
+          ? adjacentCusipIdentity(nextLine.text, columns)
+          : null;
+      const wrappedBondProof = wrappedBondSecurityProof({
+        lines,
+        index: j,
+        columns,
+        accountKeys,
+        headerPage: lines[headerIndex].page,
+        accountKey,
+      });
+      const parenthesizedIdentity = parenthesizedSecurityIdentity(
+        bound.get("description")?.text,
+      );
+      const candidateIdentities = wrappedBondContinuation
+        ? []
+        : [
+            ...(parenthesizedIdentity === null ? [] : [parenthesizedIdentity]),
+            ...(adjacentCusip === null ? [] : [adjacentCusip]),
+            ...(wrappedBondProof === null ? [] : [wrappedBondProof.identity]),
+          ];
+      const identifierBackedCandidate =
+        !inSummary &&
+        !conflictingCells &&
+        bound.has("description") &&
+        !bound.has("tradeDate") &&
+        statesValue(bound.get("price")) &&
+        resolveStatementMoney(bound.get("price").text).value !== null &&
+        candidateIdentities.length > 0;
+      const repeatedUndatedIdentity =
+        !inSummary &&
+        bound.has("description") &&
+        !bound.has("tradeDate") &&
+        [...bound].some(
+          ([name, cell]) => name !== "description" && statesValue(cell),
+        ) &&
+        candidateIdentities.some((identity) =>
+          securityIdentities.includes(identity),
+        );
+      const startsSecurity =
+        datedSecurityStart ||
+        (identifierBackedCandidate && !repeatedUndatedIdentity);
       if (inSummary && !startsSecurity) {
         if (
           bound.has("tradeDate") &&
@@ -2306,10 +2631,15 @@ function parseHoldings(
         summaryBoundaryIndex = null;
         flush();
         description = bound.get("description").text;
+        securityIdentities = candidateIdentities;
       }
       block.push({
         bound,
         conflictingCells,
+        ...(repeatedUndatedIdentity || wrappedBondProof?.conflictingIdentity
+          ? { ambiguousUndatedIdentity: true }
+          : {}),
+        ...(wrappedBondProof === null ? {} : { wrappedBondProof }),
         page: lines[j].page,
         start: lines[j].start,
       });
@@ -2340,6 +2670,7 @@ function parseHoldings(
       carried = {
         block,
         description,
+        securityIdentities,
         columns,
         headerIndex,
         context: {
