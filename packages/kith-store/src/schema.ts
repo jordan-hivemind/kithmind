@@ -354,6 +354,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "relax every bounded Plaid string CHECK on a nullable column to accept an empty string",
     url: new URL("../migrations/047_plaid_strings.sql", import.meta.url),
   },
+  {
+    version: 48,
+    name: "one unified ledger: kith.fin_accounts/fin_securities/fin_transactions/fin_holding_snapshots/fin_balance_snapshots replace the Plaid-only plaid_accounts/plaid_securities/plaid_balance_snapshots/plaid_holding_snapshots/plaid_transactions/plaid_investment_transactions tables",
+    url: new URL("../migrations/048_finance_unify.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

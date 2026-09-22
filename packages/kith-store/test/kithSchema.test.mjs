@@ -78,14 +78,16 @@ const KITH_TABLES = [
   "processing_generations",
   "processing_generation_payload_manifests",
   "source_inventory",
-  // PLAID-1 (migration 043): the daily Plaid feed's own tables.
+  // PLAID-1 (migration 043): item state only now (migration 048 retired the
+  // rest of this feed's own tables in favor of kith.fin_*).
   "plaid_items",
-  "plaid_accounts",
-  "plaid_securities",
-  "plaid_balance_snapshots",
-  "plaid_holding_snapshots",
-  "plaid_transactions",
-  "plaid_investment_transactions",
+  // FIN-1 (migration 048): the one unified ledger over the archive and the
+  // Plaid feed.
+  "fin_accounts",
+  "fin_securities",
+  "fin_transactions",
+  "fin_holding_snapshots",
+  "fin_balance_snapshots",
 ];
 
 // P2-39d: retired by migration 005, so this build must never re-create them.
@@ -95,6 +97,16 @@ const RETIRED_PROOF_TABLES = [
   "evidence",
   "synthetic_financial_attachments",
   "idempotency_receipts",
+];
+
+// FIN-1 (migration 048): retired in favor of kith.fin_*, above.
+const RETIRED_PLAID_TABLES = [
+  "plaid_accounts",
+  "plaid_securities",
+  "plaid_balance_snapshots",
+  "plaid_holding_snapshots",
+  "plaid_transactions",
+  "plaid_investment_transactions",
 ];
 
 function history(client) {
@@ -138,6 +150,14 @@ test(
       assert.equal(row.present, true, `kith.${table} should exist`);
     }
     for (const table of RETIRED_PROOF_TABLES) {
+      const [row] = await all(
+        client,
+        "SELECT to_regclass($1) IS NOT NULL AS present",
+        [`kith.${table}`],
+      );
+      assert.equal(row.present, false, `kith.${table} should be retired`);
+    }
+    for (const table of RETIRED_PLAID_TABLES) {
       const [row] = await all(
         client,
         "SELECT to_regclass($1) IS NOT NULL AS present",
