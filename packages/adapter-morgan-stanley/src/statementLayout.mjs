@@ -1252,6 +1252,33 @@ function explicitHoldingsSection(text) {
 /** "CUSIP 00000WNF1" on a bond's detail line. */
 const CUSIP_LABEL = /\bCUSIP\s+([A-Z0-9]{9})\b/;
 
+function parenthesizedSecurityIdentity(description) {
+  const match = NAME_AND_SYMBOL.exec(description ?? "");
+  return match === null ? null : `symbol:${match[2]}`;
+}
+
+/** One adjacent bond-detail description cell may prove the undated row above
+ * starts a security. Require exactly one labelled CUSIP in that bound cell;
+ * a second identifier-looking description is another possible security, not
+ * detail evidence that can be borrowed by its predecessor. */
+function adjacentCusipIdentity(text, columns) {
+  const { bound, conflictingCells } = bindRow(text, columns);
+  const description = bound.get("description")?.text;
+  if (
+    conflictingCells ||
+    description === undefined ||
+    NAME_AND_SYMBOL.test(description) ||
+    bound.has("tradeDate") ||
+    ![...bound].some(
+      ([name, cell]) => name !== "description" && statesValue(cell),
+    )
+  ) {
+    return null;
+  }
+  const identifiers = [...description.matchAll(/\bCUSIP\s+([A-Z0-9]{9})\b/g)];
+  return identifiers.length === 1 ? `cusip:${identifiers[0][1]}` : null;
+}
+
 function resolveInstrument(description, detailText) {
   const labelled = CUSIP_LABEL.exec(detailText ?? "");
   const cusip = labelled === null ? null : labelled[1];
@@ -1288,6 +1315,10 @@ function resolveInstrument(description, detailText) {
  * summed; undated value rows and interrupted blocks remain ambiguous.
  */
 function positionCells(block, context) {
+  // Two undated rows carrying the same explicit identifier do not prove two
+  // securities or a set of lots. A later Total cannot make that ambiguity go
+  // away, so refuse the whole block before choosing an aggregate row.
+  if (block.some((row) => row.ambiguousUndatedIdentity)) return null;
   const totalRow = block.find(
     ({ bound }) =>
       bound.has("description") === false &&
@@ -2265,10 +2296,12 @@ function parseHoldings(
 
     let block = [];
     let description = null;
+    let securityIdentities = [];
     let table;
     if (continues) {
       block = carried.block;
       description = carried.description;
+      securityIdentities = carried.securityIdentities;
       section = carried.context.section;
       table = carried.table;
       table.headers.push(
@@ -2367,6 +2400,7 @@ function parseHoldings(
       }
       if (SECTION_SUMMARY.test(trimmed)) {
         flush();
+        securityIdentities = [];
         inSummary = true;
         summaryBoundaryIndex = j;
         i = j;
@@ -2376,10 +2410,45 @@ function parseHoldings(
       const { bound, conflictingCells } = bindRow(text, columns);
       if (bound.size === 0) continue;
       if (bound.size === 1 && bound.has("description")) continue;
-      const startsSecurity =
+      const datedSecurityStart =
         bound.has("description") &&
         bound.has("tradeDate") &&
         (!inSummary || TRADE_DATE_CELL.test(bound.get("tradeDate").text));
+      const nextLine = lines[j + 1];
+      const adjacentCusip =
+        nextLine !== undefined &&
+        nextLine.page === lines[j].page &&
+        accountKeys[j + 1] === accountKeys[j]
+          ? adjacentCusipIdentity(nextLine.text, columns)
+          : null;
+      const parenthesizedIdentity = parenthesizedSecurityIdentity(
+        bound.get("description")?.text,
+      );
+      const candidateIdentities = [
+        ...(parenthesizedIdentity === null ? [] : [parenthesizedIdentity]),
+        ...(adjacentCusip === null ? [] : [adjacentCusip]),
+      ];
+      const identifierBackedCandidate =
+        !inSummary &&
+        !conflictingCells &&
+        bound.has("description") &&
+        !bound.has("tradeDate") &&
+        statesValue(bound.get("price")) &&
+        resolveStatementMoney(bound.get("price").text).value !== null &&
+        candidateIdentities.length > 0;
+      const repeatedUndatedIdentity =
+        !inSummary &&
+        bound.has("description") &&
+        !bound.has("tradeDate") &&
+        [...bound].some(
+          ([name, cell]) => name !== "description" && statesValue(cell),
+        ) &&
+        candidateIdentities.some((identity) =>
+          securityIdentities.includes(identity),
+        );
+      const startsSecurity =
+        datedSecurityStart ||
+        (identifierBackedCandidate && !repeatedUndatedIdentity);
       if (inSummary && !startsSecurity) {
         if (
           bound.has("tradeDate") &&
@@ -2397,10 +2466,12 @@ function parseHoldings(
         summaryBoundaryIndex = null;
         flush();
         description = bound.get("description").text;
+        securityIdentities = candidateIdentities;
       }
       block.push({
         bound,
         conflictingCells,
+        ...(repeatedUndatedIdentity ? { ambiguousUndatedIdentity: true } : {}),
         page: lines[j].page,
         start: lines[j].start,
       });
@@ -2431,6 +2502,7 @@ function parseHoldings(
       carried = {
         block,
         description,
+        securityIdentities,
         columns,
         headerIndex,
         context: {
