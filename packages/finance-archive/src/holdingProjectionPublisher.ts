@@ -20,7 +20,10 @@ import type { ImportDocument } from "./importer.js";
 import type { PositionChange } from "./positionReconciliation.js";
 import { runPositionReconciliationGate } from "./positionReconciliation.js";
 import { toNumericText } from "./pgNumeric.js";
-import { valuationNotesEquivalent } from "./valuationNote.js";
+import {
+  valuationNotesEquivalent,
+  valuationNotesEquivalentSql,
+} from "./valuationNote.js";
 import type { CashChange } from "./reconciliation.js";
 import { runReconciliationGate } from "./reconciliation.js";
 import {
@@ -133,6 +136,7 @@ export type HoldingScopedCorrectionManifest = {
         readonly oldSourceOwnedRows: number;
         readonly candidateSourceOwnedRows: number;
         readonly selectedSourceOwnedRemovals: number;
+        readonly preservedForeignExtraRows: number;
       }
     >
   >;
@@ -708,9 +712,6 @@ export async function prepareHoldingScopedPositionCorrection(input: {
   const balanceByHash = new Map(
     balanceHashOwners.map((row) => [row.rowHash!, row] as const),
   );
-  const logicalPositionByHash = new Map(
-    logicalPositions.map((row) => [row.rowHash, row]),
-  );
   const logicalBalanceByHash = new Map(
     logicalBalances.map((row) => [row.rowHash, row]),
   );
@@ -730,19 +731,6 @@ export async function prepareHoldingScopedPositionCorrection(input: {
       refuse("a foreign-owned selected position has different semantics");
     }
     foreignReferencedPositionHashes.add(row.rowHash);
-  }
-  for (const current of canonicalPositions) {
-    if (current.sourceDocumentId === input.documentId) continue;
-    const declared =
-      current.rowHash === null
-        ? undefined
-        : logicalPositionByHash.get(current.rowHash);
-    if (
-      declared === undefined ||
-      !positionSemanticsEquivalent(declared.semantic, current.semantic)
-    ) {
-      refuse("a selected scope does not represent every foreign-owned row");
-    }
   }
   const sourceOwnedBalances: CandidateHoldingRow[] = [];
   for (const row of logicalBalances) {
@@ -848,6 +836,12 @@ export async function prepareHoldingScopedPositionCorrection(input: {
               canonical([row.rowHash, row.sourceLocator, row.semantic]),
             ),
         ).length,
+        preservedForeignExtraRows: canonicalPositions.filter(
+          (row) =>
+            row.sourceDocumentId !== input.documentId &&
+            (row.rowHash === null ||
+              !foreignReferencedPositionHashes.has(row.rowHash)),
+        ).length,
       },
       balances: {
         oldSourceOwnedRows: input.stored.balances.length,
@@ -861,11 +855,18 @@ export async function prepareHoldingScopedPositionCorrection(input: {
               canonical([row.rowHash, row.sourceLocator, row.semantic]),
             ),
         ).length,
+        preservedForeignExtraRows: canonicalBalances.filter(
+          (row) =>
+            row.sourceDocumentId !== input.documentId &&
+            (row.rowHash === null ||
+              !foreignReferencedBalanceHashes.has(row.rowHash)),
+        ).length,
       },
       liabilities: {
         oldSourceOwnedRows: input.stored.liabilities.length,
         candidateSourceOwnedRows: input.stored.liabilities.length,
         selectedSourceOwnedRemovals: 0,
+        preservedForeignExtraRows: 0,
       },
     },
     completeness: {
@@ -1827,6 +1828,140 @@ async function insertVersionedPositionScope(
   );
 }
 
+const SCOPED_POSITION_RESOLUTION_PREFIX =
+  "resolved on scoped projection publication: the current complete source scope exactly matches the canonical account/date set";
+const LEGACY_SCOPED_POSITION_RESOLUTION_PREFIX =
+  "resolved on scoped projection publication: the selected complete position scope exactly matches the canonical account/date set";
+const IMPORTED_POSITION_RESOLUTION_PREFIX =
+  "resolved on reimport: every declared position scope validated and persisted exactly";
+
+/**
+ * A source-complete correction may deliberately leave rows owned by another
+ * document in place. Re-evaluate every current proof for the selected keys
+ * after the canonical rows and active generation pointer have moved. The
+ * first side of a multi-source repair therefore stays blocked; a later source
+ * correction can resolve both proofs once each immutable membership set is an
+ * exact description of the canonical snapshot.
+ */
+async function reconcilePositionScopeMismatchReviews(
+  client: ArchiveClient,
+  selectors: readonly HoldingPositionScopeSelector[],
+  now: string,
+): Promise<void> {
+  if (selectors.length === 0) return;
+  const accountIds = selectors.map((selector) => selector.accountId);
+  const dates = selectors.map((selector) => selector.asOf);
+  const found = await client.query<{
+    source_document_id: string;
+    account_id: string;
+    as_of: string;
+    proof_version: "position_scope_v1";
+    exact: boolean;
+  }>(
+    `WITH selected(account_id, as_of) AS (
+       SELECT * FROM unnest($1::text[], $2::date[])
+     )
+     SELECT o.source_document_id, o.account_id, o.as_of::text AS as_of,
+            o.proof_version,
+            (o.status = 'complete'
+             AND cardinality(o.gap_codes) = 0
+             AND o.retained_sha256 = d.retained_sha256
+             AND o.holding_projection_generation_id
+                   IS NOT DISTINCT FROM d.active_holding_projection_generation_id
+             AND (SELECT count(*) FROM position_scope_memberships count_member
+                   WHERE count_member.scope_id = o.id)
+                   = o.emitted_position_count
+             AND NOT EXISTS (
+               SELECT 1
+                 FROM position_scope_memberships m
+                 LEFT JOIN positions p
+                   ON p.row_hash = m.position_row_hash
+                  AND p.account_id = m.account_id
+                  AND p.as_of = m.as_of
+                  AND p.instrument_id IS NOT DISTINCT FROM m.instrument_id
+                  AND p.quantity IS NOT DISTINCT FROM m.quantity
+                  AND p.price IS NOT DISTINCT FROM m.price
+                  AND p.market_value IS NOT DISTINCT FROM m.market_value
+                  AND p.cost_basis IS NOT DISTINCT FROM m.cost_basis
+                  AND p.unrealized IS NOT DISTINCT FROM m.unrealized
+                  AND p.currency = m.currency
+                  AND p.valuation_basis IS NOT DISTINCT FROM m.valuation_basis
+                  AND ${valuationNotesEquivalentSql("p.valuation_note", "m.valuation_note")}
+                WHERE m.scope_id = o.id AND p.id IS NULL
+             )
+             AND NOT EXISTS (
+               SELECT 1
+                 FROM positions p
+                WHERE p.account_id = o.account_id AND p.as_of = o.as_of
+                  AND NOT EXISTS (
+                    SELECT 1 FROM position_scope_memberships m
+                     WHERE m.scope_id = o.id
+                       AND p.row_hash = m.position_row_hash
+                       AND p.account_id = m.account_id
+                       AND p.as_of = m.as_of
+                       AND p.instrument_id IS NOT DISTINCT FROM m.instrument_id
+                       AND p.quantity IS NOT DISTINCT FROM m.quantity
+                       AND p.price IS NOT DISTINCT FROM m.price
+                       AND p.market_value IS NOT DISTINCT FROM m.market_value
+                       AND p.cost_basis IS NOT DISTINCT FROM m.cost_basis
+                       AND p.unrealized IS NOT DISTINCT FROM m.unrealized
+                       AND p.currency = m.currency
+                       AND p.valuation_basis IS NOT DISTINCT FROM m.valuation_basis
+                       AND ${valuationNotesEquivalentSql("p.valuation_note", "m.valuation_note")}
+                  )
+             )) AS exact
+       FROM selected s
+       JOIN position_scope_observations o
+         ON o.account_id = s.account_id AND o.as_of = s.as_of
+       JOIN documents d ON d.id = o.source_document_id
+      WHERE d.superseded_by IS NULL
+        AND o.holding_projection_generation_id
+              IS NOT DISTINCT FROM d.active_holding_projection_generation_id`,
+    [accountIds, dates],
+  );
+  for (const scope of found.rows) {
+    const rawValue = `${scope.account_id}:${scope.as_of}:${scope.proof_version}`;
+    if (scope.exact) {
+      await client.query(
+        `UPDATE review_items
+            SET status = 'resolved', resolved_at = $4, resolution_note = $5
+          WHERE source_document_id = $1
+            AND account_id = $2
+            AND kind = 'position_scope_mismatch'
+            AND raw_value = $3
+            AND status = 'open'`,
+        [
+          scope.source_document_id,
+          scope.account_id,
+          rawValue,
+          now,
+          SCOPED_POSITION_RESOLUTION_PREFIX,
+        ],
+      );
+      continue;
+    }
+    await client.query(
+      `UPDATE review_items SET status = 'open'
+        WHERE source_document_id = $1
+          AND account_id = $2
+          AND kind = 'position_scope_mismatch'
+          AND raw_value = $3
+          AND status = 'resolved'
+          AND resolution_note LIKE ANY($4::text[])`,
+      [
+        scope.source_document_id,
+        scope.account_id,
+        rawValue,
+        [
+          `${SCOPED_POSITION_RESOLUTION_PREFIX}%`,
+          `${LEGACY_SCOPED_POSITION_RESOLUTION_PREFIX}%`,
+          `${IMPORTED_POSITION_RESOLUTION_PREFIX}%`,
+        ],
+      ],
+    );
+  }
+}
+
 async function carryForwardPositionScopes(
   client: ArchiveClient,
   input: {
@@ -2358,23 +2493,6 @@ export async function publishHoldingScopedPositionCorrection(
         members: scope.positions,
         now: now.toISOString(),
       });
-      await tx.query(
-        `UPDATE review_items
-            SET status = 'resolved', resolved_at = $4,
-                resolution_note = $5
-          WHERE source_document_id = $1
-            AND account_id = $2
-            AND kind = 'position_scope_mismatch'
-            AND raw_value = $3
-            AND status = 'open'`,
-        [
-          document.id,
-          scope.selector.accountId,
-          `${scope.selector.accountId}:${scope.selector.asOf}:${scope.selector.proofVersion}`,
-          now.toISOString(),
-          "resolved on scoped projection publication: the selected complete position scope exactly matches the canonical account/date set",
-        ],
-      );
     }
 
     const positionChangeMap = new Map<string, PositionChange>();
@@ -2455,6 +2573,11 @@ export async function publishHoldingScopedPositionCorrection(
     if (updated.rowCount !== 1) {
       refuse("active generation changed during publication");
     }
+    await reconcilePositionScopeMismatchReviews(
+      tx,
+      prepared.selectedPositionScopes.map((scope) => scope.selector),
+      now.toISOString(),
+    );
 
     return {
       documentId: document.id,
