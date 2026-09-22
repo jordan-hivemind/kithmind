@@ -132,6 +132,7 @@ export {
   MAX_EMBEDDING_COVERAGE_SPACES,
   readSpaceCounters,
   sameCounts,
+  setSpaceEmbeddingTargetPolicy,
   spaceEmbeddingCoverage,
   spaceEmbedsAllChunks,
   uniqueSpaceState,
@@ -141,9 +142,11 @@ export {
 export type {
   CoveredCount,
   EmbeddingCounterDelta,
+  EmbeddingTargetPolicy,
   HistoricalThoughtCounts,
   SpaceCounterReport,
   SpaceEmbeddingCoverage,
+  SpaceEmbeddingPolicyChange,
   SpaceEmbeddingStateRow,
 } from "./state.js";
 

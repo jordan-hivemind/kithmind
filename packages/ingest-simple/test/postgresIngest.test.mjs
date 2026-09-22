@@ -6,7 +6,14 @@
 // depth policy end to end -- a synthetic tax-support document ingests at
 // glance (one page, real metadata), then `--depth full` promotes the same
 // source item to a new full generation (docs/plans/2026-09-22-simplification-
-// and-feeds.md's "document ingestion" line and depthPolicy.ts).
+// and-feeds.md's "document ingestion" line and depthPolicy.ts); and
+// `--set-embedding-policy` end to end -- a space left at
+// `cards_and_opted_in_chunks` never registers an ingested document's chunks
+// as embedding targets, so `--backfill-embeddings` embeds nothing for them,
+// and switching the space to `all_chunks` (`postProcess.ts`'s
+// `setEmbeddingPolicy`, `@repo/kith-store`'s
+// `embeddings.setSpaceEmbeddingTargetPolicy`) is what makes a later backfill
+// register and embed them.
 
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -25,7 +32,7 @@ import {
   withKithTransaction,
 } from "@repo/kith-store";
 import { runIngest } from "../dist/ingest.js";
-import { backfillEmbeddings } from "../dist/postProcess.js";
+import { backfillEmbeddings, setEmbeddingPolicy } from "../dist/postProcess.js";
 import { ingestFile, RevisionConflictError } from "../dist/write.js";
 
 import { acquirePostgres, skip } from "./helpers/pgServer.mjs";
@@ -939,4 +946,128 @@ test("--backfill-embeddings adds vectors for a generation that was activated bef
   const second = await backfillEmbeddings(pool, accountId, env, backfillLog);
   assert.equal(second.embeddings.embedded, 0, "a second backfill must not re-embed already-covered chunks");
   assert.equal(stub.callCount(), callsBeforeSecondRun, "a second backfill must not call the provider again");
+});
+
+test("a space's chunk target policy determines whether backfill embeds an already-ingested document's chunks", { skip }, async (t) => {
+  const { pool, spaceId, accountId } = await bootstrapDatabase(t);
+
+  const stub = await startEmbeddingStub();
+  t.after(() => stub.stop());
+  const env = stubEmbeddingEnv(stub);
+  // Same empty-catalog bootstrap the other backfill test uses: the space is
+  // already counted and has an active fingerprint before anything is
+  // ingested.
+  const { fingerprint } = await activateEmptyEmbeddingGeneration(pool, spaceId, env);
+
+  // The owner's real space: an explicit `cards_and_opted_in_chunks` policy,
+  // not the `all_chunks` default `ensureSpaceEmbeddingState` leaves a
+  // freshly-created row at. Set through the store function under test, not
+  // raw SQL, which also proves it works in the "opt out of all_chunks"
+  // direction, not only the "opt in" one `--set-embedding-policy` exercises
+  // below.
+  const initialPolicy = await withKithTransaction(pool, (client) =>
+    embeddings.setSpaceEmbeddingTargetPolicy(
+      { client, now: Date.now() },
+      spaceId,
+      "cards_and_opted_in_chunks",
+    ),
+  );
+  assert.equal(initialPolicy.changed, true);
+  assert.equal(initialPolicy.after.target_policy, "cards_and_opted_in_chunks");
+
+  const root = await mkdtemp(join(tmpdir(), "ingest-simple-policy-fixture-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pdf = buildPdf(["Statement page one.\nAccount ending 4242."]);
+  await writeFile(join(root, "statement.pdf"), pdf);
+
+  const log = () => {};
+  const summary = await runIngest(
+    pool,
+    { root, sourceAccountId: accountId, dryRun: false, concurrency: 1, depth: "full", fullMatchPatterns: [] },
+    log,
+  );
+  assert.equal(summary.failed, 0, `expected no failures: ${JSON.stringify(summary.failures)}`);
+
+  const item = await pool.query(
+    `SELECT active_generation_id FROM kith.source_items WHERE source_account_id = $1`,
+    [accountId],
+  );
+  const generationId = item.rows[0].active_generation_id;
+  const chunkRows = await pool.query(`SELECT id FROM kith.chunks WHERE processing_generation_id = $1`, [
+    generationId,
+  ]);
+  assert.ok(chunkRows.rows.length > 0);
+  const chunkIds = chunkRows.rows.map((row) => row.id);
+
+  // Not opted in, and the policy is `cards_and_opted_in_chunks`: ingest never
+  // registered a target for these chunks at all (`build.ts` line ~627's
+  // `if (!embedsAllChunks && !resolved.optedIn) continue;`, mirrored by
+  // `touchGenerationTargets` in `workers/publication.ts`).
+  const targetsAfterIngest = await pool.query(
+    `SELECT id FROM kith.embedding_targets
+      WHERE space_id = $1 AND target_kind = 'chunk' AND target_id = ANY($2::text[])`,
+    [spaceId, chunkIds],
+  );
+  assert.equal(targetsAfterIngest.rows.length, 0, "an un-opted-in chunk must not be registered under cards_and_opted_in_chunks");
+
+  const backfillLog = () => {};
+  const beforePolicySwitch = await backfillEmbeddings(pool, accountId, env, backfillLog);
+  assert.equal(beforePolicySwitch.embeddings.embedded, 0, "backfill must embed nothing while the policy excludes these chunks");
+  assert.equal(beforePolicySwitch.coverage.policy, "cards_and_opted_in_chunks");
+
+  const vectorsBeforeSwitch = await pool.query(
+    `SELECT count(*)::int AS count FROM kith.embedding_vectors WHERE space_id = $1 AND chunk_id = ANY($2::text[])`,
+    [spaceId, chunkIds],
+  );
+  assert.equal(vectorsBeforeSwitch.rows[0].count, 0, "no vector must exist for these chunks before the policy switches");
+
+  // The switch itself: `setEmbeddingPolicy` is `--set-embedding-policy`'s
+  // implementation. It also re-touches and fills the space in the same call,
+  // but the assertions below still call `backfillEmbeddings` separately
+  // afterward to prove an ordinary backfill converges too, not only the
+  // switch's own bundled one.
+  const policySwitch = await setEmbeddingPolicy(pool, spaceId, "all_chunks", env, backfillLog);
+  assert.equal(policySwitch.changed, true);
+  assert.equal(policySwitch.before.policy, "cards_and_opted_in_chunks");
+  assert.equal(policySwitch.after.policy, "all_chunks");
+  assert.equal(policySwitch.before.eligible.chunk, 0);
+  assert.ok(policySwitch.after.eligible.chunk >= chunkIds.length, "switching to all_chunks must register the document's chunks");
+  assert.equal(policySwitch.embeddings.failed, false);
+  assert.ok(policySwitch.embeddings.embedded >= chunkIds.length, "switching to all_chunks must embed the document's chunks");
+
+  const targetsAfterSwitch = await pool.query(
+    `SELECT covered_fingerprint FROM kith.embedding_targets
+      WHERE space_id = $1 AND target_kind = 'chunk' AND target_id = ANY($2::text[])`,
+    [spaceId, chunkIds],
+  );
+  assert.equal(targetsAfterSwitch.rows.length, chunkIds.length, "every chunk must be registered once the policy is all_chunks");
+  for (const target of targetsAfterSwitch.rows) {
+    assert.equal(target.covered_fingerprint, fingerprint);
+  }
+
+  const vectorsAfterSwitch = await pool.query(
+    `SELECT chunk_id, embedding_fingerprint FROM kith.embedding_vectors
+      WHERE space_id = $1 AND chunk_id = ANY($2::text[])`,
+    [spaceId, chunkIds],
+  );
+  assert.equal(vectorsAfterSwitch.rows.length, chunkIds.length, "every chunk must have a vector once the policy is all_chunks");
+  for (const vector of vectorsAfterSwitch.rows) {
+    assert.equal(vector.embedding_fingerprint, fingerprint);
+  }
+
+  // An ordinary backfill after the switch converges too (not only the
+  // switch's own bundled touch-and-fill), and is idempotent against it.
+  const callsBeforeFinalBackfill = stub.callCount();
+  const finalBackfill = await backfillEmbeddings(pool, accountId, env, backfillLog);
+  assert.equal(finalBackfill.embeddings.embedded, 0, "a backfill after the switch must not re-embed already-covered chunks");
+  assert.equal(stub.callCount(), callsBeforeFinalBackfill, "a backfill after the switch must not call the provider again");
+  assert.equal(finalBackfill.coverage.policy, "all_chunks");
+  assert.ok(finalBackfill.coverage.eligible.chunk >= chunkIds.length);
+  assert.equal(finalBackfill.coverage.eligible.chunk, finalBackfill.coverage.covered.chunk);
+
+  // Switching to the policy a space is already at is a no-op on the policy
+  // row itself, but the touch-and-fill still runs and stays idempotent.
+  const noopSwitch = await setEmbeddingPolicy(pool, spaceId, "all_chunks", env, backfillLog);
+  assert.equal(noopSwitch.changed, false);
+  assert.equal(noopSwitch.embeddings.embedded, 0);
 });

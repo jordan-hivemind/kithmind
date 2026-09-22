@@ -263,6 +263,68 @@ export async function ensureSpaceEmbeddingState(
   return created;
 }
 
+/** The two policies migration 016's check constraint allows. NULL reads as
+ * `all_chunks` (`spaceEmbedsAllChunks`). */
+export type EmbeddingTargetPolicy = "all_chunks" | "cards_and_opted_in_chunks";
+
+export type SpaceEmbeddingPolicyChange = {
+  before: SpaceEmbeddingStateRow;
+  after: SpaceEmbeddingStateRow;
+  changed: boolean;
+};
+
+/**
+ * Switches a space's chunk target policy (section 8.2 of the document-card
+ * plan) -- the supported way to do it; no caller writes `target_policy` with
+ * raw SQL. A policy flip makes every already-active chunk's eligibility
+ * stale, exactly like any other eligibility-changing write, so this bumps
+ * `eligibility_epoch` and `last_eligibility_change_at` the same way
+ * `bumpEmbeddingEligibilityEpoch` (eligibility.ts) does for an ordinary one,
+ * and mirrors the epoch onto the active embedding generation row. It does
+ * not itself upsert or retire any target row: the build job's next scan
+ * (`build.ts`'s `runScanPage`, which reads `spaceEmbedsAllChunks` fresh per
+ * chunk page) and any eligibility-touching write both read the new policy
+ * live, and a caller that wants existing documents re-scanned immediately
+ * (rather than waiting for the daemon's own build job) re-touches their
+ * generations itself, the way `postProcess.ts`'s `setEmbeddingPolicy` does.
+ */
+export async function setSpaceEmbeddingTargetPolicy(
+  ctx: IdentityCtx,
+  spaceId: string,
+  policy: EmbeddingTargetPolicy,
+): Promise<SpaceEmbeddingPolicyChange> {
+  if (policy !== "all_chunks" && policy !== "cards_and_opted_in_chunks") {
+    throw new Error(`Unknown embedding target policy: ${policy}`);
+  }
+  const before = await ensureSpaceEmbeddingState(ctx, spaceId);
+  const currentPolicy = before.target_policy ?? "all_chunks";
+  if (currentPolicy === policy) {
+    return { before, after: before, changed: false };
+  }
+  const nextEpoch = countOf(before.eligibility_epoch, "Eligibility epoch") + 1;
+  if (!Number.isSafeInteger(nextEpoch)) {
+    throw new Error("Embedding eligibility epoch is exhausted");
+  }
+  await exec(
+    ctx,
+    `UPDATE kith.space_embedding_states
+        SET target_policy = $2, eligibility_epoch = $3,
+            last_eligibility_change_at = $4
+      WHERE id = $1`,
+    [before.id, policy, nextEpoch, at(ctx.now)],
+  );
+  if (before.active_embedding_generation_id) {
+    await exec(
+      ctx,
+      "UPDATE kith.embedding_generations SET eligibility_epoch = $2 WHERE id = $1",
+      [before.active_embedding_generation_id, nextEpoch],
+    );
+  }
+  const after = await uniqueSpaceState(ctx, spaceId, true);
+  if (!after) throw new Error("Space embedding state not found");
+  return { before, after, changed: true };
+}
+
 function assertProfile(profile: EmbeddingProfile): void {
   for (const [name, value] of Object.entries(profile)) {
     if (name === "dimensions") continue;
