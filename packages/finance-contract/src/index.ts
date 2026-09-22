@@ -32,7 +32,9 @@ export const FINANCE_READ_TOOL_DESCRIPTION =
   "list_balances, aggregate_money, get_evidence, get_coverage, and " +
   "list_account_inventory. " +
   "The legacy list_holdings asOf field is an upper bound over historical rows; " +
-  "use get_holdings_snapshot for exact-date or latest-snapshot selection.";
+  "use get_holdings_snapshot for exact-date or latest-snapshot selection. " +
+  "Inventory snapshot dates are source-completeness evidence; reported NAV may " +
+  "establish that date without becoming a market-price current value.";
 
 export const FINANCE_CURRENCY_REGISTRY_VERSION =
   "iso-4217-six-list-one-2026-01-p1" as const;
@@ -416,8 +418,11 @@ export type FinanceAccountInventoryRecord = {
   recordCount: number;
   activityFrom?: string;
   activityTo?: string;
-  /** The latest observed position snapshot date. An exact source-stated zero
-   * can provide this date without creating a position row or activity range. */
+  /**
+   * The latest complete position observation: an exact source-stated zero, or
+   * rows whose values are explicitly market price or reported NAV. NAV proves
+   * the dated snapshot exists without becoming a market-price current value.
+   */
   latestSnapshotAsOf?: string;
   /**
    * FIN-FRESHNESS-1. The account's most recent distinct `balances.as_of`

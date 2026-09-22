@@ -67,6 +67,23 @@ cross-space or revoked-access denial. Owner verification uses a privately
 specified real holdings request; no personal account data enters public fixtures.
 PostgreSQL consolidation alone must not be recorded as closing this usability gap.
 
+### Inventory snapshot dates and valuation meaning
+
+`list_account_inventory.latestSnapshotAsOf` reports the latest complete dated
+holdings observation. Every position at that date must have a value and an
+explicit valuation basis of either `market_price` or `reported_nav`; an exact
+source-stated zero is also a dated observation. The normal source, review and
+reconciliation gates still apply. Currency does not change whether an
+observation exists, so positions at the date may span currencies.
+
+This date does not turn every stated value into a market value. A
+`reported_nav` position can establish snapshot freshness, but inventory
+`currentValue` remains limited to a complete one-currency `market_price`
+snapshot. When the latest eligible snapshot is NAV, an older market snapshot
+must not reappear as current. `get_holdings_snapshot` selection and
+`aggregate_money` retain their existing, stricter valuation and aggregation
+semantics.
+
 ## Operations
 
 | Operation               | Result                                                     |

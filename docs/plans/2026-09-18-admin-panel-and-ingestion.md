@@ -709,9 +709,12 @@ The archive's `list_account_inventory` adds two fields, both facts about rows
 that exist: `balanceDates`, the account's latest distinct balance dates, newest
 first and at most 12; and `latestBalanceHoldsSecurities`, whether the latest
 balance that states both a total and cash holds anything besides cash. An
-expected date is never stored or returned as data. `latestSnapshotAsOf` and
-`currentValue.asOf` keep their meanings and are never merged with a balance
-date.
+expected date is never stored or returned as data. `latestSnapshotAsOf` is the
+date of the latest complete, fully valued holdings observation. Its positions
+may be explicitly marked as market price or reported NAV. `currentValue` remains
+stricter: only one-currency market-price positions can provide it, so a NAV
+snapshot advances holdings freshness without being relabeled as a market value
+or reviving an older market total. Neither field is merged with a balance date.
 
 **Cadence** comes from the balance dates. Consecutive months are `monthly`.
 `quarterly` requires at least four observed statement months that establish
