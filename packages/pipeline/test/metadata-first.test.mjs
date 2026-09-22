@@ -273,6 +273,68 @@ test("an empty new scan can bootstrap selected work before background preview", 
   }
 });
 
+test("adoption settles one answered archived request before preserving the new current", async () => {
+  const current = plan("pending-current", "1");
+  const selected = plan("pending-selected", "2");
+  const initial = parseRunnerCheckpoint({
+    ...checkpoint([current, selected], 0),
+    step: "lookup_original",
+    metadataFirst: undefined,
+    originalCatalogId: randomUUID(),
+    expectedOriginalRevision: 1,
+    processingCatalogId: randomUUID(),
+    expectedProcessingRevision: 1,
+  });
+  const state = await fixture(initial);
+  const requestId = randomUUID();
+  try {
+    await state.journal.planRequest({
+      operation: "discovery.lookupArchivedAdmission",
+      requestId,
+      requestBody: JSON.stringify({
+        protocolVersion: 1,
+        operation: "discovery.lookupArchivedAdmission",
+        spaceId: "space",
+        sourceAccountId: "source",
+        requestId,
+      }),
+      createdAt: 1,
+    });
+    await state.journal.recordValidatedResult(
+      {
+        operation: "discovery.lookupArchivedAdmission",
+        mode: "original",
+        found: false,
+      },
+      2,
+    );
+    let settlements = 0;
+    const result = await adoptMetadataFirstJournal({
+      journal: state.journal,
+      manifest: manifest([selected]),
+      manifestSha256: "7".repeat(64),
+      settleAnsweredArchivedRequest: async () => {
+        settlements += 1;
+        await state.journal.commitResult({
+          checkpoint: { ...initial, step: "capture" },
+          credentialSessionActive: true,
+        });
+      },
+    });
+    assert.equal(result.state, "adopted");
+    assert.equal(settlements, 1);
+    assert.equal(state.journal.pending, undefined);
+    assert.equal(state.journal.checkpoint.pdfIndex, 0);
+    assert.equal(state.journal.checkpoint.step, "capture");
+    assert.deepEqual(state.journal.checkpoint.metadataFirst.selected, [
+      metadataFirstIdentity(selected),
+    ]);
+  } finally {
+    await state.journal.close();
+    await rm(state.directory, { recursive: true, force: true });
+  }
+});
+
 test("selected preview enters deep intent while FIFO routing precedes background triage", async () => {
   const background = plan("background", "1");
   const selectedA = plan("selected-a", "2");
