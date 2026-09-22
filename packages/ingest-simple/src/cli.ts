@@ -4,6 +4,12 @@
 // [--depth full|glance|auto] [--full-match <regex>]... [--pdf-password <value>]...
 // [--env-from-keychain]`. `--bindings` requires `--root-alias`; `--root-alias`
 // is otherwise optional on its own. See README.md.
+//
+// `kith-ingest-simple --backfill-embeddings --source-account <id>
+// [--env-from-keychain]` is the one-off catch-up subcommand: it takes no
+// `--root` (it walks nothing) and registers/embeds `postProcess.ts`'s
+// `backfillEmbeddings` for every already-active generation on the account
+// instead of ingesting.
 
 import process from "node:process";
 
@@ -13,6 +19,7 @@ import { loadBindings } from "./bindings.js";
 import { loadDatabaseUrl } from "./config.js";
 import type { DepthOverride } from "./depthPolicy.js";
 import { runIngest, type IngestOptions } from "./ingest.js";
+import { backfillEmbeddings } from "./postProcess.js";
 import { applyProviderEnvFromKeychain } from "./providerEnv.js";
 
 const DEFAULT_CONCURRENCY = 2;
@@ -24,16 +31,20 @@ function usage(): never {
       "[--space <id>] [--limit N] [--dry-run] [--concurrency N] " +
       "[--root-alias <alias>] [--bindings <path>] " +
       "[--depth full|glance|auto] [--full-match <regex>]... " +
-      "[--pdf-password <value>]... [--env-from-keychain]\n",
+      "[--pdf-password <value>]... [--env-from-keychain]\n" +
+      "   or: kith-ingest-simple --backfill-embeddings --source-account <id> " +
+      "[--env-from-keychain]\n",
   );
   process.exit(2);
 }
 
-type ParsedArgs = Omit<IngestOptions, "externalIdBindings" | "fullMatchPatterns" | "pdfPasswords"> & {
+type ParsedArgs = Omit<IngestOptions, "externalIdBindings" | "fullMatchPatterns" | "pdfPasswords" | "root"> & {
+  root?: string;
   bindingsPath?: string;
   fullMatchSources: string[];
   pdfPasswords: string[];
   envFromKeychain: boolean;
+  backfillEmbeddings: boolean;
 };
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -47,6 +58,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   let rootAlias: string | undefined;
   let depth: DepthOverride = "auto";
   let envFromKeychain = false;
+  let backfillEmbeddingsFlag = false;
   const fullMatchSources: string[] = [];
   const pdfPasswords: string[] = [];
   for (let index = 0; index < argv.length; index += 1) {
@@ -103,11 +115,18 @@ function parseArgs(argv: string[]): ParsedArgs {
       case "--env-from-keychain":
         envFromKeychain = true;
         break;
+      case "--backfill-embeddings":
+        backfillEmbeddingsFlag = true;
+        break;
       default:
         usage();
     }
   }
-  if (!root || !sourceAccountId) usage();
+  if (!sourceAccountId) usage();
+  // `--backfill-embeddings` is a subcommand, not an ingest run: it walks
+  // nothing, so `--root` is not required for it (and is ignored if given).
+  // Every other flag still requires `--root`, exactly as before.
+  if (!backfillEmbeddingsFlag && !root) usage();
   // A bindings file with no root alias to filter it by cannot be resolved
   // into a lookup, so it is a usage error rather than a silent no-op. A bare
   // `--root-alias` with no `--bindings` is valid on its own: it still labels
@@ -115,7 +134,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   // writes (see ingest.ts), whether or not a bindings transition is in play.
   if (bindingsPath !== undefined && rootAlias === undefined) usage();
   return {
-    root,
+    ...(root !== undefined ? { root } : {}),
     sourceAccountId,
     ...(spaceId ? { spaceId } : {}),
     ...(limit ? { limit } : {}),
@@ -125,6 +144,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     fullMatchSources,
     pdfPasswords,
     envFromKeychain,
+    backfillEmbeddings: backfillEmbeddingsFlag,
     ...(bindingsPath !== undefined ? { bindingsPath } : {}),
     ...(rootAlias !== undefined ? { rootAlias } : {}),
   };
@@ -145,6 +165,35 @@ async function main(argv: string[]): Promise<void> {
     );
   }
 
+  if (args.backfillEmbeddings) {
+    const databaseUrl = await loadDatabaseUrl();
+    const pool = createKithPool(databaseUrl, 2);
+    try {
+      const result = await backfillEmbeddings(pool, args.sourceAccountId, process.env, (message) => {
+        process.stderr.write(`${message}\n`);
+      });
+      process.stdout.write(
+        [
+          `source-items-touched ${result.sourceItemsTouched}`,
+          `embedded ${result.embeddings.embedded}`,
+          `skipped ${result.embeddings.skipped}`,
+        ].join("\n") + "\n",
+      );
+      if (result.embeddings.failed) process.exitCode = 1;
+    } finally {
+      await pool.end();
+    }
+    return;
+  }
+  // `parseArgs` already refused this combination (`usage()` above), so this
+  // never actually throws; it only narrows `args.root` from `string |
+  // undefined` for everything below, which is ordinary ingest and always
+  // needs it.
+  if (args.root === undefined) {
+    throw new Error("--root is required unless --backfill-embeddings is given");
+  }
+  const root = args.root;
+
   let externalIdBindings: Map<string, string> | undefined;
   let bindingsLoaded = 0;
   if (args.bindingsPath !== undefined && args.rootAlias !== undefined) {
@@ -161,7 +210,7 @@ async function main(argv: string[]): Promise<void> {
     }
   });
   const options: IngestOptions = {
-    root: args.root,
+    root,
     sourceAccountId: args.sourceAccountId,
     ...(args.spaceId ? { spaceId: args.spaceId } : {}),
     ...(args.limit ? { limit: args.limit } : {}),
