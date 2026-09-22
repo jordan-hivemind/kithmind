@@ -1312,6 +1312,7 @@ function adjacentSummaryText({
   nextPage = "Page 2 of 2",
   nextAccount = CONSOLIDATED_ACCOUNT_ONE,
   nextClient = "CLIENT STATEMENT   For the Period March 1-31, 2026",
+  includeSection = true,
   beforeSummary = [],
   afterSummaryHeader = [],
 } = {}) {
@@ -1328,7 +1329,7 @@ function adjacentSummaryText({
       `        ${accountTitle}`,
       `        ${accountTitleContinuation}`,
       "        HOLDINGS",
-      ...equityBlockLines(),
+      ...(includeSection ? equityBlockLines() : equityBlockLines().slice(1)),
     ].join("\n"),
     [
       `        ${nextPage}`,
@@ -1355,6 +1356,79 @@ test("an exact repeated next-page header and section summary close a carried pos
   assert.match(scope.evidence.tables[0].end.binding.quote, /^Percentage\b/);
 });
 
+test("the repeated account header bounds a successor summary without a nearby section title", () => {
+  const parsed = parseStatementLines(
+    adjacentSummaryText({ includeSection: false }),
+    kind,
+  );
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+});
+
+test("successor summary uses the latest header of a table carried across several pages", () => {
+  const client = "CLIENT STATEMENT   For the Period March 1-31, 2026";
+  const personal = "Personal investment statement";
+  const accountTitle = "Account Synthetic Household";
+  const continuation = "Personal advisory services";
+  const block = equityBlockLines();
+  const runningHeader = [
+    `        ${client}`,
+    `        ${personal}`,
+    CONSOLIDATED_ACCOUNT_ONE,
+    `        ${accountTitle}`,
+    `        ${continuation}`,
+  ];
+  const text = [
+    [
+      "        Page 1 of 3",
+      ...runningHeader,
+      "        HOLDINGS",
+      block[0],
+      block[1],
+      block[2],
+    ].join("\n"),
+    [
+      "        Page 2 of 3",
+      ...runningHeader,
+      block[1],
+      block[3],
+      block[4],
+      block[5],
+    ].join("\n"),
+    [
+      "        Page 3 of 3",
+      ...runningHeader,
+      ...sectionSummaryLines(),
+      "        ACTIVITY",
+    ].join("\n"),
+  ].join(`\n${PAGE_SEPARATOR}\n`);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+});
+
+test("a successor summary accepts proved section labels and its TOTAL boundary", () => {
+  const parsed = parseStatementLines(
+    adjacentSummaryText({
+      afterSummaryHeader: [
+        "        COMMON STOCKS",
+        sectionSummaryLines()[2],
+        "        TOTAL COMMON STOCKS",
+        "        TOTAL HOLDINGS",
+      ],
+    }),
+    kind,
+  );
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+});
+
 test("adjacent summary closure refuses topology, account, header and security changes", () => {
   const datedSecurity = equityBlockLines()[2];
   const cases = [
@@ -1379,6 +1453,21 @@ test("adjacent summary closure refuses topology, account, header and security ch
     {
       name: "dated security after summary",
       options: { afterSummaryHeader: [datedSecurity] },
+    },
+    {
+      name: "dated TOTAL-named security after summary",
+      options: {
+        afterSummaryHeader: [
+          datedSecurity.replace(
+            "WIDGET NEUTRAL FUND (WNDF)",
+            "TOTAL RETURN FUND (TRNF)",
+          ),
+        ],
+      },
+    },
+    {
+      name: "new section label after summary",
+      options: { afterSummaryHeader: ["        UNKNOWN ASSET CLASS"] },
     },
   ];
   for (const { name, options } of cases) {
