@@ -2090,29 +2090,28 @@ export async function importBatch(
             member.sourceLocator,
           ]),
         );
-        continue;
-      }
-      if (existing.rows[0]?.payload_matches !== true) {
-        throw new Error(
-          "position scope replay changed an immutable proof payload",
-        );
-      }
-      const storedMembers = await client.query<{
-        position_row_hash: string;
-        account_id: string;
-        as_of: string;
-        instrument_id: string | null;
-        quantity: string | null;
-        price: string | null;
-        market_value: string | null;
-        cost_basis: string | null;
-        unrealized: string | null;
-        currency: string;
-        valuation_basis: string | null;
-        valuation_note: string | null;
-        source_locator: string;
-      }>(
-        `SELECT position_row_hash, account_id, as_of::text AS as_of,
+      } else {
+        if (existing.rows[0]?.payload_matches !== true) {
+          throw new Error(
+            "position scope replay changed an immutable proof payload",
+          );
+        }
+        const storedMembers = await client.query<{
+          position_row_hash: string;
+          account_id: string;
+          as_of: string;
+          instrument_id: string | null;
+          quantity: string | null;
+          price: string | null;
+          market_value: string | null;
+          cost_basis: string | null;
+          unrealized: string | null;
+          currency: string;
+          valuation_basis: string | null;
+          valuation_note: string | null;
+          source_locator: string;
+        }>(
+          `SELECT position_row_hash, account_id, as_of::text AS as_of,
                 instrument_id, quantity::text AS quantity, price::text AS price,
                 market_value::text AS market_value,
                 cost_basis::text AS cost_basis, unrealized::text AS unrealized,
@@ -2120,29 +2119,87 @@ export async function importBatch(
                 source_locator
            FROM position_scope_memberships WHERE scope_id = $1
           ORDER BY position_row_hash`,
-        [scopeId],
-      );
-      const expected = [...members]
-        .sort((left, right) => left.hash.localeCompare(right.hash))
-        .map((member) => ({
-          position_row_hash: member.hash,
-          account_id: member.accountId,
-          as_of: member.asOf,
-          instrument_id: member.instrumentId,
-          quantity: member.quantity,
-          price: member.price,
-          market_value: member.marketValue,
-          cost_basis: member.costBasis,
-          unrealized: member.unrealized,
-          currency: member.currency,
-          valuation_basis: member.valuationBasis,
-          valuation_note: member.valuationNote,
-          source_locator: member.sourceLocator,
-        }));
-      if (JSON.stringify(storedMembers.rows) !== JSON.stringify(expected)) {
-        throw new Error(
-          "position scope replay changed immutable source memberships",
+          [scopeId],
         );
+        const expected = [...members]
+          .sort((left, right) => left.hash.localeCompare(right.hash))
+          .map((member) => ({
+            position_row_hash: member.hash,
+            account_id: member.accountId,
+            as_of: member.asOf,
+            instrument_id: member.instrumentId,
+            quantity: member.quantity,
+            price: member.price,
+            market_value: member.marketValue,
+            cost_basis: member.costBasis,
+            unrealized: member.unrealized,
+            currency: member.currency,
+            valuation_basis: member.valuationBasis,
+            valuation_note: member.valuationNote,
+            source_locator: member.sourceLocator,
+          }));
+        if (JSON.stringify(storedMembers.rows) !== JSON.stringify(expected)) {
+          throw new Error(
+            "position scope replay changed immutable source memberships",
+          );
+        }
+      }
+
+      if (scope.status === "complete") {
+        const exact = await client.query<{ exact: boolean }>(
+          `SELECT
+             (SELECT count(*) FROM position_scope_memberships m
+               WHERE m.scope_id = $1) = $4
+             AND NOT EXISTS (
+               SELECT 1 FROM position_scope_memberships m
+                WHERE m.scope_id = $1
+                  AND NOT EXISTS (
+                    SELECT 1 FROM positions p
+                     WHERE p.account_id = m.account_id AND p.as_of = m.as_of
+                       AND p.row_hash = m.position_row_hash
+                       AND p.instrument_id IS NOT DISTINCT FROM m.instrument_id
+                       AND p.quantity IS NOT DISTINCT FROM m.quantity
+                       AND p.price IS NOT DISTINCT FROM m.price
+                       AND p.market_value IS NOT DISTINCT FROM m.market_value
+                       AND p.cost_basis IS NOT DISTINCT FROM m.cost_basis
+                       AND p.unrealized IS NOT DISTINCT FROM m.unrealized
+                       AND p.currency = m.currency
+                       AND p.valuation_basis IS NOT DISTINCT FROM m.valuation_basis
+                       AND p.valuation_note IS NOT DISTINCT FROM m.valuation_note))
+             AND NOT EXISTS (
+               SELECT 1 FROM positions p
+                WHERE p.account_id = $2 AND p.as_of = $3::date
+                  AND NOT EXISTS (
+                    SELECT 1 FROM position_scope_memberships m
+                     WHERE m.scope_id = $1
+                       AND m.position_row_hash = p.row_hash
+                       AND m.instrument_id IS NOT DISTINCT FROM p.instrument_id
+                       AND m.quantity IS NOT DISTINCT FROM p.quantity
+                       AND m.price IS NOT DISTINCT FROM p.price
+                       AND m.market_value IS NOT DISTINCT FROM p.market_value
+                       AND m.cost_basis IS NOT DISTINCT FROM p.cost_basis
+                       AND m.unrealized IS NOT DISTINCT FROM p.unrealized
+                       AND m.currency = p.currency
+                       AND m.valuation_basis IS NOT DISTINCT FROM p.valuation_basis
+                       AND m.valuation_note IS NOT DISTINCT FROM p.valuation_note))
+             AS exact`,
+          [scopeId, scope.accountId, scope.asOf, scope.emittedPositionCount],
+        );
+        if (exact.rows[0]?.exact !== true) {
+          const outcome = scopeOutcomes.get(key)!;
+          outcome.valid = false;
+          await reopenSystemResolvedPositionScopeMismatch(
+            documentId,
+            scope.accountId,
+            reviewValue,
+          );
+          openReview(scope.accountId, documentId, null, {
+            kind: "position_scope_mismatch",
+            rawValue: reviewValue,
+            reason:
+              "complete position scope proof does not exactly match the canonical account/date position set; source evidence was retained but coverage remains blocked",
+          });
+        }
       }
     }
 

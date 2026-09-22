@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { importBatch, rowHashV2 } from "../dist/index.js";
+import { importBatch, positionHash, rowHashV2 } from "../dist/index.js";
 
 import { all, archive, count, one, skip } from "./helpers/pgArchive.mjs";
 
@@ -908,6 +908,154 @@ test(
       /changed an immutable proof payload/,
     );
     assert.equal(await count(client, "position_scope_observations"), 2);
+  },
+);
+
+test(
+  "complete position scope conflicts open a per-account review and exact replay resolves it without erasing audit",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    await client.query(
+      `INSERT INTO instruments (id, symbol, name) VALUES
+         ('scope-conflict-main', 'SCM', 'Synthetic Scope Main'),
+         ('scope-conflict-extra', 'SCE', 'Synthetic Scope Extra')`,
+    );
+    const ownerSha = "96".padEnd(64, "0");
+    const witnessSha = "97".padEnd(64, "0");
+    const main = position({
+      instrumentId: "scope-conflict-main",
+      sourceLocator: '{"row":{"source":"shared","index":3}}',
+    });
+    const extra = position({
+      instrumentId: "scope-conflict-extra",
+      sourceLocator: '{"row":{"source":"owner","index":4}}',
+    });
+    await importBatch(
+      client,
+      {
+        source: "synthetic-scope-conflict",
+        documents: [
+          retainedHoldingDocument(ownerSha, { positions: [main, extra] }),
+        ],
+      },
+      NOW,
+    );
+    const witness = retainedHoldingDocument(witnessSha, {
+      positions: [main],
+      positionScopes: [positionScope()],
+    });
+    await importBatch(
+      client,
+      { source: "synthetic-scope-conflict", documents: [witness] },
+      NOW,
+    );
+    let review = await one(
+      client,
+      `SELECT status, account_id, resolved_at, resolution_note
+         FROM review_items
+        WHERE kind = 'position_scope_mismatch'
+          AND raw_value = $1`,
+      [`${ACCOUNT.id}:2026-03-31:position_scope_v1`],
+    );
+    assert.deepEqual(review, {
+      status: "open",
+      account_id: ACCOUNT.id,
+      resolved_at: null,
+      resolution_note: null,
+    });
+
+    await client.query(
+      `DELETE FROM positions
+        WHERE instrument_id = 'scope-conflict-extra'`,
+    );
+    const resolved = await importBatch(
+      client,
+      { source: "synthetic-scope-conflict", documents: [witness] },
+      new Date("2026-09-21T12:01:00.000Z"),
+    );
+    assert.equal(resolved.reviewItemsResolved, 1);
+    review = await one(
+      client,
+      `SELECT status, resolved_at IS NOT NULL AS was_resolved,
+              resolution_note LIKE
+                'resolved on reimport: every declared position scope validated and persisted exactly%'
+                AS system_resolution
+         FROM review_items
+        WHERE kind = 'position_scope_mismatch'
+          AND raw_value = $1`,
+      [`${ACCOUNT.id}:2026-03-31:position_scope_v1`],
+    );
+    assert.deepEqual(review, {
+      status: "resolved",
+      was_resolved: true,
+      system_resolution: true,
+    });
+
+    const ownerDocument = await one(
+      client,
+      "SELECT id FROM documents WHERE sha256 = $1",
+      [ownerSha],
+    );
+    const extraHash = positionHash({
+      accountId: ACCOUNT.id,
+      instrumentId: extra.instrumentId,
+      asOf: extra.asOf,
+      quantity: extra.quantity,
+      marketValue: extra.marketValueText,
+      costBasis: extra.costBasis,
+      valuationBasis: extra.valuationBasis,
+      sourceLocator: extra.sourceLocator,
+    });
+    await client.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, instrument_id, quantity, price, market_value,
+          cost_basis, unrealized, currency, valuation_basis, valuation_note,
+          source_document_id, source_locator, row_hash)
+       VALUES ('scope-conflict-extra-reopened', $1, $2::date, $3, $4, $5,
+               $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+      [
+        ACCOUNT.id,
+        extra.asOf,
+        extra.instrumentId,
+        extra.quantity,
+        extra.price,
+        extra.marketValueText,
+        extra.costBasis,
+        extra.unrealized,
+        extra.currency,
+        extra.valuationBasis,
+        extra.valuationNote,
+        ownerDocument.id,
+        extra.sourceLocator,
+        extraHash,
+      ],
+    );
+    const reopened = await importBatch(
+      client,
+      { source: "synthetic-scope-conflict", documents: [witness] },
+      new Date("2026-09-21T12:02:00.000Z"),
+    );
+    assert.equal(reopened.reviewItemsUpdated, 1);
+    assert.deepEqual(
+      await one(
+        client,
+        `SELECT status, resolved_at IS NOT NULL AS kept_resolved_at,
+                resolution_note LIKE
+                  'resolved on reimport: every declared position scope validated and persisted exactly%'
+                  AS kept_resolution
+           FROM review_items
+          WHERE kind = 'position_scope_mismatch'
+            AND raw_value = $1`,
+        [`${ACCOUNT.id}:2026-03-31:position_scope_v1`],
+      ),
+      {
+        status: "open",
+        kept_resolved_at: true,
+        kept_resolution: true,
+      },
+    );
   },
 );
 

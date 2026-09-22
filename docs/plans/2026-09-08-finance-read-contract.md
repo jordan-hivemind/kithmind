@@ -367,3 +367,31 @@ The archive records each decision durably in `review_items`: an acceptance as a
 failed. A later import that makes an acceptance unsafe dismisses it and reopens
 the weak item with `institution_symbol_match_invalidated`, so the read surface
 reports `ambiguous` again with no position rewritten.
+
+## Update 2026-09-21: account-scoped position correction
+
+Migration 15 records versioned account/date position observations and their
+exact semantic members. A read may use a complete observation only when its
+retained SHA and generation match the document's active projection, its member
+multiset exactly equals the canonical account/date rows, and every ordinary
+review and reconciliation gate still passes. A source-wide
+`document_unparsed` finding is ignored only for an account/date with that exact
+positive proof. Null-account non-parser findings remain blocking.
+
+Migration 16 lets the existing holding generation publisher replace explicitly
+selected complete position scopes in a partially parsed consolidated document.
+It retains all nonselected positions, balances and liabilities byte-for-byte,
+keeps the document partial, and carries complete and partial nonselected scope
+observations into the new generation without upgrading them. Exact rows owned
+by another retained source may satisfy membership only when their full stored
+semantics agree and this source supplies independent locator evidence. Their
+canonical ownership never moves.
+
+Every candidate and approval binds the retained SHA, prior active generation,
+old and composed projections, selected canonical row identities and owners,
+complete scope evidence, and explicit removal and empty-scope authority. A
+positive source-stated zero can remove the last selected position. Old
+assertions remain available to evidence lookups, while position reconciliation
+is recomputed for instruments present in either the old or corrected selected
+set. A stale approval, unrepresented foreign row, semantic mismatch or changed
+canonical set refuses the entire transaction.

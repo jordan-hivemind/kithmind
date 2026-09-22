@@ -140,7 +140,12 @@ import {
   type HoldingCorrectionCandidateManifest,
 } from "./holdingCorrectionCandidate.js";
 import {
+  prepareHoldingScopedPositionCorrection,
+  publishHoldingScopedPositionCorrection,
   publishHoldingProjectionReplacement,
+  type HoldingScopedCorrectionManifest,
+  type HoldingScopedCorrectionSelector,
+  type HoldingScopedProjectionApproval,
   type HoldingProjectionApproval,
 } from "./holdingProjectionPublisher.js";
 import {
@@ -1072,7 +1077,11 @@ async function selectRetainedDocuments(
 }
 
 class HoldingCorrectionCandidateRollback extends Error {
-  constructor(readonly manifest: HoldingCorrectionCandidateManifest) {
+  constructor(
+    readonly manifest:
+      | HoldingCorrectionCandidateManifest
+      | HoldingScopedCorrectionManifest,
+  ) {
     super("holding correction candidate: rolled back, nothing committed");
   }
 }
@@ -1091,6 +1100,34 @@ async function runBoundedHoldingCandidateStage<T>(
   }
 }
 
+function candidateHoldingInstrumentIds(
+  candidate: ImportDocument,
+  selectedScopes: readonly HoldingScopedCorrectionSelector[] | null,
+): readonly string[] {
+  const selectedPositionKeys =
+    selectedScopes === null
+      ? null
+      : new Set(
+          selectedScopes
+            .filter((scope) => scope.scopeKind === "positions")
+            .map((scope) => `${scope.accountId}\u0000${scope.asOf}`),
+        );
+  return [
+    ...new Set(
+      (candidate.positions ?? [])
+        .filter(
+          (position) =>
+            selectedPositionKeys === null ||
+            selectedPositionKeys.has(
+              `${position.accountId ?? candidate.accountId ?? ""}\u0000${position.asOf}`,
+            ),
+        )
+        .map((position) => position.instrumentId)
+        .filter((id): id is string => id !== null),
+    ),
+  ];
+}
+
 /**
  * Read and parse exactly one retained document, then emit only a digest/count
  * manifest for an operator to review. Instrument resolution uses the ordinary
@@ -1106,6 +1143,7 @@ async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<v
       adapter: { type: "string" },
       "document-id": { type: "string" },
       "retained-sha256": { type: "string" },
+      "scope-selection": { type: "string" },
     },
   });
   if (!values.adapter) throw new Error("--adapter <module path> is required");
@@ -1118,6 +1156,27 @@ async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<v
   if (!/^[0-9a-f]{64}$/.test(values["retained-sha256"])) {
     throw new Error("--retained-sha256 must be a lowercase sha256");
   }
+  let scopeSelection: readonly HoldingScopedCorrectionSelector[] | null = null;
+  if (values["scope-selection"]) {
+    try {
+      const parsed = JSON.parse(
+        readFileSync(resolve(values["scope-selection"]), "utf8"),
+      ) as { scopes?: unknown };
+      if (
+        parsed === null ||
+        typeof parsed !== "object" ||
+        Object.keys(parsed).length !== 1 ||
+        !Array.isArray(parsed.scopes)
+      ) {
+        throw new Error("invalid");
+      }
+      scopeSelection = parsed.scopes as HoldingScopedCorrectionSelector[];
+    } catch {
+      throw new Error(
+        "holding correction candidate failed: scope_selection_open",
+      );
+    }
+  }
 
   const adapter = await loadAdapter(values.adapter);
   const rawTreeRoot = resolveRawTreeRoot();
@@ -1125,7 +1184,10 @@ async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<v
   await pgClient.connect();
   const capabilities = adapter.capabilities();
   const loadAccountsByExternalKey = accountsByExternalKeyLoader(() => pgClient);
-  let manifest: HoldingCorrectionCandidateManifest | undefined;
+  let manifest:
+    | HoldingCorrectionCandidateManifest
+    | HoldingScopedCorrectionManifest
+    | undefined;
 
   try {
     await withArchiveTransaction(pgClient, async (tx) => {
@@ -1234,13 +1296,10 @@ async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<v
       await tx.query("ROLLBACK TO SAVEPOINT holding_correction_candidate_mapping");
       await tx.query("RELEASE SAVEPOINT holding_correction_candidate_mapping");
 
-      const holdingInstrumentIds = [
-        ...new Set(
-          (candidate.positions ?? [])
-            .map((position) => position.instrumentId)
-            .filter((id): id is string => id !== null),
-        ),
-      ];
+      const holdingInstrumentIds = candidateHoldingInstrumentIds(
+        candidate,
+        scopeSelection,
+      );
       if (holdingInstrumentIds.length > 0) {
         const existing = await tx.query<{ id: string }>(
           "SELECT id FROM instruments WHERE id = ANY($1::text[])",
@@ -1253,14 +1312,36 @@ async function runHoldingCorrectionCandidate(args: readonly string[]): Promise<v
         }
       }
 
-      await assertCandidateHashesOwnedByDocument(tx, doc.id, candidate);
       const stored = await readStoredHoldingProjection(tx, doc.id);
-      manifest = buildHoldingCorrectionCandidateManifest({
-        documentId: doc.id,
-        retainedSha256: doc.retained_sha256,
-        stored,
-        candidate,
-      });
+      if (scopeSelection === null) {
+        await assertCandidateHashesOwnedByDocument(tx, doc.id, candidate);
+        manifest = buildHoldingCorrectionCandidateManifest({
+          documentId: doc.id,
+          retainedSha256: doc.retained_sha256,
+          stored,
+          candidate,
+        });
+      } else {
+        const active = await tx.query<{
+          active_holding_projection_generation_id: string | null;
+        }>(
+          `SELECT active_holding_projection_generation_id
+             FROM documents WHERE id = $1`,
+          [doc.id],
+        );
+        manifest = (
+          await prepareHoldingScopedPositionCorrection({
+            client: tx,
+            documentId: doc.id,
+            retainedSha256: doc.retained_sha256,
+            expectedActiveGenerationId:
+              active.rows[0]?.active_holding_projection_generation_id ?? null,
+            stored,
+            candidate,
+            selectors: scopeSelection,
+          })
+        ).manifest;
+      }
       throw new HoldingCorrectionCandidateRollback(manifest);
     });
     throw new Error("holding correction candidate transaction committed unexpectedly");
@@ -1305,11 +1386,11 @@ async function runHoldingCorrectionPublish(
   if (!values.approval)
     throw new Error("--approval <private-json-path> is required");
 
-  let approval: HoldingProjectionApproval;
+  let approval: HoldingProjectionApproval | HoldingScopedProjectionApproval;
   try {
     approval = JSON.parse(
       readFileSync(resolve(values.approval), "utf8"),
-    ) as HoldingProjectionApproval;
+    ) as HoldingProjectionApproval | HoldingScopedProjectionApproval;
   } catch {
     throw new Error("holding correction publish failed: approval_open");
   }
@@ -1426,13 +1507,12 @@ async function runHoldingCorrectionPublish(
       );
       await tx.query("RELEASE SAVEPOINT holding_correction_publish_mapping");
 
-      const holdingInstrumentIds = [
-        ...new Set(
-          (candidate.positions ?? [])
-            .map((position) => position.instrumentId)
-            .filter((id): id is string => id !== null),
-        ),
-      ];
+      const holdingInstrumentIds = candidateHoldingInstrumentIds(
+        candidate,
+        approval.kind === "holding_scoped_projection_approval_v1"
+          ? approval.selectedScopes
+          : null,
+      );
       if (holdingInstrumentIds.length > 0) {
         const existing = await tx.query<{ id: string }>(
           "SELECT id FROM instruments WHERE id = ANY($1::text[])",
@@ -1443,6 +1523,12 @@ async function runHoldingCorrectionPublish(
             "candidate requires an unreviewed instrument identity",
           );
         }
+      }
+      if (approval.kind === "holding_scoped_projection_approval_v1") {
+        return publishHoldingScopedPositionCorrection(tx, {
+          candidate,
+          approval,
+        });
       }
       return publishHoldingProjectionReplacement(tx, { candidate, approval });
     });
