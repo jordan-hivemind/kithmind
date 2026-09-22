@@ -63,6 +63,11 @@ import {
   recordWorkerSourceRootReport,
 } from "./sourceRoots.js";
 import { getWorkerSourceItemCounts, getWorkerSourceStatus } from "./status.js";
+import {
+  appendTargetedTaxBatch,
+  beginTargetedTaxExtraction,
+  getTargetedTaxStatus,
+} from "./targetedTax.js";
 import { workerCtx } from "./db.js";
 
 function leaseTokens(count: number): string[] {
@@ -123,6 +128,12 @@ export async function dispatchWorkerRequest(
         return admitDiscoveryUtf8(ctx, principal, request);
       case "discovery.recordPreview":
         return recordDiscoveryPreview(ctx, principal, request);
+      case "extraction.beginTargetedTax":
+        return beginTargetedTaxExtraction(ctx, principal, request);
+      case "extraction.appendTargetedTaxBatch":
+        return appendTargetedTaxBatch(ctx, principal, request);
+      case "extraction.targetedTaxStatus":
+        return getTargetedTaxStatus(ctx, principal, request);
       case "discovery.preflightArchived":
         return preflightArchivedDiscovery(ctx, principal, request);
       case "discovery.failArchived":

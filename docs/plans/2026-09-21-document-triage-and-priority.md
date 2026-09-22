@@ -213,10 +213,8 @@ work tables. Add only the following persisted fields and table:
 
 | Change | Contract |
 | --- | --- |
-| `source_text_versions.coverage_kind` | Closed to `full_document` and `targeted_tax_v1`. Existing rows backfill to `full_document`. |
-| `source_text_versions.source_unit_count` and `inspected_original_units` | The PDF page count and, for a targeted version, a strictly increasing bounded list of exact original pages. A full version has `source_unit_count = page_count` and does not need to enumerate every unit. |
-| `source_pages.original_unit_number` | One-based original PDF page number. Dense staging ordinal remains internal ordering. Evidence and user-facing citations use this number. |
-| `kith.targeted_extraction_results` | One revision-bound result per goal version, opaque instance key and request digest. Status is closed to `running`, `complete`, `incomplete_resumable` or `conflict`; the only in-place lifecycle is `running` to one terminal state. The row stores source item/revision/text version/generation, requested fields, discovered forms, inspected original units, unresolved codes, event and observation keys, parser/extractor fingerprints and timestamps. Payloads are closed and bounded. |
+| `source_text_versions.representation` | Adds `targeted_pages_v1`. Each transport batch creates one sealed non-active text version. Its `source_pages.ordinal` retains the zero-based original PDF page, so evidence and user-facing citations preserve the source page without changing full-document rows. |
+| `kith.document_targeted_extractions` | One revision-bound result per goal version, opaque instance key and request digest. It stores a bounded manifest of immutable batch text versions and original-page hashes, requested fields, cited outcomes, unresolved codes, parser/extractor fingerprints and timestamps. Status is closed to `awaiting_pages`, `running`, `complete`, `incomplete_resumable` or `conflict`. |
 | `deferred_work.kind` | Add only `targeted_tax_extraction`. Its payload names space, source item, source revision, processing generation and goal digest. The existing lease, retry and dedupe behavior remains unchanged. |
 
 The separate result table is necessary because `document_extractions` is unique
@@ -224,7 +222,7 @@ on `source_item_id`. One assembled source can yield a Form 1040 result and
 several K-1 form-instance results. Reusing that row would either overwrite one
 goal with another or collapse distinct counterparties into one extraction.
 
-The targeted generation is sealed and auditable but does not produce a
+Each targeted batch is sealed and auditable but does not produce a
 whole-document retrieval or embedding claim and is never written to
 `source_items.active_generation_id`. If no full generation exists, document
 reads may expose its cited tax result and explicit partial coverage, but search
@@ -250,9 +248,11 @@ completion arm that seals the generation without setting the source item's
 active generation. No second ingestion service or queue is added.
 
 Targeted completion queues the existing deferred worker with
-`targeted_tax_extraction`. The handler writes the result row, event,
-observations and cited statements in one transaction after rechecking current
-source revision, goal digest, parser fingerprint and evidence. `get_document`
+`targeted_tax_extraction`. The handler writes the result's typed outcomes and
+cited evidence in one transaction after rechecking current source revision,
+goal digest, parser fingerprint and evidence. Targeted outcomes do not enter
+the general observation projection until a later, separately reviewed tax
+projection defines that meaning. `get_document`
 adds the goal status, resolved/unresolved coverage, inspected original pages and
 cited statements. This read-contract change bumps the advertised standalone and
 hosted MCP server versions under the repository version policy. No new MCP tool
@@ -271,6 +271,15 @@ These are implementation PRs with one final acceptance, not research phases.
 Schema and worker-protocol work require the repository's independent tier-2
 review. Pipeline and schema owners coordinate migration numbering and shared
 files before implementation.
+
+PR #408 was automatically marked merged when its branch still pointed at the
+already-merged selective-artifact commit. It shipped no goal controller. The
+replacement implementation must have its own commit and review receipt before
+this acceptance can be marked complete.
+
+Validate every new CI or parser-launcher command in a clean environment. A
+developer environment with an editable package install can otherwise hide a
+missing import path or undeclared fixture dependency.
 
 ### Final acceptance
 

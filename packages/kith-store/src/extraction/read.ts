@@ -57,6 +57,130 @@ export type DocumentExtraction = {
   }>;
 };
 
+export type TargetedTaxExtraction = {
+  targetId: string;
+  sourceRevisionId: string;
+  goalKind: "form_1040_totals_v1" | "schedule_k1_key_fields_v1";
+  status: "awaiting_pages" | "running" | "complete" | "incomplete_resumable" | "conflict";
+  coverage: {
+    kind: "targeted_tax_v1";
+    sourcePageCount: number;
+    inspectedOriginalPages: number[];
+    partial: true;
+  };
+  unresolvedCodes: string[];
+  outcomes: Array<{
+    field: string;
+    status: "cited";
+    valueType: string;
+    value: unknown;
+    citations: Array<{
+      originalPage: number;
+      evidenceSpanId: string;
+      quote: string;
+      quoteHash: string;
+    }>;
+  }>;
+};
+
+/** Reads only revision-bound selective results. Sparse text is never returned
+ * as active full-document content. */
+export async function readTargetedTaxExtractions(
+  client: ClientBase,
+  spaceIds: readonly string[],
+  sourceItemId: string,
+  sourceRevisionId?: string,
+): Promise<TargetedTaxExtraction[]> {
+  if (spaceIds.length === 0) return [];
+  const rows = (
+    await client.query<Record<string, unknown>>(
+      `SELECT x.* FROM kith.document_targeted_extractions x
+         JOIN kith.source_items i ON i.id=x.source_item_id AND i.space_id=x.space_id
+        WHERE x.source_item_id=$1 AND x.space_id=ANY($2::kith.kith_id[])
+          AND i.lifecycle='available'
+          AND ($3::kith.kith_id IS NULL OR x.source_revision_id=$3)
+        ORDER BY x.created_at, x.id LIMIT 17`,
+      [sourceItemId, spaceIds, sourceRevisionId ?? null],
+    )
+  ).rows;
+  if (rows.length > 16) throw new Error("Targeted extraction result bound exceeded");
+  const result: TargetedTaxExtraction[] = [];
+  for (const row of rows) {
+    const batches = row.batches as Array<{
+      requestedPages?: Array<{ originalPage: number }>;
+      pages?: Array<{ originalPage: number }>;
+    }>;
+    const outcomes = row.outcomes as Array<{
+      field: string;
+      status: "cited";
+      valueType: string;
+      value: unknown;
+      citations: Array<{ originalPage: number; evidenceSpanId: string }>;
+    }>;
+    const citationIds = outcomes.flatMap((outcome) =>
+      outcome.citations.map((citation) => citation.evidenceSpanId),
+    );
+    if (citationIds.length > 256) throw new Error("Targeted extraction citation bound exceeded");
+    const spans = citationIds.length === 0
+      ? []
+      : (
+          await client.query<{
+            id: string;
+            quote_hash: string;
+            start: string | number;
+            end: string | number;
+            text: string;
+          }>(
+            `SELECT e.id, e.quote_hash, e.start, e."end", p.text
+               FROM kith.evidence_spans e
+               JOIN kith.source_pages p ON p.id=e.source_page_id AND p.space_id=e.space_id
+              WHERE e.space_id=$1 AND e.source_revision_id=$2
+                AND e.id=ANY($3::kith.kith_id[]) LIMIT 257`,
+            [row.space_id, row.source_revision_id, citationIds],
+          )
+        ).rows;
+    if (spans.length > 256) throw new Error("Targeted extraction citation bound exceeded");
+    const byId = new Map(spans.map((span) => [span.id, span]));
+    const inspectedOriginalPages = [
+      ...new Set(
+        batches.flatMap((batch) =>
+          (batch.requestedPages ?? batch.pages ?? []).map((page) => page.originalPage),
+        ),
+      ),
+    ].sort((a, b) => a - b);
+    result.push({
+      targetId: String(row.id),
+      sourceRevisionId: String(row.source_revision_id),
+      goalKind: row.goal_kind as TargetedTaxExtraction["goalKind"],
+      status: row.status as TargetedTaxExtraction["status"],
+      coverage: {
+        kind: "targeted_tax_v1",
+        sourcePageCount: Number(row.source_page_count),
+        inspectedOriginalPages,
+        partial: true,
+      },
+      unresolvedCodes: row.unresolved_codes as string[],
+      outcomes: outcomes.map((outcome) => ({
+        field: outcome.field,
+        status: outcome.status,
+        valueType: outcome.valueType,
+        value: outcome.value,
+        citations: outcome.citations.flatMap((citation) => {
+          const span = byId.get(citation.evidenceSpanId);
+          if (!span) return [];
+          return [{
+            originalPage: citation.originalPage,
+            evidenceSpanId: citation.evidenceSpanId,
+            quote: span.text.slice(Number(span.start), Number(span.end)),
+            quoteHash: span.quote_hash,
+          }];
+        }),
+      })),
+    });
+  }
+  return result;
+}
+
 export async function readDocumentExtraction(
   client: ClientBase,
   spaceId: string,

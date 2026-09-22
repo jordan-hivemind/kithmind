@@ -345,6 +345,32 @@ export const MAX_WORKER_PASS_COUNT = 100_000_000;
  */
 export const MAX_WORKER_SOURCE_ITEM_COUNT_ROOTS = 64;
 
+export const TARGETED_TAX_GOALS = [
+  "form_1040_totals_v1",
+  "schedule_k1_key_fields_v1",
+] as const;
+export type TargetedTaxGoalKind = (typeof TARGETED_TAX_GOALS)[number];
+export const MAX_TARGETED_TAX_BATCH_PAGES = 12;
+export const MAX_TARGETED_TAX_BATCH_TEXT_BYTES = 60_000;
+
+export type TargetedTaxPageInput = {
+  originalPage: number;
+  text: string;
+  textHash: string;
+};
+
+export type TargetedTaxArtifactDeclaration = {
+  artifactKind: "selective_pdf_pages_v1";
+  sourceSha256: string;
+  selectedPdfSha256: string;
+  sourcePageCount: number;
+  originalPages: number[];
+  coverageFingerprint: string;
+  artifactFingerprint: string;
+  parserFingerprint: string;
+  extractionFingerprint: string;
+};
+
 export type WorkerRequest =
   | (WorkerSourceRequest & {
       operation: "source.status";
@@ -535,6 +561,33 @@ export type WorkerRequest =
       requestId: string;
       identity: ArchivedWorkIdentity;
       preview: TriagePreviewDeclaration;
+    })
+  | (WorkerSourceRequest & {
+      operation: "extraction.beginTargetedTax";
+      requestId: string;
+      sourceItemId: string;
+      sourceRevisionId: string;
+      observedContentHash: string;
+      goalKind: TargetedTaxGoalKind;
+      instanceKey: string;
+      requiredFields: string[];
+      optionalFields: string[];
+      sourcePageCount: number;
+      requestDigest: string;
+    })
+  | (WorkerSourceRequest & {
+      operation: "extraction.appendTargetedTaxBatch";
+      requestId: string;
+      targetId: string;
+      sourceRevisionId: string;
+      batchOrdinal: number;
+      artifact: TargetedTaxArtifactDeclaration;
+      pages: TargetedTaxPageInput[];
+    })
+  | (WorkerSourceRequest & {
+      operation: "extraction.targetedTaxStatus";
+      requestId: string;
+      targetId: string;
     })
   | (WorkerSourceRequest & {
       operation: "discovery.preflightArchived";
@@ -1015,6 +1068,26 @@ export type WorkerDiscoveryPreviewResult = {
   reused: boolean;
 };
 
+export type WorkerTargetedTaxStatus = {
+  operation:
+    | "extraction.beginTargetedTax"
+    | "extraction.appendTargetedTaxBatch"
+    | "extraction.targetedTaxStatus";
+  targetId: string;
+  sourceItemId: string;
+  sourceRevisionId: string;
+  goalKind: TargetedTaxGoalKind;
+  status:
+    | "awaiting_pages"
+    | "running"
+    | "complete"
+    | "incomplete_resumable"
+    | "conflict";
+  inspectedOriginalPages: number[];
+  unresolvedFields: string[];
+  reused: boolean;
+};
+
 export type WorkerArchivedPreflightResult = {
   operation: "discovery.preflightArchived";
   sourceItemId: string;
@@ -1423,6 +1496,7 @@ export type WorkerResult =
   | WorkerDiscoveryReserveResult
   | WorkerDiscoveryAdmitResult
   | WorkerDiscoveryPreviewResult
+  | WorkerTargetedTaxStatus
   | WorkerArchivedPreflightResult
   | WorkerArchivedFailResult
   | WorkerArchivedReserveResult
@@ -1561,6 +1635,82 @@ function paginationOptions(value: unknown): WorkerPaginationOptions {
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+const TARGETED_FIELD = /^[a-z][a-z0-9_]{0,63}$/;
+
+function targetedFields(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 128) invalid();
+  const fields = value.map((item) =>
+    string(item, { maxUtf16: 64, pattern: TARGETED_FIELD }),
+  );
+  if (new Set(fields).size !== fields.length) invalid();
+  return fields;
+}
+
+function targetedGoal(value: unknown): TargetedTaxGoalKind {
+  if (
+    typeof value !== "string" ||
+    !(TARGETED_TAX_GOALS as readonly string[]).includes(value)
+  ) invalid();
+  return value as TargetedTaxGoalKind;
+}
+
+function targetedArtifact(value: unknown): TargetedTaxArtifactDeclaration {
+  const input = object(value);
+  exactKeys(input, [
+    "artifactKind",
+    "sourceSha256",
+    "selectedPdfSha256",
+    "sourcePageCount",
+    "originalPages",
+    "coverageFingerprint",
+    "artifactFingerprint",
+    "parserFingerprint",
+    "extractionFingerprint",
+  ]);
+  if (input.artifactKind !== "selective_pdf_pages_v1") invalid();
+  if (!Array.isArray(input.originalPages)) invalid();
+  const sourcePageCount = integer(input.sourcePageCount, 1, 10_000);
+  const originalPages = input.originalPages.map((page) =>
+    integer(page, 1, sourcePageCount),
+  );
+  if (
+    originalPages.length < 1 ||
+    originalPages.length > MAX_TARGETED_TAX_BATCH_PAGES ||
+    originalPages.some((page, index) => index > 0 && page <= originalPages[index - 1]!)
+  ) invalid();
+  return {
+    artifactKind: "selective_pdf_pages_v1",
+    sourceSha256: string(input.sourceSha256, { maxUtf16: 64, pattern: SHA256 }),
+    selectedPdfSha256: string(input.selectedPdfSha256, { maxUtf16: 64, pattern: SHA256 }),
+    sourcePageCount,
+    originalPages,
+    coverageFingerprint: string(input.coverageFingerprint, { maxUtf16: 64, pattern: SHA256 }),
+    artifactFingerprint: string(input.artifactFingerprint, { maxUtf16: 64, pattern: SHA256 }),
+    parserFingerprint: string(input.parserFingerprint, { maxUtf8: 1024 }),
+    extractionFingerprint: string(input.extractionFingerprint, { maxUtf8: 1024 }),
+  };
+}
+
+function targetedPages(value: unknown): TargetedTaxPageInput[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_TARGETED_TAX_BATCH_PAGES) invalid();
+  let total = 0;
+  const pages = value.map((item) => {
+    const input = object(item);
+    exactKeys(input, ["originalPage", "text", "textHash"]);
+    if (typeof input.text !== "string" || !wellFormed(input.text)) invalid();
+    total += new TextEncoder().encode(input.text).byteLength;
+    return {
+      originalPage: integer(input.originalPage, 1, 10_000),
+      text: input.text,
+      textHash: string(input.textHash, { maxUtf16: 64, pattern: SHA256 }),
+    };
+  });
+  if (
+    total > MAX_TARGETED_TAX_BATCH_TEXT_BYTES ||
+    pages.some((page, index) => index > 0 && page.originalPage <= pages[index - 1]!.originalPage)
+  ) invalid();
+  return pages;
+}
 /**
  * ADM-10 review. A worker process's heartbeat nonce: 128 bits as 32 lowercase
  * hex characters, matching the column's own CHECK in migration 031. A closed
@@ -2780,6 +2930,76 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         requestId: requestId(input.requestId),
         identity: archivedWorkIdentity(input.identity),
         preview: triagePreview(input.preview),
+      };
+    case "extraction.beginTargetedTax": {
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "sourceItemId",
+        "sourceRevisionId",
+        "observedContentHash",
+        "goalKind",
+        "instanceKey",
+        "requiredFields",
+        "optionalFields",
+        "sourcePageCount",
+        "requestDigest",
+      ]);
+      const requiredFields = targetedFields(input.requiredFields);
+      const optionalFields = targetedFields(input.optionalFields);
+      if (
+        requiredFields.length < 1 ||
+        optionalFields.some((field) => requiredFields.includes(field))
+      ) invalid();
+      return {
+        ...base,
+        operation: "extraction.beginTargetedTax",
+        requestId: requestId(input.requestId),
+        sourceItemId: string(input.sourceItemId, { maxUtf16: 256 }),
+        sourceRevisionId: string(input.sourceRevisionId, { maxUtf16: 256 }),
+        observedContentHash: string(input.observedContentHash, { maxUtf16: 64, pattern: SHA256 }),
+        goalKind: targetedGoal(input.goalKind),
+        instanceKey: string(input.instanceKey, { maxUtf8: 256 }),
+        requiredFields,
+        optionalFields,
+        sourcePageCount: integer(input.sourcePageCount, 1, 10_000),
+        requestDigest: string(input.requestDigest, { maxUtf16: 64, pattern: SHA256 }),
+      };
+    }
+    case "extraction.appendTargetedTaxBatch": {
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "targetId",
+        "sourceRevisionId",
+        "batchOrdinal",
+        "artifact",
+        "pages",
+      ]);
+      const artifact = targetedArtifact(input.artifact);
+      const pages = targetedPages(input.pages);
+      if (
+        pages.length !== artifact.originalPages.length ||
+        pages.some((page, index) => page.originalPage !== artifact.originalPages[index])
+      ) invalid();
+      return {
+        ...base,
+        operation: "extraction.appendTargetedTaxBatch",
+        requestId: requestId(input.requestId),
+        targetId: string(input.targetId, { maxUtf16: 256 }),
+        sourceRevisionId: string(input.sourceRevisionId, { maxUtf16: 256 }),
+        batchOrdinal: integer(input.batchOrdinal, 0, 10_000),
+        artifact,
+        pages,
+      };
+    }
+    case "extraction.targetedTaxStatus":
+      exactKeys(input, [...baseKeys, "requestId", "targetId"]);
+      return {
+        ...base,
+        operation: "extraction.targetedTaxStatus",
+        requestId: requestId(input.requestId),
+        targetId: string(input.targetId, { maxUtf16: 256 }),
       };
     case "discovery.preflightArchived":
       exactKeys(input, [
