@@ -1,7 +1,8 @@
 # Document triage and prioritized ingestion
 
 Date: 2026-09-21
-Status: owner-approved direction; implementation and rollout pending.
+Status: metadata-first routing is in PR #392; targeted tax ingestion is the
+next bounded implementation slice.
 
 ## Problem and outcome
 
@@ -113,37 +114,173 @@ established over converting every page or truncating at an arbitrary page count.
 Separate bounded discovery previews from substantive extraction: two preview
 pages can classify a candidate but cannot certify a complete tax result.
 
-Define the requested field/form set before deeper extraction. Inspect opening
-pages and available document navigation to locate the relevant return and
-schedules. Continue only as needed to resolve missing fields, continuation
-markers, conflicting candidate returns, or references to required schedules.
-A cover letter mentioning a form is not proof that the form was inspected.
+### Current boundary
 
-Stop after the selected result has grounded evidence for its required fields,
-the relevant form boundaries are established, and detected conflicts or
-continuations are resolved. Missing and blank fields remain distinct from zero;
-optional fields do not require scanning unrelated appendices merely to invent
-a value. Report unresolved required fields explicitly. Original page numbering
-and exact retained evidence must survive selective parsing.
+PR #392 classifies a strong tax heading as `deep_priority`, but that selection
+still enters the ordinary archived-document path. The worker converts the whole
+PDF before typed extraction runs. The PDF converter, parsed-text declaration
+and staging path accept at most 64 pages. A longer PDF therefore fails before
+the existing tax selector can inspect its front forms.
 
-Supporting brokerage statements, worksheets and duplicate attachments can
-remain deferred when they are unnecessary for that result. State exactly what
-was extracted and which remainder was not inspected; completion of a requested
-return summary is not a claim that the entire bundle is understood. A later
-question can enqueue additional pages without repeating verified prior work.
+For an admitted document, `selectTaxFrontForms` finds Form 1040 within the first
+12 parsed pages, takes one contiguous front section, stops at a supporting
+attachment and applies a 48-page and 300,000-character bound. The typed model
+gets one initial request and at most one wider request. The kind-level ceiling
+is 60 pages. Those bounds are useful safety limits, but none proves that a
+requested return result is complete. An attachment boundary currently counts as
+intentional rather than truncated, even when a referenced schedule or requested
+total has not been resolved. Only `tax_year` is required in the shipped 1040
+catalog, and omission of a required field from a model reply is not a coverage
+proof.
 
-CPU, memory, page and token limits remain operational safety budgets, not the
-semantic stopping rule. Reaching a budget before the required evidence is
-established yields incomplete/resumable coverage. Do not mark a result complete
-because the first N pages were processed, and do not parse the whole PDF first
-merely to select its opening forms afterward.
+The first goal-aware slice must run before whole-document conversion. It does
+not raise the global page cap. It converts only selected original pages, records
+exact partial coverage, and leaves full ingestion available for retrieval goals
+that actually need the entire bundle.
 
-Acceptance uses synthetic long bundles with the same required front forms and
-variable-length irrelevant appendices: adding appendix pages must not force
-proportional parsing or model work. Also test front cover sheets, a required
-schedule later in the bundle, a missing required field, competing return
-versions and original-page citation preservation. A genuine unresolved need
-must continue or report incomplete, not be hidden by the optimization.
+### Closed goals and requested fields
+
+The first version supports exactly two goals. The goal and its version are part
+of the durable request digest. A later field-set change is a new goal version,
+not a silent reinterpretation of a completed result.
+
+| Goal | Form instances | Requested field set |
+| --- | --- | --- |
+| `form_1040_totals_v1` | One Form 1040 filing version and each applicable front Schedule 1, 2, 3, A, D or E | Form identity and every semantic total in `FEDERAL_INDIVIDUAL_RETURN`. Identity is `tax_year`, `return_version`, `filing_status` and `jurisdiction`. The total set is the checked-in Form 1040 and schedule total catalog. Names, preparer, signature and filing channel remain optional descriptive fields and do not keep page discovery alive. |
+| `schedule_k1_key_fields_v1` | One Schedule K-1 form instance, identified by form family, tax year, entity and recipient | Parts I and II identity; amended, final, PTP, partner type, domestic/foreign and K-3 flags; beginning and ending profit, loss and capital percentages; nonrecourse, qualified nonrecourse and recourse liabilities; all six Part L capital movements; Part III boxes 1, 2, 3, 4a-c, 5, 6a-b, 7, 8, 9a-c and 10; and coded values in boxes 11-15 and 17-20. |
+
+The K-1 seed currently has only partnership, tax year, recipient and eight
+optional financial fields. The K-1 implementation extends that one kind with
+the field set above. It does not create one document kind per filing year.
+Printed labels and box codes remain evidence; semantic keys remain stable.
+
+A requested field has one of four outcomes: `cited`, `source_blank`,
+`not_applicable` or `unresolved`. A printed zero is `cited`, never blank.
+`source_blank` requires an inspected, readable form region and the supported
+form/year layout; model omission alone cannot establish it. `not_applicable`
+requires a printed form choice or a closed form rule. Fields on an applicable
+form are all classified, but an optional schedule does not become applicable
+merely because its name appears in generic 1040 instructions.
+
+### Page discovery and semantic completion
+
+Start from the retained source revision selected by PR #392. Use native-text
+header and navigation windows to locate candidate form headings, form year,
+page or attachment sequence, and instance boundaries. Header discovery remains
+non-authoritative. Exact values and completion require selectively converted
+pages and retained evidence.
+
+The controller converts the smallest exact page set that can close the goal,
+then repeats only for a concrete unresolved reason:
+
+1. a requested form page or terminal page is missing;
+2. an inspected form references an applicable requested schedule;
+3. a requested coded K-1 box references a continuation statement;
+4. two candidate filing versions or form instances conflict; or
+5. a required region is image-only or unreadable and needs targeted OCR.
+
+Form 1040 is complete when its form boundary and the boundaries of every
+applicable requested front schedule are closed, and every requested field on
+those forms has one of the three resolved outcomes. A K-1 is complete when
+Parts I, II and III are closed for one identified instance, every requested
+field is resolved, and continuation statements referenced by requested coded
+boxes are closed. A contents-page mention, cover letter, first-page heading or
+model assertion cannot close a form.
+
+Supporting brokerage statements, worksheets, duplicate attachments and K-1
+continuations unrelated to the requested boxes remain deferred. CPU, memory,
+page and token limits are operational budgets. Reaching one before semantic
+completion records `incomplete_resumable` with closed unresolved codes. It does
+not record complete. A later attempt resumes from retained page coverage and
+does not reconvert already verified pages under the same source and parser
+fingerprints.
+
+### Retained partial-text and result contract
+
+Sparse pages cannot use the current full-document contract unchanged. Parsed
+PDF pages are currently numbered densely from 1 through the parsed page count,
+and typed extraction renumbers the pages shown to the model. Publishing selected
+pages 137 and 138 as pages 1 and 2 would create false citations. Activating them
+as ordinary parsed text would also make uninspected pages look searchable.
+
+Reuse the existing source revision, provider reference, parser artifact,
+parsed-staging, text-version, page, evidence, event, observation and deferred
+work tables. Add only the following persisted fields and table:
+
+| Change | Contract |
+| --- | --- |
+| `source_text_versions.coverage_kind` | Closed to `full_document` and `targeted_tax_v1`. Existing rows backfill to `full_document`. |
+| `source_text_versions.source_unit_count` and `inspected_original_units` | The PDF page count and a strictly increasing bounded list of the exact original pages represented by a targeted version. A full version covers every unit. |
+| `source_pages.original_unit_number` | One-based original PDF page number. Dense staging ordinal remains internal ordering. Evidence and user-facing citations use this number. |
+| `kith.targeted_extraction_results` | One revision-bound result per goal version and instance. It stores source item/revision/text version/generation, goal kind/version/instance key, request digest, status, requested fields, discovered forms, inspected original units, unresolved codes, event and observation keys, parser/extractor fingerprints and timestamps. Payloads are closed and bounded. |
+| `deferred_work.kind` | Add only `targeted_tax_extraction`. Its payload names space, source item, source revision, processing generation and goal digest. The existing lease, retry and dedupe behavior remains unchanged. |
+
+The targeted generation is sealed and auditable but does not produce a
+whole-document retrieval or embedding claim. It never replaces an existing
+full generation for the same revision. If no full generation exists, document
+reads may expose its cited tax result and explicit partial coverage, but search
+and full-document retrieval must report that the remainder is unprocessed. A
+later full generation can become active without deleting the targeted result or
+its evidence. Revision change makes the old result historical and queues a new
+goal; matching request replay is idempotent.
+
+Do not put private paths, native preview text or taxpayer values in goal payloads
+or error messages. Forget cascades the targeted result, its dedicated partial
+text/evidence and observations through the same source item/revision lifecycle.
+An incomplete result retains its evidence and coverage so it can resume, but it
+is not queryable as a complete tax answer.
+
+### Minimum API changes
+
+Extend the selected-item manifest with the closed tax goal and optional K-1
+instance discriminator. Extend `ParsedTextDeclaration` and parsed page input
+with the closed coverage descriptor and original unit number. The existing
+archived admission and parsed staging operations continue to carry the parser
+artifact, pages and evidence; no second ingestion service or queue is added.
+
+Activation of a `targeted_tax_v1` text version queues the existing deferred
+worker with `targeted_tax_extraction`. The handler writes the result row, event,
+observations and cited statements in one transaction after rechecking current
+source revision, goal digest, parser fingerprint and evidence. `get_document`
+adds the goal status, resolved/unresolved coverage, inspected original pages and
+cited statements. No new MCP tool or UI is part of this slice.
+
+### Implementation slices and ownership
+
+| Slice | Owner | Deliverable |
+| --- | --- | --- |
+| 1. Selective PDF artifact | Pipeline/parser | Accept an exact bounded set of original PDF pages, bind it into the parser fingerprint, preserve the original-page map in normalized output, and checkpoint only revision-bound tax goals. |
+| 2. Partial coverage admission | Worker protocol and Kith store | Apply the migration above, extend existing archived admission and parsed staging, reject stale/cross-source/mismatched coverage, and keep targeted text out of whole-document search claims. Apply the migration development-first. |
+| 3. Goal controller and extraction | Pipeline and Kith extraction | Discover form boundaries, request additional pages only for closed continuation reasons, extend the K-1 catalog, gate field outcomes, and atomically store the result with existing evidence and observations. |
+| 4. Read and recovery proof | Document read and focused integration tests | Expose partial coverage through `get_document`; prove restart, same-request replay, revision invalidation, forget and later full-generation coexistence. |
+
+These are implementation PRs with one final acceptance, not research phases.
+Schema and worker-protocol work require the repository's independent tier-2
+review. Pipeline and schema owners coordinate migration numbering and shared
+files before implementation.
+
+### Final acceptance
+
+Use synthetic PDFs with invented values:
+
+1. A 1040 with the same front forms and either 20 or 500 irrelevant appendix
+   pages yields identical fields, evidence and original page numbers. Selective
+   conversion and model page counts are identical.
+2. Covers and contents may precede Form 1040. A referenced requested schedule
+   later in the bundle is found; an unreferenced attachment remains deferred.
+3. A missing requested total, unresolved continuation, unreadable required
+   page, competing return version or exhausted budget yields
+   `incomplete_resumable`, never complete.
+4. Original pages 137 and 138 remain 137 and 138 in stored evidence after
+   conversion, restart and replay. General retrieval reports partial coverage.
+5. A late K-1 closes Parts I-III and one requested continuation while unrelated
+   appendices add no conversion or model work.
+6. Blank, absent and printed zero remain distinct. Optional descriptive fields
+   and non-applicable schedules do not prolong extraction.
+7. A changed source hash or observation epoch cannot reuse the prior result.
+   Exact replay creates no duplicate pages, evidence, observations or facts.
+8. Forget removes targeted results and evidence without disturbing another
+   source. A later full generation coexists and becomes the whole-document read.
 
 ## Priority and recovery
 

@@ -247,6 +247,13 @@ all editable afterwards from the existing screen.
 
 ## 5. Long, multi-form documents
 
+> Superseded 2026-09-21: raising every parser and protocol limit from 64 to 400
+> pages was the original proposal. The adopted direction is goal-aware targeted
+> ingestion in `2026-09-21-document-triage-and-priority.md`. Long bundles keep
+> their real page count, but the worker converts exact requested form pages and
+> records explicit partial coverage. A safety limit never becomes a completion
+> rule.
+
 | Step | How | Tier |
 | --- | --- | --- |
 | Classify pages | Regex over page text for the printed form title, the OMB number and "Attachment Sequence No.", which appear on nearly every page of a filed return | code |
@@ -255,9 +262,9 @@ all editable afterwards from the existing screen.
 | Extract | One call per form instance with only that form's fields and that year's `line_refs`. The bounds in `model.ts` (12 pages, 60k chars, 96 statements) are unchanged: an instance is one to six pages | 0, or 1 for K-1 and composite 1099 |
 | Reassemble | Instances write into one `tax_returns` row keyed by (space, tax_year, jurisdiction, filing_version) | code |
 
-Pipeline constants that must move together:
+The earlier whole-document proposal would have moved these constants together:
 
-| Constant | File | Today | Proposed |
+| Constant | File | Current bound | Obsolete proposal |
 | --- | --- | --- | --- |
 | `MAX_PARSED_TEXT_PAGES` | `packages/kith-store/src/provenance/representations.ts:25` | 64 | 400 |
 | `MAX_PAGES` | `packages/kith-store/src/provenance/parsedStaging.ts:128` | 64 | 400 |
@@ -268,8 +275,10 @@ Pipeline constants that must move together:
 | `MAX_DISCOVERED_PDF_BYTES` | `packages/pipeline/src/filesystem.ts:25` | 16 MB | 64 MB |
 | `maxInputBytes` | `packages/pipeline/src/parserProcess.ts` | 16 MB | 64 MB |
 
-These are code constants, not schema checks. The 7 files over 200 pages fit
-inside 400 with headroom.
+These bounds still exist in the current full-document path. They are not raised
+for the first goal-aware tax slice. A request that truly needs whole-document
+retrieval remains incomplete above the supported full-parser bound until a
+separate full-ingestion change is designed and verified.
 
 Page text alone suffices for 1040 and its schedules, which print
 "11 Adjusted gross income . . . 123,456" as a line. Table structure is needed
@@ -277,13 +286,12 @@ for composite brokerage 1099s, 8949 summary blocks and K-1 state schedules; the
 parser already has a table-structure path (`tableStructureBypass` in
 `packages/pipeline/src/config.ts`), so that is configuration, not new code.
 
-A 200-page return is roughly 130k tokens of page text, about 30 form instances,
-and about 120k prompt tokens across those calls: roughly 4 cents at `gpt-4o-mini`
-prices. The corpus is about 7,300 PDF pages, so a full pass costs single-digit
-dollars at tier 0, and under 25 dollars if every K-1 and composite statement
-escalates to tier 1. Parse time dominates: about 3 to 7 minutes per 200-page
-document plus about 5 minutes of extraction calls, and a few agent hours for the
-whole corpus.
+The first implementation supports the closed `form_1040_totals_v1` and
+`schedule_k1_key_fields_v1` goals. It stops when applicable form boundaries,
+requested field outcomes and detected continuations are resolved. It does not
+convert every appendix first, require values in optional blank boxes, or treat
+the first N pages as complete. Original page numbers and explicit inspected-page
+coverage are part of the persisted result.
 
 ## 6. Tax-specific gates
 
@@ -431,8 +439,8 @@ already live.
 | --- | --- | --- |
 | 0. Sensitivity: label columns and the two views, per-key ceiling. Shipped in PR #319, scoped down from the original proposal (section 8) | done | Yes: gates what every later slice can read |
 | 1. Catalog, seeder extension, migration 028 | 5 | Yes: schema and financial numbers |
-| 2. Page classification and segmentation, deterministic first | 5 | No |
-| 3. Raise the eight pipeline constants together, re-parse check | 4 | No |
+| 2. Metadata-first classification and revision-bound selection | implemented in PR #392; rollout pending | Yes: worker identity and recovery |
+| 3. Goal-aware selective parser, original-page coverage and 1040/K-1 completion | next bounded slice; see the 2026-09-21 plan | Yes: schema, evidence and partial-coverage truthfulness |
 | 4. Per-form-instance extraction, the `tax_facts` projection and its rebuild command | 6 | Yes |
 | 5. Tax gates: line reference in quote, within-form identity, cross-form carries | 5 | Yes |
 | 6. Return identity: draft, filed, amended, duplicate collapse | 4 | Yes |
