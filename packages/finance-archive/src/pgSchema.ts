@@ -1376,6 +1376,174 @@ CREATE UNIQUE INDEX review_items_projection_scope_key
     AND projection_scope_kind IS NOT NULL;
 `;
 
+// A source can prove additional positions while still carrying explicit
+// parser gaps. This third publication contract appends only positively
+// selected source-owned rows, carries the previous full generation unchanged,
+// and records the selected scopes as partial. It is deliberately distinct
+// from both whole-projection and complete-scope replacement attestations.
+const ADDITIVE_PARTIAL_HOLDING_PROJECTION_GENERATIONS = `
+CREATE FUNCTION holding_additive_manifest_has_valid_scopes(JSONB)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+STRICT
+AS $$
+  SELECT jsonb_typeof($1) = 'object'
+    AND CASE
+      WHEN jsonb_typeof($1->'selectedScopes') = 'array'
+       AND jsonb_typeof($1->'selectedRowCount') = 'number'
+      THEN jsonb_array_length($1->'selectedScopes') > 0
+       AND NOT EXISTS (
+        SELECT 1 FROM jsonb_array_elements($1->'selectedScopes') scope
+         WHERE (
+          jsonb_typeof(scope) = 'object'
+          AND scope ?& ARRAY[
+            'scopeKind', 'accountId', 'asOf', 'proofVersion', 'status',
+            'emittedRowCount', 'gapCodes', 'scopeDigest',
+            'sourceOwnedAdditions', 'carriedSourceOwnedRows',
+            'exactForeignReferences', 'unmatchedPartialMembers'
+          ]
+          AND (
+            SELECT count(*)
+              FROM jsonb_object_keys(
+                CASE WHEN jsonb_typeof(scope) = 'object'
+                     THEN scope ELSE '{}'::jsonb END)
+          ) = 12
+          AND scope->>'scopeKind' = 'positions'
+          AND coalesce(scope->>'accountId', '') <> ''
+          AND coalesce(scope->>'asOf', '') ~ '^\\d{4}-\\d{2}-\\d{2}$'
+          AND scope->>'proofVersion' = 'position_scope_v1'
+          AND scope->>'status' = 'partial'
+          AND coalesce(scope->>'scopeDigest', '') ~ '^[0-9a-f]{64}$'
+          AND CASE
+            WHEN jsonb_typeof(scope->'gapCodes') = 'array'
+            THEN jsonb_array_length(scope->'gapCodes') > 0
+             AND NOT EXISTS (
+              SELECT 1 FROM jsonb_array_elements(scope->'gapCodes') gap
+               WHERE jsonb_typeof(gap) <> 'string'
+            )
+            ELSE FALSE
+          END
+          AND CASE
+            WHEN jsonb_typeof(scope->'emittedRowCount') = 'number'
+             AND jsonb_typeof(scope->'sourceOwnedAdditions') = 'number'
+             AND jsonb_typeof(scope->'carriedSourceOwnedRows') = 'number'
+             AND jsonb_typeof(scope->'exactForeignReferences') = 'number'
+             AND jsonb_typeof(scope->'unmatchedPartialMembers') = 'number'
+            THEN (scope->>'emittedRowCount')::numeric >= 0
+             AND (scope->>'sourceOwnedAdditions')::numeric >= 0
+             AND (scope->>'carriedSourceOwnedRows')::numeric >= 0
+             AND (scope->>'exactForeignReferences')::numeric >= 0
+             AND (scope->>'unmatchedPartialMembers')::numeric >= 0
+             AND (scope->>'emittedRowCount')::numeric % 1 = 0
+             AND (scope->>'sourceOwnedAdditions')::numeric % 1 = 0
+             AND (scope->>'carriedSourceOwnedRows')::numeric % 1 = 0
+             AND (scope->>'exactForeignReferences')::numeric % 1 = 0
+             AND (scope->>'unmatchedPartialMembers')::numeric % 1 = 0
+             AND (scope->>'emittedRowCount')::numeric =
+                 (scope->>'sourceOwnedAdditions')::numeric
+                 + (scope->>'carriedSourceOwnedRows')::numeric
+                 + (scope->>'exactForeignReferences')::numeric
+                 + (scope->>'unmatchedPartialMembers')::numeric
+            ELSE FALSE
+          END
+        ) IS NOT TRUE
+      )
+       AND (
+        SELECT sum((scope->>'sourceOwnedAdditions')::numeric)
+          FROM jsonb_array_elements($1->'selectedScopes') scope
+      ) = ($1->>'selectedRowCount')::numeric
+      ELSE FALSE
+    END
+$$;
+
+REVOKE ALL ON FUNCTION holding_additive_manifest_has_valid_scopes(JSONB)
+  FROM PUBLIC;
+
+ALTER TABLE holding_projection_generations
+  DROP CONSTRAINT holding_projection_generations_shape_check;
+
+ALTER TABLE holding_projection_generations
+  ADD CONSTRAINT holding_projection_generations_shape_check CHECK (
+    (generation_kind = 'baseline'
+      AND candidate_digest IS NULL
+      AND candidate_manifest IS NULL
+      AND candidate_projection_digest IS NULL
+      AND old_projection_digest IS NULL
+      AND approval_digest IS NULL
+      AND approved_by IS NULL AND approved_at IS NULL
+      AND completeness_attestation IS NULL
+      AND removals_authorized IS NULL
+      AND empty_projection_authorized IS NULL
+      AND approval_expected_active_generation_id IS NULL
+      AND expected_previous_generation_id IS NULL)
+    OR
+    (generation_kind = 'published'
+      AND candidate_digest IS NOT NULL
+      AND candidate_manifest IS NOT NULL
+      AND jsonb_typeof(candidate_manifest) = 'object'
+      AND candidate_manifest->>'documentId' = document_id
+      AND candidate_manifest->>'retainedSha256' = retained_sha256
+      AND candidate_manifest->>'oldProjectionDigest' = old_projection_digest
+      AND candidate_manifest->>'candidateProjectionDigest' = candidate_projection_digest
+      AND candidate_manifest->>'candidateDigest' = candidate_digest
+      AND candidate_projection_digest IS NOT NULL
+      AND old_projection_digest IS NOT NULL
+      AND approval_digest IS NOT NULL
+      AND approved_by IS NOT NULL AND approved_by <> ''
+      AND char_length(approved_by) <= 200
+      AND approved_at IS NOT NULL
+      AND completeness_attestation IS NOT NULL
+      AND removals_authorized IS NOT NULL
+      AND empty_projection_authorized IS NOT NULL
+      AND expected_previous_generation_id IS NOT NULL
+      AND (
+        (candidate_manifest->>'kind' = 'holding_correction_candidate_v1'
+          AND candidate_manifest#>>'{completeness,state}' = 'unproven'
+          AND completeness_attestation = 'operator_verified_complete_projection')
+        OR
+        (candidate_manifest->>'kind' = 'holding_scoped_correction_candidate_v1'
+          AND candidate_manifest#>>'{completeness,state}' =
+            'complete_selected_scopes'
+          AND completeness_attestation = 'operator_verified_complete_scopes'
+          AND holding_scoped_manifest_has_valid_selectors(
+                candidate_manifest->'selectedScopes')
+          AND (candidate_manifest->>'expectedActiveGenerationId')
+                IS NOT DISTINCT FROM approval_expected_active_generation_id
+          AND candidate_manifest->>'selectedCurrentDigest' ~ '^[0-9a-f]{64}$')
+        OR
+        (candidate_manifest->>'kind' = 'holding_additive_correction_candidate_v1'
+          AND candidate_manifest#>>'{completeness,state}' =
+            'partial_source_additions'
+          AND candidate_manifest#>>'{completeness,changesAuthorized}' = 'false'
+          AND candidate_manifest#>>'{completeness,removalsAuthorized}' = 'false'
+          AND completeness_attestation =
+            'operator_verified_source_additions_only'
+          AND removals_authorized = FALSE
+          AND empty_projection_authorized = FALSE
+          AND holding_additive_manifest_has_valid_scopes(
+                candidate_manifest)
+          AND (candidate_manifest->>'expectedActiveGenerationId')
+                IS NOT DISTINCT FROM approval_expected_active_generation_id
+          AND candidate_manifest->>'selectedCurrentDigest' ~ '^[0-9a-f]{64}$'
+          AND candidate_manifest->>'selectedRowsDigest' ~ '^[0-9a-f]{64}$'
+          AND jsonb_typeof(candidate_manifest->'selectedRowCount') = 'number'
+          AND (candidate_manifest->>'selectedRowCount')::numeric > 0
+          AND (candidate_manifest->>'selectedRowCount')::numeric % 1 = 0
+          AND jsonb_typeof(candidate_manifest#>'{rows,oldSourceOwnedRows}') = 'number'
+          AND jsonb_typeof(candidate_manifest#>'{rows,candidateSourceOwnedRows}') = 'number'
+          AND jsonb_typeof(candidate_manifest#>'{rows,sourceOwnedAdditions}') = 'number'
+          AND (candidate_manifest#>>'{rows,sourceOwnedAdditions}')::numeric =
+                (candidate_manifest->>'selectedRowCount')::numeric
+          AND (candidate_manifest#>>'{rows,candidateSourceOwnedRows}')::numeric =
+                (candidate_manifest#>>'{rows,oldSourceOwnedRows}')::numeric
+                + (candidate_manifest#>>'{rows,sourceOwnedAdditions}')::numeric
+          AND candidate_manifest#>>'{rows,changedRows}' = '0'
+          AND candidate_manifest#>>'{rows,removedRows}' = '0')
+      ) IS TRUE)
+  );
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -1462,6 +1630,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     version: 17,
     name: "account and date attribution for system projection mismatch reviews",
     sql: PROJECTION_MISMATCH_REVIEW_SCOPES,
+  },
+  {
+    version: 18,
+    name: "additions-only partial holding projection generation audit",
+    sql: ADDITIVE_PARTIAL_HOLDING_PROJECTION_GENERATIONS,
   },
 ]);
 
