@@ -326,6 +326,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
       import.meta.url,
     ),
   },
+  {
+    version: 43,
+    name: "daily Plaid feed: items, accounts, securities, balance and holding snapshots, transactions",
+    url: new URL("../migrations/043_plaid_feed.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

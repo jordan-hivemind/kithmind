@@ -30,6 +30,7 @@ import { loadAttentionCounts } from "@/lib/kith/attention-data";
 import { loadAdminAccess } from "@/lib/kith/sources-data";
 
 const SCREENS = [
+  { href: "/admin/balances", label: "Balances", ready: true },
   { href: "/admin/institutions", label: "Investment Accounts", ready: true },
   { href: "/admin/investments", label: "Private Investments", ready: true },
   { href: "/admin/sources", label: "Data Sources", ready: true },

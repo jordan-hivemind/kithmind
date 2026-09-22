@@ -78,6 +78,14 @@ const KITH_TABLES = [
   "processing_generations",
   "processing_generation_payload_manifests",
   "source_inventory",
+  // PLAID-1 (migration 043): the daily Plaid feed's own tables.
+  "plaid_items",
+  "plaid_accounts",
+  "plaid_securities",
+  "plaid_balance_snapshots",
+  "plaid_holding_snapshots",
+  "plaid_transactions",
+  "plaid_investment_transactions",
 ];
 
 // P2-39d: retired by migration 005, so this build must never re-create them.
