@@ -26,6 +26,13 @@ export type PlaidItemRow = {
   keychainService: string;
   transactionsCursor: string | null;
   needsRelinkAt: string | null;
+  /**
+   * How far this item's investment-transaction history has been pulled, or
+   * `null` for an item that has never had investment transactions pulled
+   * (migration 045). `null` tells `pull` to fetch the full 24-month window
+   * instead of just the incremental one.
+   */
+  investmentTransactionsPulledThrough: string | null;
 };
 
 export async function listPlaidItems(pool: Pool): Promise<PlaidItemRow[]> {
@@ -36,9 +43,11 @@ export async function listPlaidItems(pool: Pool): Promise<PlaidItemRow[]> {
     keychain_service: string;
     transactions_cursor: string | null;
     needs_relink_at: string | null;
+    investment_transactions_pulled_through: string | null;
   }>(
     `SELECT item_id, institution_id, institution_name, keychain_service,
-            transactions_cursor, needs_relink_at
+            transactions_cursor, needs_relink_at,
+            investment_transactions_pulled_through
        FROM kith.plaid_items
       ORDER BY institution_name, item_id`,
   );
@@ -49,6 +58,8 @@ export async function listPlaidItems(pool: Pool): Promise<PlaidItemRow[]> {
     keychainService: row.keychain_service,
     transactionsCursor: row.transactions_cursor,
     needsRelinkAt: row.needs_relink_at,
+    investmentTransactionsPulledThrough:
+      row.investment_transactions_pulled_through,
   }));
 }
 
@@ -92,6 +103,28 @@ export async function recordPullSuccess(
             transactions_cursor = COALESCE($2, transactions_cursor)
       WHERE item_id = $1`,
     [itemId, transactionsCursor],
+  );
+}
+
+/**
+ * How far this item's investment-transaction history reaches, after a
+ * successful (partial or full) fetch of that window. Separate from
+ * `recordPullSuccess` (and called before it, from within the investment-
+ * transactions block) so a later failure elsewhere in the same pull -- for
+ * example transactions-sync -- does not also roll this back: the investment
+ * transactions already fetched are already written, so the watermark they
+ * establish should stick regardless of what happens next in the same pull.
+ */
+export async function recordInvestmentTransactionsPulledThrough(
+  pool: Pool,
+  itemId: string,
+  pulledThrough: string,
+): Promise<void> {
+  await pool.query(
+    `UPDATE kith.plaid_items
+        SET investment_transactions_pulled_through = $2
+      WHERE item_id = $1`,
+    [itemId, pulledThrough],
   );
 }
 

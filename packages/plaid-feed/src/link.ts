@@ -91,6 +91,10 @@ export async function runHostedLink(deps: LinkDeps): Promise<LinkOutcome> {
     // not narrow the picker for the ones that do not.
     products: [Products.Transactions],
     optional_products: [Products.Investments],
+    // Plaid's maximum banking-transactions history window. It is fixed at
+    // Item creation -- an Item linked before this change keeps whatever
+    // window it was created with (see README, "History depth").
+    transactions: { days_requested: 730 },
     hosted_link: {},
   });
   const linkToken = created.data.link_token;

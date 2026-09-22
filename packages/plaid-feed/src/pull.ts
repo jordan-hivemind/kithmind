@@ -1,8 +1,11 @@
 // `kith-plaid-feed pull`: one round over every linked item.
 //
 // For each item: read its access token from the Keychain, fetch balances
-// (required), then fetch holdings, a transactions-sync page and 30 days of
-// investment transactions. `link` only requires the `transactions` product
+// (required), then fetch holdings, a transactions-sync page and investment
+// transactions -- the full 24-month history Plaid allows on a first pull for
+// this item, then just the window since the last pull (see
+// mapping.ts's investmentTransactionsStartDate). `link` only requires the
+// `transactions` product
 // (`investments` is optional there, so depository-only institutions like
 // Chase are still offered), so the holdings and investment-transactions
 // calls are skipped outright -- not a failure -- for an item whose consented
@@ -31,6 +34,7 @@ import { loadDatabaseUrl, loadPlaidCredentials } from "./config.js";
 import {
   listPlaidItems,
   openPool,
+  recordInvestmentTransactionsPulledThrough,
   recordPullFailure,
   recordPullSuccess,
   upsertAccount,
@@ -44,6 +48,7 @@ import {
 } from "./db.js";
 import { readKeychainSecret } from "./keychain.js";
 import {
+  investmentTransactionsStartDate,
   isItemLoginRequired,
   isProductNotSupported,
   mapAccount,
@@ -57,10 +62,15 @@ import {
 } from "./mapping.js";
 import { createPlaidClient } from "./plaidClient.js";
 
-const INVESTMENT_TRANSACTIONS_LOOKBACK_DAYS = 30;
 /** Guards against an unbounded loop if Plaid's pagination never terminates. */
 const MAX_SYNC_PAGES = 50;
-const MAX_INVESTMENT_TRANSACTION_PAGES = 20;
+/**
+ * A first pull's full 24-month window can need more pages than an
+ * incremental one; generous enough for 50,000 investment transactions at
+ * Plaid's maximum page size below, well beyond a household's real volume.
+ */
+const MAX_INVESTMENT_TRANSACTION_PAGES = 100;
+/** Plaid's documented maximum `count` per `/investments/transactions/get` page. */
 const INVESTMENT_TRANSACTIONS_PAGE_SIZE = 500;
 
 export type ItemPullResult = {
@@ -286,16 +296,19 @@ export async function pullItem(
     if (!isProductNotSupported(error)) return await failItem(pool, item, result, error);
   }
 
-  // Investment transactions for the last 30 days: skipped for the same
-  // reason holdings is, otherwise best-effort and paginated.
+  // Investment transactions: the full 24-month window Plaid allows when
+  // this item has never had investment transactions pulled, otherwise just
+  // the incremental window since the last pull (with a 7-day overlap for
+  // late postings) -- see mapping.ts's investmentTransactionsStartDate and
+  // migration 045. Skipped for the same reason holdings is, otherwise
+  // best-effort and paginated.
   if (investmentsConsented) {
     try {
       const end = asOf;
-      const start = new Date(Date.parse(`${asOf}T00:00:00Z`));
-      start.setUTCDate(
-        start.getUTCDate() - INVESTMENT_TRANSACTIONS_LOOKBACK_DAYS,
+      const startDate = investmentTransactionsStartDate(
+        item.investmentTransactionsPulledThrough,
+        asOf,
       );
-      const startDate = start.toISOString().slice(0, 10);
       let offset = 0;
       let total = Infinity;
       let pages = 0;
@@ -332,6 +345,10 @@ export async function pullItem(
         offset += response.data.investment_transactions.length;
         if (response.data.investment_transactions.length === 0) break;
       }
+      // Only reached once every page of this window was fetched without
+      // throwing: a page that fails partway through must not advance the
+      // watermark past transactions this pull never actually saw.
+      await recordInvestmentTransactionsPulledThrough(pool, item.itemId, end);
     } catch (error) {
       if (isItemLoginRequired(error)) return await failItem(pool, item, result, error);
       if (!isProductNotSupported(error)) return await failItem(pool, item, result, error);
