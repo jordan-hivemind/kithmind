@@ -1,11 +1,18 @@
-// ADM-2's institutions grouping, masking and freshness rules.
+// ADM-2's institutions grouping and masking rules, and FIN-STATUS-1's feed
+// merge (`mergeLiveAccounts`): Current value/Holdings as of from the feed
+// when an account is linked to one, and the Status column computed from the
+// feed alone. `feed-status.test.ts` covers the status rule itself, branch by
+// branch; this file covers grouping, masking, value summation and the merge
+// that wires the feed into an archive-only row.
 
+import type { admin } from "@repo/kith-store";
 import { describe, expect, test } from "vitest";
 
 import { valueIsStale } from "@/lib/kith/account-freshness";
 import {
   friendlyAccountName,
   groupInstitutions,
+  mergeLiveAccounts,
 } from "@/lib/kith/institutions";
 
 const NOW = Date.parse("2026-09-18T12:00:00Z");
@@ -31,6 +38,30 @@ function record(overrides: Record<string, unknown> = {}) {
     openReviewCount: 0,
     ...overrides,
   } as never;
+}
+
+function finAccount(
+  overrides: Partial<admin.FinAccountRow> = {},
+): admin.FinAccountRow {
+  return {
+    accountId: "fin-1",
+    archiveAccountId: null,
+    plaidAccountId: "plaid-account-1",
+    institutionName: "Example Broker",
+    accountName: "Brokerage",
+    mask: "1234",
+    type: "investment",
+    subtype: "brokerage",
+    currentBalance: null,
+    currency: "USD",
+    balanceAsOf: null,
+    balanceSource: null,
+    holdingsValue: null,
+    holdingsAsOf: null,
+    holdingsSource: null,
+    needsRelinkAt: null,
+    ...overrides,
+  };
 }
 
 describe("account names stay separate from identifiers", () => {
@@ -73,37 +104,47 @@ describe("last four", () => {
   });
 });
 
-describe("freshness on the account row", () => {
+describe("the archive-only baseline (no feed merge)", () => {
+  // `groupInstitutions` alone never sees `kith.fin_accounts`, so every row
+  // it returns is as if nothing is feed-linked: `no_feed` when the archive
+  // has a recent-enough record, `inactive` when it does not or has none at
+  // all. `cadence`/`freshnessReason`/`expectedBy` still come from
+  // `accountFreshness`, for the account drawer, and are unaffected.
   const child = (overrides: Record<string, unknown>) =>
     groupInstitutions([record(overrides)], NOW)[0]!.children![0]!;
 
-  test("nothing held is empty, not stale", () => {
-    expect(
-      child({
-        statementCount: 0,
-        recordCount: 0,
-        activityFrom: undefined,
-        activityTo: undefined,
-        latestSnapshotAsOf: undefined,
-      }).status,
-    ).toBe("empty");
+  test("nothing held is inactive, and the row is marked empty", () => {
+    const row = child({
+      statementCount: 0,
+      recordCount: 0,
+      activityFrom: undefined,
+      activityTo: undefined,
+      latestSnapshotAsOf: undefined,
+    });
+    expect(row.status).toBe("inactive");
+    expect(row.statusDetail).toBe("no archive record");
+    expect(row.empty).toBe(true);
   });
 
-  test("records with no snapshot and no balance are fresh: nothing to hold them to", () => {
+  test("a recent archive record with no feed link reads no_feed", () => {
     const row = child({ latestSnapshotAsOf: undefined });
-    expect(row.status).toBe("fresh");
+    expect(row.status).toBe("no_feed");
     expect(row.freshnessReason).toBe("no_balance");
+    expect(row.empty).toBe(false);
   });
 
-  test("a snapshot past its next month end and grace is stale, with its date", () => {
-    expect(child({ latestSnapshotAsOf: "2026-08-31" }).status).toBe("fresh");
-    const stale = child({ latestSnapshotAsOf: "2026-06-30" });
-    expect(stale.status).toBe("stale");
-    expect(stale.freshnessReason).toBe("holdings_behind");
-    expect(stale.statusDetail).toMatch(/holdings last recorded 2026-06-30/);
+  test("an old holdings snapshot never makes the Status column stale: that is a feed question now", () => {
+    expect(child({ latestSnapshotAsOf: "2026-08-31" }).status).toBe("no_feed");
+    const behind = child({ latestSnapshotAsOf: "2026-06-30" });
+    // The archive's own cadence rule still marks this account behind, for
+    // the drawer.
+    expect(behind.freshnessReason).toBe("holdings_behind");
+    // But the Status column no longer reads it: unlinked, and the archive
+    // has a record from today.
+    expect(behind.status).toBe("no_feed");
   });
 
-  test("the row carries the balance date, cadence and expectation beside the snapshot", () => {
+  test("the row still carries the balance date, cadence and expectation beside the snapshot", () => {
     const row = child({
       activityTo: "2026-08-31",
       latestSnapshotAsOf: "2026-06-30",
@@ -114,7 +155,7 @@ describe("freshness on the account row", () => {
     expect(row.latestSnapshotAsOf).toBe("2026-06-30");
     expect(row.cadence).toBe("quarterly");
     expect(row.expectedBy).toBe("2026-10-20");
-    expect(row.status).toBe("fresh");
+    expect(row.status).toBe("no_feed");
   });
 });
 
@@ -157,7 +198,7 @@ describe("the owner's overrides", () => {
     });
   });
 
-  test("closed makes an account inactive whatever its dates say, but never fills an empty one", () => {
+  test("closed makes an account inactive whatever its dates, or its own emptiness, say", () => {
     const [group] = groupInstitutions(
       [
         record(),
@@ -191,7 +232,11 @@ describe("the owner's overrides", () => {
     );
     expect(group!.children![0]!.status).toBe("inactive");
     expect(group!.children![0]!.statusDetail).toBe("marked closed");
-    expect(group!.children![1]!.status).toBe("empty");
+    // Closed wins even over an account the archive holds nothing for: there
+    // is no separate "empty" status any more, and a closed account with
+    // nothing in it is exactly as inactive as one that still is closed.
+    expect(group!.children![1]!.status).toBe("inactive");
+    expect(group!.children![1]!.empty).toBe(true);
   });
 });
 
@@ -399,7 +444,7 @@ describe("current value", () => {
       ],
       NOW,
     );
-    expect(group!.children![1]!.status).toBe("empty");
+    expect(group!.children![1]!.status).toBe("inactive");
     expect(group!.currentValue).toBe(100);
   });
 
@@ -434,10 +479,11 @@ describe("a value older than the inactivity threshold is not a current one", () 
     expect(valueIsStale(null, NOW)).toBe(false);
   });
 
-  test("an account whose balance is years old carries the flag, although it is fresh", () => {
-    // The reviewer's fixture: a 2019 balance with 2026 holdings activity. The
-    // archive is right to report the balance, and the row is right to read
-    // fresh -- the statements are recent. The figure is still seven years old.
+  test("an account whose balance is years old carries the flag, although the archive has a recent record", () => {
+    // The reviewer's fixture: a 2019 balance with 2026 holdings activity.
+    // The archive is right to report the balance, and the row is right to
+    // read `no_feed` -- there is no feed link, and the archive has a recent
+    // record. The figure itself is still seven years old, independently.
     const [group] = groupInstitutions(
       [
         record({
@@ -451,7 +497,7 @@ describe("a value older than the inactivity threshold is not a current one", () 
       NOW,
     );
     const child = group!.children![0]!;
-    expect(child.status).toBe("fresh");
+    expect(child.status).toBe("no_feed");
     expect(child.currentValue).toBe(900);
     expect(child.currentValueStale).toBe(true);
     // And the institution's own total, dated by that same figure.
@@ -512,18 +558,20 @@ describe("inactive", () => {
       activityTo: "2022-12-31",
     });
     expect(quiet.status).toBe("inactive");
+    // The archive's own reason still names it dormant, for the drawer.
     expect(quiet.freshnessReason).toBe("dormant");
-    expect(quiet.statusDetail).toMatch(/no activity since 2022-12-31/);
+    // The Status column's own tooltip names the archive's last record.
+    expect(quiet.statusDetail).toBe("no archive record since 2022-12-31");
   });
 
-  test("recent activity with an old snapshot is still stale", () => {
+  test("recent activity with an old snapshot is not a Status problem: no feed is linked", () => {
     expect(
       child({ latestSnapshotAsOf: "2022-10-31", activityTo: "2026-09-10" })
         .status,
-    ).toBe("stale");
+    ).toBe("no_feed");
   });
 
-  test("an institution of only inactive and empty accounts is inactive", () => {
+  test("an institution of only old and contentless accounts is inactive", () => {
     const [group] = groupInstitutions(
       [
         record({
@@ -587,86 +635,26 @@ describe("grouping", () => {
     ]);
   });
 
-  test("one stale account makes the group stale, although its latest snapshot is recent", () => {
+  test("an archive-only group's status is the worst of its accounts, no_feed outranking inactive", () => {
     const [group] = groupInstitutions(
       [
-        record(),
+        record(), // recent record, no feed link: no_feed
         record({
-          account: account({ accountId: "account-2", displayLabel: "IRA" }),
-          activityFrom: "2020-01-01",
-          activityTo: "2026-08-31",
-          latestSnapshotAsOf: "2024-06-30",
-        }),
-      ],
-      NOW,
-    );
-    // The group's own latest snapshot column is still the recent one.
-    expect(group!.latestSnapshotAsOf).toBe("2026-08-31");
-    expect(group!.status).toBe("stale");
-    expect(group!.statusDetail).toMatch(
-      /1 stale \(1 holdings behind\), oldest IRA/,
-    );
-  });
-
-  test("a group counts its stale accounts by reason and names the oldest", () => {
-    const [group] = groupInstitutions(
-      [
-        record(),
-        // Statements stopped: the latest balance is past its next month end.
-        record({
-          account: account({ accountId: "b", displayLabel: "Overdue" }),
-          activityTo: "2026-06-30",
-          latestSnapshotAsOf: "2026-06-30",
-          balanceDates: ["2026-06-30", "2026-05-31"],
-          latestBalanceHoldsSecurities: true,
-        }),
-        // Statements current, holdings not recorded since last year.
-        record({
-          account: account({ accountId: "c", displayLabel: "Behind" }),
-          activityTo: "2026-08-31",
-          latestSnapshotAsOf: "2025-09-30",
-          balanceDates: ["2026-08-31", "2026-07-31"],
-          latestBalanceHoldsSecurities: true,
-        }),
-        // Quarterly and current: not counted.
-        record({
-          account: account({ accountId: "d", displayLabel: "Quarterly" }),
-          activityTo: "2026-06-30",
-          latestSnapshotAsOf: "2026-06-30",
-          balanceDates: [
-            "2026-06-30",
-            "2026-03-31",
-            "2025-12-31",
-            "2025-09-30",
-          ],
-          latestBalanceHoldsSecurities: true,
-        }),
-      ],
-      NOW,
-    );
-    expect(group!.status).toBe("stale");
-    expect(group!.statusDetail).toMatch(
-      /^2 stale \(1 statement overdue, 1 holdings behind\), oldest Behind/,
-    );
-    expect(group!.latestBalanceAsOf).toBe("2026-08-31");
-    expect(group!.cadence).toBeNull();
-    expect(group!.freshnessReason).toBeNull();
-  });
-
-  test("a fresh group says how many accounts are current and how many are quiet", () => {
-    const [group] = groupInstitutions(
-      [
-        record(),
-        record({
-          account: account({ accountId: "b" }),
+          account: account({ accountId: "b", displayLabel: "Dormant" }),
           activityTo: "2022-12-31",
           latestSnapshotAsOf: "2022-10-31",
-        }),
+        }), // years quiet: inactive
       ],
       NOW,
     );
-    expect(group!.status).toBe("fresh");
-    expect(group!.statusDetail).toBe("1 current, 1 inactive");
+    expect(group!.children!.map((child) => child.status)).toEqual([
+      "no_feed",
+      "inactive",
+    ]);
+    // An unlinked account with a recent archive record is more worth a look
+    // than one gone quiet, so it outranks it for the header's own tag.
+    expect(group!.status).toBe("no_feed");
+    expect(group!.statusDetail).toBe("1 no feed, 1 inactive");
   });
 
   test("a quarterly account's quarter-end value does not make the total stale", () => {
@@ -722,7 +710,8 @@ describe("grouping", () => {
       ],
       NOW,
     );
-    expect(group!.status).toBe("empty");
+    expect(group!.status).toBe("inactive");
+    expect(group!.children![0]!.empty).toBe(true);
     expect(group!.statements).toBe(0);
     expect(group!.activityFrom).toBeNull();
   });
@@ -747,22 +736,20 @@ describe("grouping", () => {
   });
 });
 
-describe("grouping data-quality warnings", () => {
-  test("a mixed stale and review group names both problems without changing totals", () => {
+describe("valuation and reconciliation warnings never reach this screen", () => {
+  // These checks are real (`accountFreshness`'s `needs_review` branch, read
+  // by the Needs Attention screen through a separate path), but the owner
+  // retired them from Institutions. An unpriced holding or a failed
+  // reconciliation must change nothing here: not the status, not its
+  // tooltip, and not whether the account counts toward the total.
+  test("a reconciliation failure does not become a status, and its wording never appears", () => {
     const value = {
       value: { decimal: "100", currency: "USD" },
       asOf: "2026-08-31",
       source: "balance",
     };
-    const group = groupInstitutions(
+    const [group] = groupInstitutions(
       [
-        record({
-          account: account({ accountId: "old", displayLabel: "Overdue" }),
-          latestSnapshotAsOf: "2026-04-30",
-          balanceDates: ["2026-08-31"],
-          latestBalanceHoldsSecurities: true,
-          currentValue: value,
-        }),
         record({
           account: account({ accountId: "review", displayLabel: "Review" }),
           latestSnapshotAsOf: "2026-04-30",
@@ -780,22 +767,21 @@ describe("grouping data-quality warnings", () => {
         }),
       ],
       NOW,
-    )[0]!;
-    expect(group.status).toBe("stale");
-    expect(group.statusDetail).toContain("accounts need review");
-    expect(group.statusDetail).toContain(
-      "historical trade quantities do not reconcile",
     );
-    expect(group.currentValue).toBe(200);
+    const row = group!.children![0]!;
+    expect(row.status).toBe("no_feed");
+    expect(row.statusDetail).not.toContain("reconcile");
+    expect(row.statusDetail).not.toContain("valuation");
+    expect(row.currentValue).toBe(100);
   });
 
-  test("review status stays visible and never removes an account from a group value", () => {
+  test("a reviewed account still counts toward the group total and never widens the header's own status", () => {
     const value = (decimal: string) => ({
       value: { decimal, currency: "USD" },
       asOf: "2026-08-31",
       source: "balance",
     });
-    const rows = groupInstitutions(
+    const [group] = groupInstitutions(
       [
         record({
           account: account({ accountId: "quality-account" }),
@@ -819,12 +805,236 @@ describe("grouping data-quality warnings", () => {
       ],
       NOW,
     );
-    expect(rows[0]!.status).toBe("needs_review");
-    expect(rows[0]!.currentValue).toBe(300);
-    expect(rows[0]!.latestHoldingsObservedAsOf).toBe("2026-08-31");
-    expect(rows[0]!.children![0]!.latestSnapshotAsOf).toBe("2025-12-31");
-    expect(rows[0]!.statusDetail).toContain(
-      "historical trade quantities do not reconcile",
+    expect(group!.status).toBe("no_feed");
+    expect(group!.statusDetail).toBe("2 no feed");
+    expect(group!.currentValue).toBe(300);
+    expect(group!.latestHoldingsObservedAsOf).toBe("2026-08-31");
+    expect(group!.children![0]!.latestSnapshotAsOf).toBe("2025-12-31");
+  });
+});
+
+describe("feed values and status (mergeLiveAccounts)", () => {
+  test("an archive account linked to a live Plaid account shows the feed's value, dated and sourced from it", () => {
+    const [group] = groupInstitutions([record()], NOW);
+    const merged = mergeLiveAccounts(
+      [group!],
+      [
+        finAccount({
+          archiveAccountId: "account-1",
+          currentBalance: 1234.56,
+          balanceAsOf: "2026-09-17",
+          balanceSource: "plaid",
+        }),
+      ],
+      NOW,
     );
+    const child = merged[0]!.children![0]!;
+    expect(child.currentValue).toBe(1234.56);
+    expect(child.currentValueAsOf).toBe("2026-09-17");
+    expect(child.valueSource).toBe("feed");
+    expect(child.status).toBe("fresh");
+  });
+
+  test("a fin_accounts row import-archive alone created is not a feed link: the archive value stands", () => {
+    const [group] = groupInstitutions(
+      [record({ currentValue: { value: { decimal: "500", currency: "USD" }, asOf: "2026-08-31", source: "balance" } })],
+      NOW,
+    );
+    const merged = mergeLiveAccounts(
+      [group!],
+      [
+        finAccount({
+          archiveAccountId: "account-1",
+          plaidAccountId: null,
+          currentBalance: 999,
+          balanceAsOf: "2026-08-01",
+          balanceSource: "archive",
+        }),
+      ],
+      NOW,
+    );
+    const child = merged[0]!.children![0]!;
+    expect(child.currentValue).toBe(500);
+    expect(child.valueSource).toBe("statement");
+    // Still no feed link, so the same archive-only rule as `groupInstitutions`
+    // alone: a recent record with nothing linked reads `no_feed`.
+    expect(child.status).toBe("no_feed");
+  });
+
+  test("a feed snapshot older than 2 days is stale", () => {
+    const [group] = groupInstitutions([record()], NOW);
+    const merged = mergeLiveAccounts(
+      [group!],
+      [
+        finAccount({
+          archiveAccountId: "account-1",
+          currentBalance: 100,
+          balanceAsOf: "2026-09-10",
+          balanceSource: "plaid",
+        }),
+      ],
+      NOW,
+    );
+    const child = merged[0]!.children![0]!;
+    expect(child.status).toBe("stale");
+    expect(child.currentValueStale).toBe(true);
+    expect(child.statusDetail).toContain("feed last updated 2026-09-10");
+  });
+
+  test("needs_relink wins over a fresh feed snapshot", () => {
+    const [group] = groupInstitutions([record()], NOW);
+    const merged = mergeLiveAccounts(
+      [group!],
+      [
+        finAccount({
+          archiveAccountId: "account-1",
+          currentBalance: 100,
+          balanceAsOf: "2026-09-17",
+          balanceSource: "plaid",
+          needsRelinkAt: "2026-09-01T00:00:00Z",
+        }),
+      ],
+      NOW,
+    );
+    expect(merged[0]!.children![0]!.status).toBe("needs_relink");
+  });
+
+  test("archive closed wins even over a fresh feed link", () => {
+    const overrides = new Map([
+      [
+        "account-1",
+        {
+          displayName: null,
+          accountLast4: null,
+          accountType: null,
+          closed: true,
+        },
+      ],
+    ]) as never;
+    const [group] = groupInstitutions([record()], NOW, overrides);
+    const merged = mergeLiveAccounts(
+      [group!],
+      [
+        finAccount({
+          archiveAccountId: "account-1",
+          currentBalance: 100,
+          balanceAsOf: "2026-09-17",
+          balanceSource: "plaid",
+        }),
+      ],
+      NOW,
+    );
+    expect(merged[0]!.children![0]!.status).toBe("inactive");
+    expect(merged[0]!.children![0]!.statusDetail).toBe("marked closed");
+  });
+
+  test("linked but never pulled reads stale, and the archive value still shows", () => {
+    const [group] = groupInstitutions(
+      [record({ currentValue: { value: { decimal: "500", currency: "USD" }, asOf: "2026-08-31", source: "balance" } })],
+      NOW,
+    );
+    const merged = mergeLiveAccounts(
+      [group!],
+      [finAccount({ archiveAccountId: "account-1" })],
+      NOW,
+    );
+    const child = merged[0]!.children![0]!;
+    expect(child.status).toBe("stale");
+    expect(child.statusDetail).toBe("linked; no feed snapshot yet");
+    expect(child.currentValue).toBe(500);
+    expect(child.valueSource).toBe("statement");
+  });
+
+  test("an archive account unlinked and quiet for a year reads inactive, not no_feed", () => {
+    const [group] = groupInstitutions(
+      [record({ activityTo: "2022-12-31", latestSnapshotAsOf: "2022-10-31" })],
+      NOW,
+    );
+    const merged = mergeLiveAccounts([group!], [], NOW);
+    expect(merged[0]!.children![0]!.status).toBe("inactive");
+  });
+
+  test("a Plaid-only account with no archive counterpart gets its own row and is never hidden as empty", () => {
+    const merged = mergeLiveAccounts(
+      [],
+      [
+        finAccount({
+          accountId: "fin-vanguard",
+          institutionName: "Vanguard",
+          accountName: "Roth IRA",
+          currentBalance: 42000,
+          balanceAsOf: "2026-09-17",
+          balanceSource: "plaid",
+        }),
+      ],
+      NOW,
+    );
+    expect(merged).toHaveLength(1);
+    const child = merged[0]!.children![0]!;
+    expect(child.institutionName).toBe("Vanguard");
+    expect(child.currentValue).toBe(42000);
+    expect(child.valueSource).toBe("feed");
+    expect(child.status).toBe("fresh");
+    expect(child.empty).toBe(false);
+  });
+
+  test("the institution header sums the feed-updated value and takes the worst child status", () => {
+    const [group] = groupInstitutions(
+      [
+        record(),
+        record({
+          account: account({ accountId: "b" }),
+          currentValue: {
+            value: { decimal: "10", currency: "USD" },
+            asOf: "2026-08-31",
+            source: "balance",
+          },
+        }),
+      ],
+      NOW,
+    );
+    const merged = mergeLiveAccounts(
+      [group!],
+      [
+        finAccount({
+          archiveAccountId: "account-1",
+          currentBalance: 90,
+          currency: "USD",
+          balanceAsOf: "2026-09-17",
+          balanceSource: "plaid",
+          needsRelinkAt: "2026-09-01T00:00:00Z",
+        }),
+      ],
+      NOW,
+    );
+    const [header] = merged;
+    // account-1 gets a feed value (90) but needs relinking; "b" keeps its
+    // archive value (10) and is unlinked (no_feed). The header sums both
+    // and reports the worse of the two statuses.
+    expect(header!.currentValue).toBe(100);
+    expect(header!.status).toBe("needs_relink");
+    expect(header!.statusDetail).toBe("1 needs relink, 1 no feed");
+  });
+
+  test("Holdings as of follows the feed once linked, when the feed has a holdings snapshot", () => {
+    const [group] = groupInstitutions(
+      [record({ latestSnapshotAsOf: "2025-01-31" })],
+      NOW,
+    );
+    const merged = mergeLiveAccounts(
+      [group!],
+      [
+        finAccount({
+          archiveAccountId: "account-1",
+          holdingsValue: 300,
+          holdingsAsOf: "2026-09-16",
+          holdingsSource: "plaid",
+        }),
+      ],
+      NOW,
+    );
+    const child = merged[0]!.children![0]!;
+    expect(child.latestHoldingsObservedAsOf).toBe("2026-09-16");
+    expect(merged[0]!.latestHoldingsObservedAsOf).toBe("2026-09-16");
   });
 });

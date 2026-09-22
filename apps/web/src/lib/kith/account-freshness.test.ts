@@ -462,8 +462,13 @@ describe("identity and display never change freshness", () => {
       ]),
     )[0]!.children![0]!;
     for (const row of [plain, noLast4, renamed]) {
+      // `status` is no longer read from this: an archive-only account (no
+      // feed link) reads `no_feed`, from `feedStatus` in `feed-status.ts`,
+      // whatever its own statement cadence says. `freshnessReason`,
+      // `cadence` and `expectedBy` still come from `accountFreshness`, for
+      // the account drawer.
       expect(row).toMatchObject({
-        status: "fresh",
+        status: "no_feed",
         freshnessReason: "current",
         cadence: "quarterly",
         expectedBy: "2026-10-20",
