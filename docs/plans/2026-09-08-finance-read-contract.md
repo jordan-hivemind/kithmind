@@ -347,10 +347,10 @@ holding has rows referencing it. Anything the rule refuses stays an open
 `weak_instrument_match` review item, and owner confirmation through the review
 queue remains the fallback.
 
-| Change | Where | Meaning |
-| --- | --- | --- |
-| `institution_symbol` | `FinanceSnapshotInstrument.status` | The instrument was matched on a ticker symbol alone and accepted under the rule. A usable identity, and not the same fact as `resolved`. |
-| `institutionSymbolInstrumentCount` | `FinanceHoldingsSnapshotSummary` | Positions in this snapshot whose identity rests on the rule. Required, and counted apart from both other totals. |
+| Change                             | Where                              | Meaning                                                                                                                                  |
+| ---------------------------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `institution_symbol`               | `FinanceSnapshotInstrument.status` | The instrument was matched on a ticker symbol alone and accepted under the rule. A usable identity, and not the same fact as `resolved`. |
+| `institutionSymbolInstrumentCount` | `FinanceHoldingsSnapshotSummary`   | Positions in this snapshot whose identity rests on the rule. Required, and counted apart from both other totals.                         |
 
 Compatibility rules for existing clients:
 
@@ -410,8 +410,20 @@ complete scope evidence, and explicit removal and empty-scope authority. A
 positive source-stated zero can remove the last selected position. Old
 assertions remain available to evidence lookups, while position reconciliation
 is recomputed for instruments present in either the old or corrected selected
-set. A stale approval, unrepresented foreign row, semantic mismatch or changed
-canonical set refuses the entire transaction.
+set. A scoped correction replaces only rows owned by the selected source. It
+preserves unrelated foreign-owned rows even when that source's complete proof
+does not name them. The immutable source proof remains inexact, and reads stay
+blocked, until the other source corrections converge on the same complete
+canonical set. If the candidate does name a foreign hash, every stored semantic
+field must still match and ownership never moves. A stale approval, cited
+foreign semantic mismatch or changed canonical set refuses the entire
+transaction.
+
+Parser proof changes are also immutable projection changes. A parser replay
+that would change an existing generation's proof payload refuses the replay by
+design. The supported repair is to prepare, review and publish a new scoped or
+whole-document generation bound to the retained bytes and exact prior state.
+Operators do not loop ordinary reparses to try to mutate an active proof.
 
 The generated note `Market Value|NAV column of the <SECTION> holdings table`
 records two different things. The column label states the valuation basis; the
