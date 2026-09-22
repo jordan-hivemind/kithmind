@@ -28,6 +28,7 @@ import {
   insertParsedDocuments,
   insertParsedEvidence,
   insertParsedPages,
+  parseSourceTextRepresentation,
   sealParsedPayload,
   setSourceItemFailure,
   verifySealedParsedPayload,
@@ -199,7 +200,8 @@ async function loadParsedJob(
     job.spaceId !== source.spaceId ||
     job.sourceAccountId !== source.account.id ||
     job.workerManaged !== true ||
-    job.workerProcessingMode !== "parsed_pages_v1" ||
+    (job.workerProcessingMode !== "parsed_pages_v1" &&
+      job.workerProcessingMode !== "targeted_pages_v1") ||
     !job.workerDiscoveryWorkId ||
     !Number.isSafeInteger(job.leaseEpoch) ||
     job.leaseEpoch < 0 ||
@@ -228,15 +230,56 @@ async function loadParsedJob(
     generation.desiredProcessingEpoch === null
   )
     workerProtocolError("scan_conflict");
-  await validateAdmittedArchiveChain(ctx, source, current, {
-    sourceRevisionId: job.sourceRevisionId,
-    parserArtifactId: generation.parserArtifactId,
-    sourceTextVersionId: generation.sourceTextVersionId,
-    processingGenerationId: generation.id,
-    ingestJobId: job.id,
-    desiredProcessingEpoch: job.desiredProcessingEpoch,
-    archiveSetDigest: generation.archiveSetDigest,
-  });
+  if (job.targetedExtractionId === null) {
+    await validateAdmittedArchiveChain(ctx, source, current, {
+      sourceRevisionId: job.sourceRevisionId,
+      parserArtifactId: generation.parserArtifactId,
+      sourceTextVersionId: generation.sourceTextVersionId,
+      processingGenerationId: generation.id,
+      ingestJobId: job.id,
+      desiredProcessingEpoch: job.desiredProcessingEpoch,
+      archiveSetDigest: generation.archiveSetDigest,
+    });
+  } else {
+    const target = await row<Record<string, unknown>>(
+      ctx,
+      `SELECT t.batches, i.desired_revision_id, i.lifecycle
+         FROM kith.document_targeted_extractions t
+         JOIN kith.source_items i
+           ON i.id=t.source_item_id AND i.space_id=t.space_id
+        WHERE t.id=$1 AND t.space_id=$2 AND t.source_account_id=$3
+          AND t.source_item_id=$4 AND t.source_revision_id=$5
+        FOR UPDATE OF t,i`,
+      [
+        job.targetedExtractionId,
+        source.spaceId,
+        source.account.id,
+        job.sourceItemId,
+        job.sourceRevisionId,
+      ],
+    );
+    const batches = target?.batches;
+    const selected = Array.isArray(batches)
+      ? batches.find(
+          (batch) =>
+            batch &&
+            typeof batch === "object" &&
+            Number((batch as Record<string, unknown>).ordinal) ===
+              job.targetedBatchOrdinal,
+        ) as Record<string, unknown> | undefined
+      : undefined;
+    if (
+      job.workerProcessingMode !== "targeted_pages_v1" ||
+      job.targetedBatchOrdinal === null ||
+      !target ||
+      target.lifecycle !== "available" ||
+      target.desired_revision_id !== job.sourceRevisionId ||
+      !selected ||
+      selected.processingGenerationId !== generation.id ||
+      selected.sourceTextVersionId !== generation.sourceTextVersionId ||
+      !["admitted", "pending", "extracted"].includes(String(selected.state))
+    ) workerProtocolError("stale_observation");
+  }
   const revisionRaw = await row<Record<string, unknown>>(
     ctx,
     "SELECT * FROM kith.source_revisions WHERE id = $1",
@@ -254,6 +297,11 @@ async function loadParsedJob(
   );
   if (!revisionRaw || !artifactRaw || !textRaw)
     workerProtocolError("scan_conflict");
+  const text = camelizeSourceTextVersion(textRaw);
+  if (
+    job.workerProcessingMode === "targeted_pages_v1" &&
+    parseSourceTextRepresentation(text).kind !== "targeted_pages_v1"
+  ) workerProtocolError("scan_conflict");
   return {
     source,
     current,
@@ -261,7 +309,7 @@ async function loadParsedJob(
     generation,
     revision: camelizeSourceRevision(revisionRaw),
     artifact: camelizeSourceParserArtifact(artifactRaw),
-    text: camelizeSourceTextVersion(textRaw),
+    text,
   };
 }
 
@@ -1545,6 +1593,8 @@ export async function activateParsedJob(
   );
   if (identity.prior) {
     const loaded = await loadParsedJob(ctx, source, identity.jobId);
+    if (parseSourceTextRepresentation(loaded.text).kind === "targeted_pages_v1")
+      workerProtocolError("scan_conflict");
     validateReceiptParents(loaded, identity.prior);
     if (
       identity.prior.phase !== "completed" ||
@@ -1569,6 +1619,8 @@ export async function activateParsedJob(
     };
   }
   const loaded = await loadParsedJob(ctx, source, identity.jobId);
+  if (parseSourceTextRepresentation(loaded.text).kind === "targeted_pages_v1")
+    workerProtocolError("scan_conflict");
   requireLease(loaded, request, ctx.now);
   if (
     loaded.job.state !== "staged" ||

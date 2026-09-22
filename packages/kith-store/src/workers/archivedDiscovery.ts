@@ -30,6 +30,7 @@ import {
   loadProviderOriginalBinding,
   loadProviderOriginalReference,
   parseSourceRevisionRepresentation,
+  sameTargetedPagesCoverage,
   parseSourceTextRepresentation,
   requireIndependentArchivePair,
   setDesiredSourceRevision,
@@ -454,7 +455,9 @@ export async function validateAdmittedArchiveChain(
   }
   if (
     parsedRevision!.kind !== "archived_binary_v1" ||
-    parsedText!.kind !== "parsed_pages_v1" ||
+    (ids.parsedText !== undefined &&
+      parsedText!.kind !==
+        (ids.parsedText.representation ?? "parsed_pages_v1")) ||
     revision.spaceId !== source.spaceId ||
     revision.sourceItemId !== current.item.id ||
     revision.contentHashAuthority !== "worker_asserted" ||
@@ -492,7 +495,10 @@ export async function validateAdmittedArchiveChain(
     job.admittedByUserId !== current.work.actorUserId ||
     job.admittedByCredentialId !== current.work.actorCredentialId ||
     job.workerManaged !== true ||
-    job.workerProcessingMode !== "parsed_pages_v1" ||
+    job.workerProcessingMode !==
+      (parsedText!.kind === "targeted_pages_v1"
+        ? "targeted_pages_v1"
+        : "parsed_pages_v1") ||
     job.workerDiscoveryWorkId !== current.work.id ||
     job.workerObservationEpoch !== current.work.observationEpoch ||
     current.item.desiredRevisionId !== revision.id ||
@@ -503,6 +509,16 @@ export async function validateAdmittedArchiveChain(
     current.work.ingestJobId !== job.id
   )
     workerProtocolError("scan_conflict");
+  const targetedCoverage =
+    ids.parsedText?.targetedCoverage ?? text.targetedCoverage ?? undefined;
+  if (
+    (parsedText!.kind === "targeted_pages_v1") !==
+      (targetedCoverage !== undefined) ||
+    (targetedCoverage !== undefined &&
+      (targetedCoverage.sourceSha256 !== current.work.contentHash ||
+        targetedCoverage.originalPages.length !== text.pageCount ||
+        !sameTargetedPagesCoverage(text.targetedCoverage, targetedCoverage)))
+  ) workerProtocolError("scan_conflict");
   if (
     ids.parsedText !== undefined &&
     (text.extractionFingerprint !== ids.parsedText.extractionFingerprint ||
@@ -1255,7 +1271,7 @@ export async function lookupArchivedAdmission(
     workerProtocolError("request_conflict");
   }
   if (
-    textRepresentation!.kind !== "parsed_pages_v1" ||
+    textRepresentation!.kind !== (lookup.parsedText.representation ?? "parsed_pages_v1") ||
     text.spaceId !== source.spaceId ||
     text.parserArtifactId !== artifact.id ||
     text.textHash !== lookup.parsedText.textHash ||
@@ -1265,6 +1281,11 @@ export async function lookupArchivedAdmission(
     text.mappingManifestHash !== lookup.parsedText.mappingManifestHash
   )
     workerProtocolError("request_conflict");
+  if (
+    lookup.parsedText.targetedCoverage !== undefined &&
+    (lookup.parsedText.targetedCoverage.sourceSha256 !== current.work.contentHash ||
+      lookup.parsedText.targetedCoverage.originalPages.length !== text.pageCount)
+  ) workerProtocolError("request_conflict");
   const processingFingerprint = await digestProcessingConfiguration({
     extractionFingerprint: lookup.parsedText.extractionFingerprint,
     extractorFingerprint: current.work.extractorFingerprint,
@@ -1370,6 +1391,8 @@ async function resolveParserArtifact(
       sourceRevisionId: revision.id,
       clientArtifactId: request.parserArtifact.clientArtifactId,
       parserFingerprint: current.work.parserFingerprint!,
+      targetedSelectionFingerprint:
+        request.parsedText.targetedCoverage?.artifactFingerprint,
       outputHash: request.parserArtifact.outputHash,
       outputByteLength: request.parserArtifact.outputByteLength,
       outputMediaType: request.parserArtifact.outputMediaType,
@@ -1391,6 +1414,8 @@ async function resolveParserArtifact(
     artifact.sourceItemId !== current.item.id ||
     artifact.sourceRevisionId !== revision.id ||
     artifact.parserFingerprint !== current.work.parserFingerprint ||
+    artifact.targetedSelectionFingerprint !==
+      (request.parsedText.targetedCoverage?.artifactFingerprint ?? null) ||
     artifact.outputMediaType !== expectedOutputMediaType
   )
     workerProtocolError("stale_observation");
@@ -1617,7 +1642,7 @@ async function createArchivedIngestWork(
       desired_processing_epoch, state, attempts, lease_epoch, worker_managed,
       worker_discovery_work_id, worker_observation_epoch, worker_processing_mode)
      VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$7,$8,$9,
-      'queued',0,0,true,$10,$11,'parsed_pages_v1')`,
+      'queued',0,0,true,$10,$11,$12)`,
     [
       ingestJobId,
       source.spaceId,
@@ -1630,6 +1655,9 @@ async function createArchivedIngestWork(
       desiredProcessingEpoch,
       current.work.id,
       current.work.observationEpoch,
+      input.parsedText.representation === "targeted_pages_v1"
+        ? "targeted_pages_v1"
+        : "parsed_pages_v1",
     ],
   );
   const generation = await loadGeneration(ctx, processingGenerationId);
@@ -1828,6 +1856,14 @@ export async function admitArchivedDiscovery(
     );
     if (request.parsedText.extractionFingerprint !== expectedExtraction)
       workerProtocolError("stale_observation");
+    const targetedCoverage = request.parsedText.targetedCoverage;
+    if (
+      (request.parsedText.representation === "targeted_pages_v1") !==
+        (targetedCoverage !== undefined) ||
+      (targetedCoverage !== undefined &&
+        (targetedCoverage.sourceSha256 !== current.work.contentHash ||
+          targetedCoverage.originalPages.length !== request.parsedText.pageCount))
+    ) workerProtocolError("request_conflict");
     const selections: BoundArchive[] = [];
     for (const selection of request.archives) {
       selections.push(
@@ -1939,6 +1975,8 @@ export async function admitArchivedDiscovery(
       utf16Length: request.parsedText.utf16Length,
       pageCount: request.parsedText.pageCount,
       mappingManifestHash: request.parsedText.mappingManifestHash,
+      representation: request.parsedText.representation,
+      targetedCoverage: request.parsedText.targetedCoverage,
     });
     const admitted = await createArchivedIngestWork(ctx, source, current, {
       revision,

@@ -8,6 +8,8 @@
 // also has -- those are named `createdAtField` here, matching the `_field`
 // suffix `packages/kith-migrate/src/schema.ts` gives the same collision.
 
+import type { TargetedPagesCoverage } from "@repo/worker-protocol";
+
 import { camelize } from "./sql.js";
 
 export type SourceLifecycle =
@@ -84,7 +86,12 @@ export type SourceTextVersionRow = {
   createdAt: Date;
   sourceRevisionId: string;
   extractionFingerprint: string;
-  representation: "inline_text_v1" | "parsed_pages_v1" | null;
+  representation:
+    | "inline_text_v1"
+    | "parsed_pages_v1"
+    | "targeted_pages_v1"
+    | null;
+  targetedCoverage: TargetedPagesCoverage | null;
   text: string | null;
   textHash: string;
   textHashAuthority: "server_verified_retained_text" | null;
@@ -231,6 +238,7 @@ export type SourceParserArtifactRow = {
   sourceRevisionId: string;
   clientArtifactId: string;
   parserFingerprint: string;
+  targetedSelectionFingerprint: string | null;
   outputHash: string;
   outputByteLength: number;
   outputMediaType: string;

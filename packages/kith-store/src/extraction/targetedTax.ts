@@ -152,7 +152,10 @@ export function detectTargetedTaxFormFamily(
 
 type Loaded = {
   target: TargetedTaxRow;
-  batch: TargetedTaxBatchManifest & { sourceTextVersionId: string };
+  batch: TargetedTaxBatchManifest & {
+    sourceTextVersionId: string;
+    coverage: NonNullable<TargetedTaxBatchManifest["coverage"]>;
+  };
   pages: Array<{
     sourcePageId: string;
     originalPage: number;
@@ -202,7 +205,8 @@ async function load(
   if (
     !batch ||
     batch.sourceTextVersionId === null ||
-    batch.state === "extracted" ||
+    batch.coverage === null ||
+    batch.state !== "pending" ||
     target.status === "conflict"
   ) return null;
   const current = (
@@ -230,7 +234,7 @@ async function load(
   }
   const pages = pageRows.map((page) => ({
     sourcePageId: String(page.id),
-    originalPage: Number(page.ordinal) + 1,
+    originalPage: 0,
     text: String(page.text),
     textHash: String(page.text_hash),
   }));
@@ -238,15 +242,20 @@ async function load(
     const manifest = batch.pages[index];
     if (
       !manifest ||
+      Number(pageRows[index]!.ordinal) !== index ||
       page.sourcePageId !== manifest.sourcePageId ||
-      page.originalPage !== manifest.originalPage ||
       page.textHash !== manifest.textHash ||
       sha256(page.text) !== page.textHash
     ) throw new TerminalDeferredWorkError("targeted_tax_batch_invalid");
+    page.originalPage = manifest.originalPage;
   }
   return {
     target,
-    batch: { ...batch, sourceTextVersionId: batch.sourceTextVersionId },
+    batch: {
+      ...batch,
+      sourceTextVersionId: batch.sourceTextVersionId,
+      coverage: batch.coverage,
+    },
     pages,
   };
 }
@@ -421,8 +430,8 @@ async function storeReading(
     ? ["tax_year", "return_version"]
     : ["tax_year", "form_family"];
   const coverageClosed =
-    currentBatch.coverage.requestedRegionsClosed &&
-    currentBatch.coverage.continuationsClosed &&
+    loaded.batch.coverage.requestedRegionsClosed &&
+    loaded.batch.coverage.continuationsClosed &&
     identityFields.every((field) => cited.has(field));
   const status = conflict
     ? "conflict"
@@ -434,8 +443,8 @@ async function storeReading(
     : [
         ...(preconditionCode ? [preconditionCode] : []),
         ...unresolvedFields.map((field) => `missing_required:${field}`),
-        ...(!currentBatch.coverage.requestedRegionsClosed ? ["requested_regions_open"] : []),
-        ...(!currentBatch.coverage.continuationsClosed ? ["continuations_open"] : []),
+        ...(!loaded.batch.coverage.requestedRegionsClosed ? ["requested_regions_open"] : []),
+        ...(!loaded.batch.coverage.continuationsClosed ? ["continuations_open"] : []),
         ...identityFields.filter((field) => !cited.has(field)).map((field) => `missing_identity:${field}`),
       ];
   await client.query(

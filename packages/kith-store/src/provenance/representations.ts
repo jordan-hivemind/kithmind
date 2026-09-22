@@ -88,6 +88,7 @@ export type ParsedSourceTextRepresentation =
     }
   | {
       kind: "targeted_pages_v1";
+      parserArtifactId: string;
       utf16Length: number;
       pageCount: number;
       mappingManifestHash: string;
@@ -343,7 +344,8 @@ export function parseSourceTextRepresentation(
       (typeof value.parserArtifactId !== "string" ||
         value.parserArtifactId.length === 0)) ||
     (value.representation === "targeted_pages_v1" &&
-      value.parserArtifactId != null) ||
+      (typeof value.parserArtifactId !== "string" ||
+        value.parserArtifactId.length === 0)) ||
     value.utf16Length == null ||
     value.pageCount == null ||
     value.mappingManifestHash == null
@@ -385,7 +387,7 @@ export function parseSourceTextRepresentation(
   };
   return value.representation === "parsed_pages_v1"
     ? { kind: "parsed_pages_v1", parserArtifactId: value.parserArtifactId!, ...common }
-    : { kind: "targeted_pages_v1", ...common };
+    : { kind: "targeted_pages_v1", parserArtifactId: value.parserArtifactId!, ...common };
 }
 
 export function requireInlineSourceTextVersion(
