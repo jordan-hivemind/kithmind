@@ -53,6 +53,10 @@ import {
   INSTITUTION_SYMBOL_RULE,
   type InstitutionSymbolRefusalReason,
 } from "./instrumentMatch.js";
+import {
+  instrumentDescriptorSha256,
+  normalizeInstrumentDescriptor,
+} from "./instrumentIdentitySplit.js";
 import { toMinorUnits } from "./money.js";
 import { toNumericText } from "./pgNumeric.js";
 import {
@@ -265,7 +269,7 @@ type InstrumentRow = {
 
 type InstrumentResolver = {
   /** The rules above, against rows already in memory. */
-  resolve(instrument: ParsedInstrument): string;
+  resolve(instrument: ParsedInstrument, accountId?: string): string;
   /** Rows `resolve` minted, in the order it minted them. */
   readonly created: unknown[][];
   /**
@@ -345,6 +349,83 @@ async function prefetchInstruments(
       ],
     );
     rows.push(...found.rows);
+  }
+
+  // FIN-IDENTITY-SPLIT-1. Exact-name matching remains deliberately absent
+  // from ordinary resolution. Only a durable operator-approved binding may
+  // connect a name-only descriptor to an identifier-backed instrument, and
+  // it is scoped to the account that the retained holding named.
+  const normalizedNames = new Map(
+    namesOnly.map((name) => [instrumentDescriptorSha256(name), normalizeInstrumentDescriptor(name)]),
+  );
+  const approvedBindings = new Map<string, InstrumentRow>();
+  if (institutionId !== null && normalizedNames.size > 0) {
+    const found = await client.query<
+      InstrumentRow & {
+        account_id: string;
+        descriptor_sha256: string;
+        identifier_sources: string;
+        same_institution_sources: string;
+      }
+    >(
+      `SELECT b.account_id, b.descriptor_sha256,
+              i.id, i.symbol, i.cusip, i.isin, i.name,
+              (SELECT count(*)::text FROM instrument_identifier_sources s
+                WHERE s.instrument_id = i.id) AS identifier_sources,
+              (SELECT count(*)::text FROM instrument_identifier_sources s
+                WHERE s.instrument_id = i.id AND s.institution_id = b.institution_id)
+                AS same_institution_sources
+         FROM instrument_descriptor_bindings b
+         JOIN instruments i ON i.id = b.matched_instrument_id
+        WHERE b.institution_id = $1
+          AND b.descriptor_sha256 = ANY($2::text[])`,
+      [institutionId, [...normalizedNames.keys()]],
+    );
+    for (const binding of found.rows) {
+      if (
+        (binding.cusip === null && binding.isin === null) ||
+        binding.identifier_sources !== "1" ||
+        binding.same_institution_sources !== "1"
+      ) {
+        throw new Error(
+          "approved instrument descriptor binding lost its unique same-institution strong identity",
+        );
+      }
+      const descriptor = normalizedNames.get(binding.descriptor_sha256);
+      if (descriptor === undefined) continue;
+      const competing = await client.query<{ n: string }>(
+        `SELECT count(DISTINCT t.instrument_id)::text AS n
+           FROM transactions t
+           JOIN instruments i ON i.id = t.instrument_id
+           JOIN instrument_identifier_sources s
+             ON s.instrument_id = i.id AND s.institution_id = $3
+          WHERE t.account_id = $1
+            AND t.instrument_id <> $2
+            AND (i.cusip IS NOT NULL OR i.isin IS NOT NULL)
+            AND (
+              lower(regexp_replace(btrim(coalesce(i.name, '')), '[[:space:]]+', ' ', 'g')) = $4
+              OR lower(regexp_replace(btrim(coalesce(t.description, '')), '[[:space:]]+', ' ', 'g')) = $4
+            )`,
+        [binding.account_id, binding.id, institutionId, descriptor],
+      );
+      if (competing.rows[0]?.n !== "0") {
+        throw new Error(
+          "approved instrument descriptor binding now has a competing identifier-backed instrument",
+        );
+      }
+      const instrument = {
+        id: binding.id,
+        symbol: binding.symbol,
+        cusip: binding.cusip,
+        isin: binding.isin,
+        name: binding.name,
+      };
+      if (!rows.some((row) => row.id === instrument.id)) rows.push(instrument);
+      approvedBindings.set(
+        `${binding.account_id}\0${binding.descriptor_sha256}`,
+        instrument,
+      );
+    }
   }
 
   // F1-76 phase 3. Which institutions have ever stated a cusip or an isin for
@@ -512,7 +593,7 @@ async function prefetchInstruments(
     created,
     namesLearned,
     identifierStated,
-    resolve(instrument) {
+    resolve(instrument, accountId) {
       if (instrument.cusip) {
         const found = rows.find((row) => row.cusip === instrument.cusip);
         if (!found) {
@@ -627,6 +708,12 @@ async function prefetchInstruments(
         !instrument.symbol &&
         instrument.name
       ) {
+        if (accountId !== undefined) {
+          const approved = approvedBindings.get(
+            `${accountId}\0${instrumentDescriptorSha256(instrument.name)}`,
+          );
+          if (approved !== undefined) return approved.id;
+        }
         const found = rows.find(
           (row) =>
             row.cusip === null &&
@@ -1065,7 +1152,7 @@ function parsedRowToImportRow(
     activityType: row.activityType,
     description: row.description,
     instrumentId:
-      row.instrument === null ? null : resolver.resolve(row.instrument),
+      row.instrument === null ? null : resolver.resolve(row.instrument, accountId),
     quantity: classified.quantity,
     price: row.price,
     amountText: classified.amount,
@@ -1108,7 +1195,7 @@ function parsedPositionToImportPosition(
     instrumentId:
       position.instrument === null
         ? null
-        : resolver.resolve(position.instrument),
+        : resolver.resolve(position.instrument, accountId),
     quantity: position.quantity,
     price: position.price,
     marketValueText: position.marketValue,
