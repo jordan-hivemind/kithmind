@@ -703,6 +703,8 @@ export type BalanceScopeEvidence = {
   /** Required because this proof never falls back to the pull's account. */
   readonly account: FieldLocator;
   readonly header?: FieldLocator;
+  /** The source span that states this scope's exact `asOf` date. */
+  readonly asOf?: FieldLocator;
   readonly row?: FieldLocator;
   readonly totalValue?: FieldLocator;
   readonly scopeEnd?: FieldLocator;

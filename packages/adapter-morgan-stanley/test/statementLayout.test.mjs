@@ -1083,8 +1083,9 @@ test("a consolidated statement proves each account balance from exact bounded so
       );
     }
     assert.match(scope.evidence.header.binding.quote, /BALANCE SHEET/);
+    assert.match(scope.evidence.asOf.binding.quote, /as of 03\/31\/26/);
     assert.match(scope.evidence.row.binding.quote, /^TOTAL VALUE/);
-    assert.match(scope.evidence.scopeEnd.binding.quote, /^HOLDINGS/);
+    assert.match(scope.evidence.scopeEnd.binding.quote, /^TOTAL VALUE/);
   }
 });
 
@@ -1142,6 +1143,24 @@ test("two TOTAL VALUE rows never become a complete one-row balance proof", () =>
   assert.deepEqual(parsed.holdings.balanceScopes[0].gapCodes, [
     "multiple_balance_rows",
   ]);
+});
+
+test("a later unreadable balance section prevents a complete selector from disappearing", () => {
+  const text = CONSOLIDATED_LAYOUT_TEXT.replace(
+    "        HOLDINGS",
+    [
+      "        BALANCE SHEET",
+      "        unsupported replacement section with no date or total",
+      "        HOLDINGS",
+    ].join("\n"),
+  );
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.balances.length, 2);
+  assert.deepEqual(
+    parsed.holdings.balanceScopes.map((scope) => scope.accountExternalKey),
+    [CONSOLIDATED_ACCOUNT_TWO],
+    "no arbitrary complete scope survives two observed sections for account one",
+  );
 });
 
 test("a consolidated statement attributes each position to the account whose pages it was printed under", () => {
@@ -1760,6 +1779,27 @@ test("an explicitly account-bound source statement of none proves a zero balance
   );
   assert.equal(scope.evidence.explicitNone.binding.quote, "—");
   assert.equal(scope.evidence.scopeEnd.binding.quote, "Account Summary");
+});
+
+test("a cover banner cannot borrow an amount from the next account or page", () => {
+  const text = [
+    [
+      "        Page 1 of 2",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Synthetic Household",
+      "        TOTAL VALUE OF YOUR ACCOUNT",
+    ].join("\n"),
+    [
+      "        Page 2 of 2",
+      CONSOLIDATED_ACCOUNT_TWO,
+      "        $74,310.25",
+      "        Account Summary",
+    ].join("\n"),
+  ].join(`\n${PAGE_SEPARATOR}\n`);
+  const parsed = parseStatementLines(text, kind);
+  assert.deepEqual(parsed.holdings.balances, []);
+  assert.equal(parsed.holdings.balanceScopes, undefined);
 });
 
 test("an account holding nothing says so, and is not a statement left unparsed", () => {

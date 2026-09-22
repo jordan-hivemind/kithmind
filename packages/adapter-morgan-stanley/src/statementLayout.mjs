@@ -347,6 +347,13 @@ function resolvePeriod(lines) {
   return null;
 }
 
+function statementPeriodLocator(lines, kind, textMeta) {
+  const line = lines.find(({ text }) => PERIOD_LINE.test(text));
+  return line === undefined
+    ? null
+    : lineSpanLocator(line, kind, "statement period", textMeta);
+}
+
 /** "(as of 03/31/26)" -> "2026-03-31". Two-digit years on this layout are
  * always 20xx: the provider retains seven years, so 19xx cannot occur. */
 function resolveAsOf(text) {
@@ -384,7 +391,10 @@ function balanceSheetWindow(lines, anchorIndex, kind, textMeta) {
   for (let i = anchorIndex + 1; i < maximum; i += 1) {
     const line = lines[i];
     if (line.page !== anchorPage) {
-      return { endExclusive: i, scopeEnd: null };
+      return {
+        endExclusive: i,
+        scopeEnd: null,
+      };
     }
     const isAccount = BARE_ACCOUNT_LINE.test(line.text);
     const isBalance = BALANCE_SHEET_ANCHOR.test(line.text);
@@ -517,6 +527,15 @@ function parseBalanceSheet(
   );
   const cash = read(rows.cash, "thisPeriod", "BALANCE SHEET / Cash");
   const asOf = resolveAsOf(columns[1].text);
+  const asOfLocator = spanLocator(
+    kind,
+    headerLine.page,
+    "BALANCE SHEET / This Period as of",
+    textMeta,
+    headerLine.start + columns[1].start,
+    headerLine.start + columns[1].end,
+    columns[1].text,
+  );
   const rowLocator = locator(kind, page, "BALANCE SHEET / TOTAL VALUE");
   const accountLocator = accountSpanLocator(
     lines,
@@ -525,19 +544,6 @@ function parseBalanceSheet(
     kind,
     textMeta,
   );
-  const finalEvidence = finalPageEvidence(
-    lines,
-    kind,
-    textMeta,
-    printedByPage,
-    populatedPages,
-  );
-  const scopeEnd =
-    window.scopeEnd ??
-    (finalEvidence !== null &&
-    finalEvidence.lineIndex >= rows.totalValue.lineIndex
-      ? finalEvidence
-      : null);
   const headerLocator = lineSpanLocator(
     lines[anchorIndex],
     kind,
@@ -550,6 +556,28 @@ function parseBalanceSheet(
     "BALANCE SHEET / TOTAL VALUE row",
     textMeta,
   );
+  // TOTAL VALUE is the provider's terminal balance row. Proving it terminal
+  // still requires scanning the rest of this physical account section: a
+  // later TOTAL VALUE or BALANCE SHEET must not disappear merely because row
+  // parsing retains its historical fixed-size window.
+  let laterTotalRows = 0;
+  for (let i = rows.totalValue.lineIndex + 1; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (
+      line.page !== page ||
+      BARE_ACCOUNT_LINE.test(line.text) ||
+      BALANCE_SHEET_ANCHOR.test(line.text) ||
+      BALANCE_SCOPE_BOUNDARY.test(line.text)
+    ) {
+      break;
+    }
+    if (BALANCE_ROWS.totalValue.test(line.text.trim())) laterTotalRows += 1;
+  }
+  const totalRowCount = (rowCounts.totalValue ?? 0) + laterTotalRows;
+  const scopeEnd =
+    total.value !== null && totalRowCount === 1
+      ? { lineIndex: rows.totalValue.lineIndex, locator: totalRowLocator }
+      : window.scopeEnd;
 
   const balance = {
     sourceDocument: "statement",
@@ -608,14 +636,14 @@ function parseBalanceSheet(
     const evidence = {
       account: accountLocator,
       header: headerLocator,
+      asOf: asOfLocator,
       row: totalRowLocator,
       ...(total.locator === null ? {} : { totalValue: total.locator }),
       ...(scopeEnd === null ? {} : { scopeEnd: scopeEnd.locator }),
     };
     const gapCodes = new Set();
     if (total.value === null) gapCodes.add("missing_total_value");
-    if ((rowCounts.totalValue ?? 0) !== 1)
-      gapCodes.add("multiple_balance_rows");
+    if (totalRowCount !== 1) gapCodes.add("multiple_balance_rows");
     if (scopeEnd === null) gapCodes.add("unbounded_account_scope");
     if (
       !balanceEvidenceHasAnchoredPages(evidence, printedByPage, populatedPages)
@@ -648,6 +676,50 @@ function parseBalanceSheet(
  */
 const TOTAL_VALUE_BANNER = /TOTAL VALUE OF\s+\S+\s+ACCOUNT\b/;
 
+function balanceBannerScopeEnd(
+  lines,
+  rowIndex,
+  kind,
+  textMeta,
+  printedByPage,
+  populatedPages,
+) {
+  const page = lines[rowIndex].page;
+  const maximum = Math.min(lines.length, rowIndex + BALANCE_BLOCK_LINES);
+  for (let i = rowIndex + 1; i < maximum; i += 1) {
+    const line = lines[i];
+    if (line.page !== page) return null;
+    const isAccount = BARE_ACCOUNT_LINE.test(line.text);
+    const isBalance = BALANCE_SHEET_ANCHOR.test(line.text);
+    const isSection = BALANCE_SCOPE_BOUNDARY.test(line.text);
+    if (!isAccount && !isBalance && !isSection) continue;
+    return {
+      lineIndex: i,
+      locator: lineSpanLocator(
+        line,
+        kind,
+        isAccount
+          ? "next account boundary"
+          : isBalance
+            ? "next balance sheet boundary"
+            : "balance section boundary",
+        textMeta,
+      ),
+    };
+  }
+  if (maximum !== lines.length) return null;
+  const finalEvidence = finalPageEvidence(
+    lines,
+    kind,
+    textMeta,
+    printedByPage,
+    populatedPages,
+  );
+  return finalEvidence !== null && finalEvidence.lineIndex >= rowIndex
+    ? finalEvidence
+    : null;
+}
+
 /**
  * `{ balance }` when the banner states an amount, `{ statedNone: true }` when
  * it states the em dash this layout prints for "none" (an account holding
@@ -661,17 +733,29 @@ function parseTotalValueBanner(
   accountKeys,
   markerLines,
   textMeta,
+  periodLocator,
   printedByPage,
   populatedPages,
 ) {
   const anchor = lines.findIndex(({ text }) => TOTAL_VALUE_BANNER.test(text));
   if (anchor === -1) return null;
-  for (const [offset, line] of lines.slice(anchor + 1, anchor + 3).entries()) {
+  const anchorPage = lines[anchor].page;
+  const accountKey = accountKeys[anchor];
+  for (let rowIndex = anchor + 1; rowIndex < anchor + 3; rowIndex += 1) {
+    const line = lines[rowIndex];
+    if (line === undefined) break;
+    if (
+      line.page !== anchorPage ||
+      accountKeys[rowIndex] !== accountKey ||
+      BARE_ACCOUNT_LINE.test(line.text) ||
+      BALANCE_SHEET_ANCHOR.test(line.text) ||
+      BALANCE_SCOPE_BOUNDARY.test(line.text)
+    ) {
+      break;
+    }
     const cells = splitCells(line.text);
     if (cells.length !== 1) continue;
     const cell = cells[0];
-    const rowIndex = anchor + 1 + offset;
-    const accountKey = accountKeys[anchor];
     const accountLocator = accountSpanLocator(
       lines,
       markerLines,
@@ -679,31 +763,14 @@ function parseTotalValueBanner(
       kind,
       textMeta,
     );
-    const boundaryIndex = lines.findIndex(
-      ({ text }, index) =>
-        index > rowIndex && BALANCE_SCOPE_BOUNDARY.test(text),
-    );
-    const finalEvidence = finalPageEvidence(
+    const scopeEnd = balanceBannerScopeEnd(
       lines,
+      rowIndex,
       kind,
       textMeta,
       printedByPage,
       populatedPages,
     );
-    const scopeEnd =
-      boundaryIndex !== -1
-        ? {
-            lineIndex: boundaryIndex,
-            locator: lineSpanLocator(
-              lines[boundaryIndex],
-              kind,
-              "balance section boundary",
-              textMeta,
-            ),
-          }
-        : finalEvidence !== null && finalEvidence.lineIndex >= rowIndex
-          ? finalEvidence
-          : null;
     const scopeFor = ({ count, amountLocator, explicitNone = null }) => {
       if (accountKey === null || accountLocator === null) return null;
       const evidence = {
@@ -714,6 +781,7 @@ function parseTotalValueBanner(
           "TOTAL VALUE OF ACCOUNT header",
           textMeta,
         ),
+        ...(periodLocator === null ? {} : { asOf: periodLocator }),
         row: lineSpanLocator(
           line,
           kind,
@@ -725,6 +793,7 @@ function parseTotalValueBanner(
         ...(scopeEnd === null ? {} : { scopeEnd: scopeEnd.locator }),
       };
       const gapCodes = new Set();
+      if (periodLocator === null) gapCodes.add("unsupported_balance_header");
       if (scopeEnd === null) gapCodes.add("unbounded_account_scope");
       if (
         !balanceEvidenceHasAnchoredPages(
@@ -2150,6 +2219,7 @@ export function parseRealStatement(text, kind) {
   // string the archive retains at `documents.text_path`, and carried onto
   // every evidence span this parse produces.
   const textMeta = textMetaOf(text);
+  const periodLocator = statementPeriodLocator(lines, kind, textMeta);
   const printedByPage = printedPages(lines);
   const populatedPages = new Set(lines.map(({ page }) => page));
 
@@ -2181,6 +2251,7 @@ export function parseRealStatement(text, kind) {
   // nearby and parseBalanceSheet returns null for it, contributing nothing.
   const sheets = [];
   const observedBalanceScopes = [];
+  const balanceObservationCounts = new Map();
   // F1-8l. A document that names accounts at all, and then prints a BALANCE
   // SHEET section under no account header of its own, is a consolidated
   // statement printing its `Consolidated Summary` roll-up: the household
@@ -2201,6 +2272,13 @@ export function parseRealStatement(text, kind) {
   let unattributedSections = 0;
   lines.forEach(({ text: line }, anchorIndex) => {
     if (!BALANCE_SHEET_ANCHOR.test(line)) return;
+    const accountKey = accountKeys[anchorIndex];
+    if (accountKey !== null) {
+      balanceObservationCounts.set(
+        accountKey,
+        (balanceObservationCounts.get(accountKey) ?? 0) + 1,
+      );
+    }
     const observed = parseBalanceSheet(
       lines,
       anchorIndex,
@@ -2234,12 +2312,20 @@ export function parseRealStatement(text, kind) {
           accountKeys,
           markerLines,
           textMeta,
+          periodLocator,
           printedByPage,
           populatedPages,
         )
       : null;
   if (banner?.balanceScope !== null && banner?.balanceScope !== undefined)
     observedBalanceScopes.push(banner.balanceScope);
+  if (banner?.balanceScope !== null && banner?.balanceScope !== undefined) {
+    const accountKey = banner.balanceScope.accountExternalKey;
+    balanceObservationCounts.set(
+      accountKey,
+      (balanceObservationCounts.get(accountKey) ?? 0) + 1,
+    );
+  }
   if (banner?.balance !== undefined) {
     // The same rule as above: on a statement that does name accounts, a
     // banner printed before the first account header names none this parser
@@ -2272,8 +2358,9 @@ export function parseRealStatement(text, kind) {
   }
   const balanceScopes = observedBalanceScopes.filter(
     (scope) =>
+      balanceObservationCounts.get(scope.accountExternalKey) === 1 &&
       balanceScopeCounts.get(`${scope.accountExternalKey}\0${scope.asOf}`) ===
-      1,
+        1,
   );
 
   const notes = [];
