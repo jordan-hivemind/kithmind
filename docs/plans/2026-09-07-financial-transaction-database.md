@@ -505,6 +505,20 @@ bottom of the preceding physical page and the top of the following page, and
 assert the same semantic holdings output rather than relying only on passing
 fixture counts.
 
+An exactly identified, dated position whose single source row explicitly
+prints a nonempty no-value token for both price and market value remains an
+observed position. The adapter retains its readable quantity and cost fields,
+records `marketValue: null` with an exact binding to the printed token, and
+never treats the token as zero. Every emitted position whose market value
+remains null, including this exact single-row form and previously supported
+printed Total forms, keeps its position scope partial. Until value completeness
+has its own scope vocabulary, that observation uses the existing
+`unresolved_lots` gap. This use means the position is known but its valuation
+is incomplete; it prevents the account date from becoming a latest complete,
+fully valued holdings observation. A separate parse note states that the
+retained holding lacks a readable market value, keeping the document reimportable
+without falsely calling the known row unparsed.
+
 Migration 15 persists those observations in immutable
 `position_scope_observations` and `position_scope_memberships`. Each
 observation binds the retained SHA-256, account, date, proof version, status,
