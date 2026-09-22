@@ -214,7 +214,8 @@ test("a synthetic tax-support document ingests at glance, then --depth full prom
     "Form W-2 Wage and Tax Statement for 2022.\nBox 1 Wages $50,000.00.",
     "Employer copy continuation page with additional boilerplate text.",
   ]);
-  await writeFile(join(root, "w2.pdf"), pdf);
+  const fileName = "2022 W-2.pdf";
+  await writeFile(join(root, fileName), pdf);
 
   const log = () => {};
   const autoOptions = {
@@ -263,6 +264,24 @@ test("a synthetic tax-support document ingests at glance, then --depth full prom
   assert.doesNotMatch(glanceDocument.pages[0].text, /Employer copy continuation/);
   // kind -> doc_type: see ingest.ts and documents/model.ts's effectiveDocType.
   assert.equal(glanceDocument.docType, "tax_support");
+  // kind + detected tax year -> title, findable by year without touching the
+  // read path (title.ts's buildTitle; the filename's own "2022" resolves
+  // through detectTaxYear's bare-filename-year fallback).
+  assert.equal(glanceDocument.title, "Tax support 2022 · 2022 W-2.pdf");
+
+  const glanceMetadata = await pool.query(
+    `SELECT ingest_metadata FROM kith.source_items WHERE id = $1`,
+    [sourceItemId],
+  );
+  assert.deepEqual(glanceMetadata.rows[0].ingest_metadata, {
+    pageCount: 2,
+    byteLength: pdf.length,
+    taxYear: 2022,
+    kind: "tax_support",
+    depth: "glance",
+    converter: glanceMetadata.rows[0].ingest_metadata.converter,
+  });
+  assert.match(glanceMetadata.rows[0].ingest_metadata.converter, /^pdftotext-poppler@/);
 
   // Re-running with the same auto policy is idempotent: unchanged bytes,
   // unchanged (glance) depth.
@@ -331,6 +350,23 @@ test("a synthetic tax-support document ingests at glance, then --depth full prom
   assert.equal(fullDocument.pages.length, 2, "full depth must store every page");
   assert.match(fullDocument.pages[0].text, /Form W-2 Wage and Tax Statement/);
   assert.match(fullDocument.pages[1].text, /Employer copy continuation/);
+  assert.equal(fullDocument.title, "Tax support 2022 · 2022 W-2.pdf");
+
+  // ingest_metadata is updated in place on the same source_items row, not a
+  // second row, and its `depth` now reads "full".
+  const fullMetadata = await pool.query(
+    `SELECT ingest_metadata FROM kith.source_items WHERE id = $1`,
+    [sourceItemId],
+  );
+  assert.deepEqual(fullMetadata.rows[0].ingest_metadata, {
+    pageCount: 2,
+    byteLength: pdf.length,
+    taxYear: 2022,
+    kind: "tax_support",
+    depth: "full",
+    converter: fullMetadata.rows[0].ingest_metadata.converter,
+  });
+  assert.match(fullMetadata.rows[0].ingest_metadata.converter, /^pdftotext-poppler@/);
 
   // Re-running --depth full again is idempotent: same bytes, already full
   // (never demotes, never reprocesses).

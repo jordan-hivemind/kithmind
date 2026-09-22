@@ -21,6 +21,7 @@ import { decideDepth, withDepthFingerprint, type Depth, type DepthOverride } fro
 import { toFsUri } from "./fsUri.js";
 import { runPostProcessing } from "./postProcess.js";
 import { resolveSourceAccount, resolveUserId } from "./sourceAccount.js";
+import { buildTitle } from "./title.js";
 import { ingestFile, isUpToDate, readActiveIngestState } from "./write.js";
 import { walkRoot } from "./walk.js";
 
@@ -98,12 +99,6 @@ function bump(map: Map<string, { seen: number; newCount: number }>, ext: string,
 
 function bumpCount<K>(map: Map<K, number>, key: K): void {
   map.set(key, (map.get(key) ?? 0) + 1);
-}
-
-function titleFor(relativePath: string): string {
-  const base = relativePath.split("/").pop() ?? relativePath;
-  const dot = base.lastIndexOf(".");
-  return dot > 0 ? base.slice(0, dot) : base;
 }
 
 async function runWithConcurrency<T>(
@@ -228,12 +223,14 @@ export async function runIngest(
         state?.fileByteHash === fileByteHash && state.depth === "glance" && desiredDepth === "full";
 
       let pages: string[];
-      let converterFingerprint: string;
+      let rawConverterFingerprint: string;
       let mediaType: string;
+      let totalPageCount: number;
       if (desiredDepth === "glance") {
         pages = [page1.pageText];
-        converterFingerprint = withDepthFingerprint(page1.converterFingerprint, "glance");
+        rawConverterFingerprint = page1.converterFingerprint;
         mediaType = page1.mediaType;
+        totalPageCount = page1.totalPageCount;
         log(
           `${file.relativePath}: glance (page 1 of ${page1.totalPageCount}; kind ${kind}` +
             (taxYear ? `, tax year ${taxYear}` : "") +
@@ -252,19 +249,21 @@ export async function runIngest(
           },
         });
         pages = converted.pages;
-        converterFingerprint = withDepthFingerprint(converted.converterFingerprint, "full");
+        rawConverterFingerprint = converted.converterFingerprint;
         mediaType = converted.mediaType;
+        totalPageCount = converted.pages.length;
         if (promoted) {
           log(`${file.relativePath}: promoted glance -> full (${decision.reason})`);
         }
       }
+      const converterFingerprint = withDepthFingerprint(rawConverterFingerprint, desiredDepth);
 
       const fileStat = await stat(file.absolutePath);
       await ingestFile(pool, {
         spaceId: account.spaceId,
         sourceAccountId: account.id,
         externalId,
-        title: titleFor(file.relativePath),
+        title: buildTitle(file.relativePath, kind, taxYear),
         docType: kind,
         ...(options.rootAlias !== undefined
           ? { uri: toFsUri(options.rootAlias, file.relativePath) }
@@ -275,6 +274,19 @@ export async function runIngest(
         pages,
         converterFingerprint,
         mediaType,
+        // Persisted to `kith.source_items.ingest_metadata` (migration 046)
+        // so the MCP can find a glance-depth document's real page count, tax
+        // year and how it was ingested without a schema change to the read
+        // path -- see write.ts's `setSourceItemIngestMetadata` and README.md's
+        // "Depth policy". Updated in place on every ingest and promotion.
+        ingestMetadata: {
+          pageCount: totalPageCount,
+          byteLength: bytes.length,
+          taxYear: taxYear ?? null,
+          kind,
+          depth: desiredDepth,
+          converter: rawConverterFingerprint,
+        },
       });
 
       if (promoted) {

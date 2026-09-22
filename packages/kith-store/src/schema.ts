@@ -341,6 +341,14 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "track how far each item's investment-transaction history has been pulled",
     url: new URL("../migrations/045_plaid_history.sql", import.meta.url),
   },
+  {
+    version: 46,
+    name: "source_items.ingest_metadata: the stateless filesystem ingester's depth-policy metadata",
+    url: new URL(
+      "../migrations/046_source_item_ingest_metadata.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

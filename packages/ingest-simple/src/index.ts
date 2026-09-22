@@ -12,5 +12,6 @@ export * from "./ingest.js";
 export * from "./ocr.js";
 export * from "./postProcess.js";
 export * from "./sourceAccount.js";
+export * from "./title.js";
 export * from "./walk.js";
 export * from "./write.js";

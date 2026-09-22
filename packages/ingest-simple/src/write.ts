@@ -55,6 +55,23 @@ const NORMALIZATION_FINGERPRINT = "ingest-simple-v1";
 const CHUNKER_FINGERPRINT = "ingest-simple-page-chunks-v1";
 const CORRECTION_REVISION = "ingest-simple-v1";
 
+/** Persisted to `kith.source_items.ingest_metadata` (migration 046), the
+ * ingest-simple-owned home for the depth-policy fields no existing column
+ * fits (see README.md's "Depth policy"): the document's real total page
+ * count and original byte size, its detected tax year, kind and ingested
+ * depth, and the converter identity that produced it. Provisional, ingester-
+ * owned data, not a fact or evidence -- deliberately not typed as strictly
+ * as the provenance rows around it, and updated in place by a plain `UPDATE`
+ * outside their immutability rules; see `setSourceItemIngestMetadata`. */
+export type SourceItemIngestMetadata = {
+  pageCount: number;
+  byteLength: number;
+  taxYear: number | null;
+  kind: string;
+  depth: string;
+  converter: string;
+};
+
 export type IngestFileInput = {
   spaceId: string;
   sourceAccountId: string;
@@ -72,6 +89,10 @@ export type IngestFileInput = {
   pages: string[];
   converterFingerprint: string;
   mediaType: string;
+  /** Optional so the existing tests calling `ingestFile` directly (from
+   * before this field existed) still work unchanged. Every real run through
+   * ingest.ts supplies it. */
+  ingestMetadata?: SourceItemIngestMetadata;
 };
 
 export type IngestFileResult = {
@@ -131,6 +152,22 @@ export function isUpToDate(
 ): boolean {
   if (!state || state.fileByteHash !== fileByteHash) return false;
   return state.depth === "full" || state.depth === desiredDepth;
+}
+
+/** Writes `metadata` to `kith.source_items.ingest_metadata` (migration 046),
+ * updating in place -- a plain `UPDATE`, not a provenance staging call, since
+ * this column is deliberately outside the immutable revision/generation
+ * chain (see the `SourceItemIngestMetadata` doc comment). Called from inside
+ * `stageOneFile`'s transaction on every ingest and every depth promotion, so
+ * it always reflects the currently active generation. */
+export async function setSourceItemIngestMetadata(
+  client: PoolClient,
+  input: { spaceId: string; sourceItemId: string; metadata: SourceItemIngestMetadata },
+): Promise<void> {
+  await client.query(
+    `UPDATE kith.source_items SET ingest_metadata = $1 WHERE id = $2 AND space_id = $3`,
+    [JSON.stringify(input.metadata), input.sourceItemId, input.spaceId],
+  );
 }
 
 function buildPageInputs(pages: readonly string[]): {
@@ -446,6 +483,14 @@ async function stageOneFile(
     sourceItemId: item.id,
     processingGenerationId: generation.id,
   });
+
+  if (input.ingestMetadata) {
+    await setSourceItemIngestMetadata(client, {
+      spaceId,
+      sourceItemId: item.id,
+      metadata: input.ingestMetadata,
+    });
+  }
 
   return {
     sourceItemId: item.id,

@@ -139,23 +139,53 @@ onto real, already-read columns rather than a new one:
 | Relative path | `kith.source_items.uri` (only when `--root-alias` is given) | Written as `fs://<rootAlias>/<relativePath>` (`src/fsUri.ts`), the exact scheme `apps/web/src/lib/kith/document-content.ts`'s `documentDropboxPath` already parses back to serve the original file — this is the real "so the MCP knows where to find them" mechanism, not a label. |
 | File modified time | `kith.source_revisions.captured_at` / `kith.documents.captured_at` | Previously the ingest wall-clock (`new Date()`); now the file's own `mtime`, which is what "captured at" should mean for a filesystem source and is deterministic across re-runs of an unchanged file. |
 
-**Total page count, original byte size, and detected tax year have no
-existing home.** `kith.documents` has no JSON/free-form column at all (it was
+**Total page count, original byte size and detected tax year** had no
+existing home: `kith.documents` has no JSON/free-form column at all (it was
 `kith.brain_documents` before migration 005 renamed it, and no migration
-since has added one); the only JSON-ish columns near a document are
-`kith.source_items.last_failure` (the old worker's own failure-tracking
-contract), `kith.evidence_spans.locator` (citation locations shown to users —
-writing metadata into it would fabricate a fake citation, exactly the "page
-0" trick this package was told not to do), and `kith.source_triage_previews`
-(the triage-and-priority plan's own machinery, which this package was told to
-take only the *intent* from, not reuse). None of these are a safe place for
-this data. This PR computes total page count, tax year and (implicitly) raw
-byte size for policy decisions and logs them per file
-(`glance (page 1 of N; kind ...; tax year ...)`), but does not persist them as
-queryable per-document fields. A `kith.source_items.ingest_metadata jsonb`
-column (nullable, additive) would let a future change store them properly;
-until then, an MCP caller cannot query "how many pages does this glanced
-document actually have" without opening it.
+since had added one until now), and the near-document JSON-ish columns that
+do exist (`kith.source_items.last_failure`, the old worker's own
+failure-tracking contract; `kith.evidence_spans.locator`, citation locations
+shown to users — writing metadata into it would fabricate a fake citation,
+exactly the "page 0" trick this package was told not to do; and
+`kith.source_triage_previews`, the triage-and-priority plan's own machinery,
+which this package was told to take only the *intent* from, not reuse) were
+not a safe place for it. Migration 046 adds
+`kith.source_items.ingest_metadata jsonb` (nullable, additive — no CHECK on
+shape, since this is provisional ingester-owned data, not a fact or
+evidence). Every ingest and every depth promotion writes it in place
+(`write.ts`'s `setSourceItemIngestMetadata`, a plain `UPDATE` inside the same
+transaction as activation, outside the immutable provenance chain's own
+rules) as one object:
+
+```json
+{
+  "pageCount": 3,
+  "byteLength": 214980,
+  "taxYear": 2022,
+  "kind": "tax_support",
+  "depth": "glance",
+  "converter": "pdftotext-poppler@25.09.0"
+}
+```
+
+`pageCount` is the document's real total page count (from `pdfinfo` at glance
+depth, from the actual converted page array at full depth) — for a
+glance-depth document this is the number the stored single page does *not*
+speak for. `taxYear` is `null` when `detectTaxYear` found none. `converter`
+is the raw converter identity (`convert.ts`'s `converterFingerprint`, before
+`depthPolicy.ts` folds in the depth); `depth` names the depth separately.
+There is no reader for this column yet — an MCP change to expose it is
+follow-up work — but it is now a real, queryable column rather than a log
+line.
+
+**Title.** When both a kind and a tax year are detected, the document's
+title (`kith.documents.title` / `kith.source_items.title`, already read by
+`getDocument` and search — no read-path change needed) becomes `<kind label>
+<taxYear> · <filename>` (`src/title.ts`'s `buildTitle`, e.g. `Tax return 2018
+· 2018-1040.pdf`, `K-1 2021 · acme-partners.pdf`, `Tax support 2019 · W-2
+2019.pdf`), so a glance-depth document is findable by year in an ordinary
+document list without opening it. With no detected tax year the title stays
+the filename with its extension stripped, exactly as before this feature.
 
 ### Finding the source account ID
 
@@ -232,7 +262,7 @@ template; only the loaded copy on the owner's own machine names them.
 
 ```
 pnpm --filter @repo/ingest-simple build
-pnpm --filter @repo/ingest-simple exec node --test test/walk.test.mjs test/chunker.test.mjs test/convert.test.mjs test/bindings.test.mjs test/classify.test.mjs test/depthPolicy.test.mjs test/fsUri.test.mjs
+pnpm --filter @repo/ingest-simple exec node --test test/walk.test.mjs test/chunker.test.mjs test/convert.test.mjs test/bindings.test.mjs test/classify.test.mjs test/depthPolicy.test.mjs test/fsUri.test.mjs test/title.test.mjs
 pnpm --filter @repo/ingest-simple exec node --test test/postgresIngest.test.mjs test/bindingsTransition.test.mjs
 ```
 
@@ -241,16 +271,21 @@ real vendor SDK: OCR's `fetchImpl` is stubbed; `bindings.test.mjs` covers
 `--bindings` parsing/validation against synthetic journal JSON;
 `classify.test.mjs` and `depthPolicy.test.mjs` cover every detection pattern
 and depth-policy branch; `fsUri.test.mjs` proves `toFsUri`'s output parses
-back through `documentDropboxPath`'s own regex). The last two start and stop
+back through `documentDropboxPath`'s own regex; `title.test.mjs` covers
+`buildTitle`'s composed and fallback forms). The last two start and stop
 their own throwaway local Postgres cluster (`initdb`/`pg_ctl`, under a scratch
 temp directory, deleted when the test ends) and require `initdb` and `pg_ctl`
 on `PATH` with the `pgvector` extension available (the same requirement
-`kith` migration 015 has everywhere else in this repo).
+`kith` migration 015 has everywhere else in this repo, and this package's own
+migration 046 -- see "Depth policy" -- needs `applyKithSchema` at version 46
+or later).
 `bindingsTransition.test.mjs` proves the `--bindings` transition end to end: a
 source item registered the old worker's way (a UUID external id, an archived
 revision) reuses that same item, not a second one, when this package's
 `ingestFile` runs with that UUID bound. `postgresIngest.test.mjs` also proves
 the depth policy end to end: a synthetic tax-support document ingests at
-glance (one page, real `doc_type`/`uri`/`captured_at`), a same-policy re-run
-is a no-op, and `--depth full` promotes it to a new full generation on the
-same source item while the glance generation becomes historical.
+glance (one page, real `doc_type`/`uri`/`captured_at`/`ingest_metadata`/
+composed title), a same-policy re-run is a no-op, and `--depth full` promotes
+it to a new full generation on the same source item -- `ingest_metadata`
+updated in place, title unchanged -- while the glance generation becomes
+historical.
