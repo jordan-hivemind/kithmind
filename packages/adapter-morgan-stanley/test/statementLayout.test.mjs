@@ -29,6 +29,7 @@ import {
   COVER_TOTAL_LAYOUT_TEXT,
   CROSS_MONTH_LAYOUT_TEXT,
   EMPTY_ACCOUNT_LAYOUT_TEXT,
+  EQUITY_HEADER,
   equityBlockLines,
   navFundBlockLines,
   pageSplitEquityPages,
@@ -621,6 +622,245 @@ test("same-section subtotal recognition requires its marker, section, undated sh
   assert.notEqual(
     incomplete.holdings.positionScopes[0].evidence.tables[0].end.binding.quote,
     sameSectionSubtotal().trim(),
+  );
+});
+
+const EQUITY_TEST_COLUMNS = {
+  description: { start: 8 },
+  tradeDate: { end: 62 },
+  quantity: { end: 92 },
+  price: { end: 120 },
+  costBasis: { end: 134 },
+  marketValue: { end: 150 },
+  unrealized: { end: 164 },
+};
+
+function undatedTickerRow({
+  description,
+  quantity = "5.000",
+  price = "$20.000",
+  costBasis = "$90.00",
+  marketValue = "$100.00",
+  unrealized = "$10.00",
+}) {
+  return place([
+    { text: description, ...EQUITY_TEST_COLUMNS.description },
+    { text: quantity, ...EQUITY_TEST_COLUMNS.quantity },
+    { text: price, ...EQUITY_TEST_COLUMNS.price },
+    { text: costBasis, ...EQUITY_TEST_COLUMNS.costBasis },
+    { text: marketValue, ...EQUITY_TEST_COLUMNS.marketValue },
+    { text: unrealized, ...EQUITY_TEST_COLUMNS.unrealized },
+  ]);
+}
+
+function equityTotalRow({
+  quantity = "5.000",
+  costBasis = "90.00",
+  marketValue = "100.00",
+  unrealized = "10.00",
+} = {}) {
+  return place([
+    { text: "Total", ...EQUITY_TEST_COLUMNS.tradeDate },
+    { text: quantity, ...EQUITY_TEST_COLUMNS.quantity },
+    { text: costBasis, ...EQUITY_TEST_COLUMNS.costBasis },
+    { text: marketValue, ...EQUITY_TEST_COLUMNS.marketValue },
+    { text: unrealized, ...EQUITY_TEST_COLUMNS.unrealized },
+  ]);
+}
+
+function identifierStartStatement(rows, header = EQUITY_HEADER) {
+  return [
+    "        Page 1 of 1",
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+    `        ${CONSOLIDATED_ACCOUNT_ONE}`,
+    "        Account Synthetic Household",
+    "        HOLDINGS",
+    "        COMMON STOCKS",
+    header,
+    ...rows,
+    "        TOTAL",
+  ].join("\n");
+}
+
+function positiveCents(value) {
+  const [whole, fraction = ""] = value.replace(/[$,]/g, "").split(".");
+  return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, "0"));
+}
+
+test("a distinct parenthesized ticker starts an undated security with exact totals and locators", () => {
+  const first = equityBlockLines().slice(2, 5);
+  const second = undatedTickerRow({
+    description: "SYNTHETIC SECOND FUND (SNDF)",
+  });
+  const text = identifierStartStatement([...first, second, equityTotalRow()]);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 2);
+  const [dated, undated] = parsed.holdings.positions;
+  assert.equal(dated.instrument.symbol, "WNDF");
+  assert.equal(dated.marketValue, "3184");
+  assert.equal(
+    positiveCents("1910.40") + positiveCents("1273.60"),
+    positiveCents(dated.marketValue),
+  );
+  assert.equal(undated.instrument.symbol, "SNDF");
+  assert.equal(undated.quantity, "5");
+  assert.equal(undated.price, "20");
+  assert.equal(undated.marketValue, "100");
+  assert.equal(
+    resolveStatementMoney("$100.00").value,
+    resolveStatementMoney(undated.locators.marketValue.binding.quote).value,
+  );
+  assert.equal(
+    parsed.holdings.positions.reduce(
+      (sum, position) => sum + positiveCents(position.marketValue),
+      0n,
+    ),
+    328400n,
+  );
+  for (const [field, quote] of [
+    ["quantity", "5.000"],
+    ["price", "$20.000"],
+    ["marketValue", "100.00"],
+  ]) {
+    const binding = undated.locators[field].binding;
+    assert.equal(binding.quote, quote);
+    assert.equal(text.slice(binding.start, binding.end), quote);
+  }
+});
+
+test("one adjacent same-page CUSIP detail row can identify an undated priced bond", () => {
+  const block = bondBlockLines();
+  const undated = block[2].replace("05/18/25", " ".repeat("05/18/25".length));
+  const text = identifierStartStatement([undated, block[3]], block[1]).replace(
+    "        COMMON STOCKS",
+    block[0],
+  );
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [bond] = parsed.holdings.positions;
+  assert.equal(bond.instrument.cusip, "00000WNF1");
+  assert.equal(bond.quantity, "25000");
+  assert.equal(bond.price, "99.5");
+  assert.equal(bond.marketValue, "24875");
+  for (const field of ["quantity", "price", "marketValue"]) {
+    const binding = bond.locators[field].binding;
+    assert.equal(text.slice(binding.start, binding.end), binding.quote);
+  }
+});
+
+test("repeated undated identity stays unresolved even when a Total follows", () => {
+  const repeated = undatedTickerRow({
+    description: "SYNTHETIC REPEATED FUND (RPTD)",
+  });
+  const text = identifierStartStatement([
+    repeated,
+    repeated.replace("$100.00", "$120.00"),
+    equityTotalRow({ marketValue: "220.00" }),
+  ]);
+  const parsed = parseStatementLines(text, kind);
+  assert.deepEqual(parsed.holdings.positions, []);
+  assert.ok(
+    parsed.holdings.positionScopes[0].gapCodes.includes("unresolved_lots"),
+  );
+
+  const bond = bondBlockLines();
+  const undatedBond = bond[2].replace(
+    "05/18/25",
+    " ".repeat("05/18/25".length),
+  );
+  const repeatedCusip = identifierStartStatement(
+    [undatedBond, bond[3], undatedBond, bond[3]],
+    bond[1],
+  ).replace("        COMMON STOCKS", bond[0]);
+  const parsedCusip = parseStatementLines(repeatedCusip, kind);
+  assert.deepEqual(parsedCusip.holdings.positions, []);
+  assert.ok(
+    parsedCusip.holdings.positionScopes[0].gapCodes.includes("unresolved_lots"),
+  );
+});
+
+test("identifier-backed starts refuse generic names, unreadable prices and weak CUSIP detail", () => {
+  const bond = bondBlockLines();
+  const undatedBond = bond[2].replace(
+    "05/18/25",
+    " ".repeat("05/18/25".length),
+  );
+  const bondDetailDescription =
+    "Coupon Rate 4.250%; Matures 06/01/2031; CUSIP 00000WNF1";
+  const duplicateCusips = "CUSIP 00000WNF1; CUSIP 00000WNF2".padEnd(
+    bondDetailDescription.length,
+  );
+  const cases = [
+    {
+      name: "generic description",
+      text: identifierStartStatement([
+        undatedTickerRow({ description: "SYNTHETIC UNIDENTIFIED FUND" }),
+        equityTotalRow(),
+      ]),
+    },
+    {
+      name: "unreadable price",
+      text: identifierStartStatement([
+        undatedTickerRow({
+          description: "SYNTHETIC IDENTIFIED FUND (SIDF)",
+          price: "$2O.000",
+        }),
+        equityTotalRow(),
+      ]),
+    },
+    {
+      name: "two CUSIPs",
+      text: identifierStartStatement(
+        [undatedBond, bond[3].replace(bondDetailDescription, duplicateCusips)],
+        bond[1],
+      ).replace("        COMMON STOCKS", bond[0]),
+    },
+    {
+      name: "description-only CUSIP",
+      text: identifierStartStatement(
+        [
+          undatedBond,
+          place([
+            { text: "CUSIP 00000WNF1", ...EQUITY_TEST_COLUMNS.description },
+          ]),
+        ],
+        bond[1],
+      ).replace("        COMMON STOCKS", bond[0]),
+    },
+    {
+      name: "CUSIP on another physical page",
+      text: identifierStartStatement(
+        [undatedBond, PAGE_SEPARATOR, bond[3]],
+        bond[1],
+      ).replace("        COMMON STOCKS", bond[0]),
+    },
+  ];
+  for (const { name, text } of cases) {
+    const parsed = parseStatementLines(text, kind);
+    assert.deepEqual(parsed.holdings.positions, [], name);
+    assert.ok(
+      parsed.holdings.positionScopes[0].gapCodes.some((code) =>
+        ["missing_security_start", "unresolved_lots"].includes(code),
+      ),
+      name,
+    );
+  }
+});
+
+test("an identifier-shaped undated row cannot leave a section summary", () => {
+  const text = identifierStartStatement([
+    ...equityBlockLines().slice(2, 5),
+    ...sectionSummaryLines(),
+    undatedTickerRow({ description: "SUMMARY LOOKALIKE FUND (SLKF)" }),
+  ]);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  assert.equal(parsed.holdings.positions[0].instrument.symbol, "WNDF");
+  assert.equal(
+    parsed.holdings.positions.some(
+      (position) => position.instrument?.symbol === "SLKF",
+    ),
+    false,
   );
 });
 
