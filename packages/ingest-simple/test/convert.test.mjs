@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { convertFile } from "../dist/convert.js";
+import { convertFile, convertFilePage1 } from "../dist/convert.js";
 import { buildPdf } from "./helpers/pdf.mjs";
 
 async function tempFile(t, name, bytes) {
@@ -100,4 +100,52 @@ test("convertFile leaves a low-text page as-is and warns once when OCR is unconf
   });
   assert.equal(warnings, 1, "warns once for the whole file, not once per page");
   assert.equal(converted.ocrPagesUsed, 0);
+});
+
+test("convertFilePage1 reads only page 1 of a multi-page PDF plus the real total page count", async (t) => {
+  const pdfPath = await tempFile(
+    t,
+    "return.pdf",
+    buildPdf([
+      "Page one has more than forty non whitespace characters on it, easily.",
+      "Page two also comfortably clears the forty character threshold too.",
+      "Page three is here as well, also well over the forty character mark.",
+    ]),
+  );
+  const page1 = await convertFilePage1(pdfPath, ".pdf");
+  assert.match(page1.pageText, /Page one has more than forty/);
+  assert.doesNotMatch(page1.pageText, /Page two|Page three/);
+  assert.equal(page1.totalPageCount, 3);
+  assert.equal(page1.mediaType, "application/pdf");
+  assert.equal(page1.ocrPagesUsed, 0);
+  assert.match(page1.converterFingerprint, /^pdftotext-poppler@/);
+});
+
+test("convertFilePage1 OCRs a low-text page 1 the same way convertFile does", async (t) => {
+  const pdfPath = await tempFile(t, "scan.pdf", buildPdf(["hi", "Page two has plenty of real extracted text here."]));
+  let ocrRequests = 0;
+  const fetchImpl = async () => {
+    ocrRequests += 1;
+    return new Response(
+      JSON.stringify({ choices: [{ message: { content: "Transcribed page one" } }] }),
+      { status: 200 },
+    );
+  };
+  const page1 = await convertFilePage1(pdfPath, ".pdf", {
+    env: { KITH_EXTRACT_ENDPOINT: "https://localhost/fake", KITH_EXTRACT_API_KEY: "test" },
+    fetchImpl,
+  });
+  assert.equal(ocrRequests, 1);
+  assert.equal(page1.pageText, "Transcribed page one");
+  assert.equal(page1.totalPageCount, 2);
+  assert.equal(page1.ocrPagesUsed, 1);
+  assert.match(page1.converterFingerprint, /\+ocr-vision:/);
+});
+
+test("convertFilePage1 treats a non-PDF file as one page, identically to convertFile", async (t) => {
+  const textPath = await tempFile(t, "note.txt", "Plain text note.\nSecond line.\n");
+  const page1 = await convertFilePage1(textPath, ".txt");
+  assert.equal(page1.pageText, "Plain text note.\nSecond line.\n");
+  assert.equal(page1.totalPageCount, 1);
+  assert.equal(page1.mediaType, "text/plain");
 });

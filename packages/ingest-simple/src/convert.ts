@@ -160,3 +160,86 @@ export async function convertFile(
   if (extension === ".pdf") return convertPdf(absolutePath, options);
   return convertPlainText(absolutePath, extension);
 }
+
+export type ConvertedPage1 = {
+  pageText: string;
+  /** The original document's total page count: for a PDF, from `pdfinfo`
+   * (cheap -- it does not extract text); 1 for every other supported
+   * extension, which `convert.ts` always treats as one page. */
+  totalPageCount: number;
+  converterFingerprint: string;
+  mediaType: string;
+  ocrPagesUsed: number;
+};
+
+/** Parses poppler's `pdfinfo` `Pages: N` line. Thrown, not defaulted, on a
+ * missing or unparseable line: a page count this wrong would misreport how
+ * much of the document a glance-depth summary actually saw. */
+async function pdfPageCount(absolutePath: string): Promise<number> {
+  const { stdout } = await run("pdfinfo", [absolutePath]);
+  const match = /^Pages:\s+(\d+)\s*$/m.exec(stdout);
+  if (!match) throw new Error("pdfinfo did not report a page count");
+  return Number(match[1]);
+}
+
+async function convertPdfPage1(
+  absolutePath: string,
+  options: ConvertOptions,
+): Promise<ConvertedPage1> {
+  const [{ stdout }, totalPageCount] = await Promise.all([
+    run("pdftotext", ["-f", "1", "-l", "1", "-layout", absolutePath, "-"], {
+      maxBuffer: 64 * 1024 * 1024,
+    }),
+    pdfPageCount(absolutePath),
+  ]);
+  let pageText = stdout.endsWith("\f") ? stdout.slice(0, -1) : stdout;
+
+  const poppler = await pdftotextVersion();
+  let converterFingerprint = `pdftotext-poppler@${poppler}`;
+  let ocrPagesUsed = 0;
+  const ocrConfig = loadOcrConfig(options.env ?? process.env);
+
+  if (nonWhitespaceLength(pageText) < MIN_NON_WHITESPACE_CHARS) {
+    if (!ocrConfig) {
+      options.onOcrUnconfigured?.();
+    } else {
+      try {
+        const png = await renderPagePng(absolutePath, 1);
+        const text = await ocrPageImage(png, ocrConfig, options.fetchImpl);
+        if (text.length > 0) {
+          pageText = text;
+          ocrPagesUsed = 1;
+        }
+      } catch (error) {
+        options.onOcrFailed?.(error);
+      }
+    }
+  }
+  if (ocrPagesUsed > 0 && ocrConfig) {
+    converterFingerprint += `+${ocrConverterFingerprint(ocrConfig)}`;
+  }
+  return { pageText, totalPageCount, converterFingerprint, mediaType: MEDIA_TYPES[".pdf"], ocrPagesUsed };
+}
+
+/**
+ * The `glance` depth's conversion: page 1 only (OCR'd the same way a
+ * full-document low-text page would be) plus the document's real total page
+ * count, without ever extracting or rendering any other page. For every
+ * non-PDF extension this is identical to `convertFile` -- those are already
+ * one page each, so there is nothing further a glance could omit.
+ */
+export async function convertFilePage1(
+  absolutePath: string,
+  extension: SupportedExtension,
+  options: ConvertOptions = {},
+): Promise<ConvertedPage1> {
+  if (extension === ".pdf") return convertPdfPage1(absolutePath, options);
+  const whole = await convertPlainText(absolutePath, extension);
+  return {
+    pageText: whole.pages[0]!,
+    totalPageCount: 1,
+    converterFingerprint: whole.converterFingerprint,
+    mediaType: whole.mediaType,
+    ocrPagesUsed: 0,
+  };
+}

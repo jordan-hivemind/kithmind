@@ -41,6 +41,7 @@ import { ingestion, newKithId, provenance, sha256, withKithTransaction, workers 
 import { scheduleDocumentExtraction } from "@repo/kith-store/extraction";
 
 import { batches, batchesByRowsAndBytes, pageChunkRanges } from "./chunker.js";
+import { depthFromFingerprint, type Depth } from "./depthPolicy.js";
 
 const MAX_STAGING_ROWS = 25;
 // `provenance.MAX_STAGING_TEXT_UTF8_BYTES`: the same per-call text-byte
@@ -65,8 +66,8 @@ export type IngestFileInput = {
   userId: string;
   /** sha256 hex of the raw file bytes. Stored on the revision's
    * `archive_ref` (bounded text, otherwise unused by the inline lane), the
-   * key `alreadyIngested` checks next run so an unchanged file skips
-   * conversion entirely. */
+   * key `readActiveIngestState` reads back next run so an unchanged file at
+   * an unchanged depth skips conversion entirely -- see ingest.ts. */
   fileByteHash: string;
   pages: string[];
   converterFingerprint: string;
@@ -82,28 +83,54 @@ export type IngestFileResult = {
   reused: boolean;
 };
 
-/**
- * Cheap pre-check, no transaction: true when this source item's *active*
- * generation already carries this exact file content, so the caller can skip
- * conversion (pdftotext/OCR) entirely. A file that changed, or one that was
- * never fully activated (a prior run's partial attempt), is not skipped here
- * -- `ingestFile` resumes it idempotently.
- */
-export async function alreadyIngested(
+/** What this source item's *active* generation carries right now, read
+ * before conversion so the caller can decide whether to skip it entirely.
+ * `null` when the item has never been fully activated (new, or a prior run's
+ * partial attempt) -- `ingestFile` resumes that case idempotently rather than
+ * skipping it. `depth` is `null` for an active generation from before this
+ * package recorded depth in its extraction fingerprint (see
+ * `depthPolicy.ts`); a caller must not treat that the same as `"glance"`. */
+export type ActiveIngestState = { fileByteHash: string | null; depth: Depth | null };
+
+export async function readActiveIngestState(
   pool: Pool,
-  input: { spaceId: string; sourceAccountId: string; externalId: string; fileByteHash: string },
-): Promise<boolean> {
+  input: { spaceId: string; sourceAccountId: string; externalId: string },
+): Promise<ActiveIngestState | null> {
   const externalIdHash = sha256(input.externalId);
-  const { rows } = await pool.query<{ archive_ref: string | null }>(
-    `SELECT sr.archive_ref
+  const { rows } = await pool.query<{ archive_ref: string | null; extraction_fingerprint: string | null }>(
+    `SELECT sr.archive_ref, pg.extraction_fingerprint
        FROM kith.source_items si
        JOIN kith.source_revisions sr ON sr.id = si.active_revision_id
+       JOIN kith.processing_generations pg ON pg.id = si.active_generation_id
       WHERE si.space_id = $1 AND si.source_account_id = $2 AND si.external_id_hash = $3
         AND si.active_generation_id IS NOT NULL
       LIMIT 1`,
     [input.spaceId, input.sourceAccountId, externalIdHash],
   );
-  return rows[0]?.archive_ref === input.fileByteHash;
+  const row = rows[0];
+  if (!row) return null;
+  return { fileByteHash: row.archive_ref, depth: depthFromFingerprint(row.extraction_fingerprint) };
+}
+
+/**
+ * True when `state` (from `readActiveIngestState`) already carries
+ * `fileByteHash` at a depth this run does not need to raise. Never demotes: a
+ * document already ingested in full stays full even if this run's policy (or
+ * an explicit `--depth glance`) would now only glance it -- full is a
+ * superset of what glance keeps, and silently discarding already-extracted
+ * pages on an ordinary re-run would be a surprising, unrequested loss.
+ * Promoting glance -> full is the only direction this package changes a
+ * document's depth automatically; see ingest.ts, which calls this once it has
+ * decided `desiredDepth` and also uses `state` to detect that promotion for
+ * its summary.
+ */
+export function isUpToDate(
+  state: ActiveIngestState | null,
+  fileByteHash: string,
+  desiredDepth: Depth,
+): boolean {
+  if (!state || state.fileByteHash !== fileByteHash) return false;
+  return state.depth === "full" || state.depth === desiredDepth;
 }
 
 function buildPageInputs(pages: readonly string[]): {

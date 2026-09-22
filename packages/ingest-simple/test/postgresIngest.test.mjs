@@ -1,8 +1,12 @@
-// One end-to-end proof against a real, throwaway local Postgres (started and
+// End-to-end proofs against a real, throwaway local Postgres (started and
 // stopped by this test, nothing left running): ingest a synthetic two-page
 // PDF, read it back through `documents.getDocument` and confirm two pages
 // with page-cited text, then run again and confirm the second run inserts
-// nothing (the `archive_ref` skip check holds).
+// nothing (the `archive_ref`+depth skip check holds); and the glance/full
+// depth policy end to end -- a synthetic tax-support document ingests at
+// glance (one page, real metadata), then `--depth full` promotes the same
+// source item to a new full generation (docs/plans/2026-09-22-simplification-
+// and-feeds.md's "document ingestion" line and depthPolicy.ts).
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -76,7 +80,18 @@ test("ingests a synthetic two-page PDF and is idempotent on a second run", { ski
   ]);
   await writeFile(join(root, "statement.pdf"), pdf);
 
-  const options = { root, sourceAccountId: accountId, dryRun: false, concurrency: 1 };
+  // Forces full depth explicitly: this test is about paging/evidence
+  // mechanics, not the depth policy (covered separately below), and
+  // "statement.pdf" would otherwise default to `glance` under the new
+  // policy (kind "statement" is not `tax_return`/`k1`).
+  const options = {
+    root,
+    sourceAccountId: accountId,
+    dryRun: false,
+    concurrency: 1,
+    depth: "full",
+    fullMatchPatterns: [],
+  };
   const log = () => {};
 
   const first = await runIngest(pool, options, log);
@@ -188,4 +203,146 @@ test("ingests a synthetic 40-page text document, over the old 32-page cap", { sk
   for (const page of document.pages) {
     assert.ok(page.evidence.length > 0, `page ${page.ordinal} has no evidence spans`);
   }
+});
+
+test("a synthetic tax-support document ingests at glance, then --depth full promotes it to a new full generation", { skip }, async (t) => {
+  const { pool, spaceId, accountId } = await bootstrapDatabase(t);
+
+  const root = await mkdtemp(join(tmpdir(), "ingest-simple-depth-fixture-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pdf = buildPdf([
+    "Form W-2 Wage and Tax Statement for 2022.\nBox 1 Wages $50,000.00.",
+    "Employer copy continuation page with additional boilerplate text.",
+  ]);
+  await writeFile(join(root, "w2.pdf"), pdf);
+
+  const log = () => {};
+  const autoOptions = {
+    root,
+    sourceAccountId: accountId,
+    dryRun: false,
+    concurrency: 1,
+    depth: "auto",
+    fullMatchPatterns: [],
+  };
+
+  // First run, default policy: "Form W-2" classifies as tax_support, which
+  // is not tax_return/k1, so it ingests at glance depth -- one page only.
+  const first = await runIngest(pool, autoOptions, log);
+  assert.equal(first.failed, 0, `expected no failures: ${JSON.stringify(first.failures)}`);
+  assert.equal(first.newCount, 1);
+  assert.equal(first.promoted, 0);
+  assert.equal(first.byKind.get("tax_support"), 1);
+  assert.equal(first.byDepth.get("glance"), 1);
+
+  const itemAfterGlance = await pool.query(
+    `SELECT id, active_generation_id FROM kith.source_items WHERE source_account_id = $1`,
+    [accountId],
+  );
+  assert.equal(itemAfterGlance.rows.length, 1, "expected exactly one source item after the glance ingest");
+  const sourceItemId = itemAfterGlance.rows[0].id;
+  const glanceGenerationId = itemAfterGlance.rows[0].active_generation_id;
+  assert.ok(glanceGenerationId, "source item has no active generation after the glance ingest");
+
+  const glanceDocumentRow = await pool.query(
+    `SELECT id FROM kith.documents WHERE processing_generation_id = $1`,
+    [glanceGenerationId],
+  );
+  assert.equal(glanceDocumentRow.rows.length, 1);
+
+  const readClient1 = await pool.connect();
+  let glanceDocument;
+  try {
+    glanceDocument = await documents.getDocument(readClient1, [spaceId], glanceDocumentRow.rows[0].id);
+  } finally {
+    readClient1.release();
+  }
+  assert.ok(glanceDocument, "getDocument returned null for the glance-depth document");
+  assert.equal(glanceDocument.pages.length, 1, "glance depth must store exactly page 1");
+  assert.match(glanceDocument.pages[0].text, /Form W-2 Wage and Tax Statement/);
+  assert.doesNotMatch(glanceDocument.pages[0].text, /Employer copy continuation/);
+  // kind -> doc_type: see ingest.ts and documents/model.ts's effectiveDocType.
+  assert.equal(glanceDocument.docType, "tax_support");
+
+  // Re-running with the same auto policy is idempotent: unchanged bytes,
+  // unchanged (glance) depth.
+  const second = await runIngest(pool, autoOptions, log);
+  assert.equal(second.failed, 0);
+  assert.equal(second.newCount, 0);
+  assert.equal(second.promoted, 0);
+  assert.equal(second.skippedUnchanged, 1);
+
+  const itemStillGlance = await pool.query(
+    `SELECT active_generation_id FROM kith.source_items WHERE id = $1`,
+    [sourceItemId],
+  );
+  assert.equal(
+    itemStillGlance.rows[0].active_generation_id,
+    glanceGenerationId,
+    "an unchanged auto re-run must not mint a new generation",
+  );
+
+  // `--depth full` promotes the same source item: same bytes, a new full
+  // generation.
+  const fullOptions = { ...autoOptions, depth: "full" };
+  const third = await runIngest(pool, fullOptions, log);
+  assert.equal(third.failed, 0, `expected no failures: ${JSON.stringify(third.failures)}`);
+  assert.equal(third.newCount, 0, "a promotion is not counted as newCount");
+  assert.equal(third.promoted, 1, "the summary must count the promotion");
+  assert.equal(third.byKind.get("tax_support"), 1);
+  assert.equal(third.byDepth.get("full"), 1);
+
+  const itemAfterFull = await pool.query(
+    `SELECT id, active_generation_id FROM kith.source_items WHERE source_account_id = $1`,
+    [accountId],
+  );
+  assert.equal(itemAfterFull.rows.length, 1, "promotion must reuse the same source item, not create a second one");
+  assert.equal(itemAfterFull.rows[0].id, sourceItemId);
+  const fullGenerationId = itemAfterFull.rows[0].active_generation_id;
+  assert.ok(fullGenerationId, "source item has no active generation after promotion");
+  assert.notEqual(fullGenerationId, glanceGenerationId, "promotion must mint a new generation, not reuse the glance one");
+
+  const generationCount = await pool.query(
+    `SELECT count(*)::int AS count FROM kith.processing_generations WHERE source_item_id = $1`,
+    [sourceItemId],
+  );
+  assert.equal(generationCount.rows[0].count, 2, "expected the original glance generation plus the new full one");
+
+  const glanceGenerationAfter = await pool.query(
+    `SELECT deactivated_at FROM kith.processing_generations WHERE id = $1`,
+    [glanceGenerationId],
+  );
+  assert.ok(glanceGenerationAfter.rows[0].deactivated_at, "the glance generation should be deactivated, not deleted");
+
+  const fullDocumentRow = await pool.query(
+    `SELECT id FROM kith.documents WHERE processing_generation_id = $1`,
+    [fullGenerationId],
+  );
+  assert.equal(fullDocumentRow.rows.length, 1);
+
+  const readClient2 = await pool.connect();
+  let fullDocument;
+  try {
+    fullDocument = await documents.getDocument(readClient2, [spaceId], fullDocumentRow.rows[0].id);
+  } finally {
+    readClient2.release();
+  }
+  assert.ok(fullDocument, "getDocument returned null for the promoted full document");
+  assert.equal(fullDocument.pages.length, 2, "full depth must store every page");
+  assert.match(fullDocument.pages[0].text, /Form W-2 Wage and Tax Statement/);
+  assert.match(fullDocument.pages[1].text, /Employer copy continuation/);
+
+  // Re-running --depth full again is idempotent: same bytes, already full
+  // (never demotes, never reprocesses).
+  const fourth = await runIngest(pool, fullOptions, log);
+  assert.equal(fourth.failed, 0);
+  assert.equal(fourth.newCount, 0);
+  assert.equal(fourth.promoted, 0);
+  assert.equal(fourth.skippedUnchanged, 1);
+
+  const generationCountAfter = await pool.query(
+    `SELECT count(*)::int AS count FROM kith.processing_generations WHERE source_item_id = $1`,
+    [sourceItemId],
+  );
+  assert.equal(generationCountAfter.rows[0].count, 2, "a repeated full run must not mint another generation");
 });
