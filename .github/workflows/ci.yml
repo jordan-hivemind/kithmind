@@ -5,6 +5,13 @@ on:
   push:
     branches: [main]
 
+# A new head supersedes older CI for the same pull request. Main pushes keep
+# distinct groups and never cancel one another, so every merged commit is
+# still verified.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('push-{0}', github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   parser-fixtures:
     runs-on: ubuntu-latest
