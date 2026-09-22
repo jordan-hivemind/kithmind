@@ -1,8 +1,10 @@
 # Document triage and prioritized ingestion
 
 Date: 2026-09-21
-Status: metadata-first routing is in PR #392; targeted tax ingestion is the
-next bounded implementation slice.
+Status: metadata-first routing from PR #392 is merged and adopted, and live
+preview processing is verified. Deferred-checkpoint and later-watch acceptance
+remain rollout work. Targeted tax ingestion is the next bounded implementation
+slice.
 
 ## Problem and outcome
 
@@ -217,6 +219,11 @@ work tables. Add only the following persisted fields and table:
 | `kith.targeted_extraction_results` | One revision-bound result per goal version, opaque instance key and request digest. Status is closed to `running`, `complete`, `incomplete_resumable` or `conflict`; the only in-place lifecycle is `running` to one terminal state. The row stores source item/revision/text version/generation, requested fields, discovered forms, inspected original units, unresolved codes, event and observation keys, parser/extractor fingerprints and timestamps. Payloads are closed and bounded. |
 | `deferred_work.kind` | Add only `targeted_tax_extraction`. Its payload names space, source item, source revision, processing generation and goal digest. The existing lease, retry and dedupe behavior remains unchanged. |
 
+The separate result table is necessary because `document_extractions` is unique
+on `source_item_id`. One assembled source can yield a Form 1040 result and
+several K-1 form-instance results. Reusing that row would either overwrite one
+goal with another or collapse distinct counterparties into one extraction.
+
 The targeted generation is sealed and auditable but does not produce a
 whole-document retrieval or embedding claim and is never written to
 `source_items.active_generation_id`. If no full generation exists, document
@@ -247,7 +254,9 @@ Targeted completion queues the existing deferred worker with
 observations and cited statements in one transaction after rechecking current
 source revision, goal digest, parser fingerprint and evidence. `get_document`
 adds the goal status, resolved/unresolved coverage, inspected original pages and
-cited statements. No new MCP tool or UI is part of this slice.
+cited statements. This read-contract change bumps the advertised standalone and
+hosted MCP server versions under the repository version policy. No new MCP tool
+or UI is part of this slice.
 
 ### Implementation slices and ownership
 

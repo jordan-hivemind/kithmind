@@ -439,7 +439,7 @@ already live.
 | --- | --- | --- |
 | 0. Sensitivity: label columns and the two views, per-key ceiling. Shipped in PR #319, scoped down from the original proposal (section 8) | done | Yes: gates what every later slice can read |
 | 1. Catalog, seeder extension, migration 028 | 5 | Yes: schema and financial numbers |
-| 2. Metadata-first classification and revision-bound selection | implemented in PR #392; rollout pending | Yes: worker identity and recovery |
+| 2. Metadata-first classification and revision-bound selection | merged in PR #392 and adopted; live preview processing verified, with deferred-checkpoint and later-watch acceptance still pending | Yes: worker identity and recovery |
 | 3. Goal-aware selective parser, original-page coverage and 1040/K-1 completion | next bounded slice; see the 2026-09-21 plan | Yes: schema, evidence and partial-coverage truthfulness |
 | 4. Per-form-instance extraction, the `tax_facts` projection and its rebuild command | 6 | Yes |
 | 5. Tax gates: line reference in quote, within-form identity, cross-form carries | 5 | Yes |
