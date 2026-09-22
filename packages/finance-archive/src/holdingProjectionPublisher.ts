@@ -20,6 +20,7 @@ import type { ImportDocument } from "./importer.js";
 import type { PositionChange } from "./positionReconciliation.js";
 import { runPositionReconciliationGate } from "./positionReconciliation.js";
 import { toNumericText } from "./pgNumeric.js";
+import { valuationNotesEquivalent } from "./valuationNote.js";
 import type { CashChange } from "./reconciliation.js";
 import { runReconciliationGate } from "./reconciliation.js";
 import {
@@ -40,6 +41,18 @@ const ASSERTION_KIND: Readonly<Record<HoldingProjectionTable, AssertionKind>> =
     balances: "balance",
     liabilities: "liability",
   });
+
+function positionSemanticsEquivalent(
+  left: readonly (string | null)[],
+  right: readonly (string | null)[],
+): boolean {
+  return (
+    left.length === 11 &&
+    right.length === 11 &&
+    canonical(left.slice(0, 10)) === canonical(right.slice(0, 10)) &&
+    valuationNotesEquivalent(left[10] ?? null, right[10] ?? null)
+  );
+}
 
 export type HoldingProjectionApproval = {
   readonly schemaVersion: 1;
@@ -713,7 +726,7 @@ export async function prepareHoldingScopedPositionCorrection(input: {
       sourceOwnedPositions.push(row);
       continue;
     }
-    if (canonical(current.semantic) !== canonical(row.semantic)) {
+    if (!positionSemanticsEquivalent(current.semantic, row.semantic)) {
       refuse("a foreign-owned selected position has different semantics");
     }
     foreignReferencedPositionHashes.add(row.rowHash);
@@ -726,7 +739,7 @@ export async function prepareHoldingScopedPositionCorrection(input: {
         : logicalPositionByHash.get(current.rowHash);
     if (
       declared === undefined ||
-      canonical(declared.semantic) !== canonical(current.semantic)
+      !positionSemanticsEquivalent(declared.semantic, current.semantic)
     ) {
       refuse("a selected scope does not represent every foreign-owned row");
     }

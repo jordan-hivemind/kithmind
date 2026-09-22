@@ -764,10 +764,13 @@ test(
     const secondSha = "92".padEnd(64, "0");
     const firstPosition = position({
       instrumentId: "scope-instrument",
+      valuationNote: "Market Value column of the BONDS holdings table",
       sourceLocator: '{"row":{"source":"first","index":3}}',
     });
     const secondPosition = position({
       instrumentId: "scope-instrument",
+      valuationNote:
+        "Market Value column of the GOVERNMENT/SECURITIES holdings table",
       sourceLocator: '{"row":{"source":"second","index":7}}',
     });
 
@@ -821,6 +824,16 @@ test(
     );
     assert.equal(canonical.sha256, firstSha);
     assert.equal(canonical.source_locator, firstPosition.sourceLocator);
+    assert.equal(
+      (
+        await one(
+          client,
+          "SELECT valuation_note FROM positions WHERE source_document_id = (SELECT id FROM documents WHERE sha256 = $1)",
+          [firstSha],
+        )
+      ).valuation_note,
+      firstPosition.valuationNote,
+    );
     const foreignWitness = await one(
       client,
       `SELECT m.price::text AS price, m.unrealized::text AS unrealized,
@@ -835,7 +848,7 @@ test(
     assert.deepEqual(foreignWitness, {
       price: "50",
       unrealized: "100",
-      valuation_note: "Synthetic delayed market feed.",
+      valuation_note: secondPosition.valuationNote,
       source_locator: secondPosition.sourceLocator,
       retained_sha256: secondSha,
       emitted_position_count: "1",

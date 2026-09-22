@@ -32,6 +32,8 @@ import { join } from "node:path";
 
 import type pg from "pg";
 
+import { valuationNotesEquivalentSql } from "../valuationNote.js";
+
 import {
   type AggregateMoneyRequest,
   type CanonicalFinanceDecimal,
@@ -1243,7 +1245,7 @@ function positionMatchesScopeMember(position: string, member: string): string {
     AND ${position}.unrealized IS NOT DISTINCT FROM ${member}.unrealized
     AND ${position}.currency = ${member}.currency
     AND ${position}.valuation_basis IS NOT DISTINCT FROM ${member}.valuation_basis
-    AND ${position}.valuation_note IS NOT DISTINCT FROM ${member}.valuation_note`;
+    AND ${valuationNotesEquivalentSql(`${position}.valuation_note`, `${member}.valuation_note`)}`;
 }
 
 /** A source proof is current and names exactly the whole canonical snapshot.

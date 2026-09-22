@@ -1223,7 +1223,8 @@ test(
           source_document_id, source_locator, row_hash)
        VALUES ('scope-complete-position', $1, $3::date,
                'scope-complete-instrument', 2, 50, 100, 80,
-               20, 'USD', 'market_price', 'Synthetic stated mark', $2,
+               20, 'USD', 'market_price',
+               'Market Value column of the BONDS holdings table', $2,
                $7, $4),
               ('scope-partial-position', $5, $3::date,
                'scope-partial-instrument', 1, 60, 60, 50,
@@ -1280,7 +1281,8 @@ test(
           currency, valuation_basis, valuation_note, source_locator)
        VALUES ($1, 'scope-complete', $4, $2, $6::date,
                'scope-complete-instrument', 2, 50, 100,
-               80, 20, 'USD', 'market_price', 'Synthetic stated mark',
+               80, 20, 'USD', 'market_price',
+               'Market Value column of the GOVERNMENT/SECURITIES holdings table',
                '{"row":{"source":"consolidated","index":11}}'),
               ($1, 'scope-partial', $5, $3, $6::date,
                'scope-partial-instrument', 1, 60, 60,
@@ -1376,6 +1378,21 @@ test(
     assert.equal(completeInventory.currentValue.value.decimal, "100");
     assert.equal(partialInventory.latestSnapshotAsOf, undefined);
 
+    await owner.query(
+      `UPDATE positions
+          SET valuation_note =
+            'Market Value column of the BONDS holdings table; summed from 2 dated lots without a printed Total row'
+        WHERE id = 'scope-complete-position'`,
+    );
+    complete = await snapshot(completeAccount);
+    assert.equal(complete.summary.status, "unavailable");
+    assert.equal(complete.summary.reason, "incomplete_source");
+    await owner.query(
+      `UPDATE positions
+          SET valuation_note = 'Market Value column of the BONDS holdings table'
+        WHERE id = 'scope-complete-position'`,
+    );
+
     // Price is intentionally absent from positionHash. Changing it proves
     // the read gate compares the full stored semantics rather than trusting
     // the hash alone.
@@ -1467,7 +1484,8 @@ test(
           valuation_basis, valuation_note, source_locator)
        VALUES ($1, 'scope-complete-versioned', $4, $2, $3::date,
                'scope-complete-instrument', 2, 50,
-               100, 80, 20, 'USD', 'market_price', 'Synthetic stated mark',
+               100, 80, 20, 'USD', 'market_price',
+               'Market Value column of the GOVERNMENT/SECURITIES holdings table',
                '{"row":{"source":"consolidated","index":20}}')`,
       [consolidatedDoc, completeAccount, asOf, "a".repeat(64)],
     );
@@ -1980,7 +1998,7 @@ test(
       ]);
       assert.deepEqual(client.getServerVersion(), {
         name: "kith-finance-archive",
-        version: "2.0.3",
+        version: "2.0.4",
       });
       const tools = await client.listTools();
       const financeRead = tools.tools.find(

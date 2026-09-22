@@ -105,7 +105,7 @@ export function createFinanceArchiveMcpServer(
   cursorSigningSecret: string | Uint8Array,
 ): FinanceArchiveMcpServer {
   const server = new McpServer(
-    { name: "kith-finance-archive", version: "2.0.3" },
+    { name: "kith-finance-archive", version: "2.0.4" },
     { instructions: SERVER_INSTRUCTIONS },
   );
 

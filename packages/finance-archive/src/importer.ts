@@ -63,6 +63,7 @@ import {
   toMinorUnits,
 } from "./money.js";
 import { toNumericText } from "./pgNumeric.js";
+import { valuationNotesEquivalentSql } from "./valuationNote.js";
 import {
   type ArchiveClient,
   insertRows,
@@ -2184,7 +2185,7 @@ export async function importBatch(
                        AND p.unrealized IS NOT DISTINCT FROM m.unrealized
                        AND p.currency = m.currency
                        AND p.valuation_basis IS NOT DISTINCT FROM m.valuation_basis
-                       AND p.valuation_note IS NOT DISTINCT FROM m.valuation_note))
+                       AND ${valuationNotesEquivalentSql("p.valuation_note", "m.valuation_note")}))
              AND NOT EXISTS (
                SELECT 1 FROM positions p
                 WHERE p.account_id = $2 AND p.as_of = $3::date
@@ -2200,7 +2201,7 @@ export async function importBatch(
                        AND m.unrealized IS NOT DISTINCT FROM p.unrealized
                        AND m.currency = p.currency
                        AND m.valuation_basis IS NOT DISTINCT FROM p.valuation_basis
-                       AND m.valuation_note IS NOT DISTINCT FROM p.valuation_note))
+                       AND ${valuationNotesEquivalentSql("m.valuation_note", "p.valuation_note")}))
              AS exact`,
           [scopeId, scope.accountId, scope.asOf, scope.emittedPositionCount],
         );
