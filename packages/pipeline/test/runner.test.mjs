@@ -1189,6 +1189,75 @@ test("the same document failing in two passes reports the second as exhausted", 
   // Two rows, one attempt each: the document has spent its budget even though
   // no single row ever reached it.
   assert.equal(second[0].exhausted, true);
+
+  // The server keeps the discovery disposition that produced the work row.
+  // After the exhausted report that is still `queued`, but the metadata-first
+  // scheduler must consume the durable local budget and walk on to a sibling
+  // rather than issuing a third preflight for the failed selection.
+  const setup = await fixture(0);
+  const sibling = pdfPlan({
+    relativePath: "sibling.pdf",
+    sourceItemId: "sibling-item",
+    sha256: "b".repeat(64),
+  });
+  const routing = {
+    version: 1,
+    triageStartIndex: 0,
+    refreshReady: false,
+    selected: [
+      {
+        sourceItemId: plan.sourceItemId,
+        observationEpoch: plan.observationEpoch,
+        processingEpoch: plan.processingEpoch,
+        sha256: plan.sha256,
+      },
+    ],
+    previewed: [],
+    previewGaps: [],
+    selectionReceipts: [],
+  };
+  const checkpoint = archivedCheckpoint(plan, {
+    files: [plan, sibling],
+    metadataFirst: routing,
+    step: "preview",
+    originalCatalogId: undefined,
+    expectedOriginalRevision: undefined,
+    processingCatalogId: undefined,
+    expectedProcessingRevision: undefined,
+    preflightAction: undefined,
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const operations = [];
+  try {
+    const runner = new PipelineRunner(setup.config, journal, {
+      async call(request) {
+        operations.push(request.operation);
+        throw new Error("scheduler must not call the server");
+      },
+    });
+    runner.archiveCatalog = {
+      findOriginalExact(identity) {
+        return identity.sourceExternalId === plan.externalId
+          ? original
+          : undefined;
+      },
+      listOriginals() {
+        return [original];
+      },
+      listProcessings() {
+        return rows;
+      },
+    };
+    const next = await runner.nextMetadataCheckpoint(checkpoint, routing, 0);
+    assert.equal(next.phase, "archived");
+    assert.equal(next.pdfIndex, 1);
+    assert.equal(next.step, "preview");
+    assert.deepEqual(next.metadataFirst.selected, routing.selected);
+    assert.deepEqual(operations, []);
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
 });
 
 test("a document stops being selected for archived work once its local parse attempts are exhausted", async () => {

@@ -2110,6 +2110,7 @@ export class PipelineRunner {
   }
 
   private async pdfNeedsArchivedWork(plan: PdfFilePlan): Promise<boolean> {
+    const matches = this.matchingProcessingRows(plan);
     // A `queued` entry is the server saying it has not settled this failure
     // yet, and the only thing that settles it is one more report carrying
     // `exhausted`, so going quiet here would strand the work row as retryable
@@ -2121,19 +2122,26 @@ export class PipelineRunner {
     // the source bytes, processing epoch and full parser fingerprint tuple, so
     // it cannot consume a changed or newly requested revision.
     if (plan.discoveryState === "queued") {
-      const matches = this.matchingProcessingRows(plan);
       const original = this.matchingOriginal(plan);
-      const reusable = this.reusableProcessingRow(matches, original);
+      // Failed attempts legitimately leave more than one unactivated row.
+      // Only ask the strict authoritative-row selector to resolve history when
+      // an activation exists that could still require cleanup.
+      const reusable = matches.some((row) => row.activation !== undefined)
+        ? this.reusableProcessingRow(matches, original)
+        : undefined;
       if (reusable?.activation) {
         return await this.processingArtifactsPresent(
           reusable,
           planMediaType(plan),
         );
       }
+      // The local attempt receipt is durable across scans. Once the second
+      // failed parse reports `exhausted`, the server's discovery disposition
+      // remains the original `queued` value but no third preflight is valid.
+      if (parseAttemptsSpent(matches) >= MAX_PARSE_ATTEMPTS) return false;
       return true;
     }
     if (plan.discoveryState !== "unchanged") return false;
-    const matches = this.matchingProcessingRows(plan);
     // A document that has already exhausted its bounded local parser attempts
     // (see `recordArchivedParseFailure`) stays `parse_failed` rather than being
     // retried on every future pass; a parser version bump lands on a fresh row
