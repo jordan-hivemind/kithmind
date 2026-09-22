@@ -189,7 +189,7 @@ node packages/plaid-feed/dist/cli.js import-archive
 # or: kith-plaid-feed import-archive
 ```
 
-A one-time (idempotent, safe to re-run) read of the finance archive
+A self-repairing (idempotent, safe to re-run) read of the finance archive
 (statement-derived, Morgan Stanley only, `finance.transactions` 2020 to
 present) into the same unified ledger tables `pull` writes into, tagged
 `source = 'plaid'` above and `source = 'archive'` here -- see
@@ -198,26 +198,62 @@ the archive and the Plaid feed to be two ledgers to query separately.
 
 Read-only against the archive (`FINANCE_ARCHIVE_READER_DATABASE_URL`, the
 archive's own reader-role connection string, the same one the MCP gateway
-uses); the finance-archive write path is never touched. Matches an archive
-account onto an existing `kith.fin_accounts` row by institution plus the
-last-four mask, then by institution plus name; an archive account nothing
-matches becomes its own row. An archive instrument is matched onto
+uses); the finance-archive write path is never touched. Every archive query
+schema-qualifies its tables (`${schema}.accounts`, not a bare `accounts`)
+with whatever schema the connection is actually pinned to
+(`archiveSchemaOf`, `finance` unless `FINANCE_ARCHIVE_SCHEMA` overrides it)
+-- defense in depth on top of `createArchiveClient`'s own `search_path` pin,
+so a same-named table earlier on the connection's `search_path` can never be
+read by mistake. A startup guard (`assertArchiveSchemaReady`) confirms
+`${schema}.accounts` is actually reachable before any real reading starts,
+failing with a clear message rather than a bare "relation does not exist"
+(or, worse, silently reading the wrong table) if it is not. Matches an
+archive account onto an existing `kith.fin_accounts` row by institution plus
+the last-four mask, then by institution plus name; an archive account
+nothing matches becomes its own archive-only row (`archive_account_id` set,
+`plaid_account_id` null). An archive instrument is matched onto
 `kith.fin_securities` by ticker, then CUSIP, then ISIN.
+
+**Linking persists and self-repairs.** A match sets `archive_account_id` on
+the matched `kith.fin_accounts` row (not just an in-memory pairing for that
+run), so the Institutions screen's join from a feed account onto its archive
+history works after every run, not only the run that first matched it. An
+archive account already linked is never re-matched by mask or name on a
+later run -- that link is stable. If that link points at an archive-only row
+(no feed account existed yet when it was created) and a feed account now
+exists that matches by mask, then name, the archive-only row's transactions
+and snapshots move onto the feed row, the feed row gets `archive_account_id`
+set, and the now-empty archive-only row is deleted. A candidate row already
+claimed by a different archive account this run is never offered to a
+second archive account, so two archive accounts that happen to share a
+generic display name can never collapse onto the same feed row.
 
 **Boundary rule**: an account that already has Plaid transactions in the
 ledger only gets archive transactions strictly before the earliest Plaid
 date already there -- the archive is history, Plaid is the current feed, and
 importing archive rows past where Plaid's own history starts would
-duplicate coverage under two sources rather than extend it. An account with
-no Plaid transactions yet gets its entire archive history.
+duplicate coverage under two sources rather than extend it. The same rule
+applies to holding and balance snapshots, against the earliest Plaid
+snapshot date (holding or balance, whichever is earlier). An account with no
+Plaid transactions (or no Plaid snapshots) yet gets its entire archive
+history for that row kind. Every run re-derives both boundaries from the
+ledger's current Plaid rows, **deletes** any archive-source row already on
+or after its boundary (left behind by an earlier, boundary-blind or
+not-yet-linked run), and reinserts whatever belongs before it -- so a run
+against already-correct data deletes and inserts nothing, and a run against
+data an earlier bug mis-imported repairs it in place. The more conservative
+(earlier) of the two boundaries is recorded on
+`kith.fin_accounts.archive_coverage_through` (migration
+`049_fin_archive_coverage.sql`) as the boundary this run applied for that
+account, `null` when the account has no Plaid data yet.
 
 Prints counts only, the same rule `pull` follows:
 
 ```
-plaid import-archive accounts_matched=3 accounts_created=1 instruments_matched=12 instruments_created=2 transactions_imported=4108 transactions_skipped_past_boundary=214 positions_imported=340 positions_skipped_no_instrument=0 balances_imported=48
+plaid import-archive accounts_matched=3 links_set=1 archive_only_accounts=1 rows_inserted=4108 rows_deleted_as_overlap=6 boundary_date_count=2 accounts_created=1 accounts_merged=0 instruments_matched=12 instruments_created=2 transactions_imported=4094 transactions_skipped_past_boundary=214 positions_imported=340 positions_skipped_no_instrument=0 positions_skipped_past_boundary=5 balances_imported=48 balances_skipped_past_boundary=2
 ```
 
-## Tables (migrations `043_plaid_feed.sql`, `044_plaid_currency.sql`, `045_plaid_history.sql`, `047_plaid_strings.sql`, `048_finance_unify.sql`)
+## Tables (migrations `043_plaid_feed.sql`, `044_plaid_currency.sql`, `045_plaid_history.sql`, `047_plaid_strings.sql`, `048_finance_unify.sql`, `049_fin_archive_coverage.sql`)
 
 `kith.plaid_items` is Plaid item state only -- the Keychain pointer, the
 `/transactions/sync` cursor, the investment-transaction watermark,
@@ -233,6 +269,12 @@ row carries `source` (`'archive'` or `'plaid'`); a transaction or a snapshot
 row is unique per source (a transaction by `(source, source_ref)`, a
 snapshot by `(account_id, as_of[, security_id], source)`), so the two
 sources' rows sit side by side rather than overwriting each other.
+
+Migration `049_fin_archive_coverage.sql` adds
+`kith.fin_accounts.archive_coverage_through` (nullable `date`): the overlap
+boundary `import-archive` last applied for that account. `import-archive`
+re-derives and rewrites it on every run; it is not authoritative on its own,
+just a cache of the boundary the last run applied.
 
 All in the `kith` schema and all owner-global (no `space_id`), matching
 every existing finance table in this codebase. No triggers, no change-feed
@@ -309,12 +351,19 @@ pnpm --filter @repo/plaid-feed build
 node --test packages/plaid-feed/test/*.test.mjs
 ```
 
-`test/ledger.test.mjs` is the one exception: `import-archive`'s matching and
-boundary rule reconciling an archive-style account against a Plaid-style
-one, end to end against a real throwaway Postgres (its own database on
-whatever server `KITH_STORE_DATABASE_URL` points at, created and dropped by
-the test). It skips cleanly without that variable set, and runs as part of
-the same `node --test packages/plaid-feed/test/*.test.mjs` command above.
+`test/ledger.test.mjs` is the one exception: `import-archive`'s matching,
+linking and boundary rule reconciling archive-style accounts against
+Plaid-style ones, end to end against a real throwaway Postgres (its own
+database on whatever server `KITH_STORE_DATABASE_URL` points at, created and
+dropped by the test). Three scenarios: a straight mask match with the
+boundary rule and a second, idempotent run; an archive-only account merging
+into a feed account that shows up later, with self-repair deleting the
+now-past-boundary archive row that an earlier, feed-less run had no
+boundary to skip it against; and two archive accounts at the same
+institution linking to their own distinct feed accounts rather than
+collapsing onto one. Skips cleanly without `KITH_STORE_DATABASE_URL` set,
+and runs as part of the same `node --test packages/plaid-feed/test/*.test.mjs`
+command above.
 
 A migration-apply test lives in
 `packages/kith-store/test/kithSchema.test.mjs` (it already asserts every

@@ -359,6 +359,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "one unified ledger: kith.fin_accounts/fin_securities/fin_transactions/fin_holding_snapshots/fin_balance_snapshots replace the Plaid-only plaid_accounts/plaid_securities/plaid_balance_snapshots/plaid_holding_snapshots/plaid_transactions/plaid_investment_transactions tables",
     url: new URL("../migrations/048_finance_unify.sql", import.meta.url),
   },
+  {
+    version: 49,
+    name: "kith.fin_accounts.archive_coverage_through: the overlap boundary import-archive last applied for this account",
+    url: new URL("../migrations/049_fin_archive_coverage.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

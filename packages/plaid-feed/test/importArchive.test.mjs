@@ -6,13 +6,17 @@
 // throwaway Postgres.
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
+  earlierDate,
   isBeforeArchiveCutoff,
   mapArchiveActivityKind,
   matchArchiveAccount,
   matchArchiveInstrument,
+  planArchiveAccountLink,
 } from "../dist/index.js";
 
 test("matchArchiveAccount matches by institution and mask first", () => {
@@ -103,6 +107,170 @@ test("isBeforeArchiveCutoff: strictly before the cutoff when the account has Pla
 test("isBeforeArchiveCutoff: everything passes when the account has no Plaid data yet", () => {
   assert.equal(isBeforeArchiveCutoff("2020-01-01", null), true);
   assert.equal(isBeforeArchiveCutoff("2026-09-22", null), true);
+});
+
+// earlierDate: what archive_coverage_through records -- the more
+// conservative (earlier) of the transaction and snapshot boundaries.
+test("earlierDate picks the earlier of two dates", () => {
+  assert.equal(earlierDate("2026-01-01", "2026-06-01"), "2026-01-01");
+  assert.equal(earlierDate("2026-06-01", "2026-01-01"), "2026-01-01");
+});
+
+test("earlierDate treats null as no bound, so the other side always wins", () => {
+  assert.equal(earlierDate(null, "2026-06-01"), "2026-06-01");
+  assert.equal(earlierDate("2026-06-01", null), "2026-06-01");
+});
+
+test("earlierDate is null only when both sides are null", () => {
+  assert.equal(earlierDate(null, null), null);
+});
+
+// planArchiveAccountLink: the merge-into-feed-row decision, with synthetic
+// fin_accounts rows -- no database. See importArchive.ts's own doc comment
+// for the four outcomes this decides between.
+
+const archive1 = {
+  id: "arch-1",
+  institutionName: "Morgan Stanley",
+  mask: "4321",
+  name: "Individual Brokerage",
+};
+
+test("planArchiveAccountLink: no existing link, matches an unclaimed feed row by mask", () => {
+  const candidates = [
+    {
+      id: "fin-1",
+      institutionName: "Morgan Stanley",
+      mask: "4321",
+      name: "Different name",
+      plaidAccountId: "plaid-1",
+      archiveAccountId: null,
+    },
+  ];
+  assert.deepEqual(planArchiveAccountLink(archive1, candidates), {
+    kind: "match",
+    finAccountId: "fin-1",
+  });
+});
+
+test("planArchiveAccountLink: no existing link and nothing matches creates a new archive-only row", () => {
+  assert.deepEqual(planArchiveAccountLink(archive1, []), { kind: "create" });
+});
+
+test("planArchiveAccountLink: already linked to a row that also has a plaid_account_id reuses it, no write", () => {
+  const candidates = [
+    {
+      id: "fin-1",
+      institutionName: "Morgan Stanley",
+      mask: "4321",
+      name: "Individual Brokerage",
+      plaidAccountId: "plaid-1",
+      archiveAccountId: "arch-1",
+    },
+  ];
+  assert.deepEqual(planArchiveAccountLink(archive1, candidates), {
+    kind: "already-linked",
+    finAccountId: "fin-1",
+  });
+});
+
+test("planArchiveAccountLink: already linked to an archive-only row with no feed match yet stays archive-only", () => {
+  const candidates = [
+    {
+      id: "fin-archive-only",
+      institutionName: "Morgan Stanley",
+      mask: "4321",
+      name: "Individual Brokerage",
+      plaidAccountId: null,
+      archiveAccountId: "arch-1",
+    },
+  ];
+  assert.deepEqual(planArchiveAccountLink(archive1, candidates), {
+    kind: "already-linked",
+    finAccountId: "fin-archive-only",
+  });
+});
+
+test("planArchiveAccountLink: already linked to an archive-only row, and a feed row now matches, merges", () => {
+  const candidates = [
+    {
+      id: "fin-archive-only",
+      institutionName: "Morgan Stanley",
+      mask: "4321",
+      name: "Individual Brokerage",
+      plaidAccountId: null,
+      archiveAccountId: "arch-1",
+    },
+    {
+      id: "fin-feed",
+      institutionName: "Morgan Stanley",
+      mask: "4321",
+      name: "Brokerage (Plaid)",
+      plaidAccountId: "plaid-1",
+      archiveAccountId: null,
+    },
+  ];
+  assert.deepEqual(planArchiveAccountLink(archive1, candidates), {
+    kind: "merge",
+    archiveOnlyFinAccountId: "fin-archive-only",
+    feedFinAccountId: "fin-feed",
+  });
+});
+
+test("planArchiveAccountLink: never re-matches by name onto a row already claimed by a different archive account", () => {
+  const archive2 = {
+    id: "arch-2",
+    institutionName: "Morgan Stanley",
+    mask: null,
+    name: "Brokerage",
+  };
+  const candidates = [
+    {
+      id: "fin-1",
+      institutionName: "Morgan Stanley",
+      mask: "1111",
+      name: "Brokerage",
+      plaidAccountId: "plaid-1",
+      // Already claimed by a different archive account this run.
+      archiveAccountId: "arch-1",
+    },
+  ];
+  assert.deepEqual(planArchiveAccountLink(archive2, candidates), { kind: "create" });
+});
+
+// Regression guard: every archive query in `archiveReader` schema-qualifies
+// its tables (`${schema}.accounts`, not a bare `accounts`) rather than
+// relying only on the connection's `search_path` pin. Reads the TypeScript
+// source directly -- a query never becomes a shared constant, so there is
+// nothing to import and assert on at runtime; the source text is the
+// closest thing to "the module's query constants" this module has.
+test("archiveReader's SQL always schema-qualifies the archive's tables, never a bare table name", () => {
+  const sourcePath = fileURLToPath(new URL("../src/importArchive.ts", import.meta.url));
+  const source = readFileSync(sourcePath, "utf8");
+  const readerSource = source.slice(
+    source.indexOf("export function archiveReader"),
+    source.indexOf("export async function assertArchiveSchemaReady"),
+  );
+  assert.ok(readerSource.length > 0, "archiveReader's own source slice should not be empty");
+
+  const archiveTables = ["accounts", "institutions", "instruments", "transactions", "positions", "balances"];
+
+  // No bare "FROM accounts" / "JOIN institutions" etc. -- a regression back
+  // to an unqualified reference would match this and fail the test.
+  const bareReference = new RegExp(`\\b(FROM|JOIN)\\s+(${archiveTables.join("|")})\\b`);
+  assert.equal(
+    bareReference.test(readerSource),
+    false,
+    "found a bare (unqualified) reference to an archive table",
+  );
+
+  // Every one of the six tables is actually read, schema-qualified.
+  for (const table of archiveTables) {
+    assert.ok(
+      readerSource.includes(`\${schema}.${table}`),
+      `expected a schema-qualified reference to ${table}`,
+    );
+  }
 });
 
 test("mapArchiveActivityKind maps the archive's free-text activity_type onto the shared kind vocabulary", () => {
