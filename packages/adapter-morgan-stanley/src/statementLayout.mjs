@@ -2299,6 +2299,18 @@ export function parseRealStatement(text, kind) {
     }
     sheets.push(sheet);
   });
+  // Banner parsing intentionally reads only the first matching source row.
+  // Count every explicit-account banner independently so a second numeric,
+  // empty, or malformed sibling cannot disappear and leave a unique proof.
+  lines.forEach(({ text: line }, lineIndex) => {
+    if (!TOTAL_VALUE_BANNER.test(line)) return;
+    const accountKey = accountKeys[lineIndex];
+    if (accountKey === null) return;
+    balanceObservationCounts.set(
+      accountKey,
+      (balanceObservationCounts.get(accountKey) ?? 0) + 1,
+    );
+  });
   // F1-61. A statement with no BALANCE SHEET block still states its account
   // total on the cover page. The banner is read only here, as the fallback:
   // where a BALANCE SHEET exists it is the better source, stating the cash
@@ -2319,13 +2331,6 @@ export function parseRealStatement(text, kind) {
       : null;
   if (banner?.balanceScope !== null && banner?.balanceScope !== undefined)
     observedBalanceScopes.push(banner.balanceScope);
-  if (banner?.balanceScope !== null && banner?.balanceScope !== undefined) {
-    const accountKey = banner.balanceScope.accountExternalKey;
-    balanceObservationCounts.set(
-      accountKey,
-      (balanceObservationCounts.get(accountKey) ?? 0) + 1,
-    );
-  }
   if (banner?.balance !== undefined) {
     // The same rule as above: on a statement that does name accounts, a
     // banner printed before the first account header names none this parser

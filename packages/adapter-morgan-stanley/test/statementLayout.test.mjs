@@ -1802,6 +1802,20 @@ test("a cover banner cannot borrow an amount from the next account or page", () 
   assert.equal(parsed.holdings.balanceScopes, undefined);
 });
 
+test("a second account banner prevents the first explicit none from becoming a unique proof", () => {
+  const text = EMPTY_ACCOUNT_LAYOUT_TEXT.replace(
+    "        Synthetic Active Assets Account    123-456789-012",
+    [
+      "        Synthetic Active Assets Account",
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Synthetic Household",
+    ].join("\n"),
+  ).concat("\n        TOTAL VALUE OF YOUR ACCOUNT", "\n        $74,310.25");
+  const parsed = parseStatementLines(text, kind);
+  assert.deepEqual(parsed.holdings.balances, []);
+  assert.equal(parsed.holdings.balanceScopes, undefined);
+});
+
 test("an account holding nothing says so, and is not a statement left unparsed", () => {
   const parsed = parseStatementLines(EMPTY_ACCOUNT_LAYOUT_TEXT, kind);
   assert.equal(
