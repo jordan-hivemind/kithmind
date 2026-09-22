@@ -23,6 +23,7 @@ import type {
   DiscoveredAccount,
   InstitutionCapabilities,
   ParsedBalance,
+  ParsedBalanceScope,
   ParsedHoldings,
   ParsedInstrument,
   ParsedLiability,
@@ -40,6 +41,7 @@ import { canonicalizeDecimal, compareDecimal } from "./decimal.js";
 import type {
   AdapterReviewItem,
   ImportBalance,
+  ImportBalanceScope,
   ImportDocument,
   ImportLiability,
   ImportPosition,
@@ -1136,6 +1138,22 @@ function parsedPositionScopeToImportPositionScope(
   };
 }
 
+function parsedBalanceScopeToImportBalanceScope(
+  scope: ParsedBalanceScope,
+  accountId: string,
+): ImportBalanceScope {
+  return {
+    accountId,
+    asOf: scope.asOf,
+    proofVersion: scope.proofVersion,
+    status: scope.status,
+    emittedBalanceCount: scope.emittedBalanceCount,
+    gapCodes: scope.gapCodes,
+    ...(scope.zeroBasis === undefined ? {} : { zeroBasis: scope.zeroBasis }),
+    evidence: scope.evidence,
+  };
+}
+
 function parsedBalanceToImportBalance(
   balance: ParsedBalance,
   accountId: string,
@@ -1327,6 +1345,9 @@ async function collectDocuments(
   const positionScopeGroups = groupBySourceDocument(
     holdings.positionScopes ?? [],
   );
+  const balanceScopeGroups = groupBySourceDocument(
+    holdings.balanceScopes ?? [],
+  );
   const reportedRowCount = pull.acquired.manifest.reportedRowCount;
 
   const reviews: ReviewBuffer = [];
@@ -1393,6 +1414,7 @@ async function collectDocuments(
     ...balanceGroups.keys(),
     ...liabilityGroups.keys(),
     ...positionScopeGroups.keys(),
+    ...balanceScopeGroups.keys(),
   ]);
   // A document-tier pull the adapter could not parse (or a genuinely empty
   // one) has no rows to group by, but the retained file still has to be
@@ -1450,6 +1472,13 @@ async function collectDocuments(
           resolveRowAccountId(reviews, pull, scope),
         ),
     );
+    const balanceScopes = (balanceScopeGroups.get(sourceDocument) ?? []).map(
+      (scope) =>
+        parsedBalanceScopeToImportBalanceScope(
+          scope,
+          resolveRowAccountId(reviews, pull, scope),
+        ),
+    );
     const reviewItems = reviews.splice(openedBefore);
     documents.push({
       // For a single document this literally is the acquired file's own
@@ -1497,6 +1526,7 @@ async function collectDocuments(
       balances,
       liabilities,
       positionScopes,
+      balanceScopes,
     });
   }
   await flushInstruments(client, resolver, reviews, pull.institutionId);

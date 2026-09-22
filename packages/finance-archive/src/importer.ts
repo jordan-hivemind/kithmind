@@ -34,7 +34,12 @@
 
 import { randomUUID } from "node:crypto";
 
-import type { PositionScopeEvidence, PositionScopeGapCode } from "./adapter.js";
+import type {
+  BalanceScopeEvidence,
+  BalanceScopeGapCode,
+  PositionScopeEvidence,
+  PositionScopeGapCode,
+} from "./adapter.js";
 
 import { multiplyDecimal } from "./decimal.js";
 import {
@@ -259,6 +264,18 @@ export type ImportPositionScope = {
   evidence: PositionScopeEvidence;
 };
 
+/** One adapter-proved source balance projection for an exact account/date. */
+export type ImportBalanceScope = {
+  accountId: string;
+  asOf: string;
+  proofVersion: "balance_scope_v1";
+  status: "complete" | "partial";
+  emittedBalanceCount: 0 | 1;
+  gapCodes: readonly BalanceScopeGapCode[];
+  zeroBasis?: "source_stated_none";
+  evidence: BalanceScopeEvidence;
+};
+
 /**
  * One acquired file (a raw statement, or one page of a paginated pull) and
  * the rows parsed from it. Rows are attributed to `documents` by content
@@ -337,6 +354,8 @@ export type ImportDocument = {
   liabilities?: readonly ImportLiability[];
   /** Optional positive source observations; absence preserves legacy gates. */
   positionScopes?: readonly ImportPositionScope[];
+  /** Optional account-bound balance observations used by scoped correction. */
+  balanceScopes?: readonly ImportBalanceScope[];
 };
 
 /**

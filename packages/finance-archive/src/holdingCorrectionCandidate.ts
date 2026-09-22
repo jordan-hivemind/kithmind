@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import type {
   ImportBalance,
+  ImportBalanceScope,
   ImportDocument,
   ImportLiability,
   ImportPosition,
@@ -103,6 +104,19 @@ export type PreparedHoldingPositionScope = {
   readonly positions: readonly CandidateHoldingRow[];
   /** Binds the positive boundary evidence and every source-owned locator and
    * semantic member without exposing those values in the public manifest. */
+  readonly scopeDigest: string;
+};
+
+export type HoldingBalanceScopeSelector = {
+  readonly accountId: string;
+  readonly asOf: string;
+  readonly proofVersion: "balance_scope_v1";
+};
+
+export type PreparedHoldingBalanceScope = {
+  readonly selector: HoldingBalanceScopeSelector;
+  readonly declaration: ImportBalanceScope;
+  readonly balances: readonly CandidateHoldingRow[];
   readonly scopeDigest: string;
 };
 
@@ -599,6 +613,135 @@ export function prepareHoldingPositionScopes(input: {
         ]).map((row) => [row.rowHash, row.sourceLocator, row.semantic]),
       });
       return { selector, declaration, positions, scopeDigest };
+    });
+}
+
+function balanceSelectorKey(selector: HoldingBalanceScopeSelector): string {
+  return `${selector.accountId}\u0000${selector.asOf}\u0000${selector.proofVersion}`;
+}
+
+function completeBalanceScopeEvidence(scope: ImportBalanceScope): boolean {
+  return (
+    scope.evidence.account !== undefined &&
+    scope.evidence.header !== undefined &&
+    scope.evidence.asOf !== undefined &&
+    scope.evidence.row !== undefined &&
+    scope.evidence.scopeEnd !== undefined &&
+    (scope.emittedBalanceCount === 0
+      ? scope.evidence.explicitNone !== undefined
+      : scope.evidence.totalValue !== undefined)
+  );
+}
+
+/** Prepares only explicitly selected positive account/date balance scopes. */
+export function prepareHoldingBalanceScopes(input: {
+  readonly documentId: string;
+  readonly retainedSha256: string;
+  readonly candidate: ImportDocument;
+  readonly selectors: readonly HoldingBalanceScopeSelector[];
+}): readonly PreparedHoldingBalanceScope[] {
+  validateIdentity(input.documentId, input.retainedSha256);
+  if (
+    input.candidate.retainedSha256 !== input.retainedSha256 ||
+    input.candidate.sha256 !== input.retainedSha256
+  ) {
+    fail("candidate is not bound to the selected retained bytes");
+  }
+  if (input.selectors.length === 0) fail("no balance scopes were selected");
+
+  const selected = new Map<string, HoldingBalanceScopeSelector>();
+  for (const selector of input.selectors) {
+    if (
+      selector === null ||
+      typeof selector !== "object" ||
+      canonical(Object.keys(selector).sort()) !==
+        canonical(["accountId", "asOf", "proofVersion"]) ||
+      typeof selector.accountId !== "string" ||
+      selector.accountId.length === 0 ||
+      !validDate(selector.asOf) ||
+      selector.proofVersion !== "balance_scope_v1"
+    ) {
+      fail("balance scope selector is invalid");
+    }
+    const key = balanceSelectorKey(selector);
+    if (selected.has(key)) fail("balance scope selector is duplicated");
+    selected.set(key, selector);
+  }
+
+  const declarations = new Map<string, ImportBalanceScope>();
+  for (const scope of input.candidate.balanceScopes ?? []) {
+    const key = balanceSelectorKey(scope);
+    if (!selected.has(key)) continue;
+    if (declarations.has(key)) {
+      fail("selected balance scope declaration is duplicated");
+    }
+    declarations.set(key, scope);
+  }
+
+  return [...selected.values()]
+    .sort((left, right) =>
+      balanceSelectorKey(left).localeCompare(balanceSelectorKey(right)),
+    )
+    .map((selector) => {
+      const declaration = declarations.get(balanceSelectorKey(selector));
+      if (declaration === undefined) {
+        fail("selected balance scope was not declared by the adapter");
+      }
+      if (
+        declaration.status !== "complete" ||
+        declaration.gapCodes.length !== 0 ||
+        (declaration.emittedBalanceCount !== 0 &&
+          declaration.emittedBalanceCount !== 1) ||
+        (declaration.emittedBalanceCount === 0
+          ? declaration.zeroBasis !== "source_stated_none"
+          : declaration.zeroBasis !== undefined) ||
+        !completeBalanceScopeEvidence(declaration)
+      ) {
+        fail("selected balance scope is not positively complete");
+      }
+
+      let issueCount = 0;
+      let rejectedRows = 0;
+      const prepared: CandidateHoldingRow[] = [];
+      for (const row of input.candidate.balances ?? []) {
+        const account = row.accountId ?? input.candidate.accountId;
+        if (account !== selector.accountId || row.asOf !== selector.asOf) {
+          continue;
+        }
+        const value = prepareBalance(row, input.candidate, () => {
+          issueCount += 1;
+        });
+        if (value === null) rejectedRows += 1;
+        else prepared.push(value);
+      }
+      const balances = keepFirstBalancePerAccountDate(
+        dedupeCandidateRows("balances", prepared),
+        () => {
+          rejectedRows += 1;
+        },
+      );
+      if (
+        issueCount !== 0 ||
+        rejectedRows !== 0 ||
+        balances.length !== declaration.emittedBalanceCount ||
+        new Set(balances.map((row) => row.rowHash)).size !== balances.length
+      ) {
+        fail(
+          "selected balance scope does not exactly match its mapped members",
+        );
+      }
+      const scopeDigest = digest("kith-finance-balance-scope-candidate:v1", {
+        selector,
+        emittedBalanceCount: declaration.emittedBalanceCount,
+        zeroBasis: declaration.zeroBasis ?? null,
+        evidence: declaration.evidence,
+        balances: sortedRows(balances, (row) => [
+          row.rowHash,
+          row.sourceLocator,
+          row.semantic,
+        ]).map((row) => [row.rowHash, row.sourceLocator, row.semantic]),
+      });
+      return { selector, declaration, balances, scopeDigest };
     });
 }
 

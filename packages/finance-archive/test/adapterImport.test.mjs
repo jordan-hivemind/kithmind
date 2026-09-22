@@ -1964,6 +1964,25 @@ test(
             },
           },
         ],
+        balanceScopes: [
+          {
+            sourceDocument: "statement",
+            accountExternalKey: "acct-trust-01",
+            asOf: "2026-03-31",
+            proofVersion: "balance_scope_v1",
+            status: "complete",
+            emittedBalanceCount: 1,
+            gapCodes: [],
+            evidence: {
+              account: { source: "pdf_statement", index: 10 },
+              header: { source: "pdf_statement", index: 11 },
+              asOf: { source: "pdf_statement", index: 12 },
+              row: { source: "pdf_statement", index: 13 },
+              totalValue: { source: "pdf_statement", index: 14 },
+              scopeEnd: { source: "pdf_statement", index: 15 },
+            },
+          },
+        ],
       },
       docType: "pdf_statement",
       docDate: "2026-03-31",
@@ -1972,6 +1991,17 @@ test(
     };
 
     const documents = await adapterPullToImportDocuments(client, pull);
+    assert.deepEqual(documents[0].balanceScopes, [
+      {
+        accountId: TRUST.id,
+        asOf: "2026-03-31",
+        proofVersion: "balance_scope_v1",
+        status: "complete",
+        emittedBalanceCount: 1,
+        gapCodes: [],
+        evidence: pull.holdings.balanceScopes[0].evidence,
+      },
+    ]);
     await importBatch(
       client,
       { source: INSTITUTION.slug, documents },
