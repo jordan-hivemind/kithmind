@@ -26,10 +26,14 @@
 // `content_hash` is `sha256(extracted text)`, not `sha256(file bytes)`, so it
 // cannot answer "is this file unchanged" without extracting it first. See
 // the package README for the consequence: a source revision's inline text
-// (and a text version's) is capped at 64 KiB and 32 pages by the schema's
-// existing `MAX_SOURCE_INLINE_UTF8_BYTES` / `MAX_SOURCE_PAGES` -- a bigger
-// document fails per file, logged, and is skipped rather than crashing the
-// run.
+// (and a text version's) is capped at 8 MiB and 1,000 pages by the schema's
+// existing `MAX_SOURCE_INLINE_UTF8_BYTES` / `MAX_SOURCE_PAGES` -- bounds
+// sized for one household's own documents (a 90-page tax return, a 30-60
+// page brokerage statement), not untrusted input. A bigger document still
+// fails per file, logged, and is skipped rather than crashing the run.
+// `stagePages` also enforces a MAX_STAGING_ROWS-per-call row limit
+// independent of MAX_SOURCE_PAGES, so `stageOneFile` below batches page
+// inserts the same way it already batches evidence spans and chunks.
 
 import type { Pool, PoolClient } from "pg";
 
@@ -252,11 +256,20 @@ async function stageOneFile(
     throw new Error("Processing generation text version changed underneath it");
   }
 
-  const stagedPages = await provenance.stagePages(client, {
-    spaceId,
-    sourceTextVersionId: textVersion.id,
-    pages: sourcePages,
-  });
+  // Batched the same way `stageEvidenceSpans`/`stageChunks` already are
+  // below: `stagePages` enforces a MAX_STAGING_ROWS-per-call row limit
+  // (`requireBatchBounds` in provenance/model.ts) regardless of
+  // MAX_SOURCE_PAGES, so a 1000-page document staged in one call would fail
+  // on the per-call limit long before the resource limit.
+  const stagedPages: provenance.SourcePageRow[] = [];
+  for (const batch of batches(sourcePages, MAX_STAGING_ROWS)) {
+    const staged = await provenance.stagePages(client, {
+      spaceId,
+      sourceTextVersionId: textVersion.id,
+      pages: batch,
+    });
+    stagedPages.push(...staged);
+  }
   if (stagedPages.length !== sourcePages.length) {
     throw new Error("Page staging is incomplete");
   }

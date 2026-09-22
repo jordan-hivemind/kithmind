@@ -10,13 +10,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { applyKithSchema, createKithPool, documents, newKithId } from "@repo/kith-store";
+import { applyKithSchema, createKithPool, documents, newKithId, sha256 } from "@repo/kith-store";
 import { runIngest } from "../dist/ingest.js";
+import { ingestFile } from "../dist/write.js";
 
 import { acquirePostgres, skip } from "./helpers/pgServer.mjs";
 import { buildPdf } from "./helpers/pdf.mjs";
 
-test("ingests a synthetic two-page PDF and is idempotent on a second run", { skip }, async (t) => {
+/** Boots a throwaway Postgres with the kith schema applied and one seeded
+ * user/space/fs-source-account, shared by every test below. */
+async function bootstrapDatabase(t) {
   const server = await acquirePostgres();
   const pool = createKithPool(server.url, 4);
   // Registered as one hook, in this order, so the pool's connections close
@@ -58,6 +61,12 @@ test("ingests a synthetic two-page PDF and is idempotent on a second run", { ski
      VALUES ($1, $2, transaction_timestamp(), 'fs', 'synthetic-local', 'Synthetic Folder', true, $3)`,
     [accountId, spaceId, userId],
   );
+
+  return { pool, spaceId, userId, accountId };
+}
+
+test("ingests a synthetic two-page PDF and is idempotent on a second run", { skip }, async (t) => {
+  const { pool, spaceId, accountId } = await bootstrapDatabase(t);
 
   const root = await mkdtemp(join(tmpdir(), "ingest-simple-fixture-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -124,4 +133,50 @@ test("ingests a synthetic two-page PDF and is idempotent on a second run", { ski
             (SELECT count(*) FROM kith.processing_generations)::int AS generations`,
   );
   assert.deepEqual(countsAfter.rows[0], countsBefore.rows[0], "second run inserted rows for an unchanged file");
+});
+
+test("ingests a synthetic 40-page text document, over the old 32-page cap", { skip }, async (t) => {
+  const { pool, spaceId, userId, accountId } = await bootstrapDatabase(t);
+
+  // A plain text document, not a PDF: exercises the write path's own page
+  // handling directly (`write.ts`'s `ingestFile`), independent of poppler or
+  // the one-page-per-text-file rule `convert.ts` applies to a real `.txt`
+  // file. 40 pages is over the pre-change `MAX_SOURCE_PAGES` (32) and, at
+  // more than `MAX_STAGING_ROWS` (25), forces `stagePages` to batch.
+  const pageCount = 40;
+  const pages = Array.from(
+    { length: pageCount },
+    (_, index) => `Page ${index + 1} of a long synthetic household document. Line two of page ${index + 1}.`,
+  );
+  const fileByteHash = sha256(`synthetic-40-page-document:${pageCount}`);
+
+  const result = await ingestFile(pool, {
+    spaceId,
+    sourceAccountId: accountId,
+    externalId: "long-synthetic-document.txt",
+    title: "Long synthetic document",
+    docType: "text",
+    capturedAt: new Date(),
+    userId,
+    fileByteHash,
+    pages,
+    converterFingerprint: "test-40-page-text-v1",
+    mediaType: "text/plain",
+  });
+  assert.equal(result.pageCount, pageCount);
+
+  const readClient = await pool.connect();
+  let document;
+  try {
+    document = await documents.getDocument(readClient, [spaceId], result.documentId);
+  } finally {
+    readClient.release();
+  }
+  assert.ok(document, "getDocument returned null for the 40-page document");
+  assert.equal(document.pages.length, pageCount, "getDocument did not return all 40 pages");
+  assert.match(document.pages[0].text, /Page 1 of a long synthetic/);
+  assert.match(document.pages[pageCount - 1].text, new RegExp(`Page ${pageCount} of a long synthetic`));
+  for (const page of document.pages) {
+    assert.ok(page.evidence.length > 0, `page ${page.ordinal} has no evidence spans`);
+  }
 });

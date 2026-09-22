@@ -57,8 +57,11 @@ import {
   type SourceTextVersionRow,
 } from "./rows.js";
 
-export const MAX_SOURCE_INLINE_UTF8_BYTES = 65_536;
-export const MAX_SOURCE_PAGES = 32;
+// Bounds one household's own documents (a 90-page tax return, a 30-60 page
+// brokerage statement), not untrusted input.
+export const MAX_SOURCE_INLINE_UTF8_BYTES = 8 * 1024 * 1024;
+// Bounds one household's own documents, not untrusted input.
+export const MAX_SOURCE_PAGES = 1000;
 export const MAX_EVIDENCE_SPANS = 128;
 export const MAX_GENERATION_DOCUMENTS = 16;
 export const MAX_GENERATION_CHUNKS = 128;
