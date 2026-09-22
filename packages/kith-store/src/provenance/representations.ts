@@ -21,9 +21,21 @@ import {
 
 export const MAX_ARCHIVED_BINARY_BYTES = 16 * 1_024 * 1_024;
 export const MAX_PARSER_ARTIFACT_BYTES = 64 * 1_024 * 1_024;
-export const MAX_PARSED_TEXT_UTF8_BYTES = 1_024 * 1_024;
+// The top-of-function byteLength check in `parseSourceTextRepresentation`
+// applies to every representation, inline included, so this must stay at
+// least as large as `provenance/model.ts`'s `MAX_SOURCE_INLINE_UTF8_BYTES`
+// (bounds one household's own documents, not untrusted input) or a 90-page
+// tax return's own text version fails this check on its very first read.
+export const MAX_PARSED_TEXT_UTF8_BYTES = 8 * 1024 * 1024;
 export const MAX_PARSED_TEXT_PAGES = 64;
-export const MAX_LEGACY_INLINE_UTF8_BYTES = 65_536;
+// Despite the name, `requireLegacyInlineBounds` applies this to both the
+// implicit-legacy row shape and the current explicit `inline_utf8_v1` /
+// `inline_text_v1` representations (see both branches below), so this must
+// also stay at least as large as `MAX_SOURCE_INLINE_UTF8_BYTES`: it is what
+// `createOrGetRevision`/`createOrGetTextVersion` re-validate against on an
+// idempotent replay of an existing row, not only what gates a fresh insert.
+// Bounds one household's own documents, not untrusted input.
+export const MAX_LEGACY_INLINE_UTF8_BYTES = 8 * 1024 * 1024;
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const MAX_MEDIA_TYPE_CHARS = 255;

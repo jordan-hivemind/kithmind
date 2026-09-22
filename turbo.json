@@ -72,6 +72,11 @@
       "cache": false,
       "dependsOn": ["^build"],
       "passThroughEnv": ["KITH_STORE_DATABASE_URL"]
+    },
+    "@repo/ingest-simple#test:once": {
+      "cache": false,
+      "dependsOn": ["build"],
+      "passThroughEnv": ["KITH_STORE_DATABASE_URL"]
     }
   },
   "globalPassThroughEnv": ["PORT", "WEB_PORT"],

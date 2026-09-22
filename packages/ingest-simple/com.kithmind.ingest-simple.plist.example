@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template only: copy this into a real .plist file under
+  ~/Library/LaunchAgents/, replace every ABSOLUTE/PATH/... placeholder with a
+  real path, and `launchctl load` it. No owner path, account name or
+  credential value belongs in this template or its copy checked into a public
+  clone -- DATABASE_URL comes from the environment or Keychain (see
+  README.md), never from an argument or an env var written here.
+
+  StartInterval, not KeepAlive: this CLI does one bounded pass and exits
+  (`ingest --root ... --source-account ...`), so it should be launched once
+  an hour and left to exit on its own, the same reasoning
+  docs/kithmind-deferred-work.launchd.plist.txt gives for its own `once` mode
+  -- unlike that daemon's `tick`, this has no long-lived loop to keep alive.
+
+  Do not run this LaunchAgent at the same time as the old filesystem worker
+  service (examples/worker-service/com.kithmind.filesystem-worker.plist) for
+  the same source account: see this package's README, "Do not run alongside
+  the old worker".
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.kithmind.ingest-simple</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/node</string>
+    <string>/ABSOLUTE/PATH/TO/REPOSITORY/packages/ingest-simple/dist/cli.js</string>
+    <string>--root</string>
+    <string>/ABSOLUTE/PATH/TO/DROPBOX/FOLDER</string>
+    <string>--source-account</string>
+    <string>SOURCE_ACCOUNT_ID</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/ABSOLUTE/PATH/TO/REPOSITORY</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>StandardOutPath</key>
+  <string>/ABSOLUTE/PATH/TO/PRIVATE-LOG-DIRECTORY/ingest-simple.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/ABSOLUTE/PATH/TO/PRIVATE-LOG-DIRECTORY/ingest-simple.stderr.log</string>
+</dict>
+</plist>

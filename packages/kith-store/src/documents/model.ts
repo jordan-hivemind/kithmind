@@ -83,8 +83,20 @@ const MAX_SEARCH_CANDIDATES = 64;
 const MAX_RESULTS_PER_DOCUMENT = 3;
 const MAX_CITATIONS_PER_RESULT = 16;
 const MAX_CITATION_OUTPUT_BYTES = 256 * 1024;
-const MAX_PAGES = 64;
-const MAX_EVIDENCE_SPANS = 256;
+// Must stay >= provenance/model.ts's MAX_SOURCE_PAGES (1000, bounds one
+// household's own documents such as a 90-page tax return, not untrusted
+// input) or a document that ingestion accepted becomes unreadable here
+// ("Document content exceeds the supported read bounds").
+const MAX_PAGES = 1000;
+// The inline lane (packages/ingest-simple/src/chunker.ts's `pageChunkRanges`,
+// 8192-byte chunk target) makes at least one, and at most
+// `ceil(pageBytes / 8192)`, evidence spans per non-empty page, so across a
+// document capped at MAX_PAGES pages and provenance/model.ts's
+// MAX_SOURCE_INLINE_UTF8_BYTES (8 MiB) total text, spans are bounded by
+// 8,388,608 / 8192 + 1000 = 1024 + 1000 = 2024 -- the same figure
+// provenance/model.ts's own MAX_EVIDENCE_SPANS now uses, kept in sync here
+// for the same reason MAX_PAGES is above.
+const MAX_EVIDENCE_SPANS = 2024;
 const MAX_SOURCE_ACCOUNTS = 32;
 const MAX_SOURCE_ITEMS = 128;
 const MAX_SOURCE_METADATA_ROWS = 128;
