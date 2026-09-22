@@ -9,7 +9,12 @@ import { createArchiveClient } from "@repo/finance-archive/store";
 
 import { loadArchiveReaderDatabaseUrl, loadDatabaseUrl } from "./config.js";
 import { openPool } from "./db.js";
-import { archiveReader, importArchive, summarizeImportArchive } from "./importArchive.js";
+import {
+  archiveReader,
+  assertArchiveSchemaReady,
+  importArchive,
+  summarizeImportArchive,
+} from "./importArchive.js";
 import { DEFAULT_LINK_TIMEOUT_MS, runLink } from "./link.js";
 import { pullAll } from "./pull.js";
 
@@ -32,6 +37,7 @@ async function importArchiveCommand(): Promise<void> {
   const pool = openPool(databaseUrl);
   await archiveClient.connect();
   try {
+    await assertArchiveSchemaReady(archiveClient);
     const result = await importArchive(archiveReader(archiveClient), pool);
     process.stdout.write(`${summarizeImportArchive(result)}\n`);
   } finally {

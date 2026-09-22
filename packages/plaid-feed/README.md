@@ -198,10 +198,19 @@ the archive and the Plaid feed to be two ledgers to query separately.
 
 Read-only against the archive (`FINANCE_ARCHIVE_READER_DATABASE_URL`, the
 archive's own reader-role connection string, the same one the MCP gateway
-uses); the finance-archive write path is never touched. Matches an archive
-account onto an existing `kith.fin_accounts` row by institution plus the
-last-four mask, then by institution plus name; an archive account nothing
-matches becomes its own archive-only row (`archive_account_id` set,
+uses); the finance-archive write path is never touched. Every archive query
+schema-qualifies its tables (`${schema}.accounts`, not a bare `accounts`)
+with whatever schema the connection is actually pinned to
+(`archiveSchemaOf`, `finance` unless `FINANCE_ARCHIVE_SCHEMA` overrides it)
+-- defense in depth on top of `createArchiveClient`'s own `search_path` pin,
+so a same-named table earlier on the connection's `search_path` can never be
+read by mistake. A startup guard (`assertArchiveSchemaReady`) confirms
+`${schema}.accounts` is actually reachable before any real reading starts,
+failing with a clear message rather than a bare "relation does not exist"
+(or, worse, silently reading the wrong table) if it is not. Matches an
+archive account onto an existing `kith.fin_accounts` row by institution plus
+the last-four mask, then by institution plus name; an archive account
+nothing matches becomes its own archive-only row (`archive_account_id` set,
 `plaid_account_id` null). An archive instrument is matched onto
 `kith.fin_securities` by ticker, then CUSIP, then ISIN.
 

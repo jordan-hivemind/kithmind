@@ -6,6 +6,8 @@
 // throwaway Postgres.
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
@@ -234,6 +236,41 @@ test("planArchiveAccountLink: never re-matches by name onto a row already claime
     },
   ];
   assert.deepEqual(planArchiveAccountLink(archive2, candidates), { kind: "create" });
+});
+
+// Regression guard: every archive query in `archiveReader` schema-qualifies
+// its tables (`${schema}.accounts`, not a bare `accounts`) rather than
+// relying only on the connection's `search_path` pin. Reads the TypeScript
+// source directly -- a query never becomes a shared constant, so there is
+// nothing to import and assert on at runtime; the source text is the
+// closest thing to "the module's query constants" this module has.
+test("archiveReader's SQL always schema-qualifies the archive's tables, never a bare table name", () => {
+  const sourcePath = fileURLToPath(new URL("../src/importArchive.ts", import.meta.url));
+  const source = readFileSync(sourcePath, "utf8");
+  const readerSource = source.slice(
+    source.indexOf("export function archiveReader"),
+    source.indexOf("export async function assertArchiveSchemaReady"),
+  );
+  assert.ok(readerSource.length > 0, "archiveReader's own source slice should not be empty");
+
+  const archiveTables = ["accounts", "institutions", "instruments", "transactions", "positions", "balances"];
+
+  // No bare "FROM accounts" / "JOIN institutions" etc. -- a regression back
+  // to an unqualified reference would match this and fail the test.
+  const bareReference = new RegExp(`\\b(FROM|JOIN)\\s+(${archiveTables.join("|")})\\b`);
+  assert.equal(
+    bareReference.test(readerSource),
+    false,
+    "found a bare (unqualified) reference to an archive table",
+  );
+
+  // Every one of the six tables is actually read, schema-qualified.
+  for (const table of archiveTables) {
+    assert.ok(
+      readerSource.includes(`\${schema}.${table}`),
+      `expected a schema-qualified reference to ${table}`,
+    );
+  }
 });
 
 test("mapArchiveActivityKind maps the archive's free-text activity_type onto the shared kind vocabulary", () => {

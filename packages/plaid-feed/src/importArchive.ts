@@ -65,6 +65,7 @@
 import type pg from "pg";
 import type { Pool } from "pg";
 
+import { archiveSchemaOf } from "@repo/finance-archive";
 import { newKithId } from "@repo/kith-store";
 
 export type ArchiveAccountRow = {
@@ -382,10 +383,24 @@ export type ArchiveReader = {
   balances(accountIds: readonly string[]): Promise<ArchiveBalanceRow[]>;
 };
 
-/** A read-only `ArchiveReader` against a real archive connection, `finance`
- * schema already pinned by `createArchiveClient`/`createArchivePool` so
- * every query below is unqualified. */
+/**
+ * A read-only `ArchiveReader` against a real archive connection. Every query
+ * below schema-qualifies its archive tables with the schema this connection
+ * is actually pinned to (`archiveSchemaOf(client)` -- `createArchiveClient`/
+ * `createArchivePool` record it when they pin `search_path`, defaulting to
+ * `archiveSchemaName()`, `finance` unless `FINANCE_ARCHIVE_SCHEMA` overrides
+ * it). Defense in depth on top of that `search_path` pin, not a substitute
+ * for it: `${schema}.accounts` resolves correctly regardless of whatever
+ * schemas happen to precede or follow `finance` on the connection's
+ * `search_path`, including a same-named legacy or unrelated table sitting
+ * earlier in the path. `assertArchiveSchemaReady` (below) checks that this
+ * schema and its tables actually exist before any of these queries run, so
+ * a misconfigured connection fails fast and clearly instead of this reader
+ * silently resolving to the wrong table or erroring on the first query with
+ * a bare "relation does not exist".
+ */
 export function archiveReader(client: pg.ClientBase): ArchiveReader {
+  const schema = archiveSchemaOf(client);
   return {
     async accounts() {
       const { rows } = await client.query<{
@@ -397,8 +412,8 @@ export function archiveReader(client: pg.ClientBase): ArchiveReader {
       }>(
         `SELECT a.id, i.name AS institution_name, a.acct_last4,
                 a.display_name, a.account_type
-           FROM accounts a
-           JOIN institutions i ON i.id = a.institution_id
+           FROM ${schema}.accounts a
+           JOIN ${schema}.institutions i ON i.id = a.institution_id
           WHERE a.closed_date IS NULL
           ORDER BY a.id`,
       );
@@ -418,7 +433,10 @@ export function archiveReader(client: pg.ClientBase): ArchiveReader {
         isin: string | null;
         name: string | null;
         instrument_kind: string | null;
-      }>(`SELECT id, symbol, cusip, isin, name, instrument_kind FROM instruments`);
+      }>(
+        `SELECT id, symbol, cusip, isin, name, instrument_kind
+           FROM ${schema}.instruments`,
+      );
       return rows.map((row) => ({
         id: row.id,
         symbol: row.symbol,
@@ -450,7 +468,7 @@ export function archiveReader(client: pg.ClientBase): ArchiveReader {
         `SELECT id, account_id, process_date::text AS process_date,
                 settle_date::text AS settle_date, activity_type, description,
                 instrument_id, quantity, price, amount, currency
-           FROM transactions
+           FROM ${schema}.transactions
           WHERE account_id = ANY($1)
           ORDER BY account_id, process_date`,
         [accountIds],
@@ -484,7 +502,7 @@ export function archiveReader(client: pg.ClientBase): ArchiveReader {
       }>(
         `SELECT id, account_id, as_of::text AS as_of, instrument_id,
                 quantity, price, market_value, cost_basis, currency
-           FROM positions
+           FROM ${schema}.positions
           WHERE account_id = ANY($1)
           ORDER BY account_id, as_of`,
         [accountIds],
@@ -511,7 +529,7 @@ export function archiveReader(client: pg.ClientBase): ArchiveReader {
         currency: string;
       }>(
         `SELECT id, account_id, as_of::text AS as_of, total_value, currency
-           FROM balances
+           FROM ${schema}.balances
           WHERE account_id = ANY($1)
           ORDER BY account_id, as_of`,
         [accountIds],
@@ -525,6 +543,30 @@ export function archiveReader(client: pg.ClientBase): ArchiveReader {
       }));
     },
   };
+}
+
+/**
+ * A startup guard: confirms the archive connection actually resolves
+ * `${schema}.accounts` before `import-archive` does any real reading, so a
+ * database missing the archive schema entirely, or a connection whose
+ * `search_path` pin somehow did not take, fails immediately with a clear
+ * message instead of every query below either erroring on "relation does
+ * not exist" one at a time or -- the failure mode with no error at all --
+ * silently resolving to a same-named table that happens to sit earlier on
+ * the connection's `search_path`.
+ */
+export async function assertArchiveSchemaReady(client: pg.ClientBase): Promise<void> {
+  const schema = archiveSchemaOf(client);
+  try {
+    await client.query(`SELECT count(*) FROM ${schema}.accounts`);
+  } catch (error) {
+    const cause = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `import-archive: could not read ${schema}.accounts on the archive ` +
+        `connection -- the ${schema} schema may not exist on this database, ` +
+        `or the connection's search_path may not resolve it. Original error: ${cause}`,
+    );
+  }
 }
 
 /**
