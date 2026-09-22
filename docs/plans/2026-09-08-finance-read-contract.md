@@ -514,7 +514,10 @@ changed retained bytes, canonical ownership change, selected evidence conflict
 or assertion mismatch leaves the archive unchanged.
 
 The package exports `prepareHoldingPartialPositionScopes` for the preceding
-rollback-only inspection step. An operator diagnostic runs the retained parse
-and mapping inside the same writer-locked savepoint, calls that helper for the
+rollback-only inspection step. An operator diagnostic uses `withArchiveTransaction`
+for the outer transaction, takes the writer lock, and runs retained parsing and
+mapping inside its savepoint. Do not substitute a raw SQL `BEGIN`: nested archive
+helpers must share the transaction registry to avoid an inner commit. Throw a
+private rollback sentinel after recording the diagnostic result. Call the helper for the
 chosen account/date scopes, and uses its row hashes to prepare the selection
 file. The helper makes no write and does not turn a partial scope complete.
