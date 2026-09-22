@@ -357,3 +357,25 @@ function financeContribution(
   }
   return contribution;
 }
+
+// ---------------------------------------------------------------------------
+// PLAID-1: Balances
+// ---------------------------------------------------------------------------
+//
+// The Plaid feed's own tables (migration 043_plaid_feed.sql) are owner-global,
+// like every other finance table in this codebase, so there is no space to
+// narrow this read to: `admin.listPlaidBalances` takes only the transaction's
+// `ctx`. The admin layout above this screen already gates on owner-or-editor;
+// this loader repeats only the sign-in check every page loader here repeats.
+
+export type BalancesPageData = { balances: admin.PlaidBalanceRow[] };
+
+export async function loadBalances(
+  cookieHeader: string | null,
+): Promise<BalancesPageData | null> {
+  const loaded = await loadAuthenticatedPage(cookieHeader, async ({ ctx }) => ({
+    balances: await admin.listPlaidBalances(ctx),
+  }));
+  if (loaded === null) return null;
+  return { balances: loaded.balances };
+}

@@ -16,6 +16,7 @@
 // layout's 404 would have kept them from asking for.
 
 import {
+  loadBalances,
   loadCoverage,
   loadHealth,
   loadInstitutions,
@@ -29,6 +30,7 @@ const LOADERS = {
   health: loadHealth,
   institutions: loadInstitutions,
   coverage: loadCoverage,
+  balances: loadBalances,
 } as const;
 
 export async function GET(
