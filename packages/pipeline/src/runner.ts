@@ -2260,7 +2260,14 @@ export class PipelineRunner {
   ): Promise<number> {
     for (let index = start; index < files.length; index += 1) {
       const plan = files[index];
-      if (!plan || !isPdfPlan(plan)) continue;
+      if (
+        !plan ||
+        !isPdfPlan(plan) ||
+        plan.sourceItemId === undefined ||
+        plan.observationEpoch === undefined ||
+        plan.processingEpoch === undefined
+      )
+        continue;
       let needsWork: boolean;
       try {
         needsWork = await this.pdfNeedsArchivedWork(plan);
@@ -2282,6 +2289,58 @@ export class PipelineRunner {
         continue;
       }
       if (needsWork) return index;
+    }
+    return -1;
+  }
+
+  private selectiveTaxCapabilityAvailable(): boolean {
+    const parser = this.config.pdfDocQa?.parser;
+    return (
+      parser?.selectiveLauncherPath !== undefined &&
+      parser.expectedSelectiveLauncherSha256 !== undefined
+    );
+  }
+
+  /**
+   * Targeted work has its own bounded batches and must survive an exhausted
+   * whole-document parser budget. This only identifies an exact carried
+   * identity after the selective launcher pair is available; it does not
+   * release any ordinary deep parse for retry.
+   */
+  private metadataPriorityWorkIndex(
+    files: FilePlan[],
+    routing: MetadataFirstRouting | undefined,
+  ): number {
+    if (!routing || !this.selectiveTaxCapabilityAvailable()) return -1;
+    const selected = new Set(routing.selected.map(metadataIdentityKey));
+    const previewed = new Set(routing.previewed.map(metadataIdentityKey));
+    const classified = new Set(
+      (routing.targetedTaxClassified ?? []).map(metadataIdentityKey),
+    );
+    const targeted = new Set(
+      (routing.targetedTax ?? []).map(metadataIdentityKey),
+    );
+    for (let index = 0; index < files.length; index += 1) {
+      const plan = files[index];
+      if (
+        !plan ||
+        !isPdfPlan(plan) ||
+        plan.sourceItemId === undefined ||
+        plan.observationEpoch === undefined ||
+        plan.processingEpoch === undefined
+      )
+        continue;
+      const key = metadataIdentityKey(metadataIdentity(plan));
+      const needsClassification =
+        selected.has(key) &&
+        previewed.has(key) &&
+        !classified.has(key) &&
+        !this.matchingProcessingRows(plan).some(
+          (row) => row.activation !== undefined,
+        );
+      const needsTargetedWork =
+        targeted.has(key) && !this.hasCompletedTargetedTax(plan);
+      if (needsClassification || needsTargetedWork) return index;
     }
     return -1;
   }
@@ -2326,6 +2385,17 @@ export class PipelineRunner {
     const targetedClassified = new Set(
       (routing.targetedTaxClassified ?? []).map(metadataIdentityKey),
     );
+    const routingForWork = (identityKey: string): MetadataFirstRouting =>
+      routing.archiveDecided?.some(
+        (identity) => metadataIdentityKey(identity) === identityKey,
+      )
+        ? {
+            ...routing,
+            archiveDecided: routing.archiveDecided.filter(
+              (identity) => metadataIdentityKey(identity) !== identityKey,
+            ),
+          }
+        : routing;
     const nextStep = async (
       plan: PdfFilePlan,
       alreadyPreviewed: boolean,
@@ -2358,6 +2428,9 @@ export class PipelineRunner {
       const index = checkpoint.files.findIndex(
         (candidate) =>
           isPdfPlan(candidate) &&
+          candidate.sourceItemId !== undefined &&
+          candidate.observationEpoch !== undefined &&
+          candidate.processingEpoch !== undefined &&
           metadataIdentityKey(metadataIdentity(candidate)) === selectedKey,
       );
       if (index < 0) {
@@ -2365,6 +2438,7 @@ export class PipelineRunner {
       }
       const plan = checkpoint.files[index]! as PdfFilePlan;
       const needsTargetedClassification =
+        this.selectiveTaxCapabilityAvailable() &&
         previewed.has(selectedKey) &&
         !targetedClassified.has(selectedKey) &&
         !this.matchingProcessingRows(plan).some(
@@ -2381,7 +2455,7 @@ export class PipelineRunner {
       if (step === null) continue;
       return this.metadataArchivedCheckpoint(
         checkpoint,
-        routing,
+        routingForWork(selectedKey),
         index,
         step,
         archivedPublished,
@@ -2396,6 +2470,9 @@ export class PipelineRunner {
       if (
         plan &&
         isPdfPlan(plan) &&
+        plan.sourceItemId !== undefined &&
+        plan.observationEpoch !== undefined &&
+        plan.processingEpoch !== undefined &&
         !previewed.has(metadataIdentityKey(metadataIdentity(plan))) &&
         !gapped.has(metadataIdentityKey(metadataIdentity(plan)))
       ) {
@@ -2403,7 +2480,7 @@ export class PipelineRunner {
         if (step === null) continue;
         return this.metadataArchivedCheckpoint(
           checkpoint,
-          routing,
+          routingForWork(metadataIdentityKey(metadataIdentity(plan))),
           index,
           step,
           archivedPublished,
@@ -4784,7 +4861,20 @@ export class PipelineRunner {
           }
           let pdfIndex: number;
           try {
-            pdfIndex = await this.nextPdfWorkIndex(current.files, 0);
+            const ordinaryPdfIndex = await this.nextPdfWorkIndex(
+              current.files,
+              0,
+            );
+            const metadataPriorityIndex = this.metadataPriorityWorkIndex(
+              current.files,
+              current.metadataFirstCarry,
+            );
+            pdfIndex =
+              ordinaryPdfIndex < 0
+                ? metadataPriorityIndex
+                : metadataPriorityIndex < 0
+                  ? ordinaryPdfIndex
+                  : Math.min(ordinaryPdfIndex, metadataPriorityIndex);
           } catch (error) {
             // P2-31e. Fail closed, but settle the answered page first. A throw
             // from inside a journaled transition never reaches `commitResult`,
@@ -4843,6 +4933,10 @@ export class PipelineRunner {
                 carry?.previewGaps.filter((gap) =>
                   currentIdentities.has(metadataIdentityKey(gap)),
                 ) ?? [],
+              archiveDecided:
+                carry?.archiveDecided?.filter((identity) =>
+                  currentIdentities.has(metadataIdentityKey(identity)),
+                ) ?? [],
               targetedTax:
                 carry?.targetedTax?.filter((identity) =>
                   currentIdentities.has(metadataIdentityKey(identity)),
@@ -4894,6 +4988,46 @@ export class PipelineRunner {
     if (checkpoint.phase !== "discovery_reserve") {
       throw new PipelineWorkerError("journal_phase_conflict");
     }
+    let metadataFirstCarry = checkpoint.metadataFirstCarry;
+    if (metadataFirstCarry) {
+      // The preview sweep deliberately skips an exact identity whose durable
+      // catalog state says that no archival work remains. Record that
+      // decision before the carry becomes deferred processing state. Older
+      // journals reached this phase without the witness, so deriving it here
+      // also lets a cached empty reserve answer settle without a reset.
+      const covered = new Set(
+        [
+          ...metadataFirstCarry.previewed,
+          ...metadataFirstCarry.previewGaps,
+          ...(metadataFirstCarry.archiveDecided ?? []),
+        ].map(metadataIdentityKey),
+      );
+      const archiveDecided = [...(metadataFirstCarry.archiveDecided ?? [])];
+      for (
+        let index = metadataFirstCarry.triageStartIndex;
+        index < checkpoint.files.length;
+        index += 1
+      ) {
+        const plan = checkpoint.files[index];
+        if (
+          !plan ||
+          !isPdfPlan(plan) ||
+          plan.sourceItemId === undefined ||
+          plan.observationEpoch === undefined ||
+          plan.processingEpoch === undefined
+        )
+          continue;
+        const identity = metadataIdentity(plan);
+        const key = metadataIdentityKey(identity);
+        if (covered.has(key)) continue;
+        if (await this.pdfNeedsArchivedWork(plan)) {
+          throw new PipelineWorkerError("metadata_first_identity_conflict");
+        }
+        covered.add(key);
+        archiveDecided.push(identity);
+      }
+      metadataFirstCarry = { ...metadataFirstCarry, archiveDecided };
+    }
     const result = await this.mutation(
       "discovery.reserve",
       () =>
@@ -4915,6 +5049,10 @@ export class PipelineRunner {
           "discovery_targets",
         ) as unknown as DiscoveryLease[];
         if (targets.length === 0) {
+          const deferred = metadataFirstDeferred({
+            ...current,
+            ...(metadataFirstCarry === undefined ? {} : { metadataFirstCarry }),
+          });
           return {
             version: 1,
             phase: "jobs_reserve",
@@ -4923,9 +5061,9 @@ export class PipelineRunner {
             published: current.archivedPublished ?? 0,
             bindings: bindingsFromScan(current),
             round: 0,
-            ...(metadataFirstDeferred(current) === undefined
+            ...(deferred === undefined
               ? {}
-              : { metadataFirstDeferred: metadataFirstDeferred(current) }),
+              : { metadataFirstDeferred: deferred }),
           };
         }
         if (current.round >= MAX_RESERVATION_ROUNDS) {
@@ -4939,7 +5077,10 @@ export class PipelineRunner {
         return {
           version: 1,
           phase: "discovery_admit",
-          ...activeScanBase(current),
+          ...activeScanBase({
+            ...current,
+            ...(metadataFirstCarry === undefined ? {} : { metadataFirstCarry }),
+          }),
           round: current.round,
           targets,
           index: 0,
@@ -5548,6 +5689,7 @@ export class PipelineRunner {
           automaticPreviewRoute(pendingBody.preview) === "deep_priority" &&
           pendingBody.preview.sourceUnitCount !== null;
         const targetedSelected =
+          this.selectiveTaxCapabilityAvailable() &&
           automaticPreviewRoute(pendingBody.preview) === "deep_priority" &&
           pendingBody.preview.sourceUnitCount !== null;
         const targetedGoal =
@@ -5579,7 +5721,8 @@ export class PipelineRunner {
                 ]
               : current.metadataFirst.targetedTax,
           targetedTaxClassified:
-            !alreadySelected && !automaticallySelected
+            !this.selectiveTaxCapabilityAvailable() ||
+            (!alreadySelected && !automaticallySelected)
               ? current.metadataFirst.targetedTaxClassified
               : (current.metadataFirst.targetedTaxClassified ?? []).some(
                     (candidate) => metadataIdentityKey(candidate) === key,

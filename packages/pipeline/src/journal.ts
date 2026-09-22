@@ -346,6 +346,9 @@ function sameAuthorityDifferentConfig(
  *
  * What it does require is that no scan or job is half done, because a pass
  * resumed under a different parser would mix two fingerprints inside one scan.
+ * Metadata-first's refreshed `deferred_idle` is also a pass boundary: it has
+ * no pending request or credential session, and its exact carry starts the
+ * next scan without changing any already-published artifact.
  */
 function betweenPasses(state: StoredState): boolean {
   if (state.pending !== undefined || state.credentialSessionActive)
@@ -358,7 +361,17 @@ function betweenPasses(state: StoredState): boolean {
   )
     return false;
   const phase = (checkpoint as Record<string, JsonValue>).phase;
-  return phase === "idle" || phase === "terminal";
+  if (phase === "idle" || phase === "terminal") return true;
+  if (phase !== "archived") return false;
+  const archived = checkpoint as Record<string, JsonValue>;
+  const metadataFirst = archived.metadataFirst;
+  return (
+    archived.step === "deferred_idle" &&
+    metadataFirst !== null &&
+    typeof metadataFirst === "object" &&
+    !Array.isArray(metadataFirst) &&
+    (metadataFirst as Record<string, JsonValue>).refreshReady === true
+  );
 }
 
 export function archiveCheckpointIsQuiescent(value: JsonValue): boolean {
