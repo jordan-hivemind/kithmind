@@ -215,6 +215,12 @@ export type MetadataFirstRouting = {
   selected: MetadataFirstIdentity[];
   previewed: MetadataFirstIdentity[];
   previewGaps: MetadataFirstPreviewGap[];
+  /**
+   * Exact identities for which the durable catalog currently requires no
+   * archive action. This is a routing decision, not a content-success claim;
+   * parse failures and admission blocks remain in their catalog records.
+   */
+  archiveDecided?: MetadataFirstIdentity[];
   /** Positive tax headings routed to selective goal-aware extraction. */
   targetedTax?: MetadataFirstTargetedTax[];
   /** Exact selected identities evaluated by the targeted-tax classifier. */
@@ -963,13 +969,14 @@ function metadataFirstRouting(value: unknown): MetadataFirstRouting {
       "previewed",
       "selectionReceipts",
     ],
-    ["previewGaps", "targetedTax", "targetedTaxClassified"],
+    ["previewGaps", "archiveDecided", "targetedTax", "targetedTaxClassified"],
   );
   if (
     row.version !== 1 ||
     !Array.isArray(row.selected) ||
     !Array.isArray(row.previewed) ||
     (row.previewGaps !== undefined && !Array.isArray(row.previewGaps)) ||
+    (row.archiveDecided !== undefined && !Array.isArray(row.archiveDecided)) ||
     (row.targetedTax !== undefined && !Array.isArray(row.targetedTax)) ||
     (row.targetedTaxClassified !== undefined &&
       !Array.isArray(row.targetedTaxClassified)) ||
@@ -977,6 +984,8 @@ function metadataFirstRouting(value: unknown): MetadataFirstRouting {
     row.selected.length > MAX_FILES ||
     row.previewed.length > MAX_FILES ||
     (Array.isArray(row.previewGaps) && row.previewGaps.length > MAX_FILES) ||
+    (Array.isArray(row.archiveDecided) &&
+      row.archiveDecided.length > MAX_FILES) ||
     (Array.isArray(row.targetedTax) && row.targetedTax.length > MAX_FILES) ||
     (Array.isArray(row.targetedTaxClassified) &&
       row.targetedTaxClassified.length > MAX_FILES) ||
@@ -985,6 +994,7 @@ function metadataFirstRouting(value: unknown): MetadataFirstRouting {
     fail();
   const selected = row.selected.map(metadataFirstIdentity);
   const previewed = row.previewed.map(metadataFirstIdentity);
+  const archiveDecided = (row.archiveDecided ?? []).map(metadataFirstIdentity);
   const targetedTax = (row.targetedTax ?? []).map(metadataFirstTargetedTax);
   const targetedTaxClassified = (row.targetedTaxClassified ?? []).map(
     metadataFirstIdentity,
@@ -1022,12 +1032,18 @@ function metadataFirstRouting(value: unknown): MetadataFirstRouting {
   if (
     new Set(selected.map(key)).size !== selected.length ||
     new Set(previewed.map(key)).size !== previewed.length ||
+    new Set(archiveDecided.map(key)).size !== archiveDecided.length ||
     new Set(targetedTax.map(key)).size !== targetedTax.length ||
     new Set(targetedTaxClassified.map(key)).size !==
       targetedTaxClassified.length ||
     new Set(previewGaps.map(key)).size !== previewGaps.length ||
     previewGaps.some((gap) =>
       previewed.some((item) => key(item) === key(gap)),
+    ) ||
+    archiveDecided.some(
+      (item) =>
+        previewed.some((preview) => key(preview) === key(item)) ||
+        previewGaps.some((gap) => key(gap) === key(item)),
     ) ||
     targetedTax.some(
       (target) => !selected.some((item) => key(item) === key(target)),
@@ -1074,6 +1090,7 @@ function metadataFirstRouting(value: unknown): MetadataFirstRouting {
     selected,
     previewed,
     previewGaps,
+    archiveDecided,
     targetedTax,
     targetedTaxClassified,
     selectionReceipts,
@@ -1115,20 +1132,31 @@ function metadataFirstDeferred(
           : [],
       ),
   );
-  const previewedOrGapped = new Set(
-    [...routing.previewed, ...routing.previewGaps].map(
+  const previewedGappedOrArchiveDecided = new Set(
+    [
+      ...routing.previewed,
+      ...routing.previewGaps,
+      ...(routing.archiveDecided ?? []),
+    ].map(
       (identity) =>
         `${identity.sourceItemId}\0${identity.observationEpoch}\0${identity.processingEpoch}\0${identity.sha256}`,
     ),
   );
   if (
-    [...routing.selected, ...routing.previewed, ...routing.previewGaps].some(
+    [
+      ...routing.selected,
+      ...routing.previewed,
+      ...routing.previewGaps,
+      ...(routing.archiveDecided ?? []),
+    ].some(
       (identity) =>
         !identities.has(
           `${identity.sourceItemId}\0${identity.observationEpoch}\0${identity.processingEpoch}\0${identity.sha256}`,
         ),
     ) ||
-    [...identities].some((identity) => !previewedOrGapped.has(identity))
+    [...identities].some(
+      (identity) => !previewedGappedOrArchiveDecided.has(identity),
+    )
   )
     fail();
   return {
@@ -1702,6 +1730,10 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
         (identity) =>
           `${identity.sourceItemId}\0${identity.observationEpoch}\0${identity.processingEpoch}\0${identity.sha256}`,
       );
+      const archiveDecidedKeys = (routing.archiveDecided ?? []).map(
+        (identity) =>
+          `${identity.sourceItemId}\0${identity.observationEpoch}\0${identity.processingEpoch}\0${identity.sha256}`,
+      );
       const targetedClassifiedKeys = (routing.targetedTaxClassified ?? []).map(
         (identity) =>
           `${identity.sourceItemId}\0${identity.observationEpoch}\0${identity.processingEpoch}\0${identity.sha256}`,
@@ -1709,7 +1741,8 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       if (
         selectedKeys.some((key) => !identities.has(key)) ||
         previewedKeys.some((key) => !identities.has(key)) ||
-        gapKeys.some((key) => !identities.has(key))
+        gapKeys.some((key) => !identities.has(key)) ||
+        archiveDecidedKeys.some((key) => !identities.has(key))
       )
         fail();
       if (result.step === "preview") {
@@ -1725,6 +1758,7 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
             : undefined;
         if (
           planKey === undefined ||
+          archiveDecidedKeys.includes(planKey) ||
           (previewedKeys.includes(planKey) &&
             (!selectedKeys.includes(planKey) ||
               targetedClassifiedKeys.includes(planKey)))
@@ -1734,7 +1768,10 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       if (
         result.step === "deferred_idle" &&
         [...identities.keys()].some(
-          (key) => !previewedKeys.includes(key) && !gapKeys.includes(key),
+          (key) =>
+            !previewedKeys.includes(key) &&
+            !gapKeys.includes(key) &&
+            !archiveDecidedKeys.includes(key),
         )
       )
         fail();

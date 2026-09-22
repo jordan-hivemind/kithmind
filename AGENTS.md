@@ -60,6 +60,10 @@ across mixed document types, queued work, legacy resume and deferred refresh.
 Do not substitute helper-only checks or unrelated suites for those transitions.
 Exercise newly queued selected items through publication, cleanup, next-item
 selection and restart. Publication alone does not prove scheduler acceptance.
+For a capability rollout, also test the actual pass-ending checkpoint, its
+configuration rebind boundary, and the next scan with previously exhausted
+selected work. A mid-state handler test can pass while an earlier eligibility
+gate still filters the capability out.
 Before a finance repair, inspect both legacy unversioned scope proofs and the
 active generation's versioned proofs. They are immutable and require a new
 generation when corrected source evidence changes their payload or membership.

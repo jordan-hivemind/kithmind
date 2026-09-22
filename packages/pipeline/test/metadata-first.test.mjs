@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { Journal } from "../dist/journal.js";
+import { Journal, JournalSafetyError } from "../dist/journal.js";
 import {
   adoptMetadataFirstJournal,
   metadataFirstIdentity,
@@ -80,17 +80,17 @@ function binding() {
   };
 }
 
-async function fixture(initial) {
+async function fixture(initial, authority = binding()) {
   const directory = await mkdtemp(join(tmpdir(), "kith-metadata-first-"));
   await chmod(directory, 0o700);
   const journal = await Journal.open({
     directory,
-    binding: binding(),
+    binding: authority,
     credential: "credential",
     initialCheckpoint: initial,
     codec: journalCodec,
   });
-  return { directory, journal };
+  return { directory, journal, authority };
 }
 
 function manifest(items, reason = "active_goal") {
@@ -137,7 +137,9 @@ test("automatic routing requires strong tax and bulk-history evidence", () => {
     "defer",
   );
   assert.equal(
-    automaticPreviewRoute(declaration("Schedule K-1 (Form 1041) Beneficiary's Share")),
+    automaticPreviewRoute(
+      declaration("Schedule K-1 (Form 1041) Beneficiary's Share"),
+    ),
     "defer",
   );
   const history = declaration(
@@ -451,10 +453,7 @@ test("selected preview enters deep intent while FIFO routing precedes background
     assert.deepEqual(windows, [{ startPage: 1, pageCount: 2 }]);
     assert.equal(state.journal.checkpoint.step, "intent");
     assert.equal(state.journal.checkpoint.pdfIndex, 1);
-    assert.equal(
-      requests[0].preview.provisionalMetadata.title,
-      "Form 1040",
-    );
+    assert.equal(requests[0].preview.provisionalMetadata.title, "Form 1040");
     assert.equal(JSON.stringify(requests).includes("Individual Income"), false);
 
     worker.pdfNeedsArchivedWork = async (item) =>
@@ -501,7 +500,16 @@ test("legacy selected tax carry is reclassified once despite an exhausted full p
   let exhausted = [];
   const requests = [];
   const worker = runner(
-    { spaceId: "space", sourceAccountId: "source" },
+    {
+      spaceId: "space",
+      sourceAccountId: "source",
+      pdfDocQa: {
+        parser: {
+          selectiveLauncherPath: "/synthetic/selective.py",
+          expectedSelectiveLauncherSha256: "f".repeat(64),
+        },
+      },
+    },
     state.journal,
     transport(requests),
     async (item) =>
@@ -648,11 +656,8 @@ test("a queued selected PDF is consumed after publication and cleanup across res
     },
   };
   const configure = (journal) => {
-    const worker = runner(
-      config,
-      journal,
-      { call },
-      async (item) => previewFor(item),
+    const worker = runner(config, journal, { call }, async (item) =>
+      previewFor(item),
     );
     worker.archiveCatalog = catalog;
     return worker;
@@ -741,10 +746,7 @@ test("a queued selected PDF is consumed after publication and cleanup across res
     // evidence that cleanup completed. A static `queued` discovery state must
     // not send this activated identity through publication again.
     await state.journal.transitionCheckpoint({
-      checkpoint: await worker.afterArchivedItem(
-        state.journal.checkpoint,
-        1,
-      ),
+      checkpoint: await worker.afterArchivedItem(state.journal.checkpoint, 1),
       credentialSessionActive: true,
     });
     assert.equal(state.journal.checkpoint.pdfIndex, 1);
@@ -1109,6 +1111,360 @@ test("answered preview replay does not rerun the executor before discovery drain
     assert.deepEqual(state.journal.checkpoint.metadataFirstCarry.previewed, [
       metadataFirstIdentity(item),
     ]);
+  } finally {
+    await state.journal.close().catch(() => undefined);
+    await rm(state.directory, { recursive: true, force: true });
+  }
+});
+
+test("an archive-decided identity is rechecked before later work", async () => {
+  const item = plan("decided-recheck", "6");
+  const other = plan("decided-other", "7");
+  const routing = {
+    version: 1,
+    triageStartIndex: 0,
+    refreshReady: false,
+    selected: [],
+    previewed: [],
+    previewGaps: [],
+    archiveDecided: [metadataFirstIdentity(item), metadataFirstIdentity(other)],
+    selectionReceipts: [],
+  };
+  const initial = checkpoint([item, other], 0, {
+    step: "deferred_idle",
+    metadataFirst: routing,
+  });
+  const state = await fixture(initial);
+  const worker = runner(
+    { spaceId: "space", sourceAccountId: "source" },
+    state.journal,
+    { call: async () => assert.fail("routing does not call the server") },
+    async () => assert.fail("routing does not execute the preview"),
+  );
+  worker.archiveCatalog = emptyCatalog();
+  worker.pdfNeedsArchivedWork = async () => true;
+  try {
+    const next = await worker.nextMetadataCheckpoint(initial, routing, 0);
+    assert.equal(next.phase, "archived");
+    assert.equal(next.step, "preview");
+    assert.deepEqual(next.metadataFirst.archiveDecided, [
+      metadataFirstIdentity(other),
+    ]);
+  } finally {
+    await state.journal.close();
+    await rm(state.directory, { recursive: true, force: true });
+  }
+});
+
+test("only refreshed deferred metadata state accepts a same-authority config rebind", async () => {
+  const item = plan("deferred-rebind", "8");
+  const routing = {
+    version: 1,
+    triageStartIndex: 0,
+    refreshReady: true,
+    selected: [],
+    previewed: [metadataFirstIdentity(item)],
+    previewGaps: [],
+    selectionReceipts: [],
+  };
+  const authority = binding();
+  const proposed = { ...authority, configFingerprint: "e".repeat(64) };
+  const state = await fixture(
+    checkpoint([item], 0, {
+      step: "deferred_idle",
+      metadataFirst: routing,
+    }),
+    authority,
+  );
+  try {
+    const expected = state.journal.checkpoint;
+    await state.journal.close();
+    state.journal = await Journal.open({
+      directory: state.directory,
+      binding: proposed,
+      credential: "credential",
+      initialCheckpoint: { version: 1, phase: "idle" },
+      codec: journalCodec,
+    });
+    assert.deepEqual(state.journal.checkpoint, expected);
+  } finally {
+    await state.journal.close().catch(() => undefined);
+    await rm(state.directory, { recursive: true, force: true });
+  }
+
+  const active = await fixture(checkpoint([item], 0), authority);
+  try {
+    await active.journal.close();
+    await assert.rejects(
+      () =>
+        Journal.open({
+          directory: active.directory,
+          binding: proposed,
+          credential: "credential",
+          initialCheckpoint: { version: 1, phase: "idle" },
+          codec: journalCodec,
+        }),
+      (error) => error instanceof JournalSafetyError,
+    );
+  } finally {
+    await active.journal.close().catch(() => undefined);
+    await rm(active.directory, { recursive: true, force: true });
+  }
+});
+
+test("reconcile retains targeted legacy work outside the ordinary parser budget", async () => {
+  for (const scenario of [
+    {
+      id: "legacy-exhausted",
+      name: "legacy exhausted",
+      planned: false,
+      laterOrdinary: false,
+      movedBeforePriorStart: false,
+      unboundPrefix: false,
+    },
+    {
+      id: "legacy-before-ordinary",
+      name: "legacy before ordinary",
+      planned: false,
+      laterOrdinary: true,
+      movedBeforePriorStart: false,
+      unboundPrefix: false,
+    },
+    {
+      id: "planned-unfinished",
+      name: "planned unfinished",
+      planned: true,
+      laterOrdinary: false,
+      movedBeforePriorStart: false,
+      unboundPrefix: false,
+    },
+    {
+      id: "moved-before-prior-start",
+      name: "selected moved before prior start",
+      planned: false,
+      laterOrdinary: false,
+      movedBeforePriorStart: true,
+      unboundPrefix: false,
+    },
+    {
+      id: "unbound-prefix",
+      name: "unbound PDF before selected",
+      planned: false,
+      laterOrdinary: false,
+      movedBeforePriorStart: false,
+      unboundPrefix: true,
+    },
+  ]) {
+    const prefix = plan(`${scenario.id}-prefix`, "1");
+    if (scenario.unboundPrefix) {
+      delete prefix.sourceItemId;
+      delete prefix.observationEpoch;
+      delete prefix.processingEpoch;
+      delete prefix.discoveryState;
+    }
+    const selected = plan(`${scenario.id}-selected`, "2");
+    const later = plan(`${scenario.id}-later`, "3");
+    const selectedIdentity = metadataFirstIdentity(selected);
+    const routing = {
+      version: 1,
+      triageStartIndex: scenario.movedBeforePriorStart ? 2 : 0,
+      refreshReady: true,
+      selected: [selectedIdentity],
+      previewed: [selectedIdentity],
+      previewGaps: [],
+      ...(scenario.planned
+        ? {
+            targetedTax: [
+              {
+                ...selectedIdentity,
+                goalKind: "form_1040_totals_v1",
+                sourcePageCount: 100,
+              },
+            ],
+            targetedTaxClassified: [selectedIdentity],
+          }
+        : {}),
+      selectionReceipts: [],
+    };
+    const initial = parseRunnerCheckpoint({
+      version: 1,
+      phase: "reconcile",
+      mode: "normal",
+      scanId: `scan-${scenario.id}`,
+      inventoryEpoch: 2,
+      manifestVersion: 2,
+      missingBindings: [],
+      files: scenario.movedBeforePriorStart
+        ? [selected, prefix, later]
+        : [prefix, selected, later],
+      ordinal: 0,
+      reviewSeen: false,
+      metadataFirstCarry: routing,
+    });
+    const state = await fixture(initial);
+    const worker = runner(
+      {
+        spaceId: "space",
+        sourceAccountId: "source",
+        pdfDocQa: {
+          parser: {
+            selectiveLauncherPath: "/synthetic/selective.py",
+            expectedSelectiveLauncherSha256: "f".repeat(64),
+          },
+        },
+      },
+      state.journal,
+      {
+        async call(request) {
+          assert.equal(request.operation, "scan.reconcile", scenario.name);
+          return {
+            operation: "scan.reconcile",
+            scanId: initial.scanId,
+            state: "enumerated",
+            inspected: 3,
+            unavailable: 0,
+            done: true,
+            reused: false,
+          };
+        },
+      },
+      async () => assert.fail("reconcile only schedules targeted work"),
+    );
+    worker.archiveCatalog = emptyCatalog();
+    worker.pdfNeedsArchivedWork = async (item) =>
+      scenario.laterOrdinary && item.sourceItemId === later.sourceItemId;
+    try {
+      await worker.driveReconcile();
+      assert.equal(
+        state.journal.checkpoint.phase,
+        "archived",
+        `${scenario.name}: ${state.journal.checkpoint.code ?? "no code"}`,
+      );
+      assert.equal(
+        state.journal.checkpoint.pdfIndex,
+        scenario.movedBeforePriorStart ? 0 : 1,
+        scenario.name,
+      );
+      assert.equal(
+        state.journal.checkpoint.step,
+        scenario.planned ? "intent" : "preview",
+        scenario.name,
+      );
+      assert.deepEqual(
+        state.journal.checkpoint.metadataFirst.selected,
+        [selectedIdentity],
+        scenario.name,
+      );
+    } finally {
+      await state.journal.close();
+      await rm(state.directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("cached empty discovery reserve preserves previewed and catalog-decided PDF coverage", async () => {
+  const eligible = Array.from({ length: 548 }, (_, index) =>
+    plan(`carry-${index}`, String(index % 10)),
+  );
+  const unbound = plan("carry-unbound", "5");
+  delete unbound.sourceItemId;
+  delete unbound.observationEpoch;
+  delete unbound.processingEpoch;
+  delete unbound.discoveryState;
+  const files = [unbound, ...eligible];
+  const previewed = eligible.slice(0, 412).map(metadataFirstIdentity);
+  const initial = parseRunnerCheckpoint({
+    version: 1,
+    phase: "discovery_reserve",
+    mode: "normal",
+    scanId: "scan-carry",
+    inventoryEpoch: 1,
+    manifestVersion: 1,
+    files,
+    missingBindings: [],
+    round: 0,
+    archivedPublished: 18,
+    metadataFirstCarry: {
+      version: 1,
+      triageStartIndex: 0,
+      refreshReady: false,
+      selected: previewed.slice(0, 48),
+      previewed,
+      previewGaps: [],
+      selectionReceipts: [],
+    },
+  });
+  const state = await fixture(initial);
+  let calls = 0;
+  const reserve = {
+    async call(request) {
+      calls += 1;
+      assert.equal(request.operation, "discovery.reserve");
+      return {
+        operation: "discovery.reserve",
+        receiptId: randomUUID(),
+        expiresAt: Date.now() + 300_000,
+        reused: false,
+        targets: [],
+      };
+    },
+  };
+  const first = runner(
+    { spaceId: "space", sourceAccountId: "source" },
+    state.journal,
+    reserve,
+    async () => assert.fail("reserve recovery does not preview"),
+  );
+  first.pdfNeedsArchivedWork = async (item) => {
+    assert.ok(Number(item.sourceItemId.slice("source-carry-".length)) >= 412);
+    return false;
+  };
+  const commit = state.journal.commitResult.bind(state.journal);
+  state.journal.commitResult = async () => {
+    throw new Error("synthetic interrupted commit");
+  };
+  try {
+    await assert.rejects(
+      () => first.driveDiscoveryReserve(),
+      /synthetic interrupted commit/,
+    );
+    assert.ok(state.journal.pending?.result);
+    assert.equal(calls, 1);
+    state.journal.commitResult = commit;
+    await state.journal.close();
+    state.journal = await Journal.open({
+      directory: state.directory,
+      binding: binding(),
+      credential: "credential",
+      initialCheckpoint: { version: 1, phase: "idle" },
+      codec: journalCodec,
+    });
+    const resumed = runner(
+      { spaceId: "space", sourceAccountId: "source" },
+      state.journal,
+      {
+        async call() {
+          assert.fail("cached reserve answer must not call transport");
+        },
+      },
+      async () => assert.fail("reserve recovery does not preview"),
+    );
+    resumed.pdfNeedsArchivedWork = async () => false;
+    await resumed.driveDiscoveryReserve();
+    assert.equal(calls, 1);
+    assert.equal(state.journal.pending, undefined);
+    assert.equal(state.journal.checkpoint.phase, "jobs_reserve");
+    const deferred = state.journal.checkpoint.metadataFirstDeferred;
+    assert.equal(deferred.files.length, 549);
+    assert.equal(deferred.metadataFirst.previewed.length, 412);
+    assert.deepEqual(
+      deferred.metadataFirst.archiveDecided,
+      eligible.slice(412).map(metadataFirstIdentity),
+    );
+    const mismatched = structuredClone(state.journal.checkpoint);
+    mismatched.metadataFirstDeferred.metadataFirst.archiveDecided[0].sourceItemId =
+      "source-not-in-current-files";
+    assert.throws(() => parseRunnerCheckpoint(mismatched));
   } finally {
     await state.journal.close().catch(() => undefined);
     await rm(state.directory, { recursive: true, force: true });
