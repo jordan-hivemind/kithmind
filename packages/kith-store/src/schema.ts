@@ -349,6 +349,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
       import.meta.url,
     ),
   },
+  {
+    version: 47,
+    name: "relax every bounded Plaid string CHECK on a nullable column to accept an empty string",
+    url: new URL("../migrations/047_plaid_strings.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
