@@ -23,7 +23,11 @@ import {
 import { admin } from "@repo/kith-store";
 import type { IdentityCtx, Principal } from "@repo/kith-store/identity";
 
-import { groupInstitutions, type InstitutionRow } from "@/lib/kith/institutions";
+import {
+  groupInstitutions,
+  mergeLiveAccounts,
+  type InstitutionRow,
+} from "@/lib/kith/institutions";
 import { loadAuthenticatedPage } from "@/lib/kith/page-session";
 import {
   type FinanceArchiveAccess,
@@ -276,20 +280,27 @@ export async function loadInstitutions(
         archiveSpace !== undefined && spaces.includes(archiveSpace)
           ? await admin.listAccountOverrides(ctx, { spaceId: archiveSpace })
           : [];
-      return { principal, spaces, overrides };
+      // FIN-1: the unified ledger's own account rows, read alongside the
+      // archive inventory so a Plaid-only account (no archive counterpart)
+      // still shows, and so a linked account's live value can be folded into
+      // its archive row. Owner-global like the Plaid feed it replaced
+      // (migration 048_finance_unify.sql), so no space to narrow this to.
+      const finAccounts = await admin.listFinAccounts(ctx);
+      return { principal, spaces, overrides, finAccounts };
     },
   );
   if (loaded === null) return null;
   const inventory = await archiveInventory(loaded.principal, loaded.spaces);
+  const archiveGroups =
+    inventory.state === "read"
+      ? groupInstitutions(
+          inventory.records,
+          now,
+          new Map(loaded.overrides.map((item) => [item.accountId, item])),
+        )
+      : [];
   return {
-    institutions:
-      inventory.state === "read"
-        ? groupInstitutions(
-            inventory.records,
-            now,
-            new Map(loaded.overrides.map((item) => [item.accountId, item])),
-          )
-        : [],
+    institutions: mergeLiveAccounts(archiveGroups, loaded.finAccounts),
     state: inventory.state,
     reason: inventory.state === "unavailable" ? inventory.reason : null,
     truncated: inventory.state === "read" && inventory.truncated,
@@ -359,22 +370,24 @@ function financeContribution(
 }
 
 // ---------------------------------------------------------------------------
-// PLAID-1: Balances
+// FIN-1: Balances
 // ---------------------------------------------------------------------------
 //
-// The Plaid feed's own tables (migration 043_plaid_feed.sql) are owner-global,
-// like every other finance table in this codebase, so there is no space to
-// narrow this read to: `admin.listPlaidBalances` takes only the transaction's
-// `ctx`. The admin layout above this screen already gates on owner-or-editor;
-// this loader repeats only the sign-in check every page loader here repeats.
+// PLAID-1 originally read the Plaid-only `kith.plaid_accounts`/
+// `plaid_balance_snapshots`/`plaid_holding_snapshots` here. Migration
+// 048_finance_unify.sql replaced those with the unified `kith.fin_*` tables,
+// so this now reads `admin.listFinAccounts` instead -- still owner-global
+// (no space to narrow to) and still only the transaction's `ctx`. The admin
+// layout above this screen already gates on owner-or-editor; this loader
+// repeats only the sign-in check every page loader here repeats.
 
-export type BalancesPageData = { balances: admin.PlaidBalanceRow[] };
+export type BalancesPageData = { balances: admin.FinAccountRow[] };
 
 export async function loadBalances(
   cookieHeader: string | null,
 ): Promise<BalancesPageData | null> {
   const loaded = await loadAuthenticatedPage(cookieHeader, async ({ ctx }) => ({
-    balances: await admin.listPlaidBalances(ctx),
+    balances: await admin.listFinAccounts(ctx),
   }));
   if (loaded === null) return null;
   return { balances: loaded.balances };

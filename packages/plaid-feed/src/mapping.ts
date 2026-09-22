@@ -16,6 +16,11 @@ import type {
 export type PlaidAccountRow = {
   accountId: string;
   itemId: string;
+  // FIN-1: `kith.fin_accounts.institution_name` is denormalized onto the
+  // account row rather than joined from `kith.plaid_items` at read time
+  // (migration 048 dropped the account-level Plaid table that join used to
+  // go through), so the mapper needs it from the item its caller already has.
+  institutionName: string;
   name: string;
   officialName: string | null;
   mask: string | null;
@@ -110,13 +115,40 @@ export const INVESTMENT_TRANSACTIONS_FULL_HISTORY_MONTHS = 24;
 export const INVESTMENT_TRANSACTIONS_INCREMENTAL_OVERLAP_DAYS = 7;
 
 /**
+ * A `date` column's value as `pg` actually hands it back when a caller did
+ * not read it `::text`: node-postgres's default type parser for OID 1082
+ * (`date`) returns a JS `Date`, not a string, even though this package's own
+ * row types say `string`. A live pull after PR 428 hit this directly --
+ * `kith.plaid_items.investment_transactions_pulled_through` came back as a
+ * `Date`, `` `${pulledThrough}T00:00:00Z` `` built on its default
+ * `toString()` was not a parseable timestamp, and the resulting `Invalid
+ * Date` threw "Invalid time value" the first time anything tried to read it
+ * (here, `toISOString()`). `db.ts` now reads that column `::text` so this
+ * should not happen again, but this normalizes defensively too: a `Date` is
+ * converted with its own UTC getters (never `toString()`/`toISOString()`,
+ * which shift by the runtime's timezone or are exactly what broke above)
+ * rather than trusted to already be the `YYYY-MM-DD` string the type says.
+ */
+function isoDateOnly(value: string | Date): string {
+  if (typeof value === "string") return value.slice(0, 10);
+  const year = value.getUTCFullYear();
+  const month = String(value.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(value.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+/**
  * The `start_date` for `/investments/transactions/get`: the full 24-month
  * window Plaid allows when `pulledThrough` is `null` (this item has never
  * had investment transactions pulled), otherwise `pulledThrough` minus a
  * 7-day overlap so a transaction that posts late is not missed.
+ *
+ * `pulledThrough` accepts a `Date` as well as a `string` -- see
+ * `isoDateOnly` above -- so a caller that forgot to read the column `::text`
+ * degrades to a normalized value instead of building an Invalid Date.
  */
 export function investmentTransactionsStartDate(
-  pulledThrough: string | null,
+  pulledThrough: string | Date | null,
   asOf: string,
 ): string {
   if (pulledThrough === null) {
@@ -126,7 +158,9 @@ export function investmentTransactionsStartDate(
     );
     return start.toISOString().slice(0, 10);
   }
-  const start = new Date(Date.parse(`${pulledThrough}T00:00:00Z`));
+  const start = new Date(
+    Date.parse(`${isoDateOnly(pulledThrough)}T00:00:00Z`),
+  );
   start.setUTCDate(
     start.getUTCDate() - INVESTMENT_TRANSACTIONS_INCREMENTAL_OVERLAP_DAYS,
   );
@@ -179,10 +213,12 @@ export function normalizeOptionalString(value: unknown): string | null {
 export function mapAccount(
   account: AccountBase | InvestmentAccount,
   itemId: string,
+  institutionName: string,
 ): PlaidAccountRow {
   return {
     accountId: account.account_id,
     itemId,
+    institutionName,
     name: account.name,
     officialName: normalizeOptionalString(account.official_name),
     mask: normalizeOptionalString(account.mask),

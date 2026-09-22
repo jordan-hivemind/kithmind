@@ -7,12 +7,13 @@ keyboard. See
 order of work item 1, for why this exists: current values come from this feed
 now, not from PDF statement parsing.
 
-Two commands:
+Three commands:
 
-| Command                    | What it does                                                                                                    |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `kith-plaid-feed link`      | Creates a Plaid Hosted Link session, prints a URL to open in any browser, and waits for that one institution to finish linking. |
-| `kith-plaid-feed pull`      | For every linked institution, pulls current balances, holdings and recent transactions and upserts them.          |
+| Command                       | What it does                                                                                                                        |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `kith-plaid-feed link`          | Creates a Plaid Hosted Link session, prints a URL to open in any browser, and waits for that one institution to finish linking.        |
+| `kith-plaid-feed pull`          | For every linked institution, pulls current balances, holdings and recent transactions and upserts them into the unified ledger.       |
+| `kith-plaid-feed import-archive` | One-time (idempotent) import of the finance archive's own statement history into the same unified ledger. See "`import-archive`" below. |
 
 ## One-time setup
 
@@ -106,12 +107,15 @@ node packages/plaid-feed/dist/cli.js pull
 
 For every `kith.plaid_items` row: reads the access token from the Keychain,
 then calls `/accounts/balance/get`, `/investments/holdings/get`,
-`/transactions/sync` (cursor persisted per item) and
+`/transactions/sync` (cursor persisted per item, and paged for as long as
+Plaid reports `has_more` -- there is no page cap) and
 `/investments/transactions/get` (window depends on whether this item has been
-pulled before -- see "History depth" below), and upserts everything. One
+pulled before -- see "History depth" below), and upserts everything into the
+unified ledger tables (see "Tables" below), tagged `source = 'plaid'`. One
 dated snapshot per account per day is written to
-`kith.plaid_balance_snapshots` and `kith.plaid_holding_snapshots` (unique per
-account per `as_of`, so a same-day re-run overwrites rather than duplicates).
+`kith.fin_balance_snapshots` and `kith.fin_holding_snapshots` (unique per
+account per `as_of` per source, so a same-day re-run overwrites rather than
+duplicates).
 
 An item whose consented products do not include `investments` (Chase) has
 the holdings and investment-transactions calls skipped outright, not
@@ -178,14 +182,61 @@ recent activity, but Plaid bounds the two transaction products differently:
   through does not advance the watermark past transactions this pull never
   actually saw.
 
-## Tables (migrations `043_plaid_feed.sql`, `044_plaid_currency.sql`, `045_plaid_history.sql`, `047_plaid_strings.sql`)
+## `import-archive`
 
-`plaid_items`, `plaid_accounts`, `plaid_securities`,
-`plaid_balance_snapshots`, `plaid_holding_snapshots`, `plaid_transactions`,
-`plaid_investment_transactions`, all in the `kith` schema and all
-owner-global (no `space_id`), matching every existing finance table in this
-codebase. No triggers, no change-feed rows, no immutable generations, no
-receipts.
+```sh
+node packages/plaid-feed/dist/cli.js import-archive
+# or: kith-plaid-feed import-archive
+```
+
+A one-time (idempotent, safe to re-run) read of the finance archive
+(statement-derived, Morgan Stanley only, `finance.transactions` 2020 to
+present) into the same unified ledger tables `pull` writes into, tagged
+`source = 'plaid'` above and `source = 'archive'` here -- see
+docs/plans/2026-09-22-simplification-and-feeds.md: the owner does not want
+the archive and the Plaid feed to be two ledgers to query separately.
+
+Read-only against the archive (`FINANCE_ARCHIVE_READER_DATABASE_URL`, the
+archive's own reader-role connection string, the same one the MCP gateway
+uses); the finance-archive write path is never touched. Matches an archive
+account onto an existing `kith.fin_accounts` row by institution plus the
+last-four mask, then by institution plus name; an archive account nothing
+matches becomes its own row. An archive instrument is matched onto
+`kith.fin_securities` by ticker, then CUSIP, then ISIN.
+
+**Boundary rule**: an account that already has Plaid transactions in the
+ledger only gets archive transactions strictly before the earliest Plaid
+date already there -- the archive is history, Plaid is the current feed, and
+importing archive rows past where Plaid's own history starts would
+duplicate coverage under two sources rather than extend it. An account with
+no Plaid transactions yet gets its entire archive history.
+
+Prints counts only, the same rule `pull` follows:
+
+```
+plaid import-archive accounts_matched=3 accounts_created=1 instruments_matched=12 instruments_created=2 transactions_imported=4108 transactions_skipped_past_boundary=214 positions_imported=340 positions_skipped_no_instrument=0 balances_imported=48
+```
+
+## Tables (migrations `043_plaid_feed.sql`, `044_plaid_currency.sql`, `045_plaid_history.sql`, `047_plaid_strings.sql`, `048_finance_unify.sql`)
+
+`kith.plaid_items` is Plaid item state only -- the Keychain pointer, the
+`/transactions/sync` cursor, the investment-transaction watermark,
+`needs_relink_at` -- not ledger data.
+
+Migration `048_finance_unify.sql` replaced the Plaid-only
+`plaid_accounts`/`plaid_securities`/`plaid_balance_snapshots`/
+`plaid_holding_snapshots`/`plaid_transactions`/`plaid_investment_transactions`
+tables with one unified ledger over both the archive and the Plaid feed:
+`kith.fin_accounts`, `kith.fin_securities`, `kith.fin_transactions`,
+`kith.fin_holding_snapshots` and `kith.fin_balance_snapshots`. Every ledger
+row carries `source` (`'archive'` or `'plaid'`); a transaction or a snapshot
+row is unique per source (a transaction by `(source, source_ref)`, a
+snapshot by `(account_id, as_of[, security_id], source)`), so the two
+sources' rows sit side by side rather than overwriting each other.
+
+All in the `kith` schema and all owner-global (no `space_id`), matching
+every existing finance table in this codebase. No triggers, no change-feed
+rows, no immutable generations, no receipts.
 
 ## Running `pull` daily
 
@@ -246,18 +297,26 @@ monitoring reading `StandardErrorPath`) show a failed run.
 
 ## Tests
 
-`test/mapping.test.mjs`, `test/pull.test.mjs` and `test/link.test.mjs` are
-unit tests against a mocked Plaid client and a fake `pg.Pool` (an object
-recording `.query()` calls) -- no network, no database, and (for the
-Hosted Link polling flow) no real waiting, since the clock and Keychain
-writer are injected. Run them against the built package:
+`test/mapping.test.mjs`, `test/pull.test.mjs`, `test/link.test.mjs` and
+`test/importArchive.test.mjs` are unit tests against a mocked Plaid client
+and a fake `pg.Pool` (an object recording `.query()` calls) -- no network,
+no database, and (for the Hosted Link polling flow) no real waiting, since
+the clock and Keychain writer are injected. Run them against the built
+package:
 
 ```sh
 pnpm --filter @repo/plaid-feed build
 node --test packages/plaid-feed/test/*.test.mjs
 ```
 
+`test/ledger.test.mjs` is the one exception: `import-archive`'s matching and
+boundary rule reconciling an archive-style account against a Plaid-style
+one, end to end against a real throwaway Postgres (its own database on
+whatever server `KITH_STORE_DATABASE_URL` points at, created and dropped by
+the test). It skips cleanly without that variable set, and runs as part of
+the same `node --test packages/plaid-feed/test/*.test.mjs` command above.
+
 A migration-apply test lives in
 `packages/kith-store/test/kithSchema.test.mjs` (it already asserts every
-migration's tables exist; this package's tables were added to that list) and
-runs against a throwaway Postgres when `KITH_STORE_DATABASE_URL` is set.
+migration's tables exist, and that the tables migration 048 retired do not)
+and runs against a throwaway Postgres when `KITH_STORE_DATABASE_URL` is set.

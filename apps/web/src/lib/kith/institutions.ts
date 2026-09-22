@@ -12,6 +12,7 @@
 // (`accounts.acct_last4` is the only account-number field it stores).
 
 import type { FinanceAccountInventoryRecord } from "@repo/finance-contract";
+import type { admin } from "@repo/kith-store";
 
 import {
   accountFreshness,
@@ -82,6 +83,17 @@ export type InstitutionRow = {
    * cadence, so the screen shows its date beside it and mutes it rather than
    * letting it read as today's. See `valueIsStale`. */
   currentValueStale: boolean;
+  /**
+   * FIN-1: the account's latest value from `kith.fin_accounts` -- the
+   * latest Plaid balance snapshot, or (for a depository account Plaid never
+   * reports a balance for, only holdings) the latest holdings snapshot
+   * total -- for whichever of this account's rows is linked to a Plaid
+   * account. `null` for an archive-only account nothing links to yet. See
+   * `mergeLiveAccounts`.
+   */
+  liveValue: number | null;
+  liveValueCurrency: string | null;
+  liveAsOf: string | null;
   /** What the archive itself says, and the owner's override of it. On an
    * account row only: the edit panel shows the first as what clearing the
    * second returns to. */
@@ -212,6 +224,11 @@ export function groupInstitutions(
         now,
         judged.cadence,
       ),
+      // Filled in by `mergeLiveAccounts` for an account a `kith.fin_accounts`
+      // row links to; every archive account starts with none.
+      liveValue: null,
+      liveValueCurrency: null,
+      liveAsOf: null,
       accountType: shownAccount.accountType ?? null,
       accounts: null,
       statements: record.statementCount,
@@ -245,6 +262,9 @@ export function groupInstitutions(
       currentValueStale: false,
       currentValueCurrency: null,
       currentValueAsOf: null,
+      liveValue: null,
+      liveValueCurrency: null,
+      liveAsOf: null,
       accountType: null,
       accounts: 0,
       statements: 0,
@@ -455,4 +475,162 @@ function groupValue(group: InstitutionRow): {
     currentValueAsOf: asOf,
     currentValueStale: live.some((child) => child.currentValueStale),
   };
+}
+
+// ---------------------------------------------------------------------------
+// FIN-1: live values and Plaid-only accounts (migration 048_finance_unify.sql)
+// ---------------------------------------------------------------------------
+
+/** An account row's live figure: its latest balance snapshot, or (a
+ * depository-style account Plaid never balances, only holdings) its latest
+ * holdings snapshot total. Neither present is "no live figure yet". */
+function liveValueOf(row: admin.FinAccountRow): {
+  value: number | null;
+  currency: string | null;
+  asOf: string | null;
+} {
+  if (row.currentBalance !== null) {
+    return { value: row.currentBalance, currency: row.currency, asOf: row.balanceAsOf };
+  }
+  if (row.holdingsValue !== null) {
+    return { value: row.holdingsValue, currency: row.currency, asOf: row.holdingsAsOf };
+  }
+  return { value: null, currency: null, asOf: null };
+}
+
+/** A `kith.fin_accounts` row with no archive counterpart yet, as its own
+ * account row under its institution's group -- a new group when the
+ * institution has no archive presence at all (Vanguard, Fidelity, Chase). */
+function plaidOnlyChild(row: admin.FinAccountRow): InstitutionRow {
+  const live = liveValueOf(row);
+  return {
+    id: `plaid:${row.accountId}`,
+    name: row.accountName,
+    institutionName: row.institutionName,
+    accountName: row.accountName,
+    accountLast4: row.mask,
+    accountType: row.subtype ?? row.type,
+    accounts: null,
+    statements: 0,
+    records: 0,
+    activityFrom: null,
+    activityTo: null,
+    latestSnapshotAsOf: null,
+    latestHoldingsObservedAsOf: row.holdingsAsOf,
+    latestBalanceAsOf: row.balanceAsOf,
+    cadence: null,
+    freshnessReason: null,
+    expectedBy: null,
+    openReviews: 0,
+    currentValue: null,
+    currentValueCurrency: null,
+    currentValueAsOf: null,
+    currentValueStale: false,
+    liveValue: live.value,
+    liveValueCurrency: live.currency,
+    liveAsOf: live.asOf,
+    archive: null,
+    override: null,
+    last4Reason: null,
+    // "fresh" rather than "empty": an "empty" account is hidden by the
+    // screen's default "Hide empty accounts" toggle, and a Plaid-only
+    // account is exactly the row that toggle must not hide -- it is the one
+    // place the owner sees it at all.
+    status: "fresh",
+    statusDetail: "Plaid feed only; no statement archive account yet",
+  };
+}
+
+function emptyPlaidOnlyGroup(institutionName: string): InstitutionRow {
+  return {
+    id: institutionName,
+    name: institutionName,
+    institutionName,
+    accountName: null,
+    accountLast4: null,
+    archive: null,
+    override: null,
+    last4Reason: null,
+    currentValue: null,
+    currentValueStale: false,
+    currentValueCurrency: null,
+    currentValueAsOf: null,
+    liveValue: null,
+    liveValueCurrency: null,
+    liveAsOf: null,
+    accountType: null,
+    accounts: 0,
+    statements: 0,
+    records: 0,
+    activityFrom: null,
+    activityTo: null,
+    latestSnapshotAsOf: null,
+    latestHoldingsObservedAsOf: null,
+    latestBalanceAsOf: null,
+    cadence: null,
+    freshnessReason: null,
+    expectedBy: null,
+    openReviews: 0,
+    status: "fresh",
+    statusDetail: null,
+    children: [],
+  };
+}
+
+/**
+ * The archive's institution groups (`groupInstitutions`'s own result), with
+ * `kith.fin_accounts`' live figures folded in.
+ *
+ * Two things happen here, both keyed off `admin.listFinAccounts`' rows:
+ *
+ *   - An account linked to the archive (`archiveAccountId` set) fills in
+ *     that same child row's `liveValue`/`liveValueCurrency`/`liveAsOf`.
+ *   - An account with no archive counterpart (`archiveAccountId === null`,
+ *     Plaid-only) becomes its own child row, under its institution's
+ *     existing group when there is one or a new group when there is not --
+ *     so the owner sees every linked account in one table, not two.
+ *
+ * Pure, like the rest of this file: a function of `groupInstitutions`'s
+ * output and the read `finAccounts` rows, nothing else.
+ */
+export function mergeLiveAccounts(
+  groups: readonly InstitutionRow[],
+  finAccounts: readonly admin.FinAccountRow[],
+): InstitutionRow[] {
+  const liveByArchiveId = new Map(
+    finAccounts
+      .filter((row) => row.archiveAccountId !== null)
+      .map((row) => [row.archiveAccountId!, row]),
+  );
+  const merged: InstitutionRow[] = groups.map((group) => {
+    const children = (group.children ?? []).map((child) => {
+      const fin = liveByArchiveId.get(child.id);
+      if (fin === undefined) return child;
+      const live = liveValueOf(fin);
+      return {
+        ...child,
+        liveValue: live.value,
+        liveValueCurrency: live.currency,
+        liveAsOf: live.asOf,
+      };
+    });
+    return { ...group, children };
+  });
+
+  const byInstitution = new Map<string, InstitutionRow>(
+    merged.map((group) => [group.name, group]),
+  );
+  for (const fin of finAccounts) {
+    if (fin.archiveAccountId !== null || fin.plaidAccountId === null) continue;
+    let group = byInstitution.get(fin.institutionName);
+    if (group === undefined) {
+      group = emptyPlaidOnlyGroup(fin.institutionName);
+      byInstitution.set(fin.institutionName, group);
+      merged.push(group);
+    }
+    group.accounts = (group.accounts ?? 0) + 1;
+    group.children = [...(group.children ?? []), plaidOnlyChild(fin)];
+  }
+
+  return merged.sort((left, right) => left.name.localeCompare(right.name));
 }
