@@ -191,10 +191,13 @@ field is resolved, and continuation statements referenced by requested coded
 boxes are closed. A contents-page mention, cover letter, first-page heading or
 model assertion cannot close a form.
 
-The first controller implements this conservatively. Two explicit Form 1040
-pages and an explicit following form boundary or source end are required; an
-unlabelled page between them leaves coverage open. A 1065 K-1 must expose its
-key-box region in inspected source text. When that form references an attached
+The first controller implements this conservatively. Distinct positive Form
+1040 page-one and page-two headings and an explicit following form boundary or
+source end are required; contents entries, duplicate page-one headings and an
+unlabelled page between them leave coverage open. A 1065 K-1 must expose Part
+III, a numbered box or a supported key-field label in inspected source text.
+The generic "Partner's Share" form title alone does not prove key-box coverage.
+When that form references an attached
 statement, at least one explicitly labelled statement page and its boundary or
 source end are required. Unknown header drift leaves the target
 `incomplete_resumable`. Reaching the last planned transport batch is not a
@@ -308,6 +311,13 @@ revision-bound result through `get_document`.
 Validate every new CI or parser-launcher command in a clean environment. A
 developer environment with an editable package install can otherwise hide a
 missing import path or undeclared fixture dependency.
+
+The supported parser runtime setup command prints both the unchanged
+whole-document launcher path/hash and the selective launcher path/hash. Worker
+adoption adds the selective pair to `pdfDocQa.parser`; it does not replace or
+re-fingerprint the whole-document launcher. The journal adopts that additive
+configuration fingerprint only between passes, with no pending request or
+in-flight scan, and preserves the existing checkpoint and catalog.
 
 ### Final acceptance
 

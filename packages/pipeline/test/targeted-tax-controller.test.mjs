@@ -118,6 +118,26 @@ test("missing pages, identity-only K-1s, and unknown continuation drift stay inc
       [
         {
           originalPage: 1,
+          text:
+            "Schedule K-1 (Form 1065) Partner's Share of Income, Deductions, Credits, etc.",
+        },
+        {
+          originalPage: 2,
+          text: "Schedule K-1 (Form 1065) continued",
+        },
+        { originalPage: 3, text: "Form 1099 supporting attachment" },
+      ],
+      3,
+    ),
+    false,
+    "the standard K-1 title does not prove that the Part III key-box region was inspected",
+  );
+  assert.equal(
+    targetedTaxNavigationClosed(
+      "schedule_k1_key_fields_v1",
+      [
+        {
+          originalPage: 1,
           text: "Schedule K-1 (Form 1065) Box 1 Ordinary business income. See attached statement",
         },
         { originalPage: 2, text: "unlabelled continuation content" },
@@ -138,6 +158,43 @@ test("missing pages, identity-only K-1s, and unknown continuation drift stay inc
       requestedRegionsClosed: false,
       continuationsClosed: false,
     },
+  );
+});
+
+test("1040 closure requires actual distinct page one and page two headings", () => {
+  assert.equal(
+    targetedTaxNavigationClosed(
+      "form_1040_totals_v1",
+      [
+        { originalPage: 1, text: "Contents\nForm 1040 ........ page 8" },
+        {
+          originalPage: 2,
+          text: "Contents\nForm 1040 page 2 ........ page 9",
+        },
+        { originalPage: 3, text: "Form W-2 Wage and Tax Statement" },
+      ],
+      3,
+    ),
+    false,
+  );
+  assert.equal(
+    targetedTaxNavigationClosed(
+      "form_1040_totals_v1",
+      [
+        {
+          originalPage: 1,
+          text: "Form 1040 U.S. Individual Income Tax Return",
+        },
+        {
+          originalPage: 2,
+          text: "Form 1040 U.S. Individual Income Tax Return",
+        },
+        { originalPage: 3, text: "Form W-2 Wage and Tax Statement" },
+      ],
+      3,
+    ),
+    false,
+    "a repeated page-one heading does not prove page-two coverage",
   );
 });
 

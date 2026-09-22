@@ -188,6 +188,11 @@ export type TargetedTaxPagePlan = {
 
 const FORM_1040 =
   /(?:^|\n)\s*(?:(?:u\.?s\.?\s+)?form\s+1040(?:-sr)?\b|u\.?s\.?\s+individual\s+income\s+tax\s+return\b)/im;
+const FORM_1040_PAGE_ONE =
+  /(?:^|\n)\s*(?:u\.?s\.?\s+)?form\s+1040(?:-sr)?\b[^\n]*u\.?s\.?\s+individual\s+income\s+tax\s+return\b/im;
+const FORM_1040_PAGE_TWO =
+  /(?:^|\n)\s*(?:u\.?s\.?\s+)?form\s+1040(?:-sr)?\b[^\n]*\bpage\s*2\b/im;
+const CONTENTS_PAGE = /(?:^|\n)\s*contents\b/im;
 const FRONT_SCHEDULE =
   /(?:^|\n)\s*schedule\s+(?:1|2|3|a|d|e)\b[^\n]{0,80}(?:form\s+1040|additional|itemized|capital|supplemental)/im;
 const K1_1065 = /(?:^|\n)\s*schedule\s+k-?1\s*\(\s*form\s+1065\s*\)/im;
@@ -196,7 +201,7 @@ const SUPPORTING =
 const OTHER_TAX_FORM =
   /(?:^|\n)\s*(?:form\s+(?:1040|1041|1065|1120)|schedule\s+k-?1)\b/im;
 const K1_KEY_REGION =
-  /\b(?:box\s*(?:[1-9]|1\d|20)\b|ordinary\s+business\s+income|rental\s+real\s+estate\s+income|self-employment\s+earnings|partner(?:'s)?\s+share\s+of\s+(?:income|deductions|credits))\b/i;
+  /\b(?:part\s+iii\b|box\s*(?:[1-9]|1\d|20)\b|ordinary\s+business\s+income|rental\s+real\s+estate\s+income|self-employment\s+earnings)\b/i;
 const CONTINUATION_REFERENCE =
   /\b(?:see\s+(?:attached|statement)|attached\s+statement|statement\s+(?:attached|required))\b/i;
 const STATEMENT_PAGE =
@@ -229,7 +234,10 @@ export function inspectTargetedTaxPages(
 ): TargetedTaxPagePlan {
   const sorted = [...headers].sort((a, b) => a.originalPage - b.originalPage);
   if (goal === "form_1040_totals_v1") {
-    const start = sorted.findIndex((page) => FORM_1040.test(page.text));
+    const start = sorted.findIndex(
+      (page) =>
+        !CONTENTS_PAGE.test(page.text) && FORM_1040_PAGE_ONE.test(page.text),
+    );
     if (start < 0)
       return {
         originalPages: [],
@@ -237,7 +245,8 @@ export function inspectTargetedTaxPages(
         continuationsClosed: false,
       };
     const selected: number[] = [];
-    let corePageCount = 0;
+    let pageOneSeen = false;
+    let pageTwoSeen = false;
     let boundarySeen = false;
     let unknownDrift = false;
     for (let index = start; index < sorted.length; index += 1) {
@@ -252,17 +261,20 @@ export function inspectTargetedTaxPages(
         boundarySeen = true;
         break;
       }
-      const heading =
-        FORM_1040.test(page.text) || FRONT_SCHEDULE.test(page.text);
+      const isContents = CONTENTS_PAGE.test(page.text);
+      const pageOne = !isContents && FORM_1040_PAGE_ONE.test(page.text);
+      const pageTwo = !isContents && FORM_1040_PAGE_TWO.test(page.text);
+      const heading = pageOne || pageTwo || FRONT_SCHEDULE.test(page.text);
       if (!heading) {
         unknownDrift = true;
         continue;
       }
       selected.push(page.originalPage);
-      if (FORM_1040.test(page.text)) corePageCount += 1;
+      pageOneSeen ||= pageOne;
+      pageTwoSeen ||= pageTwo;
     }
     const bounded = boundarySeen || reachedSourceEnd(sorted, sourcePageCount);
-    const closed = corePageCount >= 2 && bounded && !unknownDrift;
+    const closed = pageOneSeen && pageTwoSeen && bounded && !unknownDrift;
     return {
       originalPages: selected,
       requestedRegionsClosed: closed,

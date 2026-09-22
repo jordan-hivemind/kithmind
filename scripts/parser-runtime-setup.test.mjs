@@ -16,6 +16,8 @@ import {
 const PATHS = {
   pythonExecutable: "/w/evals/parser/.venv/bin/python3.12",
   launcherPath: "/w/evals/parser/src/parser_eval/production_launcher.py",
+  selectiveLauncherPath:
+    "/w/evals/parser/src/parser_eval/selective_production_launcher.py",
   packageRoot: "/w/evals/parser/src",
   modelAssetsPath: "/w/evals/parser/artifacts/models",
   modelLockPath: "/w/evals/parser/model-assets.lock.json",
@@ -23,6 +25,7 @@ const PATHS = {
 const DIGESTS = {
   python: "a".repeat(64),
   launcher: "b".repeat(64),
+  selectiveLauncher: "9".repeat(64),
   modelLock: "c".repeat(64),
 };
 const READY = {
@@ -61,6 +64,7 @@ test("configBlock pastes every field the pipeline config pins", () => {
     ...PATHS,
     expectedPythonSha256: DIGESTS.python,
     expectedLauncherSha256: DIGESTS.launcher,
+    expectedSelectiveLauncherSha256: DIGESTS.selectiveLauncher,
     expectedModelLockSha256: DIGESTS.modelLock,
   });
   assert.deepEqual(block.profile, {
