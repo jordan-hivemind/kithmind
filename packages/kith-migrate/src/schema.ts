@@ -353,7 +353,7 @@ export const TABLES: TableSpec[] = [
     ref("sourceRevisionId", "brain_source_revisions"),
     text("clientArtifactId"),
     text("parserFingerprint"),
-    text("targetedSelectionFingerprint"),
+    text("targetedSelectionFingerprint", { addedIn: 42 }),
     text("outputHash"),
     num("outputByteLength"),
     text("outputMediaType"),
@@ -564,7 +564,7 @@ export const TABLES: TableSpec[] = [
     text("mappingManifestHash"),
     ref("parserArtifactId", "source_parser_artifacts"),
     bool("evidenceSealed"),
-    json("targetedCoverage"),
+    json("targetedCoverage", { addedIn: 42 }),
   ]),
   table("sourcePages", "source_pages", true, true, [
     ref("sourceTextVersionId", "source_text_versions"),
