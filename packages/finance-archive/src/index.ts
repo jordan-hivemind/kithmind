@@ -108,6 +108,10 @@ export {
   toNumericText,
 } from "./pgNumeric.js";
 export {
+  valuationNoteComparisonKey,
+  valuationNotesEquivalent,
+} from "./valuationNote.js";
+export {
   applyPgReaderRole,
   READER_CONNECTION_LIMIT,
   READER_ROLE_LOCK_KEY,

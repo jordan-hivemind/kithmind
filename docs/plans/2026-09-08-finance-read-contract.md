@@ -412,3 +412,13 @@ assertions remain available to evidence lookups, while position reconciliation
 is recomputed for instruments present in either the old or corrected selected
 set. A stale approval, unrepresented foreign row, semantic mismatch or changed
 canonical set refuses the entire transaction.
+
+The generated note `Market Value|NAV column of the <SECTION> holdings table`
+records two different things. The column label states the valuation basis; the
+section label records where that source printed the row. Exact scope comparison
+therefore permits different valid all-caps section labels only within that
+closed generated grammar. It still requires the same column label and exact
+dated-lot suffix, as well as equal quantity, price, value, cost, unrealized,
+currency, row hash, account and date. Literal notes, nulls and disclaimers stay
+exact. Each source's original note and locator remain immutable evidence; no
+canonical row is rewritten or rehomed.

@@ -9,6 +9,10 @@ import {
   publishHoldingScopedPositionCorrection,
 } from "../dist/index.js";
 import { readStoredHoldingProjection } from "../dist/holdingCorrectionCandidate.js";
+import {
+  valuationNotesEquivalent,
+  valuationNotesEquivalentSql,
+} from "../dist/valuationNote.js";
 
 import { archive, count, one, skip } from "./helpers/pgArchive.mjs";
 
@@ -321,6 +325,7 @@ async function seed(client) {
     "50",
     locator("foreign", 8),
   );
+  foreignA.valuationNote = "Market Value column of the BONDS holdings table";
   const b = position(ACCOUNT_B, "instrument-b", "200", locator("b", 2));
   const c = position(ACCOUNT_C, "instrument-c", "300", locator("c", 3));
   await insertPosition(client, "position-a-old", DOCUMENT, oldA);
@@ -443,6 +448,46 @@ function approvalFor(manifest) {
 }
 
 test(
+  "TypeScript and PostgreSQL valuation-note comparison agree on the closed grammar",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    const bond = "Market Value column of the BONDS holdings table";
+    const government =
+      "Market Value column of the GOVERNMENT/SECURITIES holdings table";
+    const cases = [
+      [bond, government, true],
+      [
+        `${bond}; summed from 2 dated lots without a printed Total row`,
+        `${government}; summed from 2 dated lots without a printed Total row`,
+        true,
+      ],
+      [bond, `NAV column of the GOVERNMENT/SECURITIES holdings table`, false],
+      [
+        `${bond}; summed from 2 dated lots without a printed Total row`,
+        `${government}; summed from 3 dated lots without a printed Total row`,
+        false,
+      ],
+      [bond, `${government}\n`, false],
+      [bond, `${government}\r`, false],
+      [bond, `${government}\r\n`, false],
+      [bond, "Statement says market value is estimated.", false],
+      [null, null, true],
+      [null, bond, false],
+    ];
+    for (const [left, right, expected] of cases) {
+      const sql = await one(
+        client,
+        `SELECT ${valuationNotesEquivalentSql("$1::text", "$2::text")} AS equivalent`,
+        [left, right],
+      );
+      assert.equal(valuationNotesEquivalent(left, right), expected);
+      assert.equal(sql.equivalent, expected);
+    }
+  },
+);
+
+test(
   "scoped publication preserves neighbors, carries scope proofs and references exact foreign rows without rehoming",
   { skip },
   async (t) => {
@@ -454,7 +499,13 @@ test(
       "125",
       locator("a-new", 4),
     );
-    const parsed = candidate([newA, seeded.foreignA]);
+    const foreignWitness = {
+      ...seeded.foreignA,
+      valuationNote:
+        "Market Value column of the GOVERNMENT/SECURITIES holdings table",
+      sourceLocator: locator("witness", 9),
+    };
+    const parsed = candidate([newA, foreignWitness]);
     const before = await one(
       client,
       `SELECT
@@ -479,11 +530,31 @@ test(
     assert.deepEqual(
       await one(
         client,
-        `SELECT source_document_id, market_value::text AS market_value
+        `SELECT source_document_id, market_value::text AS market_value,
+                valuation_note
            FROM positions WHERE row_hash = $1`,
         [hash(seeded.foreignA)],
       ),
-      { source_document_id: FOREIGN_DOCUMENT, market_value: "50.000" },
+      {
+        source_document_id: FOREIGN_DOCUMENT,
+        market_value: "50.000",
+        valuation_note: seeded.foreignA.valuationNote,
+      },
+    );
+    assert.equal(
+      (
+        await one(
+          client,
+          `SELECT m.valuation_note
+             FROM position_scope_memberships m
+             JOIN position_scope_observations o ON o.id = m.scope_id
+            WHERE o.source_document_id = $1
+              AND o.holding_projection_generation_id = $2
+              AND m.position_row_hash = $3`,
+          [DOCUMENT, published.activeGenerationId, hash(seeded.foreignA)],
+        )
+      ).valuation_note,
+      foreignWitness.valuationNote,
     );
     const after = await one(
       client,
@@ -554,7 +625,7 @@ test(
       "130",
       locator("a-newer", 5),
     );
-    const secondParsed = candidate([newerA, seeded.foreignA]);
+    const secondParsed = candidate([newerA, foreignWitness]);
     const secondPrepared = await prepare(client, secondParsed);
     const second = await publishHoldingScopedPositionCorrection(
       client,
@@ -797,6 +868,43 @@ test(
       prepare(client, candidate([newA, conflict])),
       /foreign-owned selected position has different semantics/,
     );
+    for (const financialConflict of [
+      {
+        ...seeded.foreignA,
+        marketValueText: "51",
+        price: "51",
+      },
+      {
+        ...seeded.foreignA,
+        valuationBasis: "reported_nav",
+        valuationNote: "NAV column of the BONDS holdings table",
+      },
+    ]) {
+      await assert.rejects(
+        prepare(client, candidate([newA, financialConflict])),
+        /does not represent every foreign-owned row/,
+      );
+    }
+    for (const valuationNote of [
+      "NAV column of the GOVERNMENT/SECURITIES holdings table",
+      "Statement says market value is estimated.",
+      "Market Value column of the GOVERNMENT/SECURITIES holdings table; summed from 2 dated lots without a printed Total row",
+    ]) {
+      await assert.rejects(
+        prepare(
+          client,
+          candidate([
+            newA,
+            {
+              ...seeded.foreignA,
+              valuationNote,
+              sourceLocator: locator("witness", 9),
+            },
+          ]),
+        ),
+        /foreign-owned selected position has different semantics/,
+      );
+    }
     assert.equal(await count(client, "holding_projection_generations"), 0);
     assert.equal(await count(client, "positions"), 4);
   },
