@@ -204,6 +204,247 @@ async function runLedgerAssertions({ kithClient, archiveClient, pool }) {
   const second = await importArchive(archiveReader(archiveClient), pool);
   assert.equal(second.accountsCreated, 0);
   assert.equal(second.accountsMatched, 1);
+  assert.equal(second.linksSet, 0, "an already-linked account re-derives to the same link without writing");
   const ledgerAgain = await admin.listLedger(ctx, { accountId: finAccountId });
   assert.equal(ledgerAgain.rows.length, 3);
 }
+
+test(
+  "import-archive merges an archive-only account into a feed account that appears later, and self-repairs the overlap",
+  { skip },
+  async (t) => {
+    const dbUrl = await throwawayDatabase(t);
+    const kithClient = new pg.Client({ connectionString: dbUrl });
+    const archiveClient = createArchiveClient(dbUrl, "finance");
+    const pool = openPool(dbUrl);
+    try {
+      await kithClient.connect();
+      await applyKithSchema(kithClient);
+      await archiveClient.connect();
+      await applyPgSchema(archiveClient, "finance");
+
+      await archiveClient.query(
+        `INSERT INTO institutions (id, name, slug)
+         VALUES ('arch-inst-2', 'Vanguard', 'vanguard')`,
+      );
+      await archiveClient.query(
+        `INSERT INTO accounts
+           (id, institution_id, acct_last4, display_name, account_type, base_currency)
+         VALUES ('arch-acc-2', 'arch-inst-2', '7777', 'Retirement IRA', 'retirement', 'USD')`,
+      );
+      // One transaction well before any Plaid history exists, one dated
+      // after where the Plaid account's own history will start once it
+      // shows up -- both import with no boundary on the first run (there is
+      // no feed account yet), which is exactly the bug this test guards:
+      // a first run before the feed account exists must not leave the
+      // later-arriving overlap stuck in the ledger forever.
+      await archiveClient.query(
+        `INSERT INTO transactions
+           (id, account_id, process_date, activity_type, description, amount, currency, row_hash, imported_at)
+         VALUES
+           ('arch-txn-a-old', 'arch-acc-2', '2019-01-01', 'Dividend', 'Dividend payment', 5.00, 'USD', 'hash-a-old', now()),
+           ('arch-txn-a-new', 'arch-acc-2', '2024-05-01', 'Dividend', 'Dividend payment', 6.00, 'USD', 'hash-a-new', now())`,
+      );
+
+      // First run: no Plaid account for this institution/mask yet, so the
+      // archive account becomes its own archive-only row with both
+      // transactions imported (nothing to bound against).
+      const first = await importArchive(archiveReader(archiveClient), pool);
+      assert.equal(first.accountsCreated, 1);
+      assert.equal(first.accountsMatched, 0);
+
+      const { rows: archiveOnlyRows } = await kithClient.query(
+        `SELECT id, archive_account_id, plaid_account_id
+           FROM kith.fin_accounts WHERE institution_name = 'Vanguard'`,
+      );
+      assert.equal(archiveOnlyRows.length, 1);
+      assert.equal(archiveOnlyRows[0].archive_account_id, "arch-acc-2");
+      assert.equal(archiveOnlyRows[0].plaid_account_id, null);
+      const archiveOnlyId = archiveOnlyRows[0].id;
+
+      const { rows: beforeMerge } = await kithClient.query(
+        `SELECT source_ref, date::text AS date FROM kith.fin_transactions
+          WHERE account_id = $1 ORDER BY date`,
+        [archiveOnlyId],
+      );
+      assert.deepEqual(beforeMerge.map((r) => r.source_ref), ["arch-txn-a-old", "arch-txn-a-new"]);
+
+      // Now a matching Plaid account shows up (the owner links the
+      // institution and `pull` runs), with a transaction dated between the
+      // two archive rows -- this becomes the boundary.
+      await upsertPlaidItem(pool, {
+        itemId: "item-2",
+        institutionId: "ins_vanguard",
+        institutionName: "Vanguard",
+        keychainService: "com.kithmind.plaid.item.vanguard",
+      });
+      await upsertAccount(
+        pool,
+        mapAccount({ ...account, account_id: "plaid-acc-2", mask: "7777", name: "IRA" }, "item-2", "Vanguard"),
+      );
+      await upsertTransaction(
+        pool,
+        mapTransaction(
+          { ...plaidTransaction("plaid-txn-2", "2024-02-01", -25), account_id: "plaid-acc-2" },
+          "item-2",
+        ),
+      );
+
+      // Second run: merges the archive-only row into the feed row, and
+      // self-repairs the overlap the first run had no way to know about --
+      // the now-past-boundary archive transaction is deleted, not just
+      // skipped on the way in.
+      const second = await importArchive(archiveReader(archiveClient), pool);
+      assert.equal(second.accountsCreated, 0);
+      assert.equal(second.accountsMerged, 1, "the archive-only row merged into the feed row");
+      assert.equal(second.linksSet, 1);
+      assert.ok(second.rowsDeletedAsOverlap >= 1, "the overlapping archive row was deleted, not left behind");
+
+      const { rows: merged } = await kithClient.query(
+        `SELECT id, archive_account_id, plaid_account_id
+           FROM kith.fin_accounts WHERE institution_name = 'Vanguard'`,
+      );
+      assert.equal(merged.length, 1, "one row, not two, after the merge");
+      assert.equal(merged[0].archive_account_id, "arch-acc-2");
+      assert.equal(merged[0].plaid_account_id, "plaid-acc-2");
+      assert.notEqual(merged[0].id, archiveOnlyId, "the merge kept the feed row's own id, not the archive-only row's");
+
+      const ctx = identityCtx(kithClient);
+      const ledger = await admin.listLedger(ctx, { accountId: merged[0].id });
+      assert.deepEqual(
+        ledger.rows.map((row) => [row.date, row.source]),
+        [
+          ["2024-02-01", "plaid"],
+          ["2019-01-01", "archive"],
+        ],
+        "the pre-boundary archive row survived the merge; the past-boundary one was removed",
+      );
+
+      // Idempotent from here too: a third run repeats nothing.
+      const third = await importArchive(archiveReader(archiveClient), pool);
+      assert.equal(third.accountsMerged, 0);
+      assert.equal(third.rowsDeletedAsOverlap, 0);
+      const ledgerAgain = await admin.listLedger(ctx, { accountId: merged[0].id });
+      assert.equal(ledgerAgain.rows.length, 2);
+    } finally {
+      await pool.end();
+      await archiveClient.end();
+      await kithClient.end();
+    }
+  },
+);
+
+test(
+  "import-archive links two archive accounts at the same institution to their own distinct feed accounts, not to each other",
+  { skip },
+  async (t) => {
+    const dbUrl = await throwawayDatabase(t);
+    const kithClient = new pg.Client({ connectionString: dbUrl });
+    const archiveClient = createArchiveClient(dbUrl, "finance");
+    const pool = openPool(dbUrl);
+    try {
+      await kithClient.connect();
+      await applyKithSchema(kithClient);
+      await archiveClient.connect();
+      await applyPgSchema(archiveClient, "finance");
+
+      // Two archive accounts at the same institution and of the same
+      // account_type ("bank"), distinguished only by mask and display name
+      // -- exactly the shape that would collapse onto one fin_accounts row
+      // if matching ever claimed a candidate for more than one archive
+      // account.
+      await archiveClient.query(
+        `INSERT INTO institutions (id, name, slug) VALUES ('arch-inst-3', 'Chase', 'chase')`,
+      );
+      await archiveClient.query(
+        `INSERT INTO accounts
+           (id, institution_id, acct_last4, display_name, account_type, base_currency)
+         VALUES
+           ('arch-acc-checking', 'arch-inst-3', '1111', 'Checking', 'bank', 'USD'),
+           ('arch-acc-savings', 'arch-inst-3', '2222', 'Savings', 'bank', 'USD')`,
+      );
+      await archiveClient.query(
+        `INSERT INTO transactions
+           (id, account_id, process_date, activity_type, description, amount, currency, row_hash, imported_at)
+         VALUES
+           ('arch-txn-checking', 'arch-acc-checking', '2019-01-01', 'Deposit', 'Deposit', 100.00, 'USD', 'hash-checking', now()),
+           ('arch-txn-savings', 'arch-acc-savings', '2019-01-01', 'Deposit', 'Deposit', 200.00, 'USD', 'hash-savings', now())`,
+      );
+
+      await upsertPlaidItem(pool, {
+        itemId: "item-3",
+        institutionId: "ins_chase",
+        institutionName: "Chase",
+        keychainService: "com.kithmind.plaid.item.chase",
+      });
+      await upsertAccount(
+        pool,
+        mapAccount(
+          { ...account, account_id: "plaid-acc-checking", mask: "1111", name: "Checking" },
+          "item-3",
+          "Chase",
+        ),
+      );
+      await upsertAccount(
+        pool,
+        mapAccount(
+          { ...account, account_id: "plaid-acc-savings", mask: "2222", name: "Savings" },
+          "item-3",
+          "Chase",
+        ),
+      );
+      // A boundary transaction on each feed account, both dated after both
+      // archive rows, so both archive rows still import (before the
+      // boundary) and attribution is checkable independent of the boundary
+      // rule.
+      await upsertTransaction(
+        pool,
+        mapTransaction(
+          { ...plaidTransaction("plaid-txn-checking", "2024-01-01", -10), account_id: "plaid-acc-checking" },
+          "item-3",
+        ),
+      );
+      await upsertTransaction(
+        pool,
+        mapTransaction(
+          { ...plaidTransaction("plaid-txn-savings", "2024-01-01", -20), account_id: "plaid-acc-savings" },
+          "item-3",
+        ),
+      );
+
+      const result = await importArchive(archiveReader(archiveClient), pool);
+      assert.equal(result.accountsMatched, 2);
+      assert.equal(result.accountsCreated, 0);
+      assert.equal(result.accountsMerged, 0);
+
+      const { rows: finAccounts } = await kithClient.query(
+        `SELECT id, mask, archive_account_id, plaid_account_id
+           FROM kith.fin_accounts WHERE institution_name = 'Chase' ORDER BY mask`,
+      );
+      assert.equal(finAccounts.length, 2, "two distinct rows, not one shared row");
+      assert.equal(finAccounts[0].mask, "1111");
+      assert.equal(finAccounts[0].archive_account_id, "arch-acc-checking");
+      assert.equal(finAccounts[0].plaid_account_id, "plaid-acc-checking");
+      assert.equal(finAccounts[1].mask, "2222");
+      assert.equal(finAccounts[1].archive_account_id, "arch-acc-savings");
+      assert.equal(finAccounts[1].plaid_account_id, "plaid-acc-savings");
+
+      const { rows: checkingArchiveTx } = await kithClient.query(
+        `SELECT amount FROM kith.fin_transactions
+          WHERE account_id = $1 AND source = 'archive'`,
+        [finAccounts[0].id],
+      );
+      assert.equal(Number(checkingArchiveTx[0].amount), 100, "the checking account got its own archive transaction");
+      const { rows: savingsArchiveTx } = await kithClient.query(
+        `SELECT amount FROM kith.fin_transactions
+          WHERE account_id = $1 AND source = 'archive'`,
+        [finAccounts[1].id],
+      );
+      assert.equal(Number(savingsArchiveTx[0].amount), 200, "the savings account got its own archive transaction, not the checking one's");
+    } finally {
+      await pool.end();
+      await archiveClient.end();
+      await kithClient.end();
+    }
+  },
+);

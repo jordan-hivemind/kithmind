@@ -149,6 +149,19 @@ test(
       );
       assert.equal(row.present, true, `kith.${table} should exist`);
     }
+    // Migration 049: the overlap boundary import-archive last applied for
+    // an account, nullable so an unlinked or not-yet-bounded account reads
+    // as "no boundary" rather than a sentinel date.
+    const [archiveCoverageColumn] = await all(
+      client,
+      `SELECT data_type, is_nullable FROM information_schema.columns
+        WHERE table_schema = 'kith' AND table_name = 'fin_accounts'
+          AND column_name = 'archive_coverage_through'`,
+    );
+    assert.ok(archiveCoverageColumn, "kith.fin_accounts.archive_coverage_through should exist");
+    assert.equal(archiveCoverageColumn.data_type, "date");
+    assert.equal(archiveCoverageColumn.is_nullable, "YES");
+
     for (const table of RETIRED_PROOF_TABLES) {
       const [row] = await all(
         client,
