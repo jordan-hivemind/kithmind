@@ -331,6 +331,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "daily Plaid feed: items, accounts, securities, balance and holding snapshots, transactions",
     url: new URL("../migrations/043_plaid_feed.sql", import.meta.url),
   },
+  {
+    version: 44,
+    name: "relax plaid currency checks to a bounded length so unofficial currency codes pass through",
+    url: new URL("../migrations/044_plaid_currency.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
