@@ -48,5 +48,18 @@ main(process.argv.slice(2)).catch((error) => {
 });
 
 function errorMessage(error: unknown): string {
+  // Plaid returns its diagnosis in the HTTP body; axios hides it behind
+  // "Request failed with status code 400". Surface it so the operator sees
+  // the actual cause without a debugger.
+  const data = (error as { response?: { data?: Record<string, unknown> } })
+    ?.response?.data;
+  if (data && typeof data === "object") {
+    const code = data.error_code;
+    const message = data.error_message;
+    const type = data.error_type;
+    if (typeof code === "string" || typeof message === "string") {
+      return `Plaid ${String(type ?? "error")} ${String(code ?? "")}: ${String(message ?? "")}`;
+    }
+  }
   return error instanceof Error ? error.message : String(error);
 }
