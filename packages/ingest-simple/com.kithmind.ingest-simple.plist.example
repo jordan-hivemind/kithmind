@@ -18,6 +18,11 @@
   service (examples/worker-service/com.kithmind.filesystem-worker.plist) for
   the same source account: see this package's README, "Do not run alongside
   the old worker".
+
+  ROOT_ALIAS: give this root a stable short name (letters, digits, `.`, `_`,
+  `-`). Depth policy and each document's retrievable `uri` both depend on it
+  -- see README.md, "Depth policy" -- so pick it once and keep it across
+  every run. It is also the alias `--bindings` filters by, if used.
 -->
 <plist version="1.0">
 <dict>
@@ -31,6 +36,8 @@
     <string>/ABSOLUTE/PATH/TO/DROPBOX/FOLDER</string>
     <string>--source-account</string>
     <string>SOURCE_ACCOUNT_ID</string>
+    <string>--root-alias</string>
+    <string>ROOT_ALIAS</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/ABSOLUTE/PATH/TO/REPOSITORY</string>

@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // `kith-ingest-simple --root <dir> --source-account <id> [--space <id>] [--limit N]
-// [--dry-run] [--concurrency N] [--bindings <path> --root-alias <alias>]`. See README.md.
+// [--dry-run] [--concurrency N] [--root-alias <alias>] [--bindings <path>]
+// [--depth full|glance|auto] [--full-match <regex>]...`. `--bindings` requires
+// `--root-alias`; `--root-alias` is otherwise optional on its own. See README.md.
 
 import process from "node:process";
 
@@ -8,22 +10,25 @@ import { createKithPool } from "@repo/kith-store";
 
 import { loadBindings } from "./bindings.js";
 import { loadDatabaseUrl } from "./config.js";
+import type { DepthOverride } from "./depthPolicy.js";
 import { runIngest, type IngestOptions } from "./ingest.js";
 
 const DEFAULT_CONCURRENCY = 2;
+const DEPTH_OVERRIDES: readonly DepthOverride[] = ["auto", "full", "glance"];
 
 function usage(): never {
   process.stderr.write(
     "Usage: kith-ingest-simple --root <dir> --source-account <id> " +
       "[--space <id>] [--limit N] [--dry-run] [--concurrency N] " +
-      "[--bindings <path> --root-alias <alias>]\n",
+      "[--root-alias <alias>] [--bindings <path>] " +
+      "[--depth full|glance|auto] [--full-match <regex>]...\n",
   );
   process.exit(2);
 }
 
-type ParsedArgs = Omit<IngestOptions, "externalIdBindings"> & {
+type ParsedArgs = Omit<IngestOptions, "externalIdBindings" | "fullMatchPatterns"> & {
   bindingsPath?: string;
-  rootAlias?: string;
+  fullMatchSources: string[];
 };
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -35,6 +40,8 @@ function parseArgs(argv: string[]): ParsedArgs {
   let concurrency = DEFAULT_CONCURRENCY;
   let bindingsPath: string | undefined;
   let rootAlias: string | undefined;
+  let depth: DepthOverride = "auto";
+  const fullMatchSources: string[] = [];
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     switch (arg) {
@@ -68,15 +75,29 @@ function parseArgs(argv: string[]): ParsedArgs {
       case "--root-alias":
         rootAlias = argv[++index];
         break;
+      case "--depth": {
+        const value = argv[++index];
+        if (!DEPTH_OVERRIDES.includes(value as DepthOverride)) usage();
+        depth = value as DepthOverride;
+        break;
+      }
+      case "--full-match": {
+        const value = argv[++index];
+        if (value === undefined) usage();
+        fullMatchSources.push(value);
+        break;
+      }
       default:
         usage();
     }
   }
   if (!root || !sourceAccountId) usage();
-  // Both or neither: a bindings file with no root alias to filter it by (or
-  // vice versa) cannot be resolved into a lookup, so it is a usage error
-  // rather than a silent no-op.
-  if ((bindingsPath === undefined) !== (rootAlias === undefined)) usage();
+  // A bindings file with no root alias to filter it by cannot be resolved
+  // into a lookup, so it is a usage error rather than a silent no-op. A bare
+  // `--root-alias` with no `--bindings` is valid on its own: it still labels
+  // this run's `dropbox-inbox` depth-policy check and the `uri` this run
+  // writes (see ingest.ts), whether or not a bindings transition is in play.
+  if (bindingsPath !== undefined && rootAlias === undefined) usage();
   return {
     root,
     sourceAccountId,
@@ -84,6 +105,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     ...(limit ? { limit } : {}),
     dryRun,
     concurrency,
+    depth,
+    fullMatchSources,
     ...(bindingsPath !== undefined ? { bindingsPath } : {}),
     ...(rootAlias !== undefined ? { rootAlias } : {}),
   };
@@ -98,6 +121,14 @@ async function main(argv: string[]): Promise<void> {
     externalIdBindings = result.map;
     bindingsLoaded = result.loaded;
   }
+  const fullMatchPatterns = args.fullMatchSources.map((source) => {
+    try {
+      return new RegExp(source);
+    } catch (error) {
+      process.stderr.write(`kith-ingest-simple: --full-match "${source}" is not a valid regular expression: ${errorMessage(error)}\n`);
+      return process.exit(2);
+    }
+  });
   const options: IngestOptions = {
     root: args.root,
     sourceAccountId: args.sourceAccountId,
@@ -105,6 +136,9 @@ async function main(argv: string[]): Promise<void> {
     ...(args.limit ? { limit: args.limit } : {}),
     dryRun: args.dryRun,
     concurrency: args.concurrency,
+    depth: args.depth,
+    fullMatchPatterns,
+    ...(args.rootAlias !== undefined ? { rootAlias: args.rootAlias } : {}),
     ...(externalIdBindings ? { externalIdBindings } : {}),
   };
 
@@ -120,10 +154,13 @@ async function main(argv: string[]): Promise<void> {
     const skippedExtLines = [...summary.skippedExtension.entries()]
       .map(([ext, count]) => `${ext} ${count}`)
       .join(", ");
+    const byKindLine = [...summary.byKind.entries()].map(([kind, count]) => `${kind} ${count}`).join(", ");
+    const byDepthLine = [...summary.byDepth.entries()].map(([depth, count]) => `${depth} ${count}`).join(", ");
     process.stdout.write(
       [
         `seen ${summary.seen}`,
         `new ${summary.newCount}`,
+        `promoted ${summary.promoted}`,
         `skipped-unchanged ${summary.skippedUnchanged}`,
         `skipped-dot-or-archive ${summary.skippedDotOrArchive}`,
         `failed ${summary.failed}`,
@@ -132,6 +169,8 @@ async function main(argv: string[]): Promise<void> {
         externalIdBindings ? `files using path IDs ${summary.usingPathId}` : undefined,
         extensionLines ? `by-extension: ${extensionLines}` : undefined,
         skippedExtLines ? `unsupported extensions skipped: ${skippedExtLines}` : undefined,
+        byKindLine ? `by-kind: ${byKindLine}` : undefined,
+        byDepthLine ? `by-depth: ${byDepthLine}` : undefined,
       ]
         .filter(Boolean)
         .join("\n") + "\n",
