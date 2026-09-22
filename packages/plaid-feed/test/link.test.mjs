@@ -146,7 +146,17 @@ test("a pending session, then one finished with a public token, is exchanged and
 
   const upsert = pool.calls.find((call) => call.text.includes("INSERT INTO kith.plaid_items"));
   assert.ok(upsert, "the item was upserted");
-  assert.deepEqual(upsert.params, ["item-9", "ins_3", "Chase", "com.kithmind.plaid.item.chase"]);
+  // params[0] is a freshly generated kith.kith_id (migration 043_plaid_feed.sql
+  // gives every table a kith_id primary key beside Plaid's own opaque id, the
+  // same convention every other migrated table uses); everything after it is
+  // the row's own data.
+  assert.equal(upsert.params.length, 5);
+  assert.deepEqual(upsert.params.slice(1), [
+    "item-9",
+    "ins_3",
+    "Chase",
+    "com.kithmind.plaid.item.chase",
+  ]);
 });
 
 test("a session that never finishes times out without exchanging anything", async () => {

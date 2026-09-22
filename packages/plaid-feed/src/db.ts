@@ -63,13 +63,19 @@ export async function upsertPlaidItem(
 ): Promise<void> {
   await pool.query(
     `INSERT INTO kith.plaid_items
-       (item_id, institution_id, institution_name, keychain_service)
-     VALUES ($1, $2, $3, $4)
+       (id, item_id, institution_id, institution_name, keychain_service)
+     VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (item_id) DO UPDATE
        SET institution_id = EXCLUDED.institution_id,
            institution_name = EXCLUDED.institution_name,
            keychain_service = EXCLUDED.keychain_service`,
-    [item.itemId, item.institutionId, item.institutionName, item.keychainService],
+    [
+      newKithId(),
+      item.itemId,
+      item.institutionId,
+      item.institutionName,
+      item.keychainService,
+    ],
   );
 }
 
@@ -112,8 +118,8 @@ export async function upsertAccount(
 ): Promise<void> {
   await pool.query(
     `INSERT INTO kith.plaid_accounts
-       (account_id, item_id, name, official_name, mask, type, subtype, currency)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       (id, account_id, item_id, name, official_name, mask, type, subtype, currency)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (account_id) DO UPDATE
        SET name = EXCLUDED.name,
            official_name = EXCLUDED.official_name,
@@ -123,6 +129,7 @@ export async function upsertAccount(
            currency = EXCLUDED.currency,
            updated_at = transaction_timestamp()`,
     [
+      newKithId(),
       account.accountId,
       account.itemId,
       account.name,
@@ -141,8 +148,8 @@ export async function upsertSecurity(
 ): Promise<void> {
   await pool.query(
     `INSERT INTO kith.plaid_securities
-       (security_id, name, ticker_symbol, type, close_price, close_price_as_of, currency)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+       (id, security_id, name, ticker_symbol, type, close_price, close_price_as_of, currency)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      ON CONFLICT (security_id) DO UPDATE
        SET name = EXCLUDED.name,
            ticker_symbol = EXCLUDED.ticker_symbol,
@@ -152,6 +159,7 @@ export async function upsertSecurity(
            currency = EXCLUDED.currency,
            updated_at = transaction_timestamp()`,
     [
+      newKithId(),
       security.securityId,
       security.name,
       security.tickerSymbol,
@@ -226,9 +234,9 @@ export async function upsertTransaction(
 ): Promise<void> {
   await pool.query(
     `INSERT INTO kith.plaid_transactions
-       (transaction_id, account_id, item_id, date, authorized_date, name,
+       (id, transaction_id, account_id, item_id, date, authorized_date, name,
         merchant_name, amount, currency, pending, category, removed_at, raw)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
      ON CONFLICT (transaction_id) DO UPDATE
        SET date = EXCLUDED.date,
            authorized_date = EXCLUDED.authorized_date,
@@ -242,6 +250,7 @@ export async function upsertTransaction(
            raw = EXCLUDED.raw,
            updated_at = transaction_timestamp()`,
     [
+      newKithId(),
       transaction.transactionId,
       transaction.accountId,
       transaction.itemId,
@@ -278,9 +287,9 @@ export async function upsertInvestmentTransaction(
 ): Promise<void> {
   await pool.query(
     `INSERT INTO kith.plaid_investment_transactions
-       (investment_transaction_id, account_id, item_id, security_id, date,
+       (id, investment_transaction_id, account_id, item_id, security_id, date,
         name, quantity, price, amount, fees, type, subtype, currency, raw)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
      ON CONFLICT (investment_transaction_id) DO UPDATE
        SET quantity = EXCLUDED.quantity,
            price = EXCLUDED.price,
@@ -292,6 +301,7 @@ export async function upsertInvestmentTransaction(
            raw = EXCLUDED.raw,
            updated_at = transaction_timestamp()`,
     [
+      newKithId(),
       transaction.investmentTransactionId,
       transaction.accountId,
       transaction.itemId,

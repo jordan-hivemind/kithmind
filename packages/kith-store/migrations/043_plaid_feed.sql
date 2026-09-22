@@ -13,20 +13,38 @@
 -- upserted from what Plaid reports on each pull; its own `raw` jsonb is the
 -- audit trail.
 --
--- Primary keys are Plaid's own opaque ids (`item_id`, `account_id`,
--- `security_id`, `transaction_id`, `investment_transaction_id`) rather than
--- `kith.kith_id`: they are already globally unique and stable across pulls,
--- and using them directly is what makes every write here an idempotent
--- upsert. Only the two snapshot tables mint their own id, because a snapshot
--- is an event (one row per account per day) rather than an entity Plaid
--- names.
+-- Every table still carries a `kith.kith_id` primary key, the same
+-- convention every other migrated table uses (migration 003), with Plaid's
+-- own opaque id (`item_id`, `account_id`, `security_id`, `transaction_id`,
+-- `investment_transaction_id`) as a separate `NOT NULL UNIQUE` column rather
+-- than the primary key itself -- the same shape
+-- `kith.finance_account_overrides.finance_account_id` uses for the finance
+-- archive's own opaque account id (migration 035). A foreign key can
+-- reference a `UNIQUE` column exactly as well as a primary key, so
+-- `plaid_accounts.item_id` and the rest below still reference the natural
+-- Plaid id directly; only the primary key gained a level of indirection.
+-- Skipping this (an earlier revision of this migration used the Plaid id as
+-- the primary key directly) breaks `packages/kith-store/integration/
+-- postgres-proof.test.mjs`'s replay proof: it discovers every table a
+-- migration added by searching `information_schema.columns` for the
+-- `kith_id` domain rather than a hardcoded list, specifically so a later
+-- migration cannot forget to be included, and a table that domain search
+-- cannot find is not dropped before the replay -- so replaying this
+-- migration's `CREATE TABLE` collides with the table still sitting there.
+--
+-- Every write here is still an idempotent upsert: `ON CONFLICT` targets the
+-- `UNIQUE` Plaid-id column exactly as it would have targeted a primary key,
+-- and the app generates the new `kith.kith_id` only for an insert, leaving
+-- it untouched in the `DO UPDATE SET` list so it survives across pulls.
 --
 -- `limit` is a reserved word in PostgreSQL (the `LIMIT` clause), so the
 -- balance field the task and the Plaid API call "limit" is `limit_amount`
 -- here.
 
 CREATE TABLE kith.plaid_items (
-  item_id text PRIMARY KEY CHECK (char_length(item_id) BETWEEN 1 AND 200),
+  id kith.kith_id PRIMARY KEY,
+  item_id text NOT NULL UNIQUE
+    CHECK (char_length(item_id) BETWEEN 1 AND 200),
   institution_id text NOT NULL
     CHECK (char_length(institution_id) BETWEEN 1 AND 200),
   institution_name text NOT NULL
@@ -49,7 +67,9 @@ CREATE TABLE kith.plaid_items (
 );
 
 CREATE TABLE kith.plaid_accounts (
-  account_id text PRIMARY KEY CHECK (char_length(account_id) BETWEEN 1 AND 200),
+  id kith.kith_id PRIMARY KEY,
+  account_id text NOT NULL UNIQUE
+    CHECK (char_length(account_id) BETWEEN 1 AND 200),
   item_id text NOT NULL
     REFERENCES kith.plaid_items (item_id) ON DELETE CASCADE,
   name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 300),
@@ -70,7 +90,8 @@ CREATE INDEX plaid_accounts_item_idx ON kith.plaid_accounts (item_id);
 -- name what it is a holding of without repeating the security's name and
 -- ticker on every row.
 CREATE TABLE kith.plaid_securities (
-  security_id text PRIMARY KEY
+  id kith.kith_id PRIMARY KEY,
+  security_id text NOT NULL UNIQUE
     CHECK (char_length(security_id) BETWEEN 1 AND 200),
   name text CHECK (name IS NULL OR char_length(name) BETWEEN 1 AND 300),
   ticker_symbol text
@@ -119,7 +140,8 @@ CREATE INDEX plaid_holding_snapshots_account_idx
   ON kith.plaid_holding_snapshots (account_id, as_of DESC);
 
 CREATE TABLE kith.plaid_transactions (
-  transaction_id text PRIMARY KEY
+  id kith.kith_id PRIMARY KEY,
+  transaction_id text NOT NULL UNIQUE
     CHECK (char_length(transaction_id) BETWEEN 1 AND 200),
   account_id text NOT NULL
     REFERENCES kith.plaid_accounts (account_id) ON DELETE CASCADE,
@@ -145,7 +167,8 @@ CREATE INDEX plaid_transactions_account_idx
   ON kith.plaid_transactions (account_id, date DESC);
 
 CREATE TABLE kith.plaid_investment_transactions (
-  investment_transaction_id text PRIMARY KEY
+  id kith.kith_id PRIMARY KEY,
+  investment_transaction_id text NOT NULL UNIQUE
     CHECK (char_length(investment_transaction_id) BETWEEN 1 AND 200),
   account_id text NOT NULL
     REFERENCES kith.plaid_accounts (account_id) ON DELETE CASCADE,
