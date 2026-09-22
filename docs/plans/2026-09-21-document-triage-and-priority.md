@@ -164,11 +164,13 @@ merely because its name appears in generic 1040 instructions.
 
 ### Page discovery and semantic completion
 
-Start from the retained source revision selected by PR #392. Use native-text
-header and navigation windows to locate candidate form headings, form year,
-page or attachment sequence, and instance boundaries. Header discovery remains
-non-authoritative. Exact values and completion require selectively converted
-pages and retained evidence.
+Start from the exact observed item, epochs and content hash selected by PR #392.
+Use native-text header and navigation windows to locate candidate form headings,
+form year, page or attachment sequence, and instance boundaries. Header
+discovery remains non-authoritative. Exact values and completion require the
+same bytes to become a retained source revision, selectively converted pages and
+retained evidence. Admission may bind that revision and its first targeted
+parser artifact atomically; preview metadata alone never becomes evidence.
 
 The controller converts the smallest exact page set that can close the goal,
 then repeats only for a concrete unresolved reason:
@@ -210,18 +212,18 @@ work tables. Add only the following persisted fields and table:
 | Change | Contract |
 | --- | --- |
 | `source_text_versions.coverage_kind` | Closed to `full_document` and `targeted_tax_v1`. Existing rows backfill to `full_document`. |
-| `source_text_versions.source_unit_count` and `inspected_original_units` | The PDF page count and a strictly increasing bounded list of the exact original pages represented by a targeted version. A full version covers every unit. |
+| `source_text_versions.source_unit_count` and `inspected_original_units` | The PDF page count and, for a targeted version, a strictly increasing bounded list of exact original pages. A full version has `source_unit_count = page_count` and does not need to enumerate every unit. |
 | `source_pages.original_unit_number` | One-based original PDF page number. Dense staging ordinal remains internal ordering. Evidence and user-facing citations use this number. |
-| `kith.targeted_extraction_results` | One revision-bound result per goal version and instance. It stores source item/revision/text version/generation, goal kind/version/instance key, request digest, status, requested fields, discovered forms, inspected original units, unresolved codes, event and observation keys, parser/extractor fingerprints and timestamps. Payloads are closed and bounded. |
+| `kith.targeted_extraction_results` | One revision-bound result per goal version, opaque instance key and request digest. Status is closed to `running`, `complete`, `incomplete_resumable` or `conflict`; the only in-place lifecycle is `running` to one terminal state. The row stores source item/revision/text version/generation, requested fields, discovered forms, inspected original units, unresolved codes, event and observation keys, parser/extractor fingerprints and timestamps. Payloads are closed and bounded. |
 | `deferred_work.kind` | Add only `targeted_tax_extraction`. Its payload names space, source item, source revision, processing generation and goal digest. The existing lease, retry and dedupe behavior remains unchanged. |
 
 The targeted generation is sealed and auditable but does not produce a
-whole-document retrieval or embedding claim. It never replaces an existing
-full generation for the same revision. If no full generation exists, document
+whole-document retrieval or embedding claim and is never written to
+`source_items.active_generation_id`. If no full generation exists, document
 reads may expose its cited tax result and explicit partial coverage, but search
-and full-document retrieval must report that the remainder is unprocessed. A
-later full generation can become active without deleting the targeted result or
-its evidence. Revision change makes the old result historical and queues a new
+and full-document retrieval report that the remainder is unprocessed. A later
+full generation can become active without deleting the targeted result or its
+evidence. Revision change makes the old result historical and queues a new
 goal; matching request replay is idempotent.
 
 Do not put private paths, native preview text or taxpayer values in goal payloads
@@ -232,14 +234,16 @@ is not queryable as a complete tax answer.
 
 ### Minimum API changes
 
-Extend the selected-item manifest with the closed tax goal and optional K-1
-instance discriminator. Extend `ParsedTextDeclaration` and parsed page input
-with the closed coverage descriptor and original unit number. The existing
+Extend the selected-item manifest with the closed tax goal and optional opaque
+K-1 instance discriminator. Extend `ParsedTextDeclaration` and parsed page
+input with the closed coverage descriptor and original unit number. The existing
 archived admission and parsed staging operations continue to carry the parser
-artifact, pages and evidence; no second ingestion service or queue is added.
+artifact, pages and evidence. Their terminal operation gains a closed targeted
+completion arm that seals the generation without setting the source item's
+active generation. No second ingestion service or queue is added.
 
-Activation of a `targeted_tax_v1` text version queues the existing deferred
-worker with `targeted_tax_extraction`. The handler writes the result row, event,
+Targeted completion queues the existing deferred worker with
+`targeted_tax_extraction`. The handler writes the result row, event,
 observations and cited statements in one transaction after rechecking current
 source revision, goal digest, parser fingerprint and evidence. `get_document`
 adds the goal status, resolved/unresolved coverage, inspected original pages and
