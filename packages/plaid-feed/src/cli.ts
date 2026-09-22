@@ -83,6 +83,17 @@ async function importArchiveCommand(args: ImportArchiveArgs): Promise<void> {
     }
     const result = await importArchive(archiveReader(archiveClient), pool);
     process.stdout.write(`${summarizeImportArchive(result)}\n`);
+    // A phase failure is caught inside importArchive itself so every
+    // completed phase's counts still print above -- see importArchive's own
+    // doc comment. Exit non-zero here rather than throwing, so main()'s
+    // catch-all error handler is not what reports this.
+    if (result.phaseFailure !== undefined) {
+      process.stderr.write(
+        `kith-plaid-feed: import-archive failed in phase "${result.phaseFailure.phase}": ` +
+          `${result.phaseFailure.message}\n`,
+      );
+      process.exitCode = 1;
+    }
   } finally {
     await archiveClient.end();
     await pool.end();
