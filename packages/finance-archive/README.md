@@ -864,6 +864,51 @@ node dist/run.js reparse \
   --retained-sha256 <documents.retained_sha256>
 ```
 
+### Publishing complete account position scopes
+
+A partially parsed consolidated statement can correct one positively complete
+account/date position section without asserting that its other accounts are
+complete. Pass a private selection file to the same candidate command:
+
+```json
+{
+  "scopes": [
+    {
+      "scopeKind": "positions",
+      "accountId": "<opaque account id>",
+      "asOf": "2026-06-30",
+      "proofVersion": "position_scope_v1"
+    }
+  ]
+}
+```
+
+```sh
+node dist/run.js holding-correction-candidate \
+  --adapter <module path> \
+  --document-id <documents.id> \
+  --retained-sha256 <documents.retained_sha256> \
+  --scope-selection <private selection JSON path>
+```
+
+The adapter must declare each selected scope complete with exact account,
+table, end and page-continuity evidence. A zero-position scope additionally
+requires an explicit source statement that the section has no positions. The
+manifest binds the current canonical account/date set, the selected source
+members and the full source-owned projection. It reports counts and digests,
+not financial values or locators.
+
+Publish a reviewed `holding_scoped_projection_approval_v1` with the ordinary
+`holding-correction-publish` command. The transaction creates one full immutable
+generation, replaces only selected source-owned rows and carries every
+nonselected assertion and scope proof forward unchanged. An exact row already
+owned by another retained source stays owned there and is referenced only when
+all semantics and this source's own evidence agree. Any extra or conflicting
+canonical row refuses publication. The document remains partial, and parser or
+reconciliation findings outside the selected scope remain open. A canonical
+full-set mismatch opens an account-scoped `position_scope_mismatch`; an exact
+later replay resolves only that system-owned account/date finding.
+
 `scripts/nullNonCashAmounts.mjs` is what applies it. It reads the taxonomy off
 the adapter rather than naming activity types, so it cannot drift from the
 declaration it is applying and it serves the next declaration too. For every
@@ -2012,6 +2057,10 @@ one, in order, inside the same transaction and lock, and records each one.
 | 10  | provider document identity              | Institution-scoped provider document IDs and supersession.                                                                    |
 | 11  | finance read revision                   | Transactional revision epoch, counter, and reader-visible table triggers.                                                     |
 | 12  | account alias read revision             | Revision trigger for the existing alias table and one-time continuation invalidation.                                         |
+| 13  | instrument match audit                  | Closed mismatch reasons and retained identifier-source ownership.                                                             |
+| 14  | holding projection generations          | Immutable holding assertions, generation memberships and an active document pointer.                                         |
+| 15  | position scope observations             | Account/date completeness observations and exact semantic memberships.                                                       |
+| 16  | scoped holding correction audit         | Closed scoped candidate shape and generation approval checks.                                                                |
 
 Migration 2 (F1-29,
 [`docs/plans/2026-09-11-structured-evidence.md`](../../docs/plans/2026-09-11-structured-evidence.md))

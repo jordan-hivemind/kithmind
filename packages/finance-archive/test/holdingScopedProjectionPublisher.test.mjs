@@ -108,6 +108,15 @@ function candidate(aPositions) {
       {
         ...scope(ACCOUNT_A, "complete", 10),
         emittedPositionCount: aPositions.length,
+        ...(aPositions.length === 0
+          ? {
+              zeroBasis: "source_stated_none",
+              evidence: {
+                ...evidence(10),
+                explicitNone: { source: "synthetic_statement", index: 12 },
+              },
+            }
+          : {}),
       },
       scope(ACCOUNT_B, "complete", 20),
       scope(ACCOUNT_C, "partial", 30),
@@ -494,6 +503,71 @@ test(
         "WHERE assertion_kind = 'position' AND record_id = 'position-a-old'",
       ),
       1,
+    );
+  },
+);
+
+test(
+  "a positively empty selected scope removes its last owned position and stale instrument verdict while preserving its neighbor",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    await client.query(
+      "DELETE FROM positions WHERE source_document_id = $1",
+      [FOREIGN_DOCUMENT],
+    );
+    const neighborBefore = await one(
+      client,
+      "SELECT to_jsonb(p) AS row FROM positions p WHERE id = 'position-b'",
+    );
+    const parsed = candidate([]);
+    const prepared = await prepare(client, parsed);
+    assert.equal(prepared.manifest.selectedScopes[0].emittedRowCount, 0);
+    assert.equal(
+      prepared.manifest.rows.positions.selectedSourceOwnedRemovals,
+      1,
+    );
+    const approval = approvalFor(prepared.manifest);
+    assert.equal(approval.authorizeSelectedRemovals, true);
+    assert.equal(approval.authorizeEmptySelectedScopes, true);
+
+    const published = await publishHoldingScopedPositionCorrection(
+      client,
+      { candidate: parsed, approval },
+      NOW,
+    );
+
+    assert.equal(
+      await count(client, "positions", `WHERE account_id = '${ACCOUNT_A}'`),
+      0,
+    );
+    assert.deepEqual(
+      await one(
+        client,
+        "SELECT to_jsonb(p) AS row FROM positions p WHERE id = 'position-b'",
+      ),
+      neighborBefore,
+    );
+    assert.equal(
+      await count(
+        client,
+        "position_reconciliations",
+        "WHERE id = 'stale-a-old-verdict'",
+      ),
+      0,
+    );
+    assert.deepEqual(
+      await one(
+        client,
+        `SELECT status, emitted_position_count::text AS count, zero_basis
+           FROM position_scope_observations
+          WHERE source_document_id = $1
+            AND holding_projection_generation_id = $2
+            AND account_id = $3`,
+        [DOCUMENT, published.activeGenerationId, ACCOUNT_A],
+      ),
+      { status: "complete", count: "0", zero_basis: "source_stated_none" },
     );
   },
 );
