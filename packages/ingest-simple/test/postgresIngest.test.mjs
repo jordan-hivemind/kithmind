@@ -9,14 +9,14 @@
 // and-feeds.md's "document ingestion" line and depthPolicy.ts).
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import test from "node:test";
 
 import { applyKithSchema, createKithPool, documents, newKithId, sha256 } from "@repo/kith-store";
 import { runIngest } from "../dist/ingest.js";
-import { ingestFile } from "../dist/write.js";
+import { ingestFile, RevisionConflictError } from "../dist/write.js";
 
 import { acquirePostgres, skip } from "./helpers/pgServer.mjs";
 import { buildPdf } from "./helpers/pdf.mjs";
@@ -381,4 +381,235 @@ test("a synthetic tax-support document ingests at glance, then --depth full prom
     [sourceItemId],
   );
   assert.equal(generationCountAfter.rows[0].count, 2, "a repeated full run must not mint another generation");
+});
+
+// A fake `pdftotext`/`pdfinfo` placed first on PATH for the two tests below:
+// no PDF-encryption tool (`qpdf`, `pdftk`) is available in this environment
+// to build a real password-protected PDF fixture. Both fakes read the
+// fixture file's first line as "the password this document requires" (empty
+// means "no password needed") -- a convention only these tests share, not a
+// real PDF format detail. See test/convertEncryptedPdf.test.mjs for the same
+// pattern exercised against convert.ts directly.
+const ENCRYPTED_PAGE_ONE = "Form 1099-DIV Dividends and Distributions for 2022, well over forty characters.";
+const REAL_PASSWORD = "correct-horse-battery-staple";
+
+const PDFTOTEXT_FAKE = `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args.includes("-v")) {
+  process.stderr.write("pdftotext version 99.0.0 (fake, test-only)\\n");
+  process.exit(1);
+}
+const path = args[args.length - 2];
+const expected = fs.readFileSync(path, "utf8").split("\\n")[0].trim();
+const upwIndex = args.indexOf("-upw");
+const provided = upwIndex >= 0 ? args[upwIndex + 1] : undefined;
+if (expected && provided !== expected) {
+  process.stderr.write("Command Line Error: Incorrect password\\n");
+  process.exit(1);
+}
+process.stdout.write(${JSON.stringify(ENCRYPTED_PAGE_ONE)});
+`;
+
+const PDFINFO_FAKE = `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const path = args[args.length - 1];
+const expected = fs.readFileSync(path, "utf8").split("\\n")[0].trim();
+const upwIndex = args.indexOf("-upw");
+const provided = upwIndex >= 0 ? args[upwIndex + 1] : undefined;
+if (expected && provided !== expected) {
+  process.stderr.write("Command Line Error: Incorrect password\\n");
+  process.exit(1);
+}
+process.stdout.write("Pages: 1\\n");
+`;
+
+async function withFakePoppler(t) {
+  const dir = await mkdtemp(join(tmpdir(), "ingest-simple-fake-poppler-"));
+  const pdftotextPath = join(dir, "pdftotext");
+  const pdfinfoPath = join(dir, "pdfinfo");
+  await writeFile(pdftotextPath, PDFTOTEXT_FAKE, "utf8");
+  await writeFile(pdfinfoPath, PDFINFO_FAKE, "utf8");
+  await chmod(pdftotextPath, 0o755);
+  await chmod(pdfinfoPath, 0o755);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${dir}${delimiter}${originalPath ?? ""}`;
+  t.after(async () => {
+    process.env.PATH = originalPath;
+    await rm(dir, { recursive: true, force: true });
+  });
+}
+
+test("an encrypted PDF with no working password registers at glance depth with no page text, counted as encrypted", { skip }, async (t) => {
+  const { pool, spaceId, accountId } = await bootstrapDatabase(t);
+  await withFakePoppler(t);
+
+  const root = await mkdtemp(join(tmpdir(), "ingest-simple-encrypted-fixture-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const fileName = "2022 1099-DIV.pdf";
+  // First line is the fake pdftotext/pdfinfo's required password -- not real
+  // PDF bytes.
+  const fileBytes = Buffer.from(`${REAL_PASSWORD}\nfake encrypted pdf body\n`, "utf8");
+  await writeFile(join(root, fileName), fileBytes);
+
+  const log = () => {};
+  const options = {
+    root,
+    sourceAccountId: accountId,
+    dryRun: false,
+    concurrency: 1,
+    depth: "auto",
+    fullMatchPatterns: [],
+    pdfPasswords: [],
+  };
+
+  const first = await runIngest(pool, options, log);
+  assert.equal(first.failed, 0, `expected no failures: ${JSON.stringify(first.failures)}`);
+  assert.equal(first.encrypted, 1);
+  assert.equal(first.newCount, 1, "an encrypted registration still counts as a new document");
+  assert.equal(first.byDepth.get("glance"), 1);
+
+  const item = await pool.query(
+    `SELECT id, active_generation_id, ingest_metadata FROM kith.source_items WHERE source_account_id = $1`,
+    [accountId],
+  );
+  assert.equal(item.rows.length, 1);
+  assert.ok(item.rows[0].active_generation_id, "source item has no active generation after ingest");
+  assert.deepEqual(item.rows[0].ingest_metadata, {
+    pageCount: null,
+    byteLength: fileBytes.length,
+    // Filename-only classification: no page text was ever read.
+    taxYear: 2022,
+    kind: "tax_support",
+    depth: "glance",
+    converter: "encrypted-pdf-unreadable-v1",
+    encrypted: true,
+  });
+
+  const documentRow = await pool.query(
+    `SELECT id, title FROM kith.documents WHERE processing_generation_id = $1`,
+    [item.rows[0].active_generation_id],
+  );
+  assert.equal(documentRow.rows.length, 1);
+  assert.equal(documentRow.rows[0].title, "Tax support 2022 · 2022 1099-DIV.pdf");
+
+  const readClient = await pool.connect();
+  let document;
+  try {
+    document = await documents.getDocument(readClient, [spaceId], documentRow.rows[0].id);
+  } finally {
+    readClient.release();
+  }
+  assert.ok(document, "getDocument returned null for the encrypted-PDF registration");
+  assert.equal(document.pages.length, 1);
+  assert.equal(document.pages[0].text, "", "an unopened encrypted PDF must not fabricate page text");
+
+  // A second run with the same (still no) password is idempotent: unchanged
+  // bytes, unchanged (glance) depth -- not re-counted as encrypted again.
+  const second = await runIngest(pool, options, log);
+  assert.equal(second.failed, 0);
+  assert.equal(second.encrypted, 0);
+  assert.equal(second.skippedUnchanged, 1);
+});
+
+test("an encrypted PDF opens normally when the correct --pdf-password is supplied", { skip }, async (t) => {
+  const { pool, accountId } = await bootstrapDatabase(t);
+  await withFakePoppler(t);
+
+  const root = await mkdtemp(join(tmpdir(), "ingest-simple-encrypted-password-fixture-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const fileName = "2022 1099-DIV.pdf";
+  const fileBytes = Buffer.from(`${REAL_PASSWORD}\nfake encrypted pdf body\n`, "utf8");
+  await writeFile(join(root, fileName), fileBytes);
+
+  const log = () => {};
+  const options = {
+    root,
+    sourceAccountId: accountId,
+    dryRun: false,
+    concurrency: 1,
+    depth: "auto",
+    fullMatchPatterns: [],
+    pdfPasswords: ["wrong-guess", REAL_PASSWORD],
+  };
+
+  const result = await runIngest(pool, options, log);
+  assert.equal(result.failed, 0, `expected no failures: ${JSON.stringify(result.failures)}`);
+  assert.equal(result.encrypted, 0, "a password that opens the file must not be counted as encrypted");
+  assert.equal(result.newCount, 1);
+
+  const item = await pool.query(
+    `SELECT ingest_metadata FROM kith.source_items WHERE source_account_id = $1`,
+    [accountId],
+  );
+  assert.equal(item.rows[0].ingest_metadata.encrypted, undefined);
+  assert.equal(item.rows[0].ingest_metadata.pageCount, 1);
+});
+
+test("write.ts's ingestFile refuses a second write whose extracted text matches but whose file facts do not, as a distinct RevisionConflictError", { skip }, async (t) => {
+  const { pool, spaceId, userId, accountId } = await bootstrapDatabase(t);
+
+  // Same externalId (same source item), same extracted `pages` text (so
+  // `createOrGetRevision`'s `content_hash` matches), but a different
+  // `fileByteHash`/`capturedAt` -- the scenario write.ts's
+  // `RevisionConflictError` doc comment describes: a file re-saved with
+  // different bytes that happens to extract to the exact same text. Calling
+  // `ingestFile` directly (the ingester's write path, bypassing ingest.ts's
+  // own file-hash skip check) reproduces it deterministically.
+  const externalId = "conflicting-revision.pdf";
+  const pages = ["Statement text that stays exactly the same across both writes."];
+
+  const first = await ingestFile(pool, {
+    spaceId,
+    sourceAccountId: accountId,
+    externalId,
+    title: "Statement",
+    docType: "statement",
+    capturedAt: new Date("2022-01-01T00:00:00Z"),
+    userId,
+    fileByteHash: sha256("first-file-bytes"),
+    pages,
+    converterFingerprint: "test-revision-conflict-v1",
+    mediaType: "text/plain",
+  });
+  assert.ok(first.sourceItemId);
+
+  await assert.rejects(
+    () =>
+      ingestFile(pool, {
+        spaceId,
+        sourceAccountId: accountId,
+        externalId,
+        title: "Statement",
+        docType: "statement",
+        // Different modified time and different file bytes; same extracted
+        // text.
+        capturedAt: new Date("2022-06-01T00:00:00Z"),
+        userId,
+        fileByteHash: sha256("second-file-bytes"),
+        pages,
+        converterFingerprint: "test-revision-conflict-v1",
+        mediaType: "text/plain",
+      }),
+    (error) => {
+      assert.ok(error instanceof RevisionConflictError, `expected RevisionConflictError, got ${error}`);
+      assert.match(error.message, /conflicting-revision\.pdf/);
+      return true;
+    },
+  );
+
+  // The refused write left no trace: still exactly one revision and one
+  // generation for this source item -- the store's immutability check held,
+  // and the failed transaction rolled back cleanly.
+  const revisionCount = await pool.query(
+    `SELECT count(*)::int AS count FROM kith.source_revisions WHERE source_item_id = $1`,
+    [first.sourceItemId],
+  );
+  assert.equal(revisionCount.rows[0].count, 1);
+  const generationCount = await pool.query(
+    `SELECT count(*)::int AS count FROM kith.processing_generations WHERE source_item_id = $1`,
+    [first.sourceItemId],
+  );
+  assert.equal(generationCount.rows[0].count, 1);
 });

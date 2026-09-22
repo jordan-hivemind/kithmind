@@ -61,7 +61,8 @@ immediately rather than discovered as duplicate source items later.
 kith-ingest-simple --root <dir> --source-account <id> [--space <id>] \
   [--limit N] [--dry-run] [--concurrency 2] \
   [--root-alias <alias>] [--bindings <state.json>] \
-  [--depth full|glance|auto] [--full-match <regex>]...
+  [--depth full|glance|auto] [--full-match <regex>]... \
+  [--pdf-password <value>]... [--env-from-keychain]
 ```
 
 | Flag                | Meaning                                                                                     |
@@ -76,11 +77,18 @@ kith-ingest-simple --root <dir> --source-account <id> [--space <id>] \
 | `--concurrency N`    | Files processed in parallel. Default 2.                                                       |
 | `--depth full\|glance\|auto` | Overrides the depth policy for every file this run. Default `auto`. See "Depth policy". |
 | `--full-match <regex>` | Repeatable. A relative path matching any of these regular expressions is ingested in full, same as a `tax_return`/`k1` document or the `dropbox-inbox` root alias. |
+| `--pdf-password <value>` | Repeatable. Candidate passwords for an encrypted PDF, tried in order (after no password) via poppler's `-upw`. See "Encrypted PDFs" below. Never logged. |
+| `--env-from-keychain` | Reads the model-provider environment (`OPENAI_API_KEY`, `BRAIN_EMBED_MODEL`, `BRAIN_EMBED_MODEL_REVISION`) from the same macOS Keychain items the deferred-work daemon's wrapper script uses, for any of them left unset. See "Running from a shell with no provider configured" below. |
 
 Every run prints a one-line-per-count summary to stdout (`seen`, `new`,
-`promoted`, `skipped-unchanged`, `failed`, unsupported-extension counts, and
-counts by detected kind and by depth) and exits non-zero if any file failed,
-with each failure's path and error on stderr.
+`promoted`, `skipped-unchanged`, `failed`, `encrypted`, `ocr-skipped-pages`,
+`retried`, `revision-conflicts`, unsupported-extension counts, and counts by
+detected kind and by depth) and exits non-zero if any file failed, with each
+failure's path and error on stderr. `encrypted`, `revision-conflicts`, a
+retried-but-eventually-succeeded file, and a promotion are none of them
+counted in `failed` -- each is a distinct, expected outcome with its own
+count; see "Encrypted PDFs", "Revision conflicts" and "Serialization
+retries" below.
 
 The walker skips dotfiles/dot-directories and any path segment whose name
 contains "archive" or "backup" (case-insensitive) — Dropbox's own
@@ -168,6 +176,22 @@ rules) as one object:
 }
 ```
 
+An encrypted PDF no `--pdf-password` opened (see "Encrypted PDFs" above)
+carries an unknown `pageCount` (`null`) and an `encrypted` flag instead,
+omitted (not `false`) for every ordinary document:
+
+```json
+{
+  "pageCount": null,
+  "byteLength": 88412,
+  "taxYear": 2022,
+  "kind": "tax_support",
+  "depth": "glance",
+  "converter": "encrypted-pdf-unreadable-v1",
+  "encrypted": true
+}
+```
+
 `pageCount` is the document's real total page count (from `pdfinfo` at glance
 depth, from the actual converted page array at full depth) — for a
 glance-depth document this is the number the stored single page does *not*
@@ -186,6 +210,62 @@ title (`kith.documents.title` / `kith.source_items.title`, already read by
 2019.pdf`), so a glance-depth document is findable by year in an ordinary
 document list without opening it. With no detected tax year the title stays
 the filename with its extension stripped, exactly as before this feature.
+
+### Encrypted PDFs
+
+A password-protected PDF fails poppler's `pdftotext`/`pdfinfo` with "Command
+Line Error: Incorrect password" rather than partial output. Without a working
+password, this package does not fail the file: it registers the file at
+`glance` depth with no page text at all -- `kind` and any tax year come from
+the filename alone -- and `full` metadata otherwise (byte size, and
+`encrypted: true` in `kith.source_items.ingest_metadata`; page count is
+unknown, `null`, since it is never opened). The document is still findable by
+title and path, just not by content. Counted separately as `encrypted` in the
+run summary, not `failed`.
+
+`--pdf-password <value>` (repeatable) gives candidate passwords to try, in
+order, via poppler's own `-upw`, after trying with no password. A password
+that works is used for every poppler call that file needs (`pdftotext`,
+`pdfinfo`, and `pdftoppm` if a page still needs OCR); no password is ever
+logged. Because an already-registered encrypted file's `active_generation_id`
+already carries `glance` depth, a later run supplying the right password only
+retries conversion when this run's depth policy would otherwise raise it
+(`--depth full`, a `--full-match` pattern, or the `dropbox-inbox` alias) --
+`isUpToDate` (write.ts) has no way to know a newly-supplied password changes
+anything about an unchanged file at an already-satisfied depth.
+
+### Revision conflicts
+
+`@repo/kith-store`'s `createOrGetRevision` treats a source item's revision as
+immutable once inserted: a second call with the same extracted text
+(`content_hash`) but a different `archive_ref` (this package's own file byte
+hash) or `captured_at` (the file's `mtime`) is refused with "Conflicting
+immutable source revision" rather than silently overwriting the earlier facts.
+In practice this happens when a file already ingested is re-saved with
+different bytes -- a metadata-only PDF rewrite, a linearization pass,
+permissions added or removed -- that happen to extract to the exact same
+text: this package's own unchanged-file skip check only compares the file's
+own byte hash, so it cannot see this coming.
+
+This is the store's immutability check doing its job, not a bug, and it is
+not weakened here. This package catches it specifically and counts the file
+under `revision-conflicts` in the run summary instead of `failed`; the
+document already safely stored under the original bytes/mtime is left as is.
+A file that keeps landing here on every run needs a person to look at why its
+bytes keep changing without its extracted text changing.
+
+### Serialization retries
+
+`@repo/kith-store`'s own `withKithTransaction` already retries a
+`SERIALIZABLE` transaction once on a `40001`/`40P01` Postgres error; this
+package adds one more independent retry layer at the call site (`src/retry.ts`'s
+`withSerializationRetry`, up to three attempts with a short randomized
+backoff) around each file's own transaction, since the first real run over
+522 files at `--concurrency 2` still reported "could not serialize access due
+to read/write dependencies among transactions" as a hard per-file failure. A
+file that needed at least one retry (whether it went on to succeed or still
+exhausted the budget) is counted under `retried` in the run summary; one that
+exhausts the retry budget is still counted as `failed`, same as before.
 
 ### Finding the source account ID
 
@@ -218,6 +298,29 @@ Set `DATABASE_URL` directly, or provision the Keychain item once:
 ```
 security add-generic-password -a "$USER" -s com.kithmind.deferred-work.database-url -w <postgres-url>
 ```
+
+### Running from a shell with no provider configured
+
+The first real run over the owner's folders was started from a plain shell,
+which has none of `KITH_EXTRACT_*`/`OPENAI_API_KEY`/`BRAIN_EMBED_*`
+configured -- only the deferred-work daemon's own LaunchAgent environment
+does (`docs/worker-service.md`, "Deferred work daemon", and
+`examples/worker-service/macos-keychain-watch.sh`'s wrapper pattern). The
+run still completed, but every page that needed OCR logged "a page needs OCR
+but no extraction provider is configured" (98 pages) and every embedding
+attempt logged "Embedding provider request failed".
+
+`--env-from-keychain` reads the same Keychain items that daemon's wrapper
+script reads and fills in `OPENAI_API_KEY`, `BRAIN_EMBED_MODEL` and
+`BRAIN_EMBED_MODEL_REVISION` for any of them the shell left unset (an
+already-set value is never overwritten). `BRAIN_EMBED_MODEL`/
+`BRAIN_EMBED_MODEL_REVISION` default to the daemon's own active embedding
+generation, not `embeddings/provider.ts`'s baseline -- a mismatched profile
+fails the request outright rather than writing a vector under the wrong
+identity (see `src/providerEnv.ts`). No value is ever printed; only whether
+the Keychain item was found. See
+`com.kithmind.ingest-simple.plist.example` for an hourly LaunchAgent using
+this flag.
 
 ## What one run does
 
@@ -262,7 +365,7 @@ template; only the loaded copy on the owner's own machine names them.
 
 ```
 pnpm --filter @repo/ingest-simple build
-pnpm --filter @repo/ingest-simple exec node --test test/walk.test.mjs test/chunker.test.mjs test/convert.test.mjs test/bindings.test.mjs test/classify.test.mjs test/depthPolicy.test.mjs test/fsUri.test.mjs test/title.test.mjs
+pnpm --filter @repo/ingest-simple exec node --test test/walk.test.mjs test/chunker.test.mjs test/convert.test.mjs test/convertEncryptedPdf.test.mjs test/bindings.test.mjs test/classify.test.mjs test/depthPolicy.test.mjs test/fsUri.test.mjs test/title.test.mjs test/retry.test.mjs test/providerEnv.test.mjs
 pnpm --filter @repo/ingest-simple exec node --test test/postgresIngest.test.mjs test/bindingsTransition.test.mjs
 ```
 
@@ -272,13 +375,20 @@ real vendor SDK: OCR's `fetchImpl` is stubbed; `bindings.test.mjs` covers
 `classify.test.mjs` and `depthPolicy.test.mjs` cover every detection pattern
 and depth-policy branch; `fsUri.test.mjs` proves `toFsUri`'s output parses
 back through `documentDropboxPath`'s own regex; `title.test.mjs` covers
-`buildTitle`'s composed and fallback forms). The last two start and stop
-their own throwaway local Postgres cluster (`initdb`/`pg_ctl`, under a scratch
-temp directory, deleted when the test ends) and require `initdb` and `pg_ctl`
-on `PATH` with the `pgvector` extension available (the same requirement
-`kith` migration 015 has everywhere else in this repo, and this package's own
-migration 046 -- see "Depth policy" -- needs `applyKithSchema` at version 46
-or later).
+`buildTitle`'s composed and fallback forms; `convertEncryptedPdf.test.mjs`
+drives `EncryptedPdfError`/`--pdf-password` against a fake `pdftotext`/
+`pdfinfo` placed first on `PATH` -- no `qpdf`/`pdftk` to build a real
+encrypted fixture was available when this was written, so it also covers
+`isIncorrectPasswordStderr`'s classification directly against real poppler
+error text; `retry.test.mjs` covers `withSerializationRetry` with a fake that
+throws a `40001`/`40P01`-shaped error; `providerEnv.test.mjs` covers
+`applyProviderEnvFromKeychain`'s unset-only defaulting on a plain object, no
+Keychain access). The last two start and stop their own throwaway local
+Postgres cluster (`initdb`/`pg_ctl`, under a scratch temp directory, deleted
+when the test ends) and require `initdb` and `pg_ctl` on `PATH` with the
+`pgvector` extension available (the same requirement `kith` migration 015 has
+everywhere else in this repo, and this package's own migration 046 -- see
+"Depth policy" -- needs `applyKithSchema` at version 46 or later).
 `bindingsTransition.test.mjs` proves the `--bindings` transition end to end: a
 source item registered the old worker's way (a UUID external id, an archived
 revision) reuses that same item, not a second one, when this package's
@@ -288,4 +398,11 @@ glance (one page, real `doc_type`/`uri`/`captured_at`/`ingest_metadata`/
 composed title), a same-policy re-run is a no-op, and `--depth full` promotes
 it to a new full generation on the same source item -- `ingest_metadata`
 updated in place, title unchanged -- while the glance generation becomes
-historical.
+historical; the encrypted-PDF registration path end to end, with and without
+a working `--pdf-password`, through a fake `pdftotext`/`pdfinfo` on `PATH`
+(`ingest.ts`'s `encryptedFallback` handling); and write.ts's
+`RevisionConflictError` directly against real Postgres -- two `ingestFile`
+calls for the same source item whose extracted text matches but whose file
+facts (byte hash, `capturedAt`) do not, proving the store's own immutability
+check still refuses the write and that this package classifies the refusal
+distinctly rather than treating it as an ordinary failure.
