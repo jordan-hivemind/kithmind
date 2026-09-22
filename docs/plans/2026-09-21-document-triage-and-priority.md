@@ -308,6 +308,18 @@ then admits sealed `targeted_pages_v1` batches without activating them as full
 text, reuses exact page hashes across continuation batches, and exposes the
 revision-bound result through `get_document`.
 
+Legacy selected items whose ordinary whole-document conversion exhausted its
+budget remain ordinary failures. Selective admission uses a separate durable
+`targeted_tax_v1` lease over the exact current item, scan entry, observation,
+processing identity and worker authority. It does not change the ordinary
+failure code, retryability or attempt count. Only a positively classified tax
+preview and a `targeted_pages_v1` admission with exact coverage may consume the
+lease. Generic archived preflight, reservation and admission cannot consume it.
+An expired selective lease is reclaimable only through the same purpose, while
+a selective failure releases it back to the unchanged ordinary failed state.
+Conversion failures without the bounded selective eligibility proof remain
+classified and deferred so one unsupported item does not end the pass.
+
 Validate every new CI or parser-launcher command in a clean environment. A
 developer environment with an editable package install can otherwise hide a
 missing import path or undeclared fixture dependency.
