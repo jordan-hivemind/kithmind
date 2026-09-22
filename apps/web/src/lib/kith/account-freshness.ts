@@ -13,6 +13,8 @@
 // Both hid the one case that is a real gap: statements keep arriving and the
 // holdings in them stopped being recorded.
 
+import type { FinanceHoldingsObservationAssessment } from "@repo/finance-contract";
+
 /** How often the archive's own balance dates say statements arrive. */
 export type StatementCadence = "monthly" | "quarterly" | "unknown";
 
@@ -29,9 +31,16 @@ export type FreshnessReason =
   // stale
   | "statement_overdue"
   | "holdings_behind"
-  | "holdings_missing";
+  | "holdings_missing"
+  | "holdings_incomplete"
+  | "valuation_incomplete"
+  | "valuation_unsupported"
+  | "review_open"
+  | "reconciliation_failed"
+  | "reconciliation_pending";
 
-export type FreshnessStatus = "fresh" | "stale" | "inactive" | "empty";
+export type FreshnessStatus =
+  "fresh" | "stale" | "needs_review" | "inactive" | "empty";
 
 export type AccountFreshnessInput = {
   /** Any statement or record at all. */
@@ -41,6 +50,7 @@ export type AccountFreshnessInput = {
   accountType: string | null;
   activityTo: string | null;
   latestSnapshotAsOf: string | null;
+  latestHoldingsObservation?: FinanceHoldingsObservationAssessment;
   /** Distinct balance dates, newest first. Empty when there are none. */
   balanceDates: readonly string[];
   /** See `FinanceAccountInventoryRecord.latestBalanceHoldsSecurities`. */
@@ -263,19 +273,63 @@ export function accountFreshness(
   const dueAfter = (date: string) =>
     addDays(nextPeriodEnd(date, cadence), STATEMENT_GRACE_DAYS);
   const latestBalance = input.balanceDates[0] ?? null;
+  const observation = input.latestHoldingsObservation;
+  // This date describes observed data, not permission to use it in totals.
+  const observedAsOf = observation?.asOf ?? input.latestSnapshotAsOf;
+  const qualityReview = (expectedBy: string): AccountFreshness | null => {
+    if (observation === undefined) return null;
+    const issues: Array<[FreshnessReason, string]> = [];
+    if (!observation.fullyValued)
+      issues.push([
+        "valuation_incomplete",
+        "one or more holdings lack a stated value",
+      ]);
+    if (!observation.sourceComplete)
+      issues.push(["holdings_incomplete", "holdings extraction is incomplete"]);
+    if (!observation.supportedValuationBasis)
+      issues.push(["valuation_unsupported", "valuation basis requires review"]);
+    if (observation.hasBlockingReview)
+      issues.push([
+        "review_open",
+        "an unresolved source review blocks verification",
+      ]);
+    if (observation.reconciliation === "failed")
+      issues.push([
+        "reconciliation_failed",
+        "historical trade quantities do not reconcile",
+      ]);
+    if (observation.reconciliation === "pending")
+      issues.push([
+        "reconciliation_pending",
+        "historical trade reconciliation is unverified",
+      ]);
+    if (issues.length === 0) return null;
+    return {
+      status: "needs_review",
+      reason: issues[0]![0],
+      cadence,
+      expectedBy,
+      statusDetail:
+        `holdings observed ${observation.asOf}; ${issues.map(([, detail]) => detail).join("; ")}` +
+        (input.latestSnapshotAsOf === null
+          ? "; no verified holdings snapshot"
+          : input.latestSnapshotAsOf !== observation.asOf
+            ? `; last verified snapshot ${input.latestSnapshotAsOf}`
+            : ""),
+    };
+  };
   const type = input.accountType?.toLowerCase() ?? null;
   const holdingsExpected =
     input.latestBalanceHoldsSecurities === false ||
     (type !== null && NO_HOLDINGS_TYPES.has(type))
       ? false
-      : input.latestBalanceHoldsSecurities === true ||
-        input.latestSnapshotAsOf !== null;
+      : input.latestBalanceHoldsSecurities === true || observedAsOf !== null;
 
   if (latestBalance === null) {
     // No balance, so no statement cadence to hold the account to. Holdings
     // alone can still fall behind: judge the snapshot as monthly.
-    if (holdingsExpected && input.latestSnapshotAsOf !== null) {
-      const due = dueAfter(input.latestSnapshotAsOf);
+    if (holdingsExpected && observedAsOf !== null) {
+      const due = dueAfter(observedAsOf);
       if (today > due) {
         return {
           status: "stale",
@@ -283,16 +337,18 @@ export function accountFreshness(
           cadence,
           expectedBy: due,
           statusDetail:
-            `holdings last recorded ${input.latestSnapshotAsOf}, next expected by ${due}; ` +
+            `holdings last ${observation === undefined ? "recorded" : "observed"} ${observedAsOf}, next expected by ${due}; ` +
             "no statement balance recorded",
         };
       }
+      const review = qualityReview(due);
+      if (review !== null) return review;
       return {
         status: "fresh",
         reason: "current",
         cadence,
         expectedBy: due,
-        statusDetail: `holdings recorded ${input.latestSnapshotAsOf}; no statement balance recorded`,
+        statusDetail: `holdings recorded ${observedAsOf}; no statement balance recorded`,
       };
     }
     return none(
@@ -318,7 +374,7 @@ export function accountFreshness(
   }
 
   if (holdingsExpected) {
-    const snapshot = input.latestSnapshotAsOf;
+    const snapshot = observedAsOf;
     if (snapshot === null && input.latestBalanceHoldsSecurities === true) {
       return {
         status: "stale",
@@ -344,6 +400,8 @@ export function accountFreshness(
         };
       }
     }
+    const review = qualityReview(statementDue);
+    if (review !== null) return review;
   }
 
   const expected = `next expected by ${statementDue} (${cadenceLabel(cadence)})`;

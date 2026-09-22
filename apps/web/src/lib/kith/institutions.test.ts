@@ -746,3 +746,44 @@ describe("grouping", () => {
     ]);
   });
 });
+
+describe("grouping data-quality warnings", () => {
+  test("review status stays visible and never removes an account from a group value", () => {
+    const value = (decimal: string) => ({
+      value: { decimal, currency: "USD" },
+      asOf: "2026-08-31",
+      source: "balance",
+    });
+    const rows = groupInstitutions(
+      [
+        record({
+          account: account({ accountId: "quality-account" }),
+          latestSnapshotAsOf: "2025-12-31",
+          balanceDates: ["2026-08-31", "2026-07-31"],
+          latestBalanceHoldsSecurities: true,
+          currentValue: value("100"),
+          latestHoldingsObservation: {
+            asOf: "2026-08-31",
+            sourceComplete: true,
+            fullyValued: true,
+            supportedValuationBasis: true,
+            hasBlockingReview: false,
+            reconciliation: "failed",
+          },
+        }),
+        record({
+          account: account({ accountId: "current-account" }),
+          currentValue: value("200"),
+        }),
+      ],
+      NOW,
+    );
+    expect(rows[0]!.status).toBe("needs_review");
+    expect(rows[0]!.currentValue).toBe(300);
+    expect(rows[0]!.latestHoldingsObservedAsOf).toBe("2026-08-31");
+    expect(rows[0]!.children![0]!.latestSnapshotAsOf).toBe("2025-12-31");
+    expect(rows[0]!.statusDetail).toContain(
+      "historical trade quantities do not reconcile",
+    );
+  });
+});
