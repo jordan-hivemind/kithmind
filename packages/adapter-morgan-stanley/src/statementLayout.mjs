@@ -931,6 +931,58 @@ function observedHoldingsHeader(text) {
 const TOTAL_ROW = /^Total\b/;
 /** Ends a holdings table. */
 const TABLE_END = /^(TOTAL|Total Value|HOLDINGS|CASH FLOW|ACTIVITY|Page \d)/;
+/**
+ * The provider's purchases-versus-estimated-value summary. It is printed
+ * immediately after the final security as one label cell and two money cells,
+ * followed by numeric-only detail lines. The title-case `Total` must not be
+ * folded into `TABLE_END`: a security's own aggregate row uses that spelling,
+ * and a dated security name may begin with TOTAL. Require the exact provider
+ * label and the complete three-cell summary shape instead.
+ */
+const PURCHASES_VS_ESTIMATED_VALUE = "Total Purchases vs Estimated Value";
+function purchasesVsEstimatedValueSummary(text) {
+  const cells = splitCells(text);
+  return (
+    cells.length === 3 &&
+    cells[0].text === PURCHASES_VS_ESTIMATED_VALUE &&
+    cells
+      .slice(1)
+      .every(
+        (cell) =>
+          statesValue(cell) && resolveStatementMoney(cell.text).value !== null,
+      )
+  );
+}
+
+/** A section subtotal printed after the final security's Asset Class marker.
+ * Its description repeats the active table section and its remaining cells
+ * are four numeric values plus one percentage. Bind the row as well as
+ * checking its physical cells: an undated security-shaped row must not become
+ * a boundary merely because it happens to have six values. */
+function sameSectionSubtotalSummary(text, columns, section) {
+  if (explicitHoldingsSection(section) === null) return false;
+  const cells = splitCells(text);
+  if (
+    cells.length !== 6 ||
+    cells[0].text.replace(/\s+/g, " ").toUpperCase() !==
+      section.replace(/\s+/g, " ").toUpperCase() ||
+    cells
+      .slice(1, 5)
+      .some(
+        (cell) =>
+          !statesValue(cell) || resolveStatementMoney(cell.text).value === null,
+      ) ||
+    !/^\d+(?:\.\d+)?%$/.test(cells[5].text)
+  ) {
+    return false;
+  }
+  const { bound, conflictingCells } = bindRow(text, columns);
+  return (
+    !conflictingCells &&
+    JSON.stringify([...bound.keys()].sort()) ===
+      JSON.stringify(["costBasis", "description", "marketValue", "unrealized"])
+  );
+}
 const ACTIVITY_SECTION = /^ACTIVITY\b/;
 /**
  * F1-61. The page footer, the one `TABLE_END` that does not end the table:
@@ -2265,15 +2317,54 @@ function parseHoldings(
     let terminalIndex = null;
     let summaryBoundaryIndex = null;
     let summaryHasUnresolvedSecurity = false;
+    let assetClassIndex = null;
     for (let j = i + 1; j < lines.length; j += 1) {
       const text = lines[j].text;
       const trimmed = text.trim();
-      if (TABLE_END.test(trimmed) || HOLDINGS_HEADER.test(text)) {
+      const purchasesSummaryBoundary =
+        lines[j].page === lines[headerIndex].page &&
+        accountKeys[j] === accountKey &&
+        purchasesVsEstimatedValueSummary(text);
+      const tableEndCandidate = TABLE_END.test(trimmed);
+      const tableEndBound = tableEndCandidate
+        ? bindRow(text, columns)
+        : { bound: new Map(), conflictingCells: false };
+      const datedTotalSecurity =
+        tableEndCandidate &&
+        !tableEndBound.conflictingCells &&
+        /^TOTAL\b/.test(tableEndBound.bound.get("description")?.text ?? "") &&
+        TRADE_DATE_CELL.test(tableEndBound.bound.get("tradeDate")?.text ?? "");
+      if (
+        (tableEndCandidate && !datedTotalSecurity) ||
+        purchasesSummaryBoundary ||
+        HOLDINGS_HEADER.test(text)
+      ) {
         terminalIndex = j;
         interruptedByPageFooter = PAGE_FOOTER.test(trimmed);
         break;
       }
-      if (ASSET_CLASS.test(trimmed)) continue;
+      if (ASSET_CLASS.test(trimmed)) {
+        assetClassIndex = j;
+        continue;
+      }
+      const sameSectionSubtotalBoundary =
+        assetClassIndex === j - 1 &&
+        lines[assetClassIndex].page === lines[headerIndex].page &&
+        lines[j].page === lines[headerIndex].page &&
+        accountKeys[assetClassIndex] === accountKey &&
+        accountKeys[j] === accountKey &&
+        sameSectionSubtotalSummary(text, columns, section) &&
+        block.length > 0 &&
+        positionFromBlock(block, columns, {
+          ...context,
+          section,
+          description,
+        }).position !== null;
+      assetClassIndex = null;
+      if (sameSectionSubtotalBoundary) {
+        terminalIndex = j;
+        break;
+      }
       if (SECTION_SUMMARY.test(trimmed)) {
         flush();
         inSummary = true;
