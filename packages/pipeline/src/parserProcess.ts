@@ -207,6 +207,16 @@ export type RunCapturedPdfParserInput = {
   limits?: ParserProcessLimits;
 };
 
+export type RunCapturedPdfSelectiveArtifactInput = Omit<
+  RunCapturedPdfParserInput,
+  "tableStructureBypass"
+> & {
+  /** Exact, strictly increasing one-based pages in the original PDF. */
+  originalPages: number[];
+  selectiveLauncherPath: string;
+  expectedSelectiveLauncherSha256: string;
+};
+
 export type ParserTableStructure = "on" | "off";
 export type ParserTableStructureBypass = NonNullable<
   PdfDocQaConfig["parser"]["tableStructureBypass"]
@@ -373,6 +383,38 @@ export type CapturedPdfParserResult = {
     pollIntervalMs: number;
     monitorCommandTimeoutMs: number;
   };
+};
+
+export type SelectivePdfCoverage = {
+  schemaVersion: 1;
+  sourceSha256: string;
+  selectedPdfSha256: string;
+  sourcePageCount: number;
+  originalPages: number[];
+  fingerprint: string;
+};
+
+export type CapturedPdfSelectiveArtifactResult = {
+  state: "complete";
+  artifactKind: "selective_pdf_pages_v1";
+  outputId: string;
+  sourceSha256: string;
+  rawArtifact: RawParserArtifactIdentity;
+  selectiveBundle: ParsedArtifactIdentity;
+  parserFingerprint: string;
+  extractionConfigurationFingerprint: string;
+  extractionFingerprint: string;
+  modelManifestSha256: string;
+  selectedPageCount: number;
+  sourcePageCount: number;
+  originalPageMapping: Array<{ artifactPage: number; originalPage: number }>;
+  coverage: SelectivePdfCoverage;
+  selectiveImplementationSha256: string;
+  artifactFingerprint: string;
+  validated: ValidatedNormalizedBundleResult;
+  peakRssBytes: number;
+  elapsedMs: number;
+  isolation: CapturedPdfParserResult["isolation"];
 };
 
 type DirectoryIdentity = { path: string; device: number; inode: number };
@@ -2300,6 +2342,128 @@ function validateBundleAndRaw(
   };
 }
 
+function requestedOriginalPages(value: unknown): number[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 64)
+    fail("invalid_input", "selected original pages are invalid");
+  const pages = value.map((page) => {
+    if (!integer(page, 1, Number.MAX_SAFE_INTEGER))
+      fail("invalid_input", "selected original pages are invalid");
+    return page as number;
+  });
+  if (pages.some((page, index) => index > 0 && page <= pages[index - 1]!))
+    fail("invalid_input", "selected original pages are invalid");
+  return pages;
+}
+
+function selectiveDigest(domain: string, value: unknown): string {
+  return createHash("sha256")
+    .update(Buffer.from(`${domain}\0`, "utf8"))
+    .update(canonicalJson(value))
+    .digest("hex");
+}
+
+function validateSelectiveBundleAndRaw(
+  rawValue: unknown,
+  bundleValue: unknown,
+  capture: CapturedPdf,
+  modelManifestSha256: string,
+  rawSha256: string,
+  requestedPages: number[],
+) {
+  if (
+    !bundleValue ||
+    typeof bundleValue !== "object" ||
+    Array.isArray(bundleValue)
+  )
+    fail("output_invalid", "selective PDF bundle is invalid");
+  const wrapper = bundleValue as Record<string, unknown>;
+  if (
+    !exactKeys(wrapper, [
+      "schemaVersion",
+      "artifactKind",
+      "sourceSha256",
+      "selectiveImplementationSha256",
+      "coverage",
+      "selectedBundle",
+      "artifactFingerprint",
+    ]) ||
+    wrapper.schemaVersion !== 1 ||
+    wrapper.artifactKind !== "selective_pdf_pages_v1" ||
+    wrapper.sourceSha256 !== capture.sha256 ||
+    !SHA256.test(String(wrapper.selectiveImplementationSha256 ?? "")) ||
+    !SHA256.test(String(wrapper.artifactFingerprint ?? ""))
+  )
+    fail("output_invalid", "selective PDF bundle identity is invalid");
+  if (
+    !wrapper.coverage ||
+    typeof wrapper.coverage !== "object" ||
+    Array.isArray(wrapper.coverage)
+  )
+    fail("output_invalid", "selective PDF coverage is invalid");
+  const coverage = wrapper.coverage as Record<string, unknown>;
+  if (
+    !exactKeys(coverage, [
+      "schemaVersion",
+      "sourceSha256",
+      "selectedPdfSha256",
+      "sourcePageCount",
+      "originalPages",
+      "fingerprint",
+    ]) ||
+    coverage.schemaVersion !== 1 ||
+    coverage.sourceSha256 !== capture.sha256 ||
+    !SHA256.test(String(coverage.selectedPdfSha256 ?? "")) ||
+    !integer(
+      coverage.sourcePageCount,
+      requestedPages.at(-1)!,
+      Number.MAX_SAFE_INTEGER,
+    ) ||
+    canonicalIdentity(coverage.originalPages) !==
+      canonicalIdentity(requestedPages) ||
+    !SHA256.test(String(coverage.fingerprint ?? ""))
+  )
+    fail("output_invalid", "selective PDF coverage is invalid");
+  const coverageFields = {
+    schemaVersion: 1,
+    sourceSha256: capture.sha256,
+    selectedPdfSha256: coverage.selectedPdfSha256,
+    sourcePageCount: coverage.sourcePageCount,
+    originalPages: requestedPages,
+  };
+  if (
+    coverage.fingerprint !==
+    selectiveDigest("kith-selective-pdf-coverage:v1", coverageFields)
+  )
+    fail("output_invalid", "selective PDF coverage fingerprint is invalid");
+  const validated = validateBundleAndRaw(
+    rawValue,
+    wrapper.selectedBundle,
+    { ...capture, sha256: coverage.selectedPdfSha256 as string },
+    modelManifestSha256,
+    rawSha256,
+  );
+  if (validated.pageCount !== requestedPages.length)
+    fail("output_invalid", "selective PDF page count is invalid");
+  const artifactFields = [
+    wrapper.selectiveImplementationSha256,
+    coverage.fingerprint,
+    rawSha256,
+    validated.extractionFingerprint,
+  ];
+  if (
+    wrapper.artifactFingerprint !==
+    selectiveDigest("kith-selective-pdf-artifact:v1", artifactFields)
+  )
+    fail("output_invalid", "selective PDF artifact fingerprint is invalid");
+  return {
+    ...validated,
+    coverage: coverage as SelectivePdfCoverage,
+    selectiveImplementationSha256:
+      wrapper.selectiveImplementationSha256 as string,
+    artifactFingerprint: wrapper.artifactFingerprint as string,
+  };
+}
+
 async function protectedOutputFile(
   path: string,
   directory: DirectoryIdentity,
@@ -3754,17 +3918,28 @@ export async function runDocumentPreview(
   return validateDocumentPreviewResult(result, input);
 }
 
-export async function runCapturedPdfParser(
+async function runCapturedPdfParserInternal(
   input: RunCapturedPdfParserInput,
-): Promise<CapturedPdfParserResult> {
+  selective?: {
+    originalPages: number[];
+    launcherPath: string;
+    expectedLauncherSha256: string;
+  },
+): Promise<CapturedPdfParserResult | CapturedPdfSelectiveArtifactResult> {
   requiredPlatform();
   const limits = validateLimits(input.limits);
+  const selectedPages =
+    selective === undefined
+      ? undefined
+      : requestedOriginalPages(selective.originalPages);
   const tableStructure = requestedTableStructure(input.tableStructure);
   const tableStructureBypass = requestedTableStructureBypass(
     input.tableStructureBypass,
   );
   if (tableStructure === "off" && tableStructureBypass !== undefined)
     fail("invalid_input", "table structure bypass requires table mode on");
+  if (selectedPages !== undefined && tableStructureBypass !== undefined)
+    fail("invalid_input", "selective PDF artifacts do not accept table bypass");
   const sandboxTool = await boundedFile(
     "/usr/bin/sandbox-exec",
     "macOS sandbox tool",
@@ -3786,7 +3961,9 @@ export async function runCapturedPdfParser(
   if (
     !OPAQUE_ID.test(input.outputId) ||
     !SHA256.test(input.expectedPythonSha256) ||
-    !SHA256.test(input.expectedLauncherSha256) ||
+    !SHA256.test(
+      selective?.expectedLauncherSha256 ?? input.expectedLauncherSha256,
+    ) ||
     !SHA256.test(input.expectedModelLockSha256)
   )
     fail("invalid_input", "parser identity input is invalid");
@@ -3830,13 +4007,14 @@ export async function runCapturedPdfParser(
     { private: false, rejectBroad: true },
   );
   const launcher = await boundedFile(
-    input.launcherPath,
+    selective?.launcherPath ?? input.launcherPath,
     "parser launcher",
     1024 * 1024,
   );
   if (
     !contains(packageRoot.path, launcher.canonical) ||
-    digest(launcher.bytes) !== input.expectedLauncherSha256
+    digest(launcher.bytes) !==
+      (selective?.expectedLauncherSha256 ?? input.expectedLauncherSha256)
   )
     fail(
       "executable_mismatch",
@@ -3932,8 +4110,14 @@ export async function runCapturedPdfParser(
     fail("unsafe_path", "parser output and capture roots overlap");
   }
 
-  const rawPath = join(outputDirectory.path, "lossless.json");
-  const bundlePath = join(outputDirectory.path, "bundle.json");
+  const rawPath = join(
+    outputDirectory.path,
+    selectedPages === undefined ? "lossless.json" : "selective-lossless.json",
+  );
+  const bundlePath = join(
+    outputDirectory.path,
+    selectedPages === undefined ? "bundle.json" : "selective-bundle.json",
+  );
   for (const path of [rawPath, bundlePath]) {
     if (
       await lstat(path)
@@ -4007,7 +4191,7 @@ export async function runCapturedPdfParser(
       launcher.requested,
       [
         "--mode",
-        "convert",
+        selectedPages === undefined ? "convert" : "convert-selective",
         ...common,
         "--input",
         capture.path,
@@ -4028,6 +4212,9 @@ export async function runCapturedPdfParser(
         "--table-structure",
         tableStructure,
         ...tableStructureBypassArgument(tableStructureBypass),
+        ...(selectedPages === undefined
+          ? []
+          : ["--selected-original-pages", JSON.stringify(selectedPages)]),
       ],
       environment,
       limits,
@@ -4049,6 +4236,16 @@ export async function runCapturedPdfParser(
       ...(tableStructureBypass === undefined
         ? []
         : ["tableStructureBypassPages"]),
+      ...(selectedPages === undefined
+        ? []
+        : [
+            "sourcePageCount",
+            "selectedOriginalPages",
+            "selectedPdfSha256",
+            "coverageFingerprint",
+            "artifactFingerprint",
+            "selectiveImplementationSha256",
+          ]),
     ];
     if (
       !exactKeys(launcherResult, launcherKeys) ||
@@ -4079,13 +4276,31 @@ export async function runCapturedPdfParser(
     )
       fail("output_invalid", "launcher result does not match output bytes");
     const rawValue = parseBoundedParserJson(raw.bytes, limits.maxRawBytes);
-    const validated = validateBundleAndRaw(
-      rawValue,
-      parseBoundedParserJson(bundle.bytes, limits.maxBundleBytes),
-      capture,
-      modelManifestSha256,
-      rawSha256,
+    const bundleValue = parseBoundedParserJson(
+      bundle.bytes,
+      limits.maxBundleBytes,
     );
+    const validated =
+      selectedPages === undefined
+        ? validateBundleAndRaw(
+            rawValue,
+            bundleValue,
+            capture,
+            modelManifestSha256,
+            rawSha256,
+          )
+        : validateSelectiveBundleAndRaw(
+            rawValue,
+            bundleValue,
+            capture,
+            modelManifestSha256,
+            rawSha256,
+            selectedPages,
+          );
+    const selectiveValidated =
+      selectedPages === undefined
+        ? undefined
+        : (validated as ReturnType<typeof validateSelectiveBundleAndRaw>);
     if (validated.tableStructure !== tableStructure)
       fail(
         "output_invalid",
@@ -4124,6 +4339,22 @@ export async function runCapturedPdfParser(
     )
       fail("output_invalid", "parser bundle table bypass match is invalid");
     if (
+      selectedPages !== undefined &&
+      (launcherResult.sourcePageCount !==
+        selectiveValidated!.coverage.sourcePageCount ||
+        canonicalIdentity(launcherResult.selectedOriginalPages) !==
+          canonicalIdentity(selectedPages) ||
+        launcherResult.coverageFingerprint !==
+          selectiveValidated!.coverage.fingerprint ||
+        launcherResult.selectedPdfSha256 !==
+          selectiveValidated!.coverage.selectedPdfSha256 ||
+        launcherResult.artifactFingerprint !==
+          selectiveValidated!.artifactFingerprint ||
+        launcherResult.selectiveImplementationSha256 !==
+          selectiveValidated!.selectiveImplementationSha256)
+    )
+      fail("output_invalid", "launcher selective coverage is invalid");
+    if (
       launcherResult.parserFingerprint !== validated.parserFingerprint ||
       launcherResult.extractionFingerprint !==
         validated.extractionFingerprint ||
@@ -4150,6 +4381,45 @@ export async function runCapturedPdfParser(
       byteLength: bundle.bytes.length,
       mediaType: "application/json",
     };
+    if (selectedPages !== undefined) {
+      return {
+        state: "complete",
+        artifactKind: "selective_pdf_pages_v1",
+        outputId: input.outputId,
+        sourceSha256: capture.sha256,
+        rawArtifact,
+        selectiveBundle: normalizedBundle,
+        parserFingerprint: validated.parserFingerprint,
+        extractionConfigurationFingerprint:
+          validated.extractionConfigurationFingerprint,
+        extractionFingerprint: validated.extractionFingerprint,
+        modelManifestSha256,
+        selectedPageCount: validated.pageCount,
+        sourcePageCount: selectiveValidated!.coverage.sourcePageCount,
+        originalPageMapping: selectedPages.map((originalPage, index) => ({
+          artifactPage: index + 1,
+          originalPage,
+        })),
+        coverage: selectiveValidated!.coverage,
+        selectiveImplementationSha256:
+          selectiveValidated!.selectiveImplementationSha256,
+        artifactFingerprint: selectiveValidated!.artifactFingerprint,
+        validated: {
+          bundle: validated.bundle,
+          resolvedLocators: validated.resolvedLocators,
+        },
+        peakRssBytes: conversion.peakRssBytes,
+        elapsedMs: conversion.elapsedMs,
+        isolation: {
+          networkDenied: true,
+          processForkDenied: true,
+          processExecDenied: true,
+          rssBoundary: "sampled_process_tree",
+          pollIntervalMs: limits.pollIntervalMs,
+          monitorCommandTimeoutMs: PROCESS_MONITOR_TIMEOUT_MS,
+        },
+      };
+    }
     const artifacts: DurableParserOutputArtifacts = {
       outputId: input.outputId,
       outputRoot: {
@@ -4204,6 +4474,34 @@ export async function runCapturedPdfParser(
     await removeExact(bundlePath, bundleIdentity, outputDirectory);
     safeRethrow(error, "conversion_failed", "parser conversion failed");
   }
+}
+
+export async function runCapturedPdfParser(
+  input: RunCapturedPdfParserInput,
+): Promise<CapturedPdfParserResult> {
+  return (await runCapturedPdfParserInternal(input)) as CapturedPdfParserResult;
+}
+
+/**
+ * Produce a local sparse PDF artifact with an explicit original-page map.
+ * Its wrapper is intentionally rejected by the whole-document bundle
+ * validator and this result omits `DurableParserOutputArtifacts`, so it cannot
+ * enter the existing publication path without a later explicit contract.
+ */
+export async function runCapturedPdfSelectiveArtifact(
+  input: RunCapturedPdfSelectiveArtifactInput,
+): Promise<CapturedPdfSelectiveArtifactResult> {
+  const {
+    originalPages,
+    selectiveLauncherPath,
+    expectedSelectiveLauncherSha256,
+    ...parserInput
+  } = input;
+  return (await runCapturedPdfParserInternal(parserInput, {
+    originalPages,
+    launcherPath: selectiveLauncherPath,
+    expectedLauncherSha256: expectedSelectiveLauncherSha256,
+  })) as CapturedPdfSelectiveArtifactResult;
 }
 
 // --- the workbook lane: a sibling of the docling process -------------------
