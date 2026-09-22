@@ -231,7 +231,7 @@ test("a session that finishes with an exit (the owner backed out) is reported, n
   assert.equal(keychain.written.length, 0);
 });
 
-test("linkTokenCreate is asked for the transactions-required, investments-optional, hosted-link shape", async () => {
+test("linkTokenCreate is asked for the transactions-required, investments-optional, hosted-link, 730-day-history shape", async () => {
   const pool = fakePool();
   let request;
   const client = {
@@ -260,4 +260,8 @@ test("linkTokenCreate is asked for the transactions-required, investments-option
   assert.deepEqual(request.optional_products, ["investments"]);
   assert.deepEqual(request.hosted_link, {});
   assert.equal(request.redirect_uri, undefined, "Hosted Link needs no redirect URI");
+  // PLAID-3: request Plaid's maximum banking-transactions history window
+  // (default is 90 days; 730 is the max) so a newly linked Item is not
+  // stuck with only recent activity.
+  assert.deepEqual(request.transactions, { days_requested: 730 });
 });
