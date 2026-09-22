@@ -28,6 +28,16 @@ export type IngestOptions = {
   limit?: number;
   dryRun: boolean;
   concurrency: number;
+  /**
+   * `relativePath -> externalId`, loaded from the old filesystem worker's
+   * journal by `bindings.ts`/`--bindings`/`--root-alias` (see cli.ts). A file
+   * whose `relativePath` is in this map reuses that `externalId` (the same
+   * `kith.source_items.external_id` the old worker gave it) instead of the
+   * path itself, so a folder the old worker already indexed does not get a
+   * second source item per file on this package's first run against it.
+   * Absent (or a file with no entry) falls back to `relativePath`, as before.
+   */
+  externalIdBindings?: Map<string, string>;
 };
 
 export type IngestSummary = {
@@ -39,6 +49,12 @@ export type IngestSummary = {
   failed: number;
   failures: Array<{ path: string; error: string }>;
   extension: Map<string, { seen: number; newCount: number }>;
+  /** Of `seen`, how many resolved an `externalId` from `externalIdBindings`
+   * rather than falling back to their `relativePath`. */
+  matchedByBinding: number;
+  /** Of `seen`, how many had no entry in `externalIdBindings` (or no
+   * bindings were supplied) and used `relativePath` as their `externalId`. */
+  usingPathId: number;
 };
 
 function bump(map: Map<string, { seen: number; newCount: number }>, ext: string, field: "seen" | "newCount"): void {
@@ -91,19 +107,25 @@ export async function runIngest(
     failed: 0,
     failures: [],
     extension: new Map(),
+    matchedByBinding: 0,
+    usingPathId: 0,
   };
 
   let activatedThisRun = 0;
 
   await runWithConcurrency(files, options.concurrency, async (file) => {
     bump(summary.extension, file.extension, "seen");
+    const bound = options.externalIdBindings?.get(file.relativePath);
+    if (bound !== undefined) summary.matchedByBinding += 1;
+    else summary.usingPathId += 1;
+    const externalId = bound ?? file.relativePath;
     try {
       const bytes = await readFile(file.absolutePath);
       const fileByteHash = sha256(bytes);
       const skip = await alreadyIngested(pool, {
         spaceId: account.spaceId,
         sourceAccountId: account.id,
-        externalId: file.relativePath,
+        externalId,
         fileByteHash,
       });
       if (skip) {
@@ -130,7 +152,7 @@ export async function runIngest(
       await ingestFile(pool, {
         spaceId: account.spaceId,
         sourceAccountId: account.id,
-        externalId: file.relativePath,
+        externalId,
         title: titleFor(file.relativePath),
         docType: DOC_TYPES[file.extension],
         capturedAt: new Date(),

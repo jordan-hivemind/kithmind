@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 // `kith-ingest-simple --root <dir> --source-account <id> [--space <id>] [--limit N]
-// [--dry-run] [--concurrency N]`. See README.md.
+// [--dry-run] [--concurrency N] [--bindings <path> --root-alias <alias>]`. See README.md.
 
 import process from "node:process";
 
 import { createKithPool } from "@repo/kith-store";
 
+import { loadBindings } from "./bindings.js";
 import { loadDatabaseUrl } from "./config.js";
 import { runIngest, type IngestOptions } from "./ingest.js";
 
@@ -14,18 +15,26 @@ const DEFAULT_CONCURRENCY = 2;
 function usage(): never {
   process.stderr.write(
     "Usage: kith-ingest-simple --root <dir> --source-account <id> " +
-      "[--space <id>] [--limit N] [--dry-run] [--concurrency N]\n",
+      "[--space <id>] [--limit N] [--dry-run] [--concurrency N] " +
+      "[--bindings <path> --root-alias <alias>]\n",
   );
   process.exit(2);
 }
 
-function parseArgs(argv: string[]): IngestOptions {
+type ParsedArgs = Omit<IngestOptions, "externalIdBindings"> & {
+  bindingsPath?: string;
+  rootAlias?: string;
+};
+
+function parseArgs(argv: string[]): ParsedArgs {
   let root: string | undefined;
   let sourceAccountId: string | undefined;
   let spaceId: string | undefined;
   let limit: number | undefined;
   let dryRun = false;
   let concurrency = DEFAULT_CONCURRENCY;
+  let bindingsPath: string | undefined;
+  let rootAlias: string | undefined;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     switch (arg) {
@@ -53,11 +62,21 @@ function parseArgs(argv: string[]): IngestOptions {
         concurrency = value;
         break;
       }
+      case "--bindings":
+        bindingsPath = argv[++index];
+        break;
+      case "--root-alias":
+        rootAlias = argv[++index];
+        break;
       default:
         usage();
     }
   }
   if (!root || !sourceAccountId) usage();
+  // Both or neither: a bindings file with no root alias to filter it by (or
+  // vice versa) cannot be resolved into a lookup, so it is a usage error
+  // rather than a silent no-op.
+  if ((bindingsPath === undefined) !== (rootAlias === undefined)) usage();
   return {
     root,
     sourceAccountId,
@@ -65,11 +84,30 @@ function parseArgs(argv: string[]): IngestOptions {
     ...(limit ? { limit } : {}),
     dryRun,
     concurrency,
+    ...(bindingsPath !== undefined ? { bindingsPath } : {}),
+    ...(rootAlias !== undefined ? { rootAlias } : {}),
   };
 }
 
 async function main(argv: string[]): Promise<void> {
-  const options = parseArgs(argv);
+  const args = parseArgs(argv);
+  let externalIdBindings: Map<string, string> | undefined;
+  let bindingsLoaded = 0;
+  if (args.bindingsPath !== undefined && args.rootAlias !== undefined) {
+    const result = await loadBindings(args.bindingsPath, args.rootAlias);
+    externalIdBindings = result.map;
+    bindingsLoaded = result.loaded;
+  }
+  const options: IngestOptions = {
+    root: args.root,
+    sourceAccountId: args.sourceAccountId,
+    ...(args.spaceId ? { spaceId: args.spaceId } : {}),
+    ...(args.limit ? { limit: args.limit } : {}),
+    dryRun: args.dryRun,
+    concurrency: args.concurrency,
+    ...(externalIdBindings ? { externalIdBindings } : {}),
+  };
+
   const databaseUrl = await loadDatabaseUrl();
   const pool = createKithPool(databaseUrl, Math.max(2, options.concurrency));
   try {
@@ -89,6 +127,9 @@ async function main(argv: string[]): Promise<void> {
         `skipped-unchanged ${summary.skippedUnchanged}`,
         `skipped-dot-or-archive ${summary.skippedDotOrArchive}`,
         `failed ${summary.failed}`,
+        externalIdBindings ? `bindings loaded ${bindingsLoaded}` : undefined,
+        externalIdBindings ? `files matched by binding ${summary.matchedByBinding}` : undefined,
+        externalIdBindings ? `files using path IDs ${summary.usingPathId}` : undefined,
         extensionLines ? `by-extension: ${extensionLines}` : undefined,
         skippedExtLines ? `unsupported extensions skipped: ${skippedExtLines}` : undefined,
       ]
