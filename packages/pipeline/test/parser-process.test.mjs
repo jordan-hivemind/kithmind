@@ -34,6 +34,7 @@ import {
   runDocumentPreview,
   resolveRawLocators,
   runCapturedPdfParser,
+  validateDocumentPreviewResult,
 } from "../dist/parserProcess.js";
 import {
   mapParsedBundle,
@@ -211,7 +212,7 @@ test(
         sourcePath: setup.sourcePath,
         expectedSha256: setup.common.capture.sha256,
         mediaType: "application/pdf",
-        windows: [{ startPage: 1, pageCount: 1 }],
+        windows: [{ startPage: 1, pageCount: 2 }],
         pythonExecutable: setup.common.pythonExecutable,
         expectedPythonSha256: setup.common.expectedPythonSha256,
         launcherPath: setup.common.launcherPath,
@@ -224,7 +225,7 @@ test(
       assert.equal(result.mediaType, "application/pdf");
       assert.equal(result.method, "pdf_native_text_v1");
       assert.deepEqual(result.inspectedOriginalUnits, [1]);
-      assert.ok(result.sourceUnitCount >= 1);
+      assert.equal(result.sourceUnitCount, 1);
     } finally {
       await removeParserProfileWorkDirectoryExact({
         workRoot: setup.outputRoot,
@@ -234,6 +235,45 @@ test(
     }
   },
 );
+
+test("accepts the existing prefix of a preview window on a one-page PDF", () => {
+  const digest = "a".repeat(64);
+  const result = validateDocumentPreviewResult(
+    {
+      state: "complete",
+      schemaVersion: 1,
+      provisional: true,
+      sourceSha256: digest,
+      mediaType: "application/pdf",
+      pageCount: 1,
+      inspectedPageNumbers: [1],
+      units: [
+        {
+          pageNumber: 1,
+          state: "text_available",
+          text: "Schedule K-1",
+          textTruncated: false,
+        },
+      ],
+      method: {
+        schemaVersion: 1,
+        name: "pdf_native_text_v1",
+        implementationSha256: "b".repeat(64),
+        dependencies: {},
+        fingerprint: "c".repeat(64),
+      },
+    },
+    {
+      expectedSha256: digest,
+      mediaType: "application/pdf",
+      windows: [{ startPage: 1, pageCount: 2 }],
+    },
+  );
+
+  assert.equal(result.sourceUnitCount, 1);
+  assert.deepEqual(result.inspectedOriginalUnits, [1]);
+  assert.deepEqual(result.unitTexts, ["Schedule K-1"]);
+});
 
 async function outputDirectory(fixture, outputId) {
   const path = join(fixture.outputRoot, outputId);

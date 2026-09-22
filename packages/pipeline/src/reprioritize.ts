@@ -65,7 +65,7 @@ export type ReprioritizeResult =
       manifestSha256?: string;
     };
 
-class PriorityRefusal extends Error {
+export class PriorityRefusal extends Error {
   constructor(
     readonly code: Extract<ReprioritizeResult, { state: "refused" }>["code"],
   ) {
@@ -90,14 +90,17 @@ function exactObject(
   return record;
 }
 
-export function parsePriorityManifest(value: unknown): PriorityManifest {
+export function parsePriorityManifest(
+  value: unknown,
+  options: { allowEmptyTargets?: boolean } = {},
+): PriorityManifest {
   const manifest = exactObject(value, ["version", "reason", "targets"]);
   if (
     manifest.version !== 1 ||
     typeof manifest.reason !== "string" ||
     !REASONS.has(manifest.reason) ||
     !Array.isArray(manifest.targets) ||
-    manifest.targets.length === 0 ||
+    (!options.allowEmptyTargets && manifest.targets.length === 0) ||
     manifest.targets.length > MAX_TARGETS
   ) {
     throw new PriorityRefusal("manifest_invalid");
@@ -136,7 +139,10 @@ export function parsePriorityManifest(value: unknown): PriorityManifest {
   };
 }
 
-export async function loadPriorityManifest(path: string): Promise<{
+export async function loadPriorityManifest(
+  path: string,
+  options: { allowEmptyTargets?: boolean } = {},
+): Promise<{
   manifest: PriorityManifest;
   manifestSha256: string;
 }> {
@@ -185,7 +191,7 @@ export async function loadPriorityManifest(path: string): Promise<{
       throw new PriorityRefusal("manifest_invalid");
     }
     return {
-      manifest: parsePriorityManifest(parsed),
+      manifest: parsePriorityManifest(parsed, options),
       manifestSha256: createHash("sha256").update(exact).digest("hex"),
     };
   } catch (error) {

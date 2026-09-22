@@ -108,6 +108,8 @@ function previewFor(item, windows) {
         )
       : [1, 2],
     unitStates: pdf ? ["text_available", "image_only"] : [],
+    unitTexts: pdf ? ["Form 1040 synthetic heading", ""] : [],
+    unitTextTruncated: pdf ? [false, false] : [],
     method: pdf ? "pdf_native_text_v1" : "spreadsheet_manifest_v1",
     methodFingerprint: pdf ? "e".repeat(64) : "f".repeat(64),
   };
@@ -115,8 +117,15 @@ function previewFor(item, windows) {
 
 function persistedFingerprint(method, methodFingerprint, units) {
   return createHash("sha256")
-    .update("kithmind-triage-preview:v1\0")
-    .update(JSON.stringify([method, methodFingerprint, units]))
+    .update("kithmind-triage-preview:v2\0")
+    .update(
+      JSON.stringify([
+        method,
+        methodFingerprint,
+        units,
+        "bounded-native-heading-v2",
+      ]),
+    )
     .digest("hex");
 }
 
@@ -185,8 +194,11 @@ test("records bounded PDF and spreadsheet previews without changing the active c
       sourceFormat: "pdf",
       sourceUnitCount: 90,
       inspectedOriginalUnits: [1, 90],
-      provisionalMetadata: { uncertaintyCodes: ["image_only"] },
-      confidence: null,
+      provisionalMetadata: {
+        documentKind: "tax_return",
+        uncertaintyCodes: ["image_only", "insufficient_text"],
+      },
+      confidence: 0.95,
     });
     assert.deepEqual(requests[1].preview, {
       previewFingerprint: persistedFingerprint(
@@ -199,7 +211,7 @@ test("records bounded PDF and spreadsheet previews without changing the active c
       sourceUnitCount: 2,
       inspectedOriginalUnits: [1, 2],
       provisionalMetadata: { documentKind: "spreadsheet" },
-      confidence: null,
+      confidence: 1,
     });
     assert.equal(JSON.stringify(requests).includes("relativePath"), false);
     const second = await previewSelectedJournal({

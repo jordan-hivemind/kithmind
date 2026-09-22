@@ -213,6 +213,9 @@ export type PipelineRunResult = {
   parkedOldestAgeMs?: number;
   /** P2-31f: receipts `run --operator-clear` retired in this pass. */
   operatorClears?: number;
+  /** Metadata previews that truthfully refused one document and moved on. */
+  previewGaps?: number;
+  previewGapCodes?: string[];
 };
 
 export type WorkerErrorCode =

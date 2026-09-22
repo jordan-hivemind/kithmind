@@ -158,6 +158,7 @@ export type ArchivedDiscoveryLease = Omit<
 >;
 
 export type ArchivedStep =
+  | "preview"
   | "intent"
   | "preflight"
   | "lookup_original"
@@ -175,13 +176,54 @@ export type ArchivedStep =
   | "parsed_batch"
   | "parsed_seal"
   | "parsed_activate"
-  | "cleanup";
+  | "cleanup"
+  | "deferred_idle";
+
+export type MetadataFirstIdentity = {
+  sourceItemId: string;
+  observationEpoch: number;
+  processingEpoch: number;
+  sha256: string;
+};
+
+export type MetadataFirstPreviewGap = MetadataFirstIdentity & {
+  code:
+    | "conversion_failed"
+    | "conversion_output_invalid"
+    | "page_limit_exceeded"
+    | "bundle_too_large"
+    | "workbook_invalid"
+    | "workbook_encrypted"
+    | "workbook_unsupported"
+    | "workbook_oversized";
+};
+
+export type MetadataFirstRouting = {
+  version: 1;
+  triageStartIndex: number;
+  /** False until one pass has reported the durable deferred result. */
+  refreshReady: boolean;
+  selected: MetadataFirstIdentity[];
+  previewed: MetadataFirstIdentity[];
+  previewGaps: MetadataFirstPreviewGap[];
+  selectionReceipts: Array<{
+    selectorSha256: string;
+    reason:
+      | "active_goal"
+      | "code_acceptance"
+      | "explicit_user_request"
+      | "automatic_policy";
+    selectedCount: number;
+    selectedIdentitySha256: string;
+  }>;
+};
 
 type PlannedScan = {
   mode: "normal" | "identity_recovery";
   expectedInventoryEpoch: number;
   files: FilePlan[];
   missingBindings: IdentityBinding[];
+  metadataFirstCarry?: MetadataFirstRouting;
 };
 
 type ActiveScan = Omit<PlannedScan, "expectedInventoryEpoch"> & {
@@ -195,6 +237,16 @@ type ProcessingRun = {
   scanned: number;
   published: number;
   bindings: IdentityBinding[];
+  metadataFirstDeferred?: {
+    mode: "normal" | "identity_recovery";
+    inventoryEpoch: number;
+    manifestVersion: number;
+    files: FilePlan[];
+    missingBindings: IdentityBinding[];
+    pdfIndex: number;
+    archivedPublished: number;
+    metadataFirst: MetadataFirstRouting;
+  };
 };
 
 type ArchivedRun = ActiveScan & {
@@ -253,6 +305,7 @@ type ArchivedRun = ActiveScan & {
     selectedCount: number;
     selectedIdentitySha256: string;
   };
+  metadataFirst?: MetadataFirstRouting;
   providerV2Transition?: {
     version: 1;
     previousConfigSha256: string;
@@ -274,6 +327,7 @@ export type RunnerCheckpoint =
       code?: string;
       scanId?: string;
       assessmentId?: string;
+      metadataFirstCarry?: MetadataFirstRouting;
     }
   | ({ version: 1; phase: "scan_begin" } & PlannedScan)
   | ({
@@ -757,12 +811,14 @@ function archiveReceiptReuse(value: unknown): ArchiveReceiptReuse {
       (row.backupBindingEpoch === undefined) ||
     (row.providerReferenceId === undefined) !==
       (row.providerBindingEpoch === undefined) ||
-    (row.backupReceiptId !== undefined && row.providerReferenceId !== undefined) ||
+    (row.backupReceiptId !== undefined &&
+      row.providerReferenceId !== undefined) ||
     (row.providerReferenceVersion !== undefined &&
       (row.providerReferenceVersion !== "provider_original_v2" ||
         row.providerReferenceId === undefined ||
         row.primaryReceiptId !== undefined)) ||
-    (row.primaryReceiptId === undefined && row.providerReferenceId === undefined) ||
+    (row.primaryReceiptId === undefined &&
+      row.providerReferenceId === undefined) ||
     (row.backupReceiptId !== undefined && row.primaryReceiptId === undefined)
   )
     fail();
@@ -833,6 +889,186 @@ function priorityReceipt(
   };
 }
 
+function metadataFirstIdentity(value: unknown): MetadataFirstIdentity {
+  const row = object(value);
+  exact(row, ["sourceItemId", "observationEpoch", "processingEpoch", "sha256"]);
+  return {
+    sourceItemId: id(row.sourceItemId),
+    observationEpoch: integer(row.observationEpoch),
+    processingEpoch: integer(row.processingEpoch),
+    sha256: string(row.sha256, 64, HEX_64),
+  };
+}
+
+function metadataFirstRouting(value: unknown): MetadataFirstRouting {
+  const row = object(value);
+  exact(
+    row,
+    [
+      "version",
+      "triageStartIndex",
+      "refreshReady",
+      "selected",
+      "previewed",
+      "selectionReceipts",
+    ],
+    ["previewGaps"],
+  );
+  if (
+    row.version !== 1 ||
+    !Array.isArray(row.selected) ||
+    !Array.isArray(row.previewed) ||
+    (row.previewGaps !== undefined && !Array.isArray(row.previewGaps)) ||
+    !Array.isArray(row.selectionReceipts) ||
+    row.selected.length > MAX_FILES ||
+    row.previewed.length > MAX_FILES ||
+    (Array.isArray(row.previewGaps) && row.previewGaps.length > MAX_FILES) ||
+    row.selectionReceipts.length > MAX_FILES
+  )
+    fail();
+  const selected = row.selected.map(metadataFirstIdentity);
+  const previewed = row.previewed.map(metadataFirstIdentity);
+  const previewGaps = (row.previewGaps ?? []).map((value) => {
+    const gap = object(value);
+    exact(gap, [
+      "sourceItemId",
+      "observationEpoch",
+      "processingEpoch",
+      "sha256",
+      "code",
+    ]);
+    const identity = metadataFirstIdentity({
+      sourceItemId: gap.sourceItemId,
+      observationEpoch: gap.observationEpoch,
+      processingEpoch: gap.processingEpoch,
+      sha256: gap.sha256,
+    });
+    const codes = [
+      "conversion_failed",
+      "conversion_output_invalid",
+      "page_limit_exceeded",
+      "bundle_too_large",
+      "workbook_invalid",
+      "workbook_encrypted",
+      "workbook_unsupported",
+      "workbook_oversized",
+    ] as const;
+    if (!codes.includes(gap.code as (typeof codes)[number])) fail();
+    return { ...identity, code: gap.code as (typeof codes)[number] };
+  });
+  const key = (item: MetadataFirstIdentity) =>
+    `${item.sourceItemId}\0${item.observationEpoch}\0${item.processingEpoch}\0${item.sha256}`;
+  if (
+    new Set(selected.map(key)).size !== selected.length ||
+    new Set(previewed.map(key)).size !== previewed.length ||
+    new Set(previewGaps.map(key)).size !== previewGaps.length ||
+    previewGaps.some((gap) => previewed.some((item) => key(item) === key(gap)))
+  )
+    fail();
+  const selectionReceipts = row.selectionReceipts.map((value) => {
+    const receipt = object(value);
+    exact(receipt, [
+      "selectorSha256",
+      "reason",
+      "selectedCount",
+      "selectedIdentitySha256",
+    ]);
+    if (
+      receipt.reason !== "active_goal" &&
+      receipt.reason !== "code_acceptance" &&
+      receipt.reason !== "explicit_user_request" &&
+      receipt.reason !== "automatic_policy"
+    )
+      fail();
+    return {
+      selectorSha256: string(receipt.selectorSha256, 64, HEX_64),
+      reason: receipt.reason as
+        | "active_goal"
+        | "code_acceptance"
+        | "explicit_user_request"
+        | "automatic_policy",
+      selectedCount: integer(receipt.selectedCount, 1, MAX_FILES),
+      selectedIdentitySha256: string(
+        receipt.selectedIdentitySha256,
+        64,
+        HEX_64,
+      ),
+    };
+  });
+  return {
+    version: 1,
+    triageStartIndex: integer(row.triageStartIndex, 0, MAX_FILES - 1),
+    refreshReady: boolean(row.refreshReady),
+    selected,
+    previewed,
+    previewGaps,
+    selectionReceipts,
+  };
+}
+
+function metadataFirstDeferred(
+  value: unknown,
+): NonNullable<ProcessingRun["metadataFirstDeferred"]> {
+  const row = object(value);
+  exact(row, [
+    "mode",
+    "inventoryEpoch",
+    "manifestVersion",
+    "files",
+    "missingBindings",
+    "pdfIndex",
+    "archivedPublished",
+    "metadataFirst",
+  ]);
+  if (row.mode !== "normal" && row.mode !== "identity_recovery") fail();
+  const parsedFiles = files(row.files);
+  const pdfIndex = integer(row.pdfIndex, 0, MAX_FILES - 1);
+  if (pdfIndex >= parsedFiles.length) fail();
+  const routing = metadataFirstRouting(row.metadataFirst);
+  if (routing.triageStartIndex >= parsedFiles.length) fail();
+  const identities = new Set(
+    parsedFiles
+      .slice(routing.triageStartIndex)
+      .flatMap((plan) =>
+        "kind" in plan &&
+        plan.kind === "pdf" &&
+        plan.sourceItemId !== undefined &&
+        plan.observationEpoch !== undefined &&
+        plan.processingEpoch !== undefined
+          ? [
+              `${plan.sourceItemId}\0${plan.observationEpoch}\0${plan.processingEpoch}\0${plan.sha256}`,
+            ]
+          : [],
+      ),
+  );
+  const previewedOrGapped = new Set(
+    [...routing.previewed, ...routing.previewGaps].map(
+      (identity) =>
+        `${identity.sourceItemId}\0${identity.observationEpoch}\0${identity.processingEpoch}\0${identity.sha256}`,
+    ),
+  );
+  if (
+    [...routing.selected, ...routing.previewed, ...routing.previewGaps].some(
+      (identity) =>
+        !identities.has(
+          `${identity.sourceItemId}\0${identity.observationEpoch}\0${identity.processingEpoch}\0${identity.sha256}`,
+        ),
+    ) ||
+    [...identities].some((identity) => !previewedOrGapped.has(identity))
+  )
+    fail();
+  return {
+    mode: row.mode,
+    inventoryEpoch: integer(row.inventoryEpoch),
+    manifestVersion: integer(row.manifestVersion),
+    files: parsedFiles,
+    missingBindings: bindings(row.missingBindings),
+    pdfIndex,
+    archivedPublished: integer(row.archivedPublished, 0, MAX_FILES),
+    metadataFirst: routing,
+  };
+}
+
 const scanBaseFields = [
   "version",
   "phase",
@@ -851,6 +1087,7 @@ const processingFields = [
   "published",
   "bindings",
 ] as const;
+const processingOptionalFields = ["metadataFirstDeferred"] as const;
 
 function scanBase(input: Record<string, unknown>): ActiveScan {
   if (input.mode !== "normal" && input.mode !== "identity_recovery") fail();
@@ -861,6 +1098,9 @@ function scanBase(input: Record<string, unknown>): ActiveScan {
     manifestVersion: integer(input.manifestVersion),
     files: files(input.files),
     missingBindings: bindings(input.missingBindings),
+    ...(input.metadataFirstCarry === undefined
+      ? {}
+      : { metadataFirstCarry: metadataFirstRouting(input.metadataFirstCarry) }),
   };
 }
 
@@ -870,6 +1110,13 @@ function processing(input: Record<string, unknown>): ProcessingRun {
     scanned: integer(input.scanned, 0, MAX_FILES),
     published: integer(input.published, 0, MAX_FILES),
     bindings: bindings(input.bindings),
+    ...(input.metadataFirstDeferred === undefined
+      ? {}
+      : {
+          metadataFirstDeferred: metadataFirstDeferred(
+            input.metadataFirstDeferred,
+          ),
+        }),
   };
 }
 
@@ -892,7 +1139,7 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
         "scanned",
         "published",
       ],
-      ["code", "scanId", "assessmentId"],
+      ["code", "scanId", "assessmentId", "metadataFirstCarry"],
     );
     if (
       input.outcome !== "complete" &&
@@ -914,17 +1161,26 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       ...(input.assessmentId === undefined
         ? {}
         : { assessmentId: id(input.assessmentId) }),
+      ...(input.metadataFirstCarry === undefined
+        ? {}
+        : {
+            metadataFirstCarry: metadataFirstRouting(input.metadataFirstCarry),
+          }),
     };
   }
   if (input.phase === "scan_begin") {
-    exact(input, [
-      "version",
-      "phase",
-      "mode",
-      "expectedInventoryEpoch",
-      "files",
-      "missingBindings",
-    ]);
+    exact(
+      input,
+      [
+        "version",
+        "phase",
+        "mode",
+        "expectedInventoryEpoch",
+        "files",
+        "missingBindings",
+      ],
+      ["metadataFirstCarry"],
+    );
     if (input.mode !== "normal" && input.mode !== "identity_recovery") fail();
     return {
       version: 1,
@@ -933,16 +1189,19 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       expectedInventoryEpoch: integer(input.expectedInventoryEpoch),
       files: files(input.files),
       missingBindings: bindings(input.missingBindings),
+      ...(input.metadataFirstCarry === undefined
+        ? {}
+        : {
+            metadataFirstCarry: metadataFirstRouting(input.metadataFirstCarry),
+          }),
     };
   }
   if (input.phase === "inventory") {
-    exact(input, [
-      ...scanBaseFields,
-      "cursor",
-      "pageCount",
-      "itemCount",
-      "identities",
-    ]);
+    exact(
+      input,
+      [...scanBaseFields, "cursor", "pageCount", "itemCount", "identities"],
+      ["metadataFirstCarry"],
+    );
     const base = scanBase(input);
     if (base.mode !== "identity_recovery") fail();
     return {
@@ -956,12 +1215,11 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
     };
   }
   if (input.phase === "append") {
-    exact(input, [
-      ...scanBaseFields,
-      "nextOrdinal",
-      "identities",
-      "reviewSeen",
-    ]);
+    exact(
+      input,
+      [...scanBaseFields, "nextOrdinal", "identities", "reviewSeen"],
+      ["metadataFirstCarry"],
+    );
     return {
       version: 1,
       phase: "append",
@@ -972,7 +1230,11 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
     };
   }
   if (input.phase === "seal_check") {
-    exact(input, [...scanBaseFields, "nextOrdinal", "reviewSeen"]);
+    exact(
+      input,
+      [...scanBaseFields, "nextOrdinal", "reviewSeen"],
+      ["metadataFirstCarry"],
+    );
     return {
       version: 1,
       phase: "seal_check",
@@ -982,7 +1244,11 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
     };
   }
   if (input.phase === "seal") {
-    exact(input, [...scanBaseFields, "nextOrdinal", "reviewSeen", "health"]);
+    exact(
+      input,
+      [...scanBaseFields, "nextOrdinal", "reviewSeen", "health"],
+      ["metadataFirstCarry"],
+    );
     const health = object(input.health);
     if (health.status === "healthy") exact(health, ["status"]);
     else if (health.status === "failed") {
@@ -1002,7 +1268,11 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
     };
   }
   if (input.phase === "reconcile") {
-    exact(input, [...scanBaseFields, "ordinal", "reviewSeen"]);
+    exact(
+      input,
+      [...scanBaseFields, "ordinal", "reviewSeen"],
+      ["metadataFirstCarry"],
+    );
     return {
       version: 1,
       phase: "reconcile",
@@ -1012,7 +1282,11 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
     };
   }
   if (input.phase === "discovery_reserve") {
-    exact(input, [...scanBaseFields, "round"], ["archivedPublished"]);
+    exact(
+      input,
+      [...scanBaseFields, "round"],
+      ["archivedPublished", "metadataFirstCarry"],
+    );
     return {
       version: 1,
       phase: "discovery_reserve",
@@ -1052,10 +1326,12 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
         "stagePhase",
         "stageOrdinal",
         "priorityReceipt",
+        "metadataFirst",
         "providerV2Transition",
       ],
     );
     const steps: ArchivedStep[] = [
+      "preview",
       "intent",
       "preflight",
       "lookup_original",
@@ -1074,6 +1350,7 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       "parsed_seal",
       "parsed_activate",
       "cleanup",
+      "deferred_idle",
     ];
     if (!steps.includes(input.step as ArchivedStep)) fail();
     const result: Extract<RunnerCheckpoint, { phase: "archived" }> = {
@@ -1175,6 +1452,9 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       ...(input.priorityReceipt === undefined
         ? {}
         : { priorityReceipt: priorityReceipt(input.priorityReceipt) }),
+      ...(input.metadataFirst === undefined
+        ? {}
+        : { metadataFirst: metadataFirstRouting(input.metadataFirst) }),
       ...(input.providerV2Transition === undefined
         ? {}
         : {
@@ -1211,8 +1491,10 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       result.expectedProcessingRevision,
     ].filter((value) => value !== undefined).length;
     if (
-      (result.step === "intent" && catalogFieldCount !== 0) ||
-      (result.step !== "intent" && catalogFieldCount !== 4)
+      (["preview", "intent", "deferred_idle"].includes(result.step) &&
+        catalogFieldCount !== 0) ||
+      (!["preview", "intent", "deferred_idle"].includes(result.step) &&
+        catalogFieldCount !== 4)
     )
       fail();
     if (
@@ -1230,13 +1512,83 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
       (result.preflightAction !== undefined)
     )
       fail();
+    if (
+      (result.step === "preview" || result.step === "deferred_idle") &&
+      result.metadataFirst === undefined
+    )
+      fail();
+    if (result.metadataFirst) {
+      const routing = result.metadataFirst;
+      if (routing.triageStartIndex >= result.files.length) fail();
+      const identities = new Map<string, number>();
+      for (
+        let index = routing.triageStartIndex;
+        index < result.files.length;
+        index += 1
+      ) {
+        const plan = result.files[index];
+        if (
+          !plan ||
+          !("kind" in plan) ||
+          plan.kind !== "pdf" ||
+          plan.sourceItemId === undefined ||
+          plan.observationEpoch === undefined ||
+          plan.processingEpoch === undefined
+        )
+          continue;
+        identities.set(
+          `${plan.sourceItemId}\0${plan.observationEpoch}\0${plan.processingEpoch}\0${plan.sha256}`,
+          index,
+        );
+      }
+      const selectedKeys = routing.selected.map(
+        (identity) =>
+          `${identity.sourceItemId}\0${identity.observationEpoch}\0${identity.processingEpoch}\0${identity.sha256}`,
+      );
+      const previewedKeys = routing.previewed.map(
+        (identity) =>
+          `${identity.sourceItemId}\0${identity.observationEpoch}\0${identity.processingEpoch}\0${identity.sha256}`,
+      );
+      const gapKeys = routing.previewGaps.map(
+        (identity) =>
+          `${identity.sourceItemId}\0${identity.observationEpoch}\0${identity.processingEpoch}\0${identity.sha256}`,
+      );
+      if (
+        selectedKeys.some((key) => !identities.has(key)) ||
+        previewedKeys.some((key) => !identities.has(key)) ||
+        gapKeys.some((key) => !identities.has(key))
+      )
+        fail();
+      if (result.step === "preview") {
+        const plan = result.files[result.pdfIndex];
+        if (
+          !plan ||
+          !("kind" in plan) ||
+          plan.kind !== "pdf" ||
+          plan.sourceItemId === undefined ||
+          plan.observationEpoch === undefined ||
+          plan.processingEpoch === undefined ||
+          previewedKeys.includes(
+            `${plan.sourceItemId}\0${plan.observationEpoch}\0${plan.processingEpoch}\0${plan.sha256}`,
+          )
+        )
+          fail();
+      }
+      if (
+        result.step === "deferred_idle" &&
+        [...identities.keys()].some(
+          (key) => !previewedKeys.includes(key) && !gapKeys.includes(key),
+        )
+      )
+        fail();
+    }
     return result;
   }
   if (input.phase === "discovery_admit") {
     exact(
       input,
       [...scanBaseFields, "round", "targets", "index"],
-      ["archivedPublished"],
+      ["archivedPublished", "metadataFirstCarry"],
     );
     const targets = discoveryLeases(input.targets);
     const index = integer(input.index, 0, targets.length);
@@ -1255,7 +1607,7 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
     };
   }
   if (input.phase === "jobs_reserve") {
-    exact(input, [...processingFields, "round"]);
+    exact(input, [...processingFields, "round"], processingOptionalFields);
     return {
       version: 1,
       phase: "jobs_reserve",
@@ -1268,7 +1620,11 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
     input.phase === "jobs_stage" ||
     input.phase === "jobs_activate"
   ) {
-    exact(input, [...processingFields, "round", "jobs", "index"]);
+    exact(
+      input,
+      [...processingFields, "round", "jobs", "index"],
+      processingOptionalFields,
+    );
     const jobs = jobLeases(input.jobs);
     return {
       version: 1,
@@ -1280,13 +1636,11 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
     };
   }
   if (input.phase === "jobs_fail") {
-    exact(input, [
-      ...processingFields,
-      "round",
-      "jobs",
-      "index",
-      "failureCode",
-    ]);
+    exact(
+      input,
+      [...processingFields, "round", "jobs", "index", "failureCode"],
+      processingOptionalFields,
+    );
     if (input.failureCode !== "staging_invalid") fail();
     const jobs = jobLeases(input.jobs);
     return {
@@ -1300,15 +1654,19 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
     };
   }
   if (input.phase === "assess_status") {
-    exact(input, processingFields);
+    exact(input, processingFields, processingOptionalFields);
     return { version: 1, phase: "assess_status", ...processing(input) };
   }
   if (input.phase === "assess_begin") {
-    exact(input, [
-      ...processingFields,
-      "expectedInventoryEpoch",
-      "expectedManifestVersion",
-    ]);
+    exact(
+      input,
+      [
+        ...processingFields,
+        "expectedInventoryEpoch",
+        "expectedManifestVersion",
+      ],
+      processingOptionalFields,
+    );
     return {
       version: 1,
       phase: "assess_begin",
@@ -1318,7 +1676,11 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
     };
   }
   if (input.phase === "assess_page") {
-    exact(input, [...processingFields, "assessmentId", "ordinal", "pageCount"]);
+    exact(
+      input,
+      [...processingFields, "assessmentId", "ordinal", "pageCount"],
+      processingOptionalFields,
+    );
     return {
       version: 1,
       phase: "assess_page",

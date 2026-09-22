@@ -128,6 +128,9 @@ export type DocumentPreviewResult = {
   sourceUnitCount: number;
   inspectedOriginalUnits: number[];
   unitStates: Array<"text_available" | "image_only" | "unknown">;
+  /** Bounded native text used only for provisional classification. */
+  unitTexts: string[];
+  unitTextTruncated: boolean[];
   method: "pdf_native_text_v1" | "spreadsheet_manifest_v1";
   methodFingerprint: string;
 };
@@ -3402,7 +3405,7 @@ function previewInteger(value: unknown, maximum: number): number {
   return value as number;
 }
 
-function validateDocumentPreviewResult(
+export function validateDocumentPreviewResult(
   value: Record<string, unknown>,
   input: Pick<
     RunDocumentPreviewInput,
@@ -3438,9 +3441,13 @@ function validateDocumentPreviewResult(
     )
       fail("output_invalid", "PDF preview shape is invalid");
     const pageCount = previewInteger(value.pageCount, Number.MAX_SAFE_INTEGER);
-    const requested = input.windows.flatMap(({ startPage, pageCount }) =>
-      Array.from({ length: pageCount }, (_, index) => startPage + index),
-    );
+    if (input.windows.some(({ startPage }) => startPage > pageCount))
+      fail("output_invalid", "PDF preview window starts past the source");
+    const requested = input.windows
+      .flatMap(({ startPage, pageCount }) =>
+        Array.from({ length: pageCount }, (_, index) => startPage + index),
+      )
+      .filter((page) => page <= pageCount);
     const inspected = value.inspectedPageNumbers.map((item) =>
       previewInteger(item, pageCount),
     );
@@ -3448,6 +3455,8 @@ function validateDocumentPreviewResult(
       fail("output_invalid", "PDF preview units do not match the request");
     let textCharacters = 0;
     let textBytes = 0;
+    const unitTexts: string[] = [];
+    const unitTextTruncated: boolean[] = [];
     const unitStates = value.units.map((item, index) => {
       if (!item || typeof item !== "object" || Array.isArray(item))
         fail("output_invalid", "PDF preview unit is invalid");
@@ -3467,6 +3476,8 @@ function validateDocumentPreviewResult(
         fail("output_invalid", "PDF preview unit is invalid");
       textCharacters += unit.text.length;
       textBytes += Buffer.byteLength(unit.text, "utf8");
+      unitTexts.push(unit.text);
+      unitTextTruncated.push(unit.textTruncated);
       return unit.state;
     });
     if (textCharacters > 768 || textBytes > 4 * 1024)
@@ -3477,6 +3488,8 @@ function validateDocumentPreviewResult(
       sourceUnitCount: pageCount,
       inspectedOriginalUnits: inspected,
       unitStates,
+      unitTexts,
+      unitTextTruncated,
       method: "pdf_native_text_v1",
       methodFingerprint: previewMethod(value.method, "pdf_native_text_v1"),
     };
@@ -3523,6 +3536,8 @@ function validateDocumentPreviewResult(
       (_, index) => index + 1,
     ),
     unitStates: [],
+    unitTexts: [],
+    unitTextTruncated: [],
     method: "spreadsheet_manifest_v1",
     methodFingerprint: previewMethod(value.method, "spreadsheet_manifest_v1"),
   };

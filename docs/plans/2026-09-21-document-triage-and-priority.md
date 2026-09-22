@@ -25,9 +25,10 @@ Do not discard originals or erase already indexed content during this change.
 | Targeted ingestion            | Extract pages and fields relevant to the selected goal, preserving original page numbers and evidence.                                                                                                                                                        | Queryable fields with stated coverage. Preview absence is never evidence that a field or document section does not exist. |
 | Full ingestion when warranted | Convert and index the document when whole-document retrieval, a supported extractor or a user request needs it.                                                                                                                                               | Full declared processing coverage, subject to explicit failures.                                                          |
 
-A first-page preview is a classification aid, not a financial completeness
-proof. A cover letter may precede a return, and a bundle may contain several
-document types. Unknown or image-only previews remain unknown until a bounded
+A bounded opening-two-page preview is a classification aid, not a financial
+completeness proof. The second page allows a return or Schedule K-1 behind a
+cover letter to route immediately. A bundle may contain several document
+types. Unknown or image-only previews remain unknown until a bounded
 escalation supplies evidence. They must not silently disappear from discovery.
 Do not copy guessed dates or monetary values into authoritative facts.
 
@@ -52,6 +53,51 @@ lock and with no pending request. Each server write uses the complete archived
 work identity and a deterministic request ID, so retry after a lost response is
 idempotent. The command leaves the checkpoint byte-for-byte unchanged and does
 not persist native text or workbook names.
+
+Automatic two-pass routing uses the same preview store and archived discovery
+work. A locked adoption command binds a private deep-selection manifest to
+exact remaining source, observation, processing and content identities. The
+manifest may select no items when automatic policy should route the remaining
+inventory. The active item finishes unchanged. Selected priority items each receive their
+bounded preview and then enter the existing deep pipeline immediately, in
+queue order. Once selected work is exhausted, the worker previews the
+unselected suffix without capturing, archiving or parsing it deeply.
+
+Before reporting the deferred result, the worker drains ordinary UTF-8
+discovery, pending processing jobs and assessment for the same sealed scan.
+One deferred binary therefore cannot starve other publishable work. A preview
+refusal caused by one document is retained as a typed gap for that exact
+revision and the worker advances; executable, sandbox and resource failures
+still fail the run.
+
+The worker retains that suffix in an archived `metadata_only_deferred`
+checkpoint instead of claiming a complete pass or discarding the queue. A
+later locked selection may promote an unchanged identity already recorded in
+the checkpoint's previewed set. Promotion reuses its preview and enters deep
+work without a rescan, file reorder or repeated preview. After reporting that
+deferred result once, the next watch pass opens a normal scan while carrying
+only exact selected and previewed revision identities. Reconcile keeps carry
+entries whose source item, observation epoch, processing epoch and content hash
+still match the sealed inventory. New and changed binaries receive previews;
+unchanged binaries reuse their recorded preview status. This keeps new files
+discoverable without turning deferred work into success or losing later
+promotion. Existing active checkpoints keep their prior behavior until the
+supported adoption command records the routing policy. Fresh scan cycles carry
+an explicit metadata-first marker. Its absence on an older serialized scan
+preserves the legacy deep intent path.
+
+The first automatic policy is deliberately narrow. A strong Form 1040, income
+tax return or Schedule K-1 heading adds that exact revision to the selected
+FIFO immediately after its own preview. Folder names and incidental form
+mentions do not select deep work. A Morgan Stanley bulk trade history needs a
+positive history or all-trades heading and remains metadata-only with generic
+provisional metadata. Individual trade confirmations also remain metadata-only
+and keep an accurate generic title. Account and portfolio statements, holdings
+or positions reports, annual Form 1099 material and tax-reporting summaries are
+never classified as low-value trade histories from those words alone. An
+explicit exact-identity selection can promote any still-current deferred item.
+The automatic policy records its version digest and selected identity digest in
+the journal; native preview text and private paths are not persisted.
 
 Preview execution reuses the existing parser sandbox boundary but grants no
 model-asset access and does not run Docling or OCR. A separate locked adoption
