@@ -347,6 +347,13 @@ function resolvePeriod(lines) {
   return null;
 }
 
+function statementPeriodLocator(lines, kind, textMeta) {
+  const line = lines.find(({ text }) => PERIOD_LINE.test(text));
+  return line === undefined
+    ? null
+    : lineSpanLocator(line, kind, "statement period", textMeta);
+}
+
 /** "(as of 03/31/26)" -> "2026-03-31". Two-digit years on this layout are
  * always 20xx: the provider retains seven years, so 19xx cannot occur. */
 function resolveAsOf(text) {
@@ -367,6 +374,63 @@ const BALANCE_ROWS = {
 };
 /** How far past the anchor the block's rows can run before the next section. */
 const BALANCE_BLOCK_LINES = 40;
+const BALANCE_SCOPE_BOUNDARY =
+  /^\s*(?:HOLDINGS|ACTIVITY|Account Summary|CASH MANAGEMENT ACTIVITY)\b/i;
+
+/**
+ * Bound a balance block before looking for its rows. The former fixed-size
+ * window remains the maximum, but it may no longer borrow a date or TOTAL
+ * VALUE row from a following account, page, balance block, or section.
+ * Account and section markers are also positive end evidence. A physical
+ * page change clips parsing but is not by itself proof that the section was
+ * complete.
+ */
+function balanceSheetWindow(lines, anchorIndex, kind, textMeta) {
+  const anchorPage = lines[anchorIndex].page;
+  const maximum = Math.min(lines.length, anchorIndex + BALANCE_BLOCK_LINES);
+  for (let i = anchorIndex + 1; i < maximum; i += 1) {
+    const line = lines[i];
+    if (line.page !== anchorPage) {
+      return {
+        endExclusive: i,
+        scopeEnd: null,
+      };
+    }
+    const isAccount = BARE_ACCOUNT_LINE.test(line.text);
+    const isBalance = BALANCE_SHEET_ANCHOR.test(line.text);
+    const isSection = BALANCE_SCOPE_BOUNDARY.test(line.text);
+    if (!isAccount && !isBalance && !isSection) continue;
+    return {
+      endExclusive: i,
+      scopeEnd: {
+        lineIndex: i,
+        locator: lineSpanLocator(
+          line,
+          kind,
+          isAccount
+            ? "next account boundary"
+            : isBalance
+              ? "next balance sheet boundary"
+              : "balance section boundary",
+          textMeta,
+        ),
+      },
+    };
+  }
+  return { endExclusive: maximum, scopeEnd: null };
+}
+
+function balanceEvidenceHasAnchoredPages(
+  evidence,
+  printedByPage,
+  populatedPages,
+) {
+  return Object.values(evidence)
+    .filter((entry) => entry !== undefined)
+    .every((entry) =>
+      printedPageSequenceIsAnchored(entry.index, printedByPage, populatedPages),
+    );
+}
 
 /**
  * The per-account BALANCE SHEET: two columns, "Last Period (as of ...)" and
@@ -385,16 +449,19 @@ function parseBalanceSheet(
   accountKey,
   markerLines,
   textMeta,
+  printedByPage,
+  populatedPages,
 ) {
-  const block = lines.slice(anchorIndex, anchorIndex + BALANCE_BLOCK_LINES);
+  const window = balanceSheetWindow(lines, anchorIndex, kind, textMeta);
+  const block = lines.slice(anchorIndex, window.endExclusive);
   const headerLine = block.find(
     ({ text }) => (text.match(AS_OF_HEADER) ?? []).length > 0,
   );
-  if (headerLine === undefined) return null;
+  if (headerLine === undefined) return { sheet: null, balanceScope: null };
   const asOfCells = splitCells(headerLine.text).filter((cell) =>
     AS_OF_HEADER.test(cell.text),
   );
-  if (asOfCells.length !== 2) return null;
+  if (asOfCells.length !== 2) return { sheet: null, balanceScope: null };
   // Printed left to right: last period, then this period.
   const columns = [
     { name: "lastPeriod", ...asOfCells[0] },
@@ -402,18 +469,21 @@ function parseBalanceSheet(
   ];
   const page = headerLine.page;
   const rows = {};
-  for (const { text, start: lineStart } of block) {
+  const rowCounts = {};
+  for (const [blockIndex, { text, start: lineStart }] of block.entries()) {
     for (const [name, pattern] of Object.entries(BALANCE_ROWS)) {
-      if (rows[name] !== undefined) continue;
       const trimmed = text.trim();
       if (!pattern.test(trimmed)) continue;
+      rowCounts[name] = (rowCounts[name] ?? 0) + 1;
+      if (rows[name] !== undefined) continue;
       rows[name] = {
         bound: bindRow(text, columns, BALANCE_SHEET_EDGE_TOLERANCE).bound,
         lineStart,
+        lineIndex: anchorIndex + blockIndex,
       };
     }
   }
-  if (rows.totalValue === undefined) return null;
+  if (rows.totalValue === undefined) return { sheet: null, balanceScope: null };
 
   // F1-53. `span` is null exactly when there is no cell to cite (row or
   // column not printed); `resolveStatementMoney` failing to read a cell that
@@ -457,6 +527,15 @@ function parseBalanceSheet(
   );
   const cash = read(rows.cash, "thisPeriod", "BALANCE SHEET / Cash");
   const asOf = resolveAsOf(columns[1].text);
+  const asOfLocator = spanLocator(
+    kind,
+    headerLine.page,
+    "BALANCE SHEET / This Period as of",
+    textMeta,
+    headerLine.start + columns[1].start,
+    headerLine.start + columns[1].end,
+    columns[1].text,
+  );
   const rowLocator = locator(kind, page, "BALANCE SHEET / TOTAL VALUE");
   const accountLocator = accountSpanLocator(
     lines,
@@ -465,6 +544,40 @@ function parseBalanceSheet(
     kind,
     textMeta,
   );
+  const headerLocator = lineSpanLocator(
+    lines[anchorIndex],
+    kind,
+    "BALANCE SHEET header",
+    textMeta,
+  );
+  const totalRowLocator = lineSpanLocator(
+    lines[rows.totalValue.lineIndex],
+    kind,
+    "BALANCE SHEET / TOTAL VALUE row",
+    textMeta,
+  );
+  // TOTAL VALUE is the provider's terminal balance row. Proving it terminal
+  // still requires scanning the rest of this physical account section: a
+  // later TOTAL VALUE or BALANCE SHEET must not disappear merely because row
+  // parsing retains its historical fixed-size window.
+  let laterTotalRows = 0;
+  for (let i = rows.totalValue.lineIndex + 1; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (
+      line.page !== page ||
+      BARE_ACCOUNT_LINE.test(line.text) ||
+      BALANCE_SHEET_ANCHOR.test(line.text) ||
+      BALANCE_SCOPE_BOUNDARY.test(line.text)
+    ) {
+      break;
+    }
+    if (BALANCE_ROWS.totalValue.test(line.text.trim())) laterTotalRows += 1;
+  }
+  const totalRowCount = (rowCounts.totalValue ?? 0) + laterTotalRows;
+  const scopeEnd =
+    total.value !== null && totalRowCount === 1
+      ? { lineIndex: rows.totalValue.lineIndex, locator: totalRowLocator }
+      : window.scopeEnd;
 
   const balance = {
     sourceDocument: "statement",
@@ -518,7 +631,37 @@ function parseBalanceSheet(
       },
     });
   }
-  return { balance, liabilities };
+  let balanceScope = null;
+  if (accountKey !== null && accountLocator !== null && asOf !== null) {
+    const evidence = {
+      account: accountLocator,
+      header: headerLocator,
+      asOf: asOfLocator,
+      row: totalRowLocator,
+      ...(total.locator === null ? {} : { totalValue: total.locator }),
+      ...(scopeEnd === null ? {} : { scopeEnd: scopeEnd.locator }),
+    };
+    const gapCodes = new Set();
+    if (total.value === null) gapCodes.add("missing_total_value");
+    if (totalRowCount !== 1) gapCodes.add("multiple_balance_rows");
+    if (scopeEnd === null) gapCodes.add("unbounded_account_scope");
+    if (
+      !balanceEvidenceHasAnchoredPages(evidence, printedByPage, populatedPages)
+    ) {
+      gapCodes.add("page_sequence_gap");
+    }
+    balanceScope = {
+      sourceDocument: "statement",
+      accountExternalKey: accountKey,
+      asOf,
+      proofVersion: "balance_scope_v1",
+      status: gapCodes.size === 0 ? "complete" : "partial",
+      emittedBalanceCount: 1,
+      gapCodes: [...gapCodes].sort(),
+      evidence,
+    };
+  }
+  return { sheet: { balance, liabilities }, balanceScope };
 }
 
 /**
@@ -533,6 +676,50 @@ function parseBalanceSheet(
  */
 const TOTAL_VALUE_BANNER = /TOTAL VALUE OF\s+\S+\s+ACCOUNT\b/;
 
+function balanceBannerScopeEnd(
+  lines,
+  rowIndex,
+  kind,
+  textMeta,
+  printedByPage,
+  populatedPages,
+) {
+  const page = lines[rowIndex].page;
+  const maximum = Math.min(lines.length, rowIndex + BALANCE_BLOCK_LINES);
+  for (let i = rowIndex + 1; i < maximum; i += 1) {
+    const line = lines[i];
+    if (line.page !== page) return null;
+    const isAccount = BARE_ACCOUNT_LINE.test(line.text);
+    const isBalance = BALANCE_SHEET_ANCHOR.test(line.text);
+    const isSection = BALANCE_SCOPE_BOUNDARY.test(line.text);
+    if (!isAccount && !isBalance && !isSection) continue;
+    return {
+      lineIndex: i,
+      locator: lineSpanLocator(
+        line,
+        kind,
+        isAccount
+          ? "next account boundary"
+          : isBalance
+            ? "next balance sheet boundary"
+            : "balance section boundary",
+        textMeta,
+      ),
+    };
+  }
+  if (maximum !== lines.length) return null;
+  const finalEvidence = finalPageEvidence(
+    lines,
+    kind,
+    textMeta,
+    printedByPage,
+    populatedPages,
+  );
+  return finalEvidence !== null && finalEvidence.lineIndex >= rowIndex
+    ? finalEvidence
+    : null;
+}
+
 /**
  * `{ balance }` when the banner states an amount, `{ statedNone: true }` when
  * it states the em dash this layout prints for "none" (an account holding
@@ -546,29 +733,29 @@ function parseTotalValueBanner(
   accountKeys,
   markerLines,
   textMeta,
+  periodLocator,
+  printedByPage,
+  populatedPages,
 ) {
   const anchor = lines.findIndex(({ text }) => TOTAL_VALUE_BANNER.test(text));
   if (anchor === -1) return null;
-  for (const line of lines.slice(anchor + 1, anchor + 3)) {
+  const anchorPage = lines[anchor].page;
+  const accountKey = accountKeys[anchor];
+  for (let rowIndex = anchor + 1; rowIndex < anchor + 3; rowIndex += 1) {
+    const line = lines[rowIndex];
+    if (line === undefined) break;
+    if (
+      line.page !== anchorPage ||
+      accountKeys[rowIndex] !== accountKey ||
+      BARE_ACCOUNT_LINE.test(line.text) ||
+      BALANCE_SHEET_ANCHOR.test(line.text) ||
+      BALANCE_SCOPE_BOUNDARY.test(line.text)
+    ) {
+      break;
+    }
     const cells = splitCells(line.text);
     if (cells.length !== 1) continue;
     const cell = cells[0];
-    if (NO_VALUE.has(cell.text)) {
-      return {
-        statedNone: true,
-        locator: spanLocator(
-          kind,
-          line.page,
-          "TOTAL VALUE OF ACCOUNT / explicit none",
-          textMeta,
-          line.start + cell.start,
-          line.start + cell.end,
-          cell.text,
-        ),
-      };
-    }
-    const { value } = resolveStatementMoney(cell.text);
-    if (value === null) continue;
     const accountLocator = accountSpanLocator(
       lines,
       markerLines,
@@ -576,6 +763,81 @@ function parseTotalValueBanner(
       kind,
       textMeta,
     );
+    const scopeEnd = balanceBannerScopeEnd(
+      lines,
+      rowIndex,
+      kind,
+      textMeta,
+      printedByPage,
+      populatedPages,
+    );
+    const scopeFor = ({ count, amountLocator, explicitNone = null }) => {
+      if (accountKey === null || accountLocator === null) return null;
+      const evidence = {
+        account: accountLocator,
+        header: lineSpanLocator(
+          lines[anchor],
+          kind,
+          "TOTAL VALUE OF ACCOUNT header",
+          textMeta,
+        ),
+        ...(periodLocator === null ? {} : { asOf: periodLocator }),
+        row: lineSpanLocator(
+          line,
+          kind,
+          "TOTAL VALUE OF ACCOUNT row",
+          textMeta,
+        ),
+        ...(amountLocator === null ? {} : { totalValue: amountLocator }),
+        ...(explicitNone === null ? {} : { explicitNone }),
+        ...(scopeEnd === null ? {} : { scopeEnd: scopeEnd.locator }),
+      };
+      const gapCodes = new Set();
+      if (periodLocator === null) gapCodes.add("unsupported_balance_header");
+      if (scopeEnd === null) gapCodes.add("unbounded_account_scope");
+      if (
+        !balanceEvidenceHasAnchoredPages(
+          evidence,
+          printedByPage,
+          populatedPages,
+        )
+      ) {
+        gapCodes.add("page_sequence_gap");
+      }
+      return {
+        sourceDocument: "statement",
+        accountExternalKey: accountKey,
+        asOf,
+        proofVersion: "balance_scope_v1",
+        status: gapCodes.size === 0 ? "complete" : "partial",
+        emittedBalanceCount: count,
+        gapCodes: [...gapCodes].sort(),
+        ...(count === 0 ? { zeroBasis: "source_stated_none" } : {}),
+        evidence,
+      };
+    };
+    if (NO_VALUE.has(cell.text)) {
+      const explicitNone = spanLocator(
+        kind,
+        line.page,
+        "TOTAL VALUE OF ACCOUNT / explicit none",
+        textMeta,
+        line.start + cell.start,
+        line.start + cell.end,
+        cell.text,
+      );
+      return {
+        statedNone: true,
+        locator: explicitNone,
+        balanceScope: scopeFor({
+          count: 0,
+          amountLocator: null,
+          explicitNone,
+        }),
+      };
+    }
+    const { value } = resolveStatementMoney(cell.text);
+    if (value === null) continue;
     const amountLocator = spanLocator(
       kind,
       line.page,
@@ -604,6 +866,7 @@ function parseTotalValueBanner(
           ...(accountLocator === null ? {} : { account: accountLocator }),
         },
       },
+      balanceScope: scopeFor({ count: 1, amountLocator }),
     };
   }
   return null;
@@ -668,6 +931,7 @@ function observedHoldingsHeader(text) {
 const TOTAL_ROW = /^Total\b/;
 /** Ends a holdings table. */
 const TABLE_END = /^(TOTAL|Total Value|HOLDINGS|CASH FLOW|ACTIVITY|Page \d)/;
+const ACTIVITY_SECTION = /^ACTIVITY\b/;
 /**
  * F1-61. The page footer, the one `TABLE_END` that does not end the table:
  * a security's lots run past the bottom of a page and the rest of them,
@@ -1634,6 +1898,49 @@ function parseHoldings(
   // with the carried block, so a continuation cannot look like two complete
   // tables and a missing successor cannot look complete at all.
   let carried = null;
+  const activityBoundaryAfterCarried = (pending) => {
+    if (pending.footerPage !== pending.page + 1) return null;
+    if (
+      !printedPageRunContinuesThrough(
+        pending.page,
+        pending.footerPage,
+        printedByPage,
+        populatedPages,
+      )
+    ) {
+      return null;
+    }
+    for (let i = pending.footerIndex + 1; i < lines.length; i += 1) {
+      const line = lines[i];
+      if (line.page !== pending.footerPage) return null;
+      const trimmed = line.text.trim();
+      if (ACTIVITY_SECTION.test(trimmed)) {
+        if (accountKeys[i] !== pending.context.accountKey) return null;
+        return {
+          lineIndex: i,
+          locator: lineSpanLocator(
+            line,
+            kind,
+            "activity section boundary",
+            textMeta,
+          ),
+        };
+      }
+      // Only the provider's repeated page/account furniture may intervene.
+      // Any source content or a new table keeps the carry unresolved.
+      if (
+        PAGE_FOOTER.test(trimmed) ||
+        /^CLIENT STATEMENT\b/.test(trimmed) ||
+        BARE_ACCOUNT_LINE.test(line.text) ||
+        (markerLines[i] === i - 1 &&
+          /^Account\s+[A-Za-z][A-Za-z .,&'-]*$/.test(trimmed))
+      ) {
+        continue;
+      }
+      return null;
+    }
+    return null;
+  };
   const flushCarried = (
     nextAccountKey = null,
     nextMarker = null,
@@ -1645,6 +1952,9 @@ function parseHoldings(
         ...carried.context,
         allowLotAggregation: false,
       }).position !== null;
+    const activityBoundary = independentlyComplete
+      ? activityBoundaryAfterCarried(carried)
+      : null;
     if (nextMarker !== null && nextAccountKey !== carried.context.accountKey) {
       carried.table.end = lineSpanLocator(
         lines[nextMarker],
@@ -1689,6 +1999,9 @@ function parseHoldings(
       } else {
         carried.table.gapCodes.add("page_sequence_gap");
       }
+    } else if (activityBoundary !== null) {
+      carried.table.end = activityBoundary.locator;
+      carried.table.lastLineIndex = activityBoundary.lineIndex;
     } else if (
       carried.finalPageFooter &&
       !lines.some(
@@ -1801,6 +2114,8 @@ function parseHoldings(
     let interruptedByPageFooter = false;
     let finalPageFooter = false;
     let terminalIndex = null;
+    let summaryBoundaryIndex = null;
+    let summaryHasUnresolvedSecurity = false;
     for (let j = i + 1; j < lines.length; j += 1) {
       const text = lines[j].text;
       const trimmed = text.trim();
@@ -1813,6 +2128,7 @@ function parseHoldings(
       if (SECTION_SUMMARY.test(trimmed)) {
         flush();
         inSummary = true;
+        summaryBoundaryIndex = j;
         i = j;
         table.lastLineIndex = j;
         continue;
@@ -1825,12 +2141,20 @@ function parseHoldings(
         bound.has("tradeDate") &&
         (!inSummary || TRADE_DATE_CELL.test(bound.get("tradeDate").text));
       if (inSummary && !startsSecurity) {
+        if (
+          bound.has("tradeDate") &&
+          TRADE_DATE_CELL.test(bound.get("tradeDate").text)
+        ) {
+          summaryHasUnresolvedSecurity = true;
+          table.gapCodes.add("missing_security_start");
+        }
         i = j;
         table.lastLineIndex = j;
         continue;
       }
       if (startsSecurity) {
         inSummary = false;
+        summaryBoundaryIndex = null;
         flush();
         description = bound.get("description").text;
       }
@@ -1842,6 +2166,20 @@ function parseHoldings(
       });
       i = j;
       table.lastLineIndex = j;
+    }
+    if (
+      interruptedByPageFooter &&
+      inSummary &&
+      block.length === 0 &&
+      summaryBoundaryIndex !== null &&
+      !summaryHasUnresolvedSecurity
+    ) {
+      // The provider's own Percentage/of Holdings summary positively closes
+      // the preceding security table. A leading Page line on the following
+      // page is therefore furniture after a closed table, not an interrupted
+      // empty security block waiting for a new header.
+      interruptedByPageFooter = false;
+      terminalIndex = summaryBoundaryIndex;
     }
     if (terminalIndex !== null) table.lastLineIndex = terminalIndex;
     if (interruptedByPageFooter) {
@@ -1956,6 +2294,9 @@ export function parseRealStatement(text, kind) {
   // string the archive retains at `documents.text_path`, and carried onto
   // every evidence span this parse produces.
   const textMeta = textMetaOf(text);
+  const periodLocator = statementPeriodLocator(lines, kind, textMeta);
+  const printedByPage = printedPages(lines);
+  const populatedPages = new Set(lines.map(({ page }) => page));
 
   const period = resolvePeriod(lines);
   if (period === null) {
@@ -1984,6 +2325,8 @@ export function parseRealStatement(text, kind) {
   // (disclosure text mentioning the phrase, say) has no TOTAL VALUE row
   // nearby and parseBalanceSheet returns null for it, contributing nothing.
   const sheets = [];
+  const observedBalanceScopes = [];
+  const balanceObservationCounts = new Map();
   // F1-8l. A document that names accounts at all, and then prints a BALANCE
   // SHEET section under no account header of its own, is a consolidated
   // statement printing its `Consolidated Summary` roll-up: the household
@@ -2004,20 +2347,44 @@ export function parseRealStatement(text, kind) {
   let unattributedSections = 0;
   lines.forEach(({ text: line }, anchorIndex) => {
     if (!BALANCE_SHEET_ANCHOR.test(line)) return;
-    const sheet = parseBalanceSheet(
+    const accountKey = accountKeys[anchorIndex];
+    if (accountKey !== null) {
+      balanceObservationCounts.set(
+        accountKey,
+        (balanceObservationCounts.get(accountKey) ?? 0) + 1,
+      );
+    }
+    const observed = parseBalanceSheet(
       lines,
       anchorIndex,
       kind,
       accountKeys[anchorIndex],
       markerLines,
       textMeta,
+      printedByPage,
+      populatedPages,
     );
-    if (sheet === null) return;
+    if (observed.balanceScope !== null)
+      observedBalanceScopes.push(observed.balanceScope);
+    if (observed.sheet === null) return;
+    const sheet = observed.sheet;
     if (namesAccounts && sheet.balance.accountExternalKey === undefined) {
       unattributedSections += 1;
       return;
     }
     sheets.push(sheet);
+  });
+  // Banner parsing intentionally reads only the first matching source row.
+  // Count every explicit-account banner independently so a second numeric,
+  // empty, or malformed sibling cannot disappear and leave a unique proof.
+  lines.forEach(({ text: line }, lineIndex) => {
+    if (!TOTAL_VALUE_BANNER.test(line)) return;
+    const accountKey = accountKeys[lineIndex];
+    if (accountKey === null) return;
+    balanceObservationCounts.set(
+      accountKey,
+      (balanceObservationCounts.get(accountKey) ?? 0) + 1,
+    );
   });
   // F1-61. A statement with no BALANCE SHEET block still states its account
   // total on the cover page. The banner is read only here, as the fallback:
@@ -2032,8 +2399,13 @@ export function parseRealStatement(text, kind) {
           accountKeys,
           markerLines,
           textMeta,
+          periodLocator,
+          printedByPage,
+          populatedPages,
         )
       : null;
+  if (banner?.balanceScope !== null && banner?.balanceScope !== undefined)
+    observedBalanceScopes.push(banner.balanceScope);
   if (banner?.balance !== undefined) {
     // The same rule as above: on a statement that does name accounts, a
     // banner printed before the first account header names none this parser
@@ -2055,6 +2427,20 @@ export function parseRealStatement(text, kind) {
     textMeta,
     namesAccounts,
     banner?.statedNone === true ? banner.locator : null,
+  );
+  // More than one emitted section for the same account/date cannot be a
+  // one-row replacement proof. Omit that selector entirely so downstream
+  // correction stays fail-closed rather than picking an arbitrary section.
+  const balanceScopeCounts = new Map();
+  for (const scope of observedBalanceScopes) {
+    const key = `${scope.accountExternalKey}\0${scope.asOf}`;
+    balanceScopeCounts.set(key, (balanceScopeCounts.get(key) ?? 0) + 1);
+  }
+  const balanceScopes = observedBalanceScopes.filter(
+    (scope) =>
+      balanceObservationCounts.get(scope.accountExternalKey) === 1 &&
+      balanceScopeCounts.get(`${scope.accountExternalKey}\0${scope.asOf}`) ===
+        1,
   );
 
   const notes = [];
@@ -2089,6 +2475,7 @@ export function parseRealStatement(text, kind) {
       balances: sheets.map((sheet) => sheet.balance),
       liabilities: sheets.flatMap((sheet) => sheet.liabilities),
       ...(positionScopes.length === 0 ? {} : { positionScopes }),
+      ...(balanceScopes.length === 0 ? {} : { balanceScopes }),
     },
     ...(notes.length > 0
       ? { parseNote: `partially parsed: ${notes.join("; ")}` }
