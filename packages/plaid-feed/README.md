@@ -126,10 +126,20 @@ A currency is recorded as Plaid's `iso_currency_code` when present,
 otherwise its `unofficial_currency_code` (a crypto ticker, or a code longer
 than three letters), trimmed and uppercased; migration `044_plaid_currency.sql`
 relaxed every `currency` CHECK to a bounded length so that value is never
-rejected. A single security or holding row whose own upsert still fails for
-some other reason does not end the item's pull: it is counted in
-`row_failures` and the rest of that item, including its balances and
-transactions, is still written.
+rejected. Every other optional Plaid string (`subtype`, `type`, `name`,
+`merchant_name`, `category`, `official_name`, `mask`, `ticker_symbol`) is
+trimmed and an empty result mapped to `null` before it is written; migration
+`047_plaid_strings.sql` additionally relaxed every bounded-length CHECK on
+these columns to accept an empty string too, after a second real pull failed
+partway through -- after 949 investment-transaction rows had already been
+written -- on a `subtype` value Plaid sent as `""` rather than omitted. A
+single security, holding, transaction or investment-transaction row whose
+own upsert still fails for some other reason does not end the item's pull:
+it is counted in `row_failures` and the rest of that item, including its
+balances and transactions, is still written. A transaction or
+investment-transaction row failure additionally keeps that call's own
+cursor or watermark from advancing past the window it happened in, so a
+retried pull sees the failed row again instead of skipping past it.
 
 Prints one line per item, counts only, never a balance, holding value or
 transaction amount:
@@ -168,7 +178,7 @@ recent activity, but Plaid bounds the two transaction products differently:
   through does not advance the watermark past transactions this pull never
   actually saw.
 
-## Tables (migrations `043_plaid_feed.sql`, `044_plaid_currency.sql`, `045_plaid_history.sql`)
+## Tables (migrations `043_plaid_feed.sql`, `044_plaid_currency.sql`, `045_plaid_history.sql`, `047_plaid_strings.sql`)
 
 `plaid_items`, `plaid_accounts`, `plaid_securities`,
 `plaid_balance_snapshots`, `plaid_holding_snapshots`, `plaid_transactions`,

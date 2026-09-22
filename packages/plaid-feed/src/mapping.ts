@@ -156,6 +156,26 @@ export function mapCurrency(
   return normalized.length > 0 ? normalized : null;
 }
 
+/**
+ * Plaid's optional strings -- subtype, type, name, merchant_name, category,
+ * official_name, mask, ticker_symbol and similar -- sometimes arrive as an
+ * empty string, or some other shape than a string at all, rather than
+ * omitted. Trimmed, with an empty result (after trimming) mapped to `null`,
+ * and anything that is not actually a string degrading to `null` instead of
+ * throwing. Migration `047_plaid_strings.sql` relaxed every bounded-length
+ * CHECK on these columns to accept an empty string too, but there is no
+ * reason to store one when `null` already means "Plaid did not provide
+ * this" -- and normalizing here, not just relaxing the CHECK, is what keeps
+ * a value like `String(undefined)` ("undefined") from ever reaching the
+ * database in the first place (PLAID-2's `type`/`subtype` coercion on
+ * investment transactions did exactly that).
+ */
+export function normalizeOptionalString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 export function mapAccount(
   account: AccountBase | InvestmentAccount,
   itemId: string,
@@ -164,10 +184,10 @@ export function mapAccount(
     accountId: account.account_id,
     itemId,
     name: account.name,
-    officialName: account.official_name,
-    mask: account.mask,
+    officialName: normalizeOptionalString(account.official_name),
+    mask: normalizeOptionalString(account.mask),
     type: String(account.type),
-    subtype: account.subtype === null ? null : String(account.subtype),
+    subtype: normalizeOptionalString(account.subtype),
     currency: mapCurrency(
       account.balances.iso_currency_code,
       account.balances.unofficial_currency_code,
@@ -196,9 +216,9 @@ export function mapBalanceSnapshot(
 export function mapSecurity(security: Security): PlaidSecurityRow {
   return {
     securityId: security.security_id,
-    name: security.name,
-    tickerSymbol: security.ticker_symbol,
-    type: security.type,
+    name: normalizeOptionalString(security.name),
+    tickerSymbol: normalizeOptionalString(security.ticker_symbol),
+    type: normalizeOptionalString(security.type),
     closePrice: security.close_price,
     closePriceAsOf: security.close_price_as_of,
     currency: mapCurrency(security.iso_currency_code, security.unofficial_currency_code),
@@ -232,15 +252,17 @@ export function mapTransaction(
     itemId,
     date: transaction.date,
     authorizedDate: transaction.authorized_date,
-    name: transaction.name,
-    merchantName: transaction.merchant_name ?? null,
+    name: normalizeOptionalString(transaction.name),
+    merchantName: normalizeOptionalString(transaction.merchant_name),
     amount: transaction.amount,
     currency: mapCurrency(
       transaction.iso_currency_code,
       transaction.unofficial_currency_code,
     ),
     pending: transaction.pending,
-    category: transaction.personal_finance_category?.primary ?? null,
+    category: normalizeOptionalString(
+      transaction.personal_finance_category?.primary,
+    ),
     removedAt: null,
     raw: transaction,
   };
@@ -260,13 +282,13 @@ export function mapInvestmentTransaction(
     itemId,
     securityId: transaction.security_id,
     date: transaction.date,
-    name: transaction.name,
+    name: normalizeOptionalString(transaction.name),
     quantity: transaction.quantity,
     price: transaction.price,
     amount: transaction.amount,
     fees: transaction.fees,
-    type: String(transaction.type),
-    subtype: String(transaction.subtype),
+    type: normalizeOptionalString(transaction.type),
+    subtype: normalizeOptionalString(transaction.subtype),
     currency: mapCurrency(
       transaction.iso_currency_code,
       transaction.unofficial_currency_code,
