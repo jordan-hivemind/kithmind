@@ -84,6 +84,11 @@ cleanup. Every agent reads this section before starting.
 | Finish cleanly | Record verification under the policy below. Remove containers and your own scratch files. Tell the owner the PR is ready. The orchestrator removes your worktree and branch at merge. |
 | Do not read the owner's data | No document text, database values or files under the watched folders. Counts, enums and booleans only. Use synthetic fixtures. |
 
+For a stacked change, commit at least one unique task change before opening its
+draft PR. If the branch still equals its dependency, claim the work in the
+task or issue until the first diff exists; GitHub can mark a zero-diff stacked
+PR merged when the dependency lands.
+
 ### Waiting costs tokens
 
 Every model turn re-reads the whole conversation. An agent that checks
