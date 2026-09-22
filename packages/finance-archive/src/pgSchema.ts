@@ -1389,49 +1389,72 @@ IMMUTABLE
 STRICT
 AS $$
   SELECT jsonb_typeof($1) = 'object'
-    AND jsonb_typeof($1->'selectedScopes') = 'array'
-    AND jsonb_array_length($1->'selectedScopes') > 0
-    AND NOT EXISTS (
-      SELECT 1 FROM jsonb_array_elements($1->'selectedScopes') scope
-       WHERE jsonb_typeof(scope) <> 'object'
-          OR (SELECT count(*) FROM jsonb_object_keys(scope)) <> 12
-          OR scope->>'scopeKind' <> 'positions'
-          OR coalesce(scope->>'accountId', '') = ''
-          OR coalesce(scope->>'asOf', '') !~ '^\\d{4}-\\d{2}-\\d{2}$'
-          OR scope->>'proofVersion' <> 'position_scope_v1'
-          OR scope->>'status' <> 'partial'
-          OR coalesce(scope->>'scopeDigest', '') !~ '^[0-9a-f]{64}$'
-          OR jsonb_typeof(scope->'gapCodes') <> 'array'
-          OR jsonb_array_length(scope->'gapCodes') = 0
-          OR EXISTS (
-            SELECT 1 FROM jsonb_array_elements(scope->'gapCodes') gap
-             WHERE jsonb_typeof(gap) <> 'string'
-          )
-          OR jsonb_typeof(scope->'emittedRowCount') <> 'number'
-          OR jsonb_typeof(scope->'sourceOwnedAdditions') <> 'number'
-          OR jsonb_typeof(scope->'carriedSourceOwnedRows') <> 'number'
-          OR jsonb_typeof(scope->'exactForeignReferences') <> 'number'
-          OR jsonb_typeof(scope->'unmatchedPartialMembers') <> 'number'
-          OR (scope->>'emittedRowCount')::numeric < 0
-          OR (scope->>'sourceOwnedAdditions')::numeric < 0
-          OR (scope->>'carriedSourceOwnedRows')::numeric < 0
-          OR (scope->>'exactForeignReferences')::numeric < 0
-          OR (scope->>'unmatchedPartialMembers')::numeric < 0
-          OR (scope->>'emittedRowCount')::numeric % 1 <> 0
-          OR (scope->>'sourceOwnedAdditions')::numeric % 1 <> 0
-          OR (scope->>'carriedSourceOwnedRows')::numeric % 1 <> 0
-          OR (scope->>'exactForeignReferences')::numeric % 1 <> 0
-          OR (scope->>'unmatchedPartialMembers')::numeric % 1 <> 0
-          OR (scope->>'emittedRowCount')::numeric <>
-             (scope->>'sourceOwnedAdditions')::numeric
-             + (scope->>'carriedSourceOwnedRows')::numeric
-             + (scope->>'exactForeignReferences')::numeric
-             + (scope->>'unmatchedPartialMembers')::numeric
-    )
-    AND (
-      SELECT sum((scope->>'sourceOwnedAdditions')::numeric)
-        FROM jsonb_array_elements($1->'selectedScopes') scope
-    ) = ($1->>'selectedRowCount')::numeric
+    AND CASE
+      WHEN jsonb_typeof($1->'selectedScopes') = 'array'
+       AND jsonb_typeof($1->'selectedRowCount') = 'number'
+      THEN jsonb_array_length($1->'selectedScopes') > 0
+       AND NOT EXISTS (
+        SELECT 1 FROM jsonb_array_elements($1->'selectedScopes') scope
+         WHERE (
+          jsonb_typeof(scope) = 'object'
+          AND scope ?& ARRAY[
+            'scopeKind', 'accountId', 'asOf', 'proofVersion', 'status',
+            'emittedRowCount', 'gapCodes', 'scopeDigest',
+            'sourceOwnedAdditions', 'carriedSourceOwnedRows',
+            'exactForeignReferences', 'unmatchedPartialMembers'
+          ]
+          AND (
+            SELECT count(*)
+              FROM jsonb_object_keys(
+                CASE WHEN jsonb_typeof(scope) = 'object'
+                     THEN scope ELSE '{}'::jsonb END)
+          ) = 12
+          AND scope->>'scopeKind' = 'positions'
+          AND coalesce(scope->>'accountId', '') <> ''
+          AND coalesce(scope->>'asOf', '') ~ '^\\d{4}-\\d{2}-\\d{2}$'
+          AND scope->>'proofVersion' = 'position_scope_v1'
+          AND scope->>'status' = 'partial'
+          AND coalesce(scope->>'scopeDigest', '') ~ '^[0-9a-f]{64}$'
+          AND CASE
+            WHEN jsonb_typeof(scope->'gapCodes') = 'array'
+            THEN jsonb_array_length(scope->'gapCodes') > 0
+             AND NOT EXISTS (
+              SELECT 1 FROM jsonb_array_elements(scope->'gapCodes') gap
+               WHERE jsonb_typeof(gap) <> 'string'
+            )
+            ELSE FALSE
+          END
+          AND CASE
+            WHEN jsonb_typeof(scope->'emittedRowCount') = 'number'
+             AND jsonb_typeof(scope->'sourceOwnedAdditions') = 'number'
+             AND jsonb_typeof(scope->'carriedSourceOwnedRows') = 'number'
+             AND jsonb_typeof(scope->'exactForeignReferences') = 'number'
+             AND jsonb_typeof(scope->'unmatchedPartialMembers') = 'number'
+            THEN (scope->>'emittedRowCount')::numeric >= 0
+             AND (scope->>'sourceOwnedAdditions')::numeric >= 0
+             AND (scope->>'carriedSourceOwnedRows')::numeric >= 0
+             AND (scope->>'exactForeignReferences')::numeric >= 0
+             AND (scope->>'unmatchedPartialMembers')::numeric >= 0
+             AND (scope->>'emittedRowCount')::numeric % 1 = 0
+             AND (scope->>'sourceOwnedAdditions')::numeric % 1 = 0
+             AND (scope->>'carriedSourceOwnedRows')::numeric % 1 = 0
+             AND (scope->>'exactForeignReferences')::numeric % 1 = 0
+             AND (scope->>'unmatchedPartialMembers')::numeric % 1 = 0
+             AND (scope->>'emittedRowCount')::numeric =
+                 (scope->>'sourceOwnedAdditions')::numeric
+                 + (scope->>'carriedSourceOwnedRows')::numeric
+                 + (scope->>'exactForeignReferences')::numeric
+                 + (scope->>'unmatchedPartialMembers')::numeric
+            ELSE FALSE
+          END
+        ) IS NOT TRUE
+      )
+       AND (
+        SELECT sum((scope->>'sourceOwnedAdditions')::numeric)
+          FROM jsonb_array_elements($1->'selectedScopes') scope
+      ) = ($1->>'selectedRowCount')::numeric
+      ELSE FALSE
+    END
 $$;
 
 REVOKE ALL ON FUNCTION holding_additive_manifest_has_valid_scopes(JSONB)

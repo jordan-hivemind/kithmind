@@ -1027,13 +1027,67 @@ function selectedRawPosition(
       row.marketValueNote === null ||
       row.marketValueNote.length === 0 ||
       typeof row.valuationNote !== "string" ||
-      row.valuationNote.length === 0)
+      row.valuationNote.length === 0 ||
+      !hasExplicitUnavailableValueEvidence(row))
   ) {
     refuse(
       "a selected addition with no market value lacks source-stated evidence",
     );
   }
   return row;
+}
+
+const EXPLICIT_NO_VALUE_TOKENS = new Set(["—", "–", "-", "N/A", "NA"]);
+
+function boundRawValue(locator: unknown): string | null {
+  if (locator === null || typeof locator !== "object") return null;
+  const binding = (locator as { binding?: unknown }).binding;
+  if (binding === null || typeof binding !== "object") return null;
+  const typed = binding as {
+    format?: unknown;
+    quote?: unknown;
+    rawValue?: unknown;
+  };
+  if (
+    typed.format === "retained_text_span_v1" &&
+    typeof typed.quote === "string"
+  ) {
+    return typed.quote;
+  }
+  if (
+    (typed.format === "json_pointer_v1" ||
+      typed.format === "delimited_row_v1") &&
+    typeof typed.rawValue === "string"
+  ) {
+    return typed.rawValue;
+  }
+  return null;
+}
+
+function hasExplicitUnavailableValueEvidence(row: ImportPosition): boolean {
+  if (row.price !== null) return false;
+  let locators: unknown;
+  try {
+    locators = JSON.parse(row.sourceLocator) as unknown;
+  } catch {
+    return false;
+  }
+  if (locators === null || typeof locators !== "object") return false;
+  const fields = locators as Record<string, unknown>;
+  const priceToken = boundRawValue(fields.price);
+  const marketValueToken = boundRawValue(fields.marketValue);
+  if (
+    priceToken === null ||
+    marketValueToken === null ||
+    !EXPLICIT_NO_VALUE_TOKENS.has(priceToken.trim()) ||
+    !EXPLICIT_NO_VALUE_TOKENS.has(marketValueToken.trim())
+  ) {
+    return false;
+  }
+  return (
+    row.marketValueNote ===
+    `no value stated (${JSON.stringify(marketValueToken.trim())})`
+  );
 }
 
 /**

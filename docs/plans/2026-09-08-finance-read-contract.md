@@ -472,6 +472,10 @@ equal membership reference. A selected row that already exists, has an
 unreadable typed value, or collides with an existing source-owned evidence
 boundary is refused.
 
+A selected row with no market value is eligible only when both its printed
+price and market-value cells bind exact, nonempty source tokens from the closed
+no-value grammar. A parser-failure note or an unbound blank does not qualify.
+
 The new generation records each selected observation with its actual `partial`
 status, gap codes, evidence and complete emitted membership. Unselected parser
 differences remain partial membership evidence and cannot rewrite a reviewed
@@ -508,3 +512,9 @@ retained bytes and uses the ordinary writer lock, document row lock, active
 generation compare-and-swap and one database transaction. A stale approval,
 changed retained bytes, canonical ownership change, selected evidence conflict
 or assertion mismatch leaves the archive unchanged.
+
+The package exports `prepareHoldingPartialPositionScopes` for the preceding
+rollback-only inspection step. An operator diagnostic runs the retained parse
+and mapping inside the same writer-locked savepoint, calls that helper for the
+chosen account/date scopes, and uses its row hashes to prepare the selection
+file. The helper makes no write and does not turn a partial scope complete.

@@ -290,7 +290,7 @@ async function seed(client) {
 }
 
 function unpriced(instrumentId, name, quantity = "5") {
-  const note = `no value stated ("N/A") at ${name}`;
+  const note = 'no value stated ("N/A")';
   return position({
     instrumentId,
     quantity,
@@ -301,7 +301,35 @@ function unpriced(instrumentId, name, quantity = "5") {
     unrealized: null,
     valuationBasis: null,
     valuationNote: note,
-    sourceLocator: locator(name, 9),
+    sourceLocator: JSON.stringify({
+      row: { source: name, index: 9 },
+      price: {
+        source: "synthetic_statement",
+        index: 9,
+        binding: {
+          format: "retained_text_span_v1",
+          textSha256: "7".repeat(64),
+          textByteLength: 100,
+          textCodepointLength: 100,
+          start: 10,
+          end: 13,
+          quote: "N/A",
+        },
+      },
+      marketValue: {
+        source: "synthetic_statement",
+        index: 9,
+        binding: {
+          format: "retained_text_span_v1",
+          textSha256: "7".repeat(64),
+          textByteLength: 100,
+          textCodepointLength: 100,
+          start: 20,
+          end: 23,
+          quote: "N/A",
+        },
+      },
+    }),
   });
 }
 
@@ -358,6 +386,39 @@ test(
         )
       ).valid,
       true,
+    );
+    for (const [missingKey, replacementKey] of [
+      ["status", "unknownStatus"],
+      ["sourceOwnedAdditions", "unknownCount"],
+    ]) {
+      const malformed = structuredClone(prepared.manifest);
+      malformed.selectedScopes[0][replacementKey] =
+        malformed.selectedScopes[0][missingKey];
+      delete malformed.selectedScopes[0][missingKey];
+      assert.equal(
+        (
+          await one(
+            client,
+            "SELECT holding_additive_manifest_has_valid_scopes($1::jsonb) AS valid",
+            [malformed],
+          )
+        ).valid,
+        false,
+      );
+    }
+    const scalarScope = {
+      ...prepared.manifest,
+      selectedScopes: [null],
+    };
+    assert.equal(
+      (
+        await one(
+          client,
+          "SELECT holding_additive_manifest_has_valid_scopes($1::jsonb) AS valid",
+          [scalarScope],
+        )
+      ).valid,
+      false,
     );
     assert.equal(prepared.manifest.rows.changedRows, 0);
     assert.equal(prepared.manifest.rows.removedRows, 0);
@@ -563,10 +624,14 @@ test(
   async (t) => {
     const client = await archive(t);
     const { corrected } = await seed(client);
-    const conflict = {
-      ...unpriced("instrument-unpriced-one", "conflict"),
+    const conflict = position({
+      instrumentId: "instrument-unpriced-one",
+      marketValue: "75",
+      price: "15",
+      costBasis: "50",
+      unrealized: "25",
       sourceLocator: corrected.sourceLocator,
-    };
+    });
     await assert.rejects(
       prepare(client, candidate([conflict]), [rowHash(conflict)]),
       /conflicts with an existing source-owned evidence boundary/,
@@ -579,6 +644,26 @@ test(
       ]),
       1,
     );
+
+    const unsupportedNull = position({
+      instrumentId: "instrument-unpriced-one",
+      price: null,
+      marketValue: null,
+      marketValueNote: "parser could not read the market value",
+      valuationBasis: null,
+      valuationNote: "parser could not read the market value",
+      sourceLocator: locator("unbound-null-value", 4),
+    });
+    await assert.rejects(
+      prepare(
+        client,
+        candidate([unsupportedNull]),
+        [rowHash(unsupportedNull)],
+      ),
+      /lacks source-stated evidence/,
+    );
+    assert.equal(await count(client, "holding_projection_generations"), 0);
+    assert.equal(await count(client, "holding_projection_assertions"), 0);
 
     const addition = unpriced(
       "instrument-unpriced-one",

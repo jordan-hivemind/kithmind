@@ -63,6 +63,9 @@ selection and restart. Publication alone does not prove scheduler acceptance.
 Before a finance repair, inspect both legacy unversioned scope proofs and the
 active generation's versioned proofs. They are immutable and require a new
 generation when corrected source evidence changes their payload or membership.
+Clean disposable proof containers in a `finally` block or shell trap. If an
+interrupted run leaves one behind, label it with the owner PID and mounts so
+the orchestrator can verify and remove only the orphaned container.
 
 ## Parallel lanes
 
