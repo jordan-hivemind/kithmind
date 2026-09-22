@@ -129,7 +129,13 @@ export {
 } from "./pgSchema.js";
 export {
   holdingProjectionApprovalDigest,
+  holdingScopedProjectionApprovalDigest,
+  prepareHoldingScopedPositionCorrection,
   publishHoldingProjectionReplacement,
+  publishHoldingScopedPositionCorrection,
+  type HoldingScopedCorrectionManifest,
+  type HoldingScopedCorrectionSelector,
+  type HoldingScopedProjectionApproval,
   type HoldingProjectionApproval,
   type HoldingProjectionPublication,
 } from "./holdingProjectionPublisher.js";

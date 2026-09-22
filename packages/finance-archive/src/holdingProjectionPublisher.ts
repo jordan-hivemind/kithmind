@@ -4,9 +4,11 @@ import {
   assertCandidateHashesOwnedByDocument,
   type CandidateHoldingProjection,
   type CandidateHoldingRow,
+  type HoldingPositionScopeSelector,
   type HoldingCorrectionCandidateManifest,
   type HoldingProjectionTable,
   holdingProjectionCurrentDigest,
+  prepareHoldingPositionScopes,
   prepareHoldingCorrectionCandidate,
   readStoredHoldingProjection,
   type StoredHoldingProjection,
@@ -15,6 +17,7 @@ import {
 import type { ImportDocument } from "./importer.js";
 import type { PositionChange } from "./positionReconciliation.js";
 import { runPositionReconciliationGate } from "./positionReconciliation.js";
+import { toNumericText } from "./pgNumeric.js";
 import type { CashChange } from "./reconciliation.js";
 import { runReconciliationGate } from "./reconciliation.js";
 import {
@@ -73,6 +76,76 @@ export type HoldingProjectionPublication = {
   };
 };
 
+export type HoldingScopedCorrectionSelector =
+  | (HoldingPositionScopeSelector & { readonly scopeKind: "positions" })
+  | {
+      readonly scopeKind: "balance";
+      readonly accountId: string;
+      readonly asOf: string;
+      readonly proofVersion: "balance_scope_v1";
+    };
+
+export type HoldingScopedCorrectionManifest = {
+  readonly schemaVersion: 1;
+  readonly kind: "holding_scoped_correction_candidate_v1";
+  readonly documentId: string;
+  readonly retainedSha256: string;
+  readonly expectedActiveGenerationId: string | null;
+  readonly oldProjectionDigest: string;
+  readonly candidateProjectionDigest: string;
+  readonly selectedCurrentDigest: string;
+  readonly selectedScopes: readonly {
+    readonly scopeKind: "positions";
+    readonly accountId: string;
+    readonly asOf: string;
+    readonly proofVersion: "position_scope_v1";
+    readonly emittedRowCount: number;
+    readonly scopeDigest: string;
+    readonly sourceOwnedRows: number;
+    readonly foreignReferencedRows: number;
+  }[];
+  readonly rows: Readonly<
+    Record<
+      HoldingProjectionTable,
+      {
+        readonly oldSourceOwnedRows: number;
+        readonly candidateSourceOwnedRows: number;
+        readonly selectedSourceOwnedRemovals: number;
+      }
+    >
+  >;
+  readonly completeness: {
+    readonly state: "complete_selected_scopes";
+    readonly removalsAuthorized: false;
+  };
+  readonly candidateDigest: string;
+};
+
+export type HoldingScopedProjectionApproval = {
+  readonly schemaVersion: 1;
+  readonly kind: "holding_scoped_projection_approval_v1";
+  readonly documentId: string;
+  readonly retainedSha256: string;
+  readonly expectedActiveGenerationId: string | null;
+  readonly oldProjectionDigest: string;
+  readonly candidateProjectionDigest: string;
+  readonly selectedCurrentDigest: string;
+  readonly selectedScopes: readonly HoldingScopedCorrectionSelector[];
+  readonly candidateDigest: string;
+  readonly completenessAttestation: "operator_verified_complete_scopes";
+  readonly authorizeSelectedRemovals: boolean;
+  readonly authorizeEmptySelectedScopes: boolean;
+  readonly approvedBy: string;
+  readonly approvedAt: string;
+  readonly approvalDigest: string;
+};
+
+export function holdingScopedProjectionApprovalDigest(
+  approval: Omit<HoldingScopedProjectionApproval, "approvalDigest">,
+): string {
+  return digest("kith-finance-holding-scoped-approval:v1", approval);
+}
+
 type Assertion = {
   readonly kind: AssertionKind;
   readonly recordId: string;
@@ -89,6 +162,21 @@ type DocumentRow = {
   retained_sha256: string | null;
   active_holding_projection_generation_id: string | null;
   superseded_by: string | null;
+};
+
+type CanonicalPosition = {
+  readonly id: string;
+  readonly sourceDocumentId: string;
+  readonly rowHash: string | null;
+  readonly sourceLocator: string | null;
+  readonly semantic: readonly (string | null)[];
+};
+
+export type PreparedScopedCorrection = {
+  readonly manifest: HoldingScopedCorrectionManifest;
+  readonly selectedScopes: ReturnType<typeof prepareHoldingPositionScopes>;
+  readonly sourceOwnedPositions: readonly CandidateHoldingRow[];
+  readonly foreignReferencedHashes: ReadonlySet<string>;
 };
 
 function canonical(value: unknown): string {
@@ -169,6 +257,319 @@ function sortedProjection(projection: StoredHoldingProjection): unknown {
       .sort((left, right) => left.id.localeCompare(right.id))
       .map((row) => [row.id, row.rowHash, row.sourceLocator, row.semantic]),
   ]);
+}
+
+function scopeKey(scope: HoldingPositionScopeSelector): string {
+  return `${scope.accountId}\u0000${scope.asOf}\u0000${scope.proofVersion}`;
+}
+
+function selectedPosition(
+  semantic: readonly (string | null)[],
+  selected: ReadonlySet<string>,
+): boolean {
+  return selected.has(
+    `${semantic[0]}\u0000${semantic[1]}\u0000position_scope_v1`,
+  );
+}
+
+function canonicalPositionDigest(rows: readonly CanonicalPosition[]): string {
+  return digest(
+    "kith-finance-holding-scoped-position-current:v1",
+    [...rows]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((row) => [
+        row.id,
+        row.sourceDocumentId,
+        row.rowHash,
+        row.sourceLocator,
+        row.semantic,
+      ]),
+  );
+}
+
+function normalizedNumeric(value: string | null): string | null {
+  return value === null ? null : toNumericText(value);
+}
+
+function scopedCandidateProjectionDigest(input: {
+  stored: StoredHoldingProjection;
+  selected: ReadonlySet<string>;
+  sourceOwnedPositions: readonly CandidateHoldingRow[];
+}): string {
+  return digest("kith-finance-holding-scoped-position-projection:v1", {
+    preservedPositions: input.stored.positions
+      .filter((row) => !selectedPosition(row.semantic, input.selected))
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((row) => [row.id, row.rowHash, row.sourceLocator, row.semantic]),
+    selectedSourceOwnedPositions: [...input.sourceOwnedPositions]
+      .sort((left, right) => left.rowHash.localeCompare(right.rowHash))
+      .map((row) => [row.rowHash, row.sourceLocator, row.semantic]),
+    balances: [...input.stored.balances]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((row) => [row.id, row.rowHash, row.sourceLocator, row.semantic]),
+    liabilities: [...input.stored.liabilities]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((row) => [row.id, row.rowHash, row.sourceLocator, row.semantic]),
+  });
+}
+
+async function readCanonicalSelectedPositions(
+  client: ArchiveClient,
+  selectors: readonly HoldingPositionScopeSelector[],
+): Promise<CanonicalPosition[]> {
+  const found = await client.query<{
+    id: string;
+    source_document_id: string;
+    row_hash: string | null;
+    source_locator: string | null;
+    account_id: string;
+    as_of: string;
+    instrument_id: string | null;
+    quantity: string | null;
+    price: string | null;
+    market_value: string | null;
+    cost_basis: string | null;
+    unrealized: string | null;
+    currency: string;
+    valuation_basis: string | null;
+    valuation_note: string | null;
+  }>(
+    `WITH selected AS (
+       SELECT * FROM jsonb_to_recordset($1::jsonb)
+         AS x(account_id text, as_of date)
+     )
+     SELECT p.id, p.source_document_id, p.row_hash, p.source_locator,
+            p.account_id, p.as_of::text AS as_of, p.instrument_id,
+            p.quantity::text, p.price::text, p.market_value::text,
+            p.cost_basis::text, p.unrealized::text, p.currency::text,
+            p.valuation_basis, p.valuation_note
+       FROM positions p
+       JOIN selected s ON s.account_id = p.account_id AND s.as_of = p.as_of
+      ORDER BY p.id
+      FOR UPDATE OF p`,
+    [
+      JSON.stringify(
+        selectors.map((scope) => ({
+          account_id: scope.accountId,
+          as_of: scope.asOf,
+        })),
+      ),
+    ],
+  );
+  return found.rows.map((row) => ({
+    id: row.id,
+    sourceDocumentId: row.source_document_id,
+    rowHash: row.row_hash,
+    sourceLocator: row.source_locator,
+    semantic: [
+      row.account_id,
+      row.as_of,
+      row.instrument_id,
+      normalizedNumeric(row.quantity),
+      normalizedNumeric(row.price),
+      normalizedNumeric(row.market_value),
+      normalizedNumeric(row.cost_basis),
+      normalizedNumeric(row.unrealized),
+      row.currency,
+      row.valuation_basis,
+      row.valuation_note,
+    ],
+  }));
+}
+
+async function readCanonicalPositionsByHash(
+  client: ArchiveClient,
+  hashes: readonly string[],
+): Promise<CanonicalPosition[]> {
+  if (hashes.length === 0) return [];
+  const found = await client.query<{
+    id: string;
+    source_document_id: string;
+    row_hash: string;
+    source_locator: string | null;
+    account_id: string;
+    as_of: string;
+    instrument_id: string | null;
+    quantity: string | null;
+    price: string | null;
+    market_value: string | null;
+    cost_basis: string | null;
+    unrealized: string | null;
+    currency: string;
+    valuation_basis: string | null;
+    valuation_note: string | null;
+  }>(
+    `SELECT p.id, p.source_document_id, p.row_hash, p.source_locator,
+            p.account_id, p.as_of::text AS as_of, p.instrument_id,
+            p.quantity::text, p.price::text, p.market_value::text,
+            p.cost_basis::text, p.unrealized::text, p.currency::text,
+            p.valuation_basis, p.valuation_note
+       FROM positions p WHERE p.row_hash = ANY($1::text[])
+      ORDER BY p.id FOR UPDATE OF p`,
+    [hashes],
+  );
+  return found.rows.map((row) => ({
+    id: row.id,
+    sourceDocumentId: row.source_document_id,
+    rowHash: row.row_hash,
+    sourceLocator: row.source_locator,
+    semantic: [
+      row.account_id,
+      row.as_of,
+      row.instrument_id,
+      normalizedNumeric(row.quantity),
+      normalizedNumeric(row.price),
+      normalizedNumeric(row.market_value),
+      normalizedNumeric(row.cost_basis),
+      normalizedNumeric(row.unrealized),
+      row.currency,
+      row.valuation_basis,
+      row.valuation_note,
+    ],
+  }));
+}
+
+export async function prepareHoldingScopedPositionCorrection(input: {
+  readonly client: ArchiveClient;
+  readonly documentId: string;
+  readonly retainedSha256: string;
+  readonly expectedActiveGenerationId: string | null;
+  readonly stored: StoredHoldingProjection;
+  readonly candidate: ImportDocument;
+  readonly selectors: readonly HoldingScopedCorrectionSelector[];
+}): Promise<PreparedScopedCorrection> {
+  if (input.selectors.some((scope) => scope.scopeKind !== "positions")) {
+    refuse("this publisher does not yet implement selected balance scopes");
+  }
+  const positionSelectors = input.selectors.map((scope) => ({
+    accountId: scope.accountId,
+    asOf: scope.asOf,
+    proofVersion: "position_scope_v1" as const,
+  }));
+  const selectedScopes = prepareHoldingPositionScopes({
+    documentId: input.documentId,
+    retainedSha256: input.retainedSha256,
+    candidate: input.candidate,
+    selectors: positionSelectors,
+  });
+  const selectors = selectedScopes.map((scope) => scope.selector);
+  const selected = new Set(selectors.map(scopeKey));
+  const canonicalRows = await readCanonicalSelectedPositions(
+    input.client,
+    selectors,
+  );
+  const logicalRows = selectedScopes.flatMap((scope) => scope.positions);
+  const hashOwners = await readCanonicalPositionsByHash(
+    input.client,
+    logicalRows.map((row) => row.rowHash),
+  );
+  const byHash = new Map(hashOwners.map((row) => [row.rowHash!, row] as const));
+  const logicalByHash = new Map(logicalRows.map((row) => [row.rowHash, row]));
+  const foreignReferencedHashes = new Set<string>();
+  const sourceOwnedPositions: CandidateHoldingRow[] = [];
+  for (const row of logicalRows) {
+    const current = byHash.get(row.rowHash);
+    if (
+      current === undefined ||
+      current.sourceDocumentId === input.documentId
+    ) {
+      sourceOwnedPositions.push(row);
+      continue;
+    }
+    if (canonical(current.semantic) !== canonical(row.semantic)) {
+      refuse("a foreign-owned selected position has different semantics");
+    }
+    foreignReferencedHashes.add(row.rowHash);
+  }
+  for (const current of canonicalRows) {
+    if (current.sourceDocumentId === input.documentId) continue;
+    const declared =
+      current.rowHash === null ? undefined : logicalByHash.get(current.rowHash);
+    if (
+      declared === undefined ||
+      canonical(declared.semantic) !== canonical(current.semantic)
+    ) {
+      refuse("a selected scope does not represent every foreign-owned row");
+    }
+  }
+
+  const scopeSummaries = selectedScopes.map((scope) => ({
+    scopeKind: "positions" as const,
+    ...scope.selector,
+    emittedRowCount: scope.declaration.emittedPositionCount,
+    scopeDigest: scope.scopeDigest,
+    sourceOwnedRows: scope.positions.filter(
+      (row) => !foreignReferencedHashes.has(row.rowHash),
+    ).length,
+    foreignReferencedRows: scope.positions.filter((row) =>
+      foreignReferencedHashes.has(row.rowHash),
+    ).length,
+  }));
+  const oldSelectedPositions = input.stored.positions.filter((row) =>
+    selectedPosition(row.semantic, selected),
+  );
+  const candidateContent = new Set(
+    sourceOwnedPositions.map((row) =>
+      canonical([row.rowHash, row.sourceLocator, row.semantic]),
+    ),
+  );
+  const withoutDigest = {
+    schemaVersion: 1 as const,
+    kind: "holding_scoped_correction_candidate_v1" as const,
+    documentId: input.documentId,
+    retainedSha256: input.retainedSha256,
+    expectedActiveGenerationId: input.expectedActiveGenerationId,
+    oldProjectionDigest: holdingProjectionCurrentDigest(input.stored),
+    candidateProjectionDigest: scopedCandidateProjectionDigest({
+      stored: input.stored,
+      selected,
+      sourceOwnedPositions,
+    }),
+    selectedCurrentDigest: canonicalPositionDigest(canonicalRows),
+    selectedScopes: scopeSummaries,
+    rows: {
+      positions: {
+        oldSourceOwnedRows: input.stored.positions.length,
+        candidateSourceOwnedRows:
+          input.stored.positions.filter(
+            (row) => !selectedPosition(row.semantic, selected),
+          ).length + sourceOwnedPositions.length,
+        selectedSourceOwnedRemovals: oldSelectedPositions.filter(
+          (row) =>
+            !candidateContent.has(
+              canonical([row.rowHash, row.sourceLocator, row.semantic]),
+            ),
+        ).length,
+      },
+      balances: {
+        oldSourceOwnedRows: input.stored.balances.length,
+        candidateSourceOwnedRows: input.stored.balances.length,
+        selectedSourceOwnedRemovals: 0,
+      },
+      liabilities: {
+        oldSourceOwnedRows: input.stored.liabilities.length,
+        candidateSourceOwnedRows: input.stored.liabilities.length,
+        selectedSourceOwnedRemovals: 0,
+      },
+    },
+    completeness: {
+      state: "complete_selected_scopes" as const,
+      removalsAuthorized: false as const,
+    },
+  };
+  const manifest = {
+    ...withoutDigest,
+    candidateDigest: digest(
+      "kith-finance-holding-scoped-manifest:v1",
+      withoutDigest,
+    ),
+  };
+  return {
+    manifest,
+    selectedScopes,
+    sourceOwnedPositions,
+    foreignReferencedHashes,
+  };
 }
 
 function assertionValues(item: Assertion): readonly unknown[] {
@@ -646,6 +1047,103 @@ function validateApproval(
   }
 }
 
+function validateScopedApproval(
+  approval: HoldingScopedProjectionApproval,
+  manifest: HoldingScopedCorrectionManifest,
+): void {
+  const expectedKeys = [
+    "approvalDigest",
+    "approvedAt",
+    "approvedBy",
+    "authorizeEmptySelectedScopes",
+    "authorizeSelectedRemovals",
+    "candidateDigest",
+    "candidateProjectionDigest",
+    "completenessAttestation",
+    "documentId",
+    "expectedActiveGenerationId",
+    "kind",
+    "oldProjectionDigest",
+    "retainedSha256",
+    "schemaVersion",
+    "selectedCurrentDigest",
+    "selectedScopes",
+  ];
+  if (
+    approval === null ||
+    typeof approval !== "object" ||
+    canonical(Object.keys(approval).sort()) !== canonical(expectedKeys) ||
+    approval.schemaVersion !== 1 ||
+    approval.kind !== "holding_scoped_projection_approval_v1" ||
+    approval.completenessAttestation !== "operator_verified_complete_scopes" ||
+    typeof approval.documentId !== "string" ||
+    typeof approval.retainedSha256 !== "string" ||
+    (approval.expectedActiveGenerationId !== null &&
+      typeof approval.expectedActiveGenerationId !== "string") ||
+    typeof approval.oldProjectionDigest !== "string" ||
+    typeof approval.candidateProjectionDigest !== "string" ||
+    typeof approval.selectedCurrentDigest !== "string" ||
+    !Array.isArray(approval.selectedScopes) ||
+    typeof approval.candidateDigest !== "string" ||
+    typeof approval.authorizeSelectedRemovals !== "boolean" ||
+    typeof approval.authorizeEmptySelectedScopes !== "boolean" ||
+    typeof approval.approvedBy !== "string" ||
+    typeof approval.approvedAt !== "string" ||
+    typeof approval.approvalDigest !== "string"
+  ) {
+    refuse("scoped approval contract is invalid");
+  }
+  const manifestSelectors = manifest.selectedScopes.map(
+    ({ scopeKind, accountId, asOf, proofVersion }) => ({
+      scopeKind,
+      accountId,
+      asOf,
+      proofVersion,
+    }),
+  );
+  if (
+    approval.documentId !== manifest.documentId ||
+    approval.retainedSha256 !== manifest.retainedSha256 ||
+    approval.expectedActiveGenerationId !==
+      manifest.expectedActiveGenerationId ||
+    approval.oldProjectionDigest !== manifest.oldProjectionDigest ||
+    approval.candidateProjectionDigest !== manifest.candidateProjectionDigest ||
+    approval.selectedCurrentDigest !== manifest.selectedCurrentDigest ||
+    canonical(approval.selectedScopes) !== canonical(manifestSelectors) ||
+    approval.candidateDigest !== manifest.candidateDigest
+  ) {
+    refuse("scoped approval does not bind the selected candidate and state");
+  }
+  if (
+    approval.approvedBy.length === 0 ||
+    approval.approvedBy.length > 200 ||
+    !Number.isFinite(Date.parse(approval.approvedAt)) ||
+    new Date(approval.approvedAt).toISOString() !== approval.approvedAt ||
+    !SHA256.test(approval.approvalDigest) ||
+    holdingScopedProjectionApprovalDigest(
+      (({ approvalDigest: _approvalDigest, ...rest }) => rest)(approval),
+    ) !== approval.approvalDigest
+  ) {
+    refuse("scoped approval attribution or digest is invalid");
+  }
+  const hasRemovals = TABLES.some(
+    (table) => manifest.rows[table].selectedSourceOwnedRemovals > 0,
+  );
+  // This is deliberately a conservative authorization signal. The manifest
+  // also binds exact scope membership and the full composed projection.
+  if (approval.authorizeSelectedRemovals !== hasRemovals) {
+    refuse("scoped approval removal authority does not match the candidate");
+  }
+  const hasEmpty = manifest.selectedScopes.some(
+    (scope) => scope.emittedRowCount === 0,
+  );
+  if (approval.authorizeEmptySelectedScopes !== hasEmpty) {
+    refuse(
+      "scoped approval empty-scope authority does not match the candidate",
+    );
+  }
+}
+
 async function insertGeneration(
   client: ArchiveClient,
   input: {
@@ -657,13 +1155,25 @@ async function insertGeneration(
     projectionDigest: string;
     candidateProjectionDigest: string | null;
     candidateDigest: string | null;
-    candidateManifest: HoldingCorrectionCandidateManifest | null;
+    candidateManifest:
+      | HoldingCorrectionCandidateManifest
+      | HoldingScopedCorrectionManifest
+      | null;
     oldProjectionDigest: string | null;
-    approval: HoldingProjectionApproval | null;
+    approval:
+      HoldingProjectionApproval | HoldingScopedProjectionApproval | null;
     previousGenerationId: string | null;
     now: string;
   },
 ): Promise<void> {
+  const scopedApproval =
+    input.approval?.kind === "holding_scoped_projection_approval_v1"
+      ? input.approval
+      : null;
+  const fullApproval =
+    input.approval?.kind === "holding_projection_approval_v1"
+      ? input.approval
+      : null;
   await client.query(
     `INSERT INTO holding_projection_generations
        (id, document_id, generation_number, generation_kind,
@@ -690,8 +1200,12 @@ async function insertGeneration(
       input.approval?.approvedBy ?? null,
       input.approval?.approvedAt ?? null,
       input.approval?.completenessAttestation ?? null,
-      input.approval?.authorizeRemovals ?? null,
-      input.approval?.authorizeEmptyProjection ?? null,
+      fullApproval?.authorizeRemovals ??
+        scopedApproval?.authorizeSelectedRemovals ??
+        null,
+      fullApproval?.authorizeEmptyProjection ??
+        scopedApproval?.authorizeEmptySelectedScopes ??
+        null,
       input.approval?.expectedActiveGenerationId ?? null,
       input.previousGenerationId,
       input.now,
@@ -821,6 +1335,235 @@ async function replaceCurrentProjection(
         item.rowHash,
       ]),
   );
+}
+
+async function replaceSelectedCurrentPositions(
+  client: ArchiveClient,
+  documentId: string,
+  selectors: readonly HoldingPositionScopeSelector[],
+  assertions: readonly Assertion[],
+): Promise<void> {
+  await client.query(
+    `DELETE FROM positions p
+      USING jsonb_to_recordset($2::jsonb) AS selected(account_id text, as_of date)
+      WHERE p.source_document_id = $1
+        AND p.account_id = selected.account_id AND p.as_of = selected.as_of`,
+    [
+      documentId,
+      JSON.stringify(
+        selectors.map((scope) => ({
+          account_id: scope.accountId,
+          as_of: scope.asOf,
+        })),
+      ),
+    ],
+  );
+  await insertRows(
+    client,
+    "positions",
+    POSITION_COLUMNS,
+    assertions.map((item) => [
+      item.recordId,
+      item.semantic[0],
+      item.semantic[1],
+      item.semantic[2],
+      item.semantic[3],
+      item.semantic[4],
+      item.semantic[5],
+      item.semantic[6],
+      item.semantic[7],
+      item.semantic[8],
+      item.semantic[9],
+      item.semantic[10],
+      documentId,
+      item.sourceLocator,
+      item.rowHash,
+    ]),
+  );
+}
+
+const SCOPE_MEMBER_COLUMNS = [
+  "source_document_id",
+  "scope_id",
+  "position_row_hash",
+  "account_id",
+  "as_of",
+  "instrument_id",
+  "quantity",
+  "price",
+  "market_value",
+  "cost_basis",
+  "unrealized",
+  "currency",
+  "valuation_basis",
+  "valuation_note",
+  "source_locator",
+] as const;
+
+async function insertVersionedPositionScope(
+  client: ArchiveClient,
+  input: {
+    readonly documentId: string;
+    readonly generationId: string;
+    readonly retainedSha256: string;
+    readonly accountId: string;
+    readonly asOf: string;
+    readonly proofVersion: "position_scope_v1";
+    readonly status: "complete" | "partial";
+    readonly emittedPositionCount: number;
+    readonly gapCodes: readonly string[];
+    readonly zeroBasis: "source_stated_none" | null;
+    readonly evidence: unknown;
+    readonly members: readonly CandidateHoldingRow[];
+    readonly now: string;
+  },
+): Promise<void> {
+  const scopeId = randomUUID();
+  await client.query(
+    `INSERT INTO position_scope_observations
+       (id, source_document_id, holding_projection_generation_id,
+        retained_sha256, account_id, as_of, proof_version, status,
+        emitted_position_count, gap_codes, zero_basis, evidence, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6::date, $7, $8, $9,
+             $10::text[], $11, $12::jsonb, $13)`,
+    [
+      scopeId,
+      input.documentId,
+      input.generationId,
+      input.retainedSha256,
+      input.accountId,
+      input.asOf,
+      input.proofVersion,
+      input.status,
+      input.emittedPositionCount,
+      input.gapCodes,
+      input.zeroBasis,
+      JSON.stringify(input.evidence),
+      input.now,
+    ],
+  );
+  await insertRows(
+    client,
+    "position_scope_memberships",
+    SCOPE_MEMBER_COLUMNS,
+    input.members.map((row) => [
+      input.documentId,
+      scopeId,
+      row.rowHash,
+      row.semantic[0],
+      row.semantic[1],
+      row.semantic[2],
+      row.semantic[3],
+      row.semantic[4],
+      row.semantic[5],
+      row.semantic[6],
+      row.semantic[7],
+      row.semantic[8],
+      row.semantic[9],
+      row.semantic[10],
+      row.sourceLocator,
+    ]),
+  );
+}
+
+async function carryForwardPositionScopes(
+  client: ArchiveClient,
+  input: {
+    readonly documentId: string;
+    readonly retainedSha256: string;
+    readonly previousGenerationId: string | null;
+    readonly activeGenerationId: string;
+    readonly selected: ReadonlySet<string>;
+    readonly now: string;
+  },
+): Promise<void> {
+  const found = await client.query<{
+    id: string;
+    account_id: string;
+    as_of: string;
+    proof_version: "position_scope_v1";
+    status: "complete" | "partial";
+    emitted_position_count: string;
+    gap_codes: string[];
+    zero_basis: "source_stated_none" | null;
+    evidence: unknown;
+    retained_sha256: string;
+  }>(
+    `SELECT id, account_id, as_of::text AS as_of, proof_version, status,
+            emitted_position_count::text, gap_codes, zero_basis, evidence,
+            retained_sha256
+       FROM position_scope_observations
+      WHERE source_document_id = $1
+        AND holding_projection_generation_id IS NOT DISTINCT FROM $2
+      ORDER BY account_id, as_of, proof_version`,
+    [input.documentId, input.previousGenerationId],
+  );
+  for (const scope of found.rows) {
+    if (
+      input.selected.has(
+        `${scope.account_id}\u0000${scope.as_of}\u0000${scope.proof_version}`,
+      )
+    ) {
+      continue;
+    }
+    if (scope.retained_sha256 !== input.retainedSha256) {
+      refuse("a nonselected position scope has stale retained provenance");
+    }
+    const members = await client.query<{
+      position_row_hash: string;
+      source_locator: string;
+      account_id: string;
+      as_of: string;
+      instrument_id: string | null;
+      quantity: string | null;
+      price: string | null;
+      market_value: string | null;
+      cost_basis: string | null;
+      unrealized: string | null;
+      currency: string;
+      valuation_basis: string | null;
+      valuation_note: string | null;
+    }>(
+      `SELECT position_row_hash, source_locator, account_id,
+              as_of::text AS as_of, instrument_id, quantity::text, price::text,
+              market_value::text, cost_basis::text, unrealized::text,
+              currency::text, valuation_basis, valuation_note
+         FROM position_scope_memberships WHERE scope_id = $1
+        ORDER BY position_row_hash`,
+      [scope.id],
+    );
+    await insertVersionedPositionScope(client, {
+      documentId: input.documentId,
+      generationId: input.activeGenerationId,
+      retainedSha256: input.retainedSha256,
+      accountId: scope.account_id,
+      asOf: scope.as_of,
+      proofVersion: scope.proof_version,
+      status: scope.status,
+      emittedPositionCount: Number(scope.emitted_position_count),
+      gapCodes: scope.gap_codes,
+      zeroBasis: scope.zero_basis,
+      evidence: scope.evidence,
+      members: members.rows.map((row) => ({
+        rowHash: row.position_row_hash,
+        sourceLocator: row.source_locator,
+        semantic: [
+          row.account_id,
+          row.as_of,
+          row.instrument_id,
+          row.quantity,
+          row.price,
+          row.market_value,
+          row.cost_basis,
+          row.unrealized,
+          row.currency,
+          row.valuation_basis,
+          row.valuation_note,
+        ],
+      })),
+      now: input.now,
+    });
+  }
 }
 
 function reconciliationScopes(
@@ -1043,6 +1786,292 @@ export async function publishHoldingProjectionReplacement(
         positionsPassed: positions.passed,
         positionsFailed: positions.failed,
         positionsUnverified: positions.unverified,
+      },
+    };
+  });
+}
+
+/**
+ * Publishes positively complete account/date position scopes as one ordinary
+ * full document generation. Nonselected holdings remain the exact prior
+ * assertions, while exact foreign-owned scope members remain references.
+ */
+export async function publishHoldingScopedPositionCorrection(
+  client: ArchiveClient,
+  input: {
+    readonly candidate: ImportDocument;
+    readonly approval: HoldingScopedProjectionApproval;
+  },
+  now: Date = new Date(),
+): Promise<HoldingProjectionPublication> {
+  return withArchiveTransaction(client, async (tx) => {
+    await lockArchiveForWrite(tx);
+    const selectedDocument = await tx.query<DocumentRow>(
+      `SELECT id, retained_sha256, active_holding_projection_generation_id,
+              superseded_by
+         FROM documents WHERE id = $1 FOR UPDATE`,
+      [input.approval.documentId],
+    );
+    const document = selectedDocument.rows[0];
+    if (document === undefined) refuse("selected document does not exist");
+    if (document.superseded_by !== null) {
+      refuse("superseded documents cannot publish a holding projection");
+    }
+    if (
+      document.retained_sha256 === null ||
+      document.retained_sha256 !== input.approval.retainedSha256 ||
+      input.candidate.retainedSha256 !== document.retained_sha256 ||
+      input.candidate.sha256 !== document.retained_sha256
+    ) {
+      refuse("selected retained bytes do not match the approval and candidate");
+    }
+
+    const stored = await readStoredHoldingProjection(tx, document.id);
+    const prepared = await prepareHoldingScopedPositionCorrection({
+      client: tx,
+      documentId: document.id,
+      retainedSha256: document.retained_sha256,
+      expectedActiveGenerationId:
+        document.active_holding_projection_generation_id,
+      stored,
+      candidate: input.candidate,
+      selectors: input.approval.selectedScopes,
+    });
+    validateScopedApproval(input.approval, prepared.manifest);
+
+    const selected = new Set(
+      prepared.selectedScopes.map((scope) => scopeKey(scope.selector)),
+    );
+    const oldAssertions = assertionsForStored(
+      stored,
+      document.id,
+      document.retained_sha256,
+    );
+    const oldSelectedAssertions = oldAssertions.filter(
+      (item) =>
+        item.kind === "position" && selectedPosition(item.semantic, selected),
+    );
+    const preservedAssertions = oldAssertions.filter(
+      (item) =>
+        item.kind !== "position" || !selectedPosition(item.semantic, selected),
+    );
+    const selectedNext = assertionsForCandidate(
+      {
+        positions: prepared.sourceOwnedPositions,
+        balances: [],
+        liabilities: [],
+      },
+      oldSelectedAssertions,
+      document.id,
+      document.retained_sha256,
+    );
+    const nextAssertions = [...preservedAssertions, ...selectedNext.assertions];
+
+    let previousGenerationId = document.active_holding_projection_generation_id;
+    const priorScopeGenerationId = previousGenerationId;
+    const sequence = await tx.query<{ generation_number: string | null }>(
+      `SELECT max(generation_number)::text AS generation_number
+         FROM holding_projection_generations WHERE document_id = $1`,
+      [document.id],
+    );
+    let generationNumber = Number(sequence.rows[0]?.generation_number ?? 0);
+    if (!Number.isSafeInteger(generationNumber) || generationNumber < 0) {
+      refuse("generation sequence is invalid");
+    }
+    if (previousGenerationId === null) {
+      previousGenerationId = randomUUID();
+      generationNumber += 1;
+      await insertAssertions(tx, oldAssertions);
+      await insertGeneration(tx, {
+        id: previousGenerationId,
+        documentId: document.id,
+        generationNumber,
+        kind: "baseline",
+        retainedSha256: document.retained_sha256,
+        projectionDigest: prepared.manifest.oldProjectionDigest,
+        candidateProjectionDigest: null,
+        candidateDigest: null,
+        candidateManifest: null,
+        oldProjectionDigest: null,
+        approval: null,
+        previousGenerationId: null,
+        now: now.toISOString(),
+      });
+      await insertMemberships(tx, previousGenerationId, oldAssertions);
+    } else {
+      const active = await tx.query<{
+        retained_sha256: string;
+        projection_digest: string;
+      }>(
+        `SELECT retained_sha256, projection_digest
+           FROM holding_projection_generations
+          WHERE document_id = $1 AND id = $2`,
+        [document.id, previousGenerationId],
+      );
+      if (
+        active.rows[0]?.retained_sha256 !== document.retained_sha256 ||
+        active.rows[0]?.projection_digest !==
+          prepared.manifest.oldProjectionDigest
+      ) {
+        refuse("active generation does not bind the current projection");
+      }
+      const historical = await readGenerationProjection(
+        tx,
+        document.id,
+        previousGenerationId,
+      );
+      if (
+        canonical(sortedProjection(historical)) !==
+        canonical(sortedProjection(stored))
+      ) {
+        refuse("current projection does not match its active generation");
+      }
+    }
+
+    await insertAssertions(tx, nextAssertions);
+    const activeGenerationId = randomUUID();
+    generationNumber += 1;
+    await insertGeneration(tx, {
+      id: activeGenerationId,
+      documentId: document.id,
+      generationNumber,
+      kind: "published",
+      retainedSha256: document.retained_sha256,
+      projectionDigest: holdingProjectionCurrentDigest(
+        storedProjectionFromAssertions(nextAssertions),
+      ),
+      candidateProjectionDigest: prepared.manifest.candidateProjectionDigest,
+      candidateDigest: prepared.manifest.candidateDigest,
+      candidateManifest: prepared.manifest,
+      oldProjectionDigest: prepared.manifest.oldProjectionDigest,
+      approval: input.approval,
+      previousGenerationId,
+      now: now.toISOString(),
+    });
+    await insertMemberships(tx, activeGenerationId, nextAssertions);
+    await replaceSelectedCurrentPositions(
+      tx,
+      document.id,
+      prepared.selectedScopes.map((scope) => scope.selector),
+      selectedNext.assertions,
+    );
+
+    await carryForwardPositionScopes(tx, {
+      documentId: document.id,
+      retainedSha256: document.retained_sha256,
+      previousGenerationId: priorScopeGenerationId,
+      activeGenerationId,
+      selected,
+      now: now.toISOString(),
+    });
+    for (const scope of prepared.selectedScopes) {
+      await insertVersionedPositionScope(tx, {
+        documentId: document.id,
+        generationId: activeGenerationId,
+        retainedSha256: document.retained_sha256,
+        accountId: scope.selector.accountId,
+        asOf: scope.selector.asOf,
+        proofVersion: scope.selector.proofVersion,
+        status: "complete",
+        emittedPositionCount: scope.declaration.emittedPositionCount,
+        gapCodes: [],
+        zeroBasis: scope.declaration.zeroBasis ?? null,
+        evidence: scope.declaration.evidence,
+        members: scope.positions,
+        now: now.toISOString(),
+      });
+      await tx.query(
+        `UPDATE review_items
+            SET status = 'resolved', resolved_at = $4,
+                resolution_note = $5
+          WHERE source_document_id = $1
+            AND account_id = $2
+            AND kind = 'position_scope_mismatch'
+            AND raw_value = $3
+            AND status = 'open'`,
+        [
+          document.id,
+          scope.selector.accountId,
+          `${scope.selector.accountId}:${scope.selector.asOf}:${scope.selector.proofVersion}`,
+          now.toISOString(),
+          "resolved on scoped projection publication: the selected complete position scope exactly matches the canonical account/date set",
+        ],
+      );
+    }
+
+    const positionChangeMap = new Map<string, PositionChange>();
+    for (const item of oldSelectedAssertions) {
+      const accountId = item.semantic[0];
+      const date = item.semantic[1];
+      const instrumentId = item.semantic[2];
+      if (
+        accountId === null ||
+        accountId === undefined ||
+        date === null ||
+        date === undefined ||
+        instrumentId === null ||
+        instrumentId === undefined
+      ) {
+        continue;
+      }
+      const value = { accountId, date, instrumentId };
+      positionChangeMap.set(canonical(value), value);
+    }
+    for (const scope of prepared.selectedScopes) {
+      for (const row of scope.positions) {
+        const instrumentId = row.semantic[2];
+        if (instrumentId === null || instrumentId === undefined) continue;
+        const value = {
+          accountId: scope.selector.accountId,
+          date: scope.selector.asOf,
+          instrumentId,
+        };
+        positionChangeMap.set(canonical(value), value);
+      }
+    }
+    const positionReconciliations = await runPositionReconciliationGate(
+      tx,
+      undefined,
+      { snapshots: [...positionChangeMap.values()], activity: [] },
+    );
+
+    const updated = await tx.query(
+      `UPDATE documents
+          SET active_holding_projection_generation_id = $2
+        WHERE id = $1
+          AND active_holding_projection_generation_id IS NOT DISTINCT FROM $3`,
+      [
+        document.id,
+        activeGenerationId,
+        input.approval.expectedActiveGenerationId,
+      ],
+    );
+    if (updated.rowCount !== 1) {
+      refuse("active generation changed during publication");
+    }
+
+    return {
+      documentId: document.id,
+      previousGenerationId,
+      activeGenerationId,
+      generationNumber,
+      retainedIds: preservedAssertions.length + selectedNext.retainedIds,
+      mintedIds: selectedNext.mintedIds,
+      rows: {
+        positions: nextAssertions.filter((item) => item.kind === "position")
+          .length,
+        balances: stored.balances.length,
+        liabilities: stored.liabilities.length,
+      },
+      candidateDigest: prepared.manifest.candidateDigest,
+      approvalDigest: input.approval.approvalDigest,
+      reconciliations: {
+        cashPassed: 0,
+        cashFailed: 0,
+        cashUnverified: 0,
+        positionsPassed: positionReconciliations.passed,
+        positionsFailed: positionReconciliations.failed,
+        positionsUnverified: positionReconciliations.unverified,
       },
     };
   });

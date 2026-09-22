@@ -5,6 +5,7 @@ import type {
   ImportDocument,
   ImportLiability,
   ImportPosition,
+  ImportPositionScope,
 } from "./importer.js";
 import { toMinorUnits } from "./money.js";
 import { toNumericText } from "./pgNumeric.js";
@@ -88,6 +89,21 @@ export type HoldingCorrectionCandidateManifest = {
 export type PreparedHoldingCorrectionCandidate = {
   readonly manifest: HoldingCorrectionCandidateManifest;
   readonly projection: CandidateHoldingProjection;
+};
+
+export type HoldingPositionScopeSelector = {
+  readonly accountId: string;
+  readonly asOf: string;
+  readonly proofVersion: "position_scope_v1";
+};
+
+export type PreparedHoldingPositionScope = {
+  readonly selector: HoldingPositionScopeSelector;
+  readonly declaration: ImportPositionScope;
+  readonly positions: readonly CandidateHoldingRow[];
+  /** Binds the positive boundary evidence and every source-owned locator and
+   * semantic member without exposing those values in the public manifest. */
+  readonly scopeDigest: string;
 };
 
 type CandidateBuild = {
@@ -458,6 +474,132 @@ function prepareCandidate(document: ImportDocument): CandidateBuild {
     ),
   };
   return { issueCount, rejectedRows, projection };
+}
+
+function selectorKey(selector: HoldingPositionScopeSelector): string {
+  return `${selector.accountId}\u0000${selector.asOf}\u0000${selector.proofVersion}`;
+}
+
+function completeScopeEvidence(scope: ImportPositionScope): boolean {
+  return (
+    scope.evidence.scopeEnd !== undefined &&
+    (scope.emittedPositionCount === 0
+      ? scope.evidence.explicitNone !== undefined
+      : scope.evidence.tables.length > 0 &&
+        scope.evidence.tables.every(
+          (table) => table.headers.length > 0 && table.end !== undefined,
+        ))
+  );
+}
+
+/**
+ * Prepares only explicitly selected positive position scopes. Parser gaps and
+ * unsupported holdings in neighboring accounts remain visible on the source
+ * document but cannot make this function infer a broader replacement.
+ */
+export function prepareHoldingPositionScopes(input: {
+  readonly documentId: string;
+  readonly retainedSha256: string;
+  readonly candidate: ImportDocument;
+  readonly selectors: readonly HoldingPositionScopeSelector[];
+}): readonly PreparedHoldingPositionScope[] {
+  validateIdentity(input.documentId, input.retainedSha256);
+  if (
+    input.candidate.retainedSha256 !== input.retainedSha256 ||
+    input.candidate.sha256 !== input.retainedSha256
+  ) {
+    fail("candidate is not bound to the selected retained bytes");
+  }
+  if (input.selectors.length === 0) fail("no position scopes were selected");
+
+  const selected = new Map<string, HoldingPositionScopeSelector>();
+  for (const selector of input.selectors) {
+    if (
+      selector === null ||
+      typeof selector !== "object" ||
+      canonical(Object.keys(selector).sort()) !==
+        canonical(["accountId", "asOf", "proofVersion"]) ||
+      typeof selector.accountId !== "string" ||
+      selector.accountId.length === 0 ||
+      !validDate(selector.asOf) ||
+      selector.proofVersion !== "position_scope_v1"
+    ) {
+      fail("position scope selector is invalid");
+    }
+    const key = selectorKey(selector);
+    if (selected.has(key)) fail("position scope selector is duplicated");
+    selected.set(key, selector);
+  }
+
+  const declarations = new Map<string, ImportPositionScope>();
+  for (const scope of input.candidate.positionScopes ?? []) {
+    const key = selectorKey(scope);
+    if (!selected.has(key)) continue;
+    if (declarations.has(key)) {
+      fail("selected position scope declaration is duplicated");
+    }
+    declarations.set(key, scope);
+  }
+
+  return [...selected.values()]
+    .sort((left, right) => selectorKey(left).localeCompare(selectorKey(right)))
+    .map((selector) => {
+      const key = selectorKey(selector);
+      const declaration = declarations.get(key);
+      if (declaration === undefined) {
+        fail("selected position scope was not declared by the adapter");
+      }
+      if (
+        declaration.status !== "complete" ||
+        declaration.gapCodes.length !== 0 ||
+        !Number.isSafeInteger(declaration.emittedPositionCount) ||
+        declaration.emittedPositionCount < 0 ||
+        (declaration.emittedPositionCount === 0
+          ? declaration.zeroBasis !== "source_stated_none"
+          : declaration.zeroBasis !== undefined) ||
+        !completeScopeEvidence(declaration)
+      ) {
+        fail("selected position scope is not positively complete");
+      }
+
+      let issueCount = 0;
+      let rejectedRows = 0;
+      const prepared: CandidateHoldingRow[] = [];
+      for (const row of input.candidate.positions ?? []) {
+        const account = row.accountId ?? input.candidate.accountId;
+        if (account !== selector.accountId || row.asOf !== selector.asOf) {
+          continue;
+        }
+        const value = preparePosition(row, input.candidate, () => {
+          issueCount += 1;
+        });
+        if (value === null) rejectedRows += 1;
+        else prepared.push(value);
+      }
+      const positions = dedupeCandidateRows("positions", prepared);
+      if (
+        issueCount !== 0 ||
+        rejectedRows !== 0 ||
+        positions.length !== declaration.emittedPositionCount ||
+        new Set(positions.map((row) => row.rowHash)).size !== positions.length
+      ) {
+        fail(
+          "selected position scope does not exactly match its mapped members",
+        );
+      }
+      const scopeDigest = digest("kith-finance-position-scope-candidate:v1", {
+        selector,
+        emittedPositionCount: declaration.emittedPositionCount,
+        zeroBasis: declaration.zeroBasis ?? null,
+        evidence: declaration.evidence,
+        positions: sortedRows(positions, (row) => [
+          row.rowHash,
+          row.sourceLocator,
+          row.semantic,
+        ]).map((row) => [row.rowHash, row.sourceLocator, row.semantic]),
+      });
+      return { selector, declaration, positions, scopeDigest };
+    });
 }
 
 function sortedRows<T>(rows: readonly T[], key: (row: T) => unknown): T[] {

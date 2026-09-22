@@ -1235,6 +1235,95 @@ CREATE TRIGGER finance_read_revision_bump
   FOR EACH STATEMENT EXECUTE FUNCTION bump_finance_read_revision();
 `;
 
+// Migration 14 admitted only whole-document holding candidates. The same
+// immutable generation graph also supports a narrowly approved scoped
+// correction, provided its manifest binds the old full projection, composed
+// full projection, exact selected current set and nonempty closed scope list.
+const SCOPED_HOLDING_PROJECTION_GENERATIONS = `
+CREATE FUNCTION holding_scoped_manifest_has_valid_selectors(JSONB)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+STRICT
+AS $$
+  SELECT jsonb_typeof($1) = 'array'
+    AND jsonb_array_length($1) > 0
+    AND NOT EXISTS (
+      SELECT 1 FROM jsonb_array_elements($1) scope
+       WHERE jsonb_typeof(scope) <> 'object'
+          OR (SELECT count(*) FROM jsonb_object_keys(scope)) <> 8
+          OR scope->>'scopeKind' NOT IN ('positions', 'balance')
+          OR coalesce(scope->>'accountId', '') = ''
+          OR coalesce(scope->>'asOf', '') !~ '^\\d{4}-\\d{2}-\\d{2}$'
+          OR (scope->>'scopeKind' = 'positions'
+              AND scope->>'proofVersion' <> 'position_scope_v1')
+          OR (scope->>'scopeKind' = 'balance'
+              AND scope->>'proofVersion' <> 'balance_scope_v1')
+          OR coalesce(scope->>'scopeDigest', '') !~ '^[0-9a-f]{64}$'
+          OR jsonb_typeof(scope->'emittedRowCount') <> 'number'
+          OR jsonb_typeof(scope->'sourceOwnedRows') <> 'number'
+          OR jsonb_typeof(scope->'foreignReferencedRows') <> 'number'
+    )
+$$;
+
+REVOKE ALL ON FUNCTION holding_scoped_manifest_has_valid_selectors(JSONB)
+  FROM PUBLIC;
+
+ALTER TABLE holding_projection_generations
+  DROP CONSTRAINT holding_projection_generations_check;
+
+ALTER TABLE holding_projection_generations
+  ADD CONSTRAINT holding_projection_generations_shape_check CHECK (
+    (generation_kind = 'baseline'
+      AND candidate_digest IS NULL
+      AND candidate_manifest IS NULL
+      AND candidate_projection_digest IS NULL
+      AND old_projection_digest IS NULL
+      AND approval_digest IS NULL
+      AND approved_by IS NULL AND approved_at IS NULL
+      AND completeness_attestation IS NULL
+      AND removals_authorized IS NULL
+      AND empty_projection_authorized IS NULL
+      AND approval_expected_active_generation_id IS NULL
+      AND expected_previous_generation_id IS NULL)
+    OR
+    (generation_kind = 'published'
+      AND candidate_digest IS NOT NULL
+      AND candidate_manifest IS NOT NULL
+      AND jsonb_typeof(candidate_manifest) = 'object'
+      AND candidate_manifest->>'documentId' = document_id
+      AND candidate_manifest->>'retainedSha256' = retained_sha256
+      AND candidate_manifest->>'oldProjectionDigest' = old_projection_digest
+      AND candidate_manifest->>'candidateProjectionDigest' = candidate_projection_digest
+      AND candidate_manifest->>'candidateDigest' = candidate_digest
+      AND candidate_projection_digest IS NOT NULL
+      AND old_projection_digest IS NOT NULL
+      AND approval_digest IS NOT NULL
+      AND approved_by IS NOT NULL AND approved_by <> ''
+      AND char_length(approved_by) <= 200
+      AND approved_at IS NOT NULL
+      AND completeness_attestation IS NOT NULL
+      AND removals_authorized IS NOT NULL
+      AND empty_projection_authorized IS NOT NULL
+      AND expected_previous_generation_id IS NOT NULL
+      AND (
+        (candidate_manifest->>'kind' = 'holding_correction_candidate_v1'
+          AND candidate_manifest#>>'{completeness,state}' = 'unproven'
+          AND completeness_attestation = 'operator_verified_complete_projection')
+        OR
+        (candidate_manifest->>'kind' = 'holding_scoped_correction_candidate_v1'
+          AND candidate_manifest#>>'{completeness,state}' =
+            'complete_selected_scopes'
+          AND completeness_attestation = 'operator_verified_complete_scopes'
+          AND holding_scoped_manifest_has_valid_selectors(
+                candidate_manifest->'selectedScopes')
+          AND (candidate_manifest->>'expectedActiveGenerationId')
+                IS NOT DISTINCT FROM approval_expected_active_generation_id
+          AND candidate_manifest->>'selectedCurrentDigest' ~ '^[0-9a-f]{64}$')
+      ) IS TRUE)
+  );
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -1311,6 +1400,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     version: 15,
     name: "account-scoped position coverage observations and exact memberships",
     sql: POSITION_SCOPE_OBSERVATIONS,
+  },
+  {
+    version: 16,
+    name: "scoped holding correction generation audit",
+    sql: SCOPED_HOLDING_PROJECTION_GENERATIONS,
   },
 ]);
 
