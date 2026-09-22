@@ -1911,6 +1911,59 @@ test(
           balance({ accountExternalKey: "acct-trust-01", totalValue: "25000" }),
         ],
         liabilities: [],
+        positionScopes: [
+          {
+            sourceDocument: "statement",
+            accountExternalKey: "acct-brokerage-01",
+            asOf: "2026-03-31",
+            proofVersion: "position_scope_v1",
+            status: "complete",
+            emittedPositionCount: 1,
+            gapCodes: [],
+            evidence: {
+              account: { source: "pdf_statement", index: 1 },
+              tables: [
+                {
+                  headers: [{ source: "pdf_statement", index: 2 }],
+                  end: { source: "pdf_statement", index: 4 },
+                },
+              ],
+              scopeEnd: { source: "pdf_statement", index: 5 },
+            },
+          },
+          {
+            sourceDocument: "statement",
+            accountExternalKey: "acct-trust-01",
+            asOf: "2026-03-31",
+            proofVersion: "position_scope_v1",
+            status: "partial",
+            emittedPositionCount: 1,
+            gapCodes: ["unresolved_lots"],
+            evidence: {
+              account: { source: "pdf_statement", index: 6 },
+              tables: [
+                {
+                  headers: [{ source: "pdf_statement", index: 7 }],
+                },
+              ],
+            },
+          },
+          {
+            sourceDocument: "statement",
+            accountExternalKey: "acct-brokerage-01",
+            asOf: "2026-02-28",
+            proofVersion: "position_scope_v1",
+            status: "complete",
+            emittedPositionCount: 0,
+            gapCodes: [],
+            zeroBasis: "source_stated_none",
+            evidence: {
+              tables: [],
+              explicitNone: { source: "pdf_statement", index: 8 },
+              scopeEnd: { source: "pdf_statement", index: 9 },
+            },
+          },
+        ],
       },
       docType: "pdf_statement",
       docDate: "2026-03-31",
@@ -1961,6 +2014,38 @@ test(
     );
     assert.equal(brokerageBalance.total_value, "10000");
     assert.equal(trustBalance.total_value, "25000");
+
+    const storedScopes = await all(
+      client,
+      `SELECT account_id, as_of::text AS as_of, status,
+              emitted_position_count::text AS emitted_position_count,
+              gap_codes
+         FROM position_scope_observations
+        ORDER BY account_id, as_of`,
+    );
+    assert.deepEqual(storedScopes, [
+      {
+        account_id: BROKERAGE.id,
+        as_of: "2026-02-28",
+        status: "complete",
+        emitted_position_count: "0",
+        gap_codes: [],
+      },
+      {
+        account_id: BROKERAGE.id,
+        as_of: "2026-03-31",
+        status: "complete",
+        emitted_position_count: "1",
+        gap_codes: [],
+      },
+      {
+        account_id: TRUST.id,
+        as_of: "2026-03-31",
+        status: "partial",
+        emitted_position_count: "1",
+        gap_codes: ["unresolved_lots"],
+      },
+    ]);
 
     const [review] = await all(
       client,

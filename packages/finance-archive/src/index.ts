@@ -25,6 +25,10 @@ export {
   type ParsedInstrument,
   type ParsedLiability,
   type ParsedPosition,
+  type ParsedPositionScope,
+  type PositionScopeEvidence,
+  type PositionScopeGapCode,
+  type PositionScopeTableEvidence,
   type ParsedPull,
   type ParsedRow,
   type RawFile,
@@ -124,6 +128,12 @@ export {
   pgSchemaVersion,
 } from "./pgSchema.js";
 export {
+  holdingProjectionApprovalDigest,
+  publishHoldingProjectionReplacement,
+  type HoldingProjectionApproval,
+  type HoldingProjectionPublication,
+} from "./holdingProjectionPublisher.js";
+export {
   ARCHIVE_TYPES,
   ARCHIVE_WRITE_LOCK_KEY,
   archiveDatabaseUrl,
@@ -160,6 +170,7 @@ export {
   type ImportDocument,
   type ImportLiability,
   type ImportPosition,
+  type ImportPositionScope,
   type ImportChanges,
   type ImportRow,
   type AdapterReviewItem,

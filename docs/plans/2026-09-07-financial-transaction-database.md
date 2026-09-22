@@ -468,8 +468,27 @@ not encode a positive, complete, zero-position observation for every
 account/date, and this read rule does not claim that it does. Parser replay and
 source-projection replacement are separate importer concerns.
 
+Reviewed source-projection replacement keeps immutable generations and full
+typed assertions for positions, balances and liabilities while atomically
+maintaining the existing current tables. An approval binds the exact document,
+retained SHA-256, active generation, old and candidate projection digests,
+candidate manifest digest, explicit removal and empty-projection authority,
+reviewer and time. Changed assertions receive new record ids; unchanged ids are
+retained only when their semantic values, locator and provenance all match.
+Historical evidence resolves through the retained assertion after checking its
+retained SHA-256 against the document. Exact authoritative replay then validates
+both activity and the active reviewed holding projection before restoring
+`parsed_ok` or resolving system-owned parser findings.
+
+Migration 14 adds `holding_projection_generations`,
+`holding_projection_assertions` and
+`holding_projection_generation_memberships`. Existing production reader roles
+use `NO_DEFAULT_SELECT`, so rollout applies the migration as the archive owner,
+then grants the existing finance reader `SELECT` on those three tables without
+rotating its password. Historical position, balance and liability evidence is
+verified through the reader credential before any correction is activated.
 The adapter contract can additionally return optional positive position-scope
-observations for later persistence. A scope names the exact document-local
+observations. A scope names the exact document-local
 account and statement date, emitted position count, closed parser-gap codes and
 retained-text evidence for each table header and end. Complete status requires
 a positively bounded account section, every observed table accounted for and
@@ -477,15 +496,46 @@ an anchored continuous printed-page run. A complete zero-position scope also
 requires the statement's own explicit assertion that the account holds none;
 no rows and no rejected blocks are never enough. Consolidated tables before an
 account marker produce no account scope. Older adapters and documents omit the
-optional field and keep the conservative document-wide behavior above. Until
-the account-scope persistence migration and reader integration land, these
-adapter observations do not relax `documents.parsed_ok` or any read gate.
-Adding or tightening this metadata must preserve the adapter's emitted
+optional field and keep the conservative document-wide behavior above. The
+absence of a valid positive observation does not relax `documents.parsed_ok`
+or any read gate. Adding or tightening this metadata must preserve the adapter's emitted
 holdings unless a separate parser defect and its intended correction are
 demonstrated. Regression fixtures cover printed page declarations at both the
 bottom of the preceding physical page and the top of the following page, and
 assert the same semantic holdings output rather than relying only on passing
 fixture counts.
+
+Migration 15 persists those observations in immutable
+`position_scope_observations` and `position_scope_memberships`. Each
+observation binds the retained SHA-256, account, date, proof version, status,
+count, closed gaps, zero basis and source evidence. Each membership retains the
+source's own locator plus every stored position semantic field. It deliberately
+does not own or rehome the canonical position row. A second retained source may
+vouch for a globally deduplicated row only when its full semantics match.
+Versioned observations bind the active holding-projection generation;
+unversioned observations become ineligible when a generation is activated.
+Deleting a source document cascades its proof, while direct updates to either
+proof table are refused.
+
+Production uses `NO_DEFAULT_SELECT` for the existing finance reader. Migration
+15 rollout therefore grants that role `SELECT` on
+`position_scope_observations` and `position_scope_memberships` after applying
+the migration as the archive owner. It does not recreate the role or rotate
+its password. The read surface is verified through the existing reader
+credential before release.
+
+Inventory, direct snapshots and holdings aggregates accept a scope only when
+it is complete, its retained SHA and generation are current, every membership
+still has a full-semantic canonical match, and the membership set equals the
+entire current account/date snapshot. A subset, extra row, semantic drift,
+partial scope or stale generation therefore fails closed. A complete zero-row
+scope is selectable only with `source_stated_none`. An exact scope can replace
+that source document's generic `document_unparsed` finding for the proved
+account/date. Account-specific findings such as ambiguous values and balance
+conflicts, null-account non-parser findings, and failed or pending position
+reconciliations remain blocking. Legacy documents with no scope keep the
+document-wide rule, and one unsafe contributor still withholds a mixed-source
+date.
 
 Coverage is reported at the same granularity as the record contract requires,
 so the later Kith Mind adapter wraps this surface rather than re-deriving it.

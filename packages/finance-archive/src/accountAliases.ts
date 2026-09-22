@@ -360,6 +360,16 @@ export async function moveHoldings(
   if (targetByLocator.size === 0) {
     return { examined: 0, moved, removed, hashMismatch: 0, collision: 0 };
   }
+  const versioned = await client.query<{ versioned: boolean }>(
+    `SELECT active_holding_projection_generation_id IS NOT NULL AS versioned
+       FROM documents WHERE id = $1`,
+    [documentId],
+  );
+  if (versioned.rows[0]?.versioned) {
+    throw new Error(
+      "document has versioned holdings; use the reviewed holding projection publisher",
+    );
+  }
   const found = await client.query<HoldingRow>(
     `SELECT ${HASH_SELECT[table]} FROM ${table}
       WHERE source_document_id = $1 AND account_id = $2 AND source_locator = ANY($3::text[])`,

@@ -416,7 +416,8 @@ export type FinanceAccountInventoryRecord = {
   recordCount: number;
   activityFrom?: string;
   activityTo?: string;
-  /** The latest `positions.as_of` the account has, if it has one. */
+  /** The latest observed position snapshot date. An exact source-stated zero
+   * can provide this date without creating a position row or activity range. */
   latestSnapshotAsOf?: string;
   /**
    * FIN-FRESHNESS-1. The account's most recent distinct `balances.as_of`
@@ -2506,10 +2507,10 @@ function coverageRecord(value: unknown): FinanceCoverageRecord {
 /**
  * ADM-2. Counts are bounded integers and the three dates are plain ISO dates.
  *
- * The two ordering rules are what stop a nonsense row: activity cannot end
- * before it began, and a snapshot the archive reports as its latest cannot sit
- * outside the activity the same row claims. A row with a snapshot but no
- * activity range is refused for the same reason.
+ * Activity cannot end before it began. Snapshot observation is independent:
+ * an exact source-stated zero can postdate the latest financial row, because
+ * proving no positions creates no row to extend the activity range. Without
+ * an activity range, only a zero-record inventory may carry such a date.
  */
 function accountInventoryRecord(value: unknown): FinanceAccountInventoryRecord {
   const input = object(value, "invalid_response");
@@ -2540,16 +2541,15 @@ function accountInventoryRecord(value: unknown): FinanceAccountInventoryRecord {
     input.latestSnapshotAsOf === undefined
       ? undefined
       : isoDate(input.latestSnapshotAsOf, "invalid_response");
+  const recordCount = count(input.recordCount);
   if (
     (activityFrom === undefined) !== (activityTo === undefined) ||
     (activityFrom !== undefined &&
       activityTo !== undefined &&
       activityFrom > activityTo) ||
     (latestSnapshotAsOf !== undefined &&
-      (activityFrom === undefined ||
-        activityTo === undefined ||
-        latestSnapshotAsOf < activityFrom ||
-        latestSnapshotAsOf > activityTo))
+      activityFrom === undefined &&
+      recordCount !== 0)
   )
     fail("invalid_response");
   // Balance dates are balance rows, so they sit inside the activity the same
@@ -2598,7 +2598,7 @@ function accountInventoryRecord(value: unknown): FinanceAccountInventoryRecord {
   return {
     account: accountDescriptor(input.account),
     statementCount: count(input.statementCount),
-    recordCount: count(input.recordCount),
+    recordCount,
     openReviewCount: count(input.openReviewCount),
     ...(currentValue === undefined ? {} : { currentValue }),
     ...(activityFrom === undefined ? {} : { activityFrom }),

@@ -1231,6 +1231,72 @@ type HoldingsDateAssessment = {
   currency_count: string;
 };
 
+function positionMatchesScopeMember(position: string, member: string): string {
+  return `${position}.row_hash = ${member}.position_row_hash
+    AND ${position}.account_id = ${member}.account_id
+    AND ${position}.as_of = ${member}.as_of
+    AND ${position}.instrument_id IS NOT DISTINCT FROM ${member}.instrument_id
+    AND ${position}.quantity IS NOT DISTINCT FROM ${member}.quantity
+    AND ${position}.price IS NOT DISTINCT FROM ${member}.price
+    AND ${position}.market_value IS NOT DISTINCT FROM ${member}.market_value
+    AND ${position}.cost_basis IS NOT DISTINCT FROM ${member}.cost_basis
+    AND ${position}.unrealized IS NOT DISTINCT FROM ${member}.unrealized
+    AND ${position}.currency = ${member}.currency
+    AND ${position}.valuation_basis IS NOT DISTINCT FROM ${member}.valuation_basis
+    AND ${position}.valuation_note IS NOT DISTINCT FROM ${member}.valuation_note`;
+}
+
+/** A source proof is current and names exactly the whole canonical snapshot.
+ * Row ownership is intentionally absent: a second retained source may vouch
+ * for a globally deduplicated row, but only with full semantic equality and
+ * its own immutable source evidence. */
+function exactPositionScope(
+  observation: string,
+  document: string,
+  account: string,
+  asOf: string,
+): string {
+  return `${observation}.account_id = ${account}
+    AND ${observation}.as_of = ${asOf}
+    AND ${observation}.status = 'complete'
+    AND cardinality(${observation}.gap_codes) = 0
+    AND ${observation}.retained_sha256 = ${document}.retained_sha256
+    AND ${observation}.holding_projection_generation_id
+          IS NOT DISTINCT FROM ${document}.active_holding_projection_generation_id
+    AND (SELECT count(*) FROM position_scope_memberships exact_count
+          WHERE exact_count.scope_id = ${observation}.id)
+          = ${observation}.emitted_position_count
+    AND NOT EXISTS (
+      SELECT 1 FROM position_scope_memberships expected_member
+      LEFT JOIN positions represented_position
+        ON ${positionMatchesScopeMember("represented_position", "expected_member")}
+       WHERE expected_member.scope_id = ${observation}.id
+         AND represented_position.id IS NULL
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM positions current_position
+       WHERE current_position.account_id = ${account}
+         AND current_position.as_of = ${asOf}
+         AND NOT EXISTS (
+           SELECT 1 FROM position_scope_memberships represented_member
+            WHERE represented_member.scope_id = ${observation}.id
+              AND ${positionMatchesScopeMember("current_position", "represented_member")}
+         )
+    )`;
+}
+
+function documentHasExactPositionScope(
+  document: string,
+  account: string,
+  asOf: string,
+): string {
+  return `EXISTS (
+    SELECT 1 FROM position_scope_observations exact_scope
+     WHERE exact_scope.source_document_id = ${document}.id
+       AND ${exactPositionScope("exact_scope", document, account, asOf)}
+  )`;
+}
+
 /**
  * The durable facts that can disqualify one account/date from being called a
  * complete holdings snapshot. Keep these predicates in one place: inventory,
@@ -1244,11 +1310,16 @@ type HoldingsDateAssessment = {
  * a review does not make a parser produce rows it previously omitted.
  */
 function holdingsDatePredicates(account: string, asOf: string) {
+  const exactScope = documentHasExactPositionScope("pd", account, asOf);
+  const openReviewExactScope = documentHasExactPositionScope(
+    "open_d",
+    account,
+    asOf,
+  );
   return {
     partialSource: `EXISTS (
       SELECT 1 FROM documents pd
-       WHERE pd.parsed_ok = FALSE
-         AND pd.superseded_by IS NULL
+       WHERE pd.superseded_by IS NULL
          AND (
            (pd.account_id = ${account} AND pd.doc_date = ${asOf})
            OR EXISTS (
@@ -1259,17 +1330,35 @@ function holdingsDatePredicates(account: string, asOf: string) {
            )
            OR (pd.doc_date = ${asOf} AND EXISTS (
              SELECT 1 FROM review_items partial_r
-              WHERE partial_r.source_document_id = pd.id
+             WHERE partial_r.source_document_id = pd.id
                 AND partial_r.account_id = ${account}
            ))
+           OR EXISTS (
+             SELECT 1 FROM position_scope_observations attributed_scope
+              WHERE attributed_scope.source_document_id = pd.id
+                AND attributed_scope.account_id = ${account}
+                AND attributed_scope.as_of = ${asOf}
+           )
+         )
+         AND (
+           (pd.parsed_ok = FALSE AND NOT ${exactScope})
+           OR (
+             EXISTS (
+               SELECT 1 FROM position_scope_observations known_scope
+                WHERE known_scope.source_document_id = pd.id
+                  AND known_scope.account_id = ${account}
+                  AND known_scope.as_of = ${asOf}
+             )
+             AND NOT ${exactScope}
+           )
          )
     )`,
     openReview: `EXISTS (
       SELECT 1 FROM review_items open_r
-      LEFT JOIN documents open_d ON open_d.id = open_r.source_document_id
-       WHERE open_r.account_id = ${account}
-         AND open_r.status = 'open'
+      JOIN documents open_d ON open_d.id = open_r.source_document_id
+       WHERE open_r.status = 'open'
          AND open_d.superseded_by IS NULL
+         AND (open_r.account_id = ${account} OR open_r.account_id IS NULL)
          AND (
            open_d.doc_date = ${asOf}
            OR EXISTS (
@@ -1278,6 +1367,16 @@ function holdingsDatePredicates(account: string, asOf: string) {
                 AND open_p.account_id = ${account}
                 AND open_p.as_of = ${asOf}
            )
+           OR EXISTS (
+             SELECT 1 FROM position_scope_observations open_scope
+              WHERE open_scope.source_document_id = open_r.source_document_id
+                AND open_scope.account_id = ${account}
+                AND open_scope.as_of = ${asOf}
+           )
+         )
+         AND NOT (
+           open_r.kind = 'document_unparsed'
+           AND ${openReviewExactScope}
          )
     )`,
     failedReconciliation: `EXISTS (
@@ -1487,6 +1586,12 @@ async function listAccountInventory(
   options: FinanceReadOptions,
 ): Promise<FinanceReadResponse> {
   const cursorKey = readCursorKey(scope, request, options);
+  const inventoryExactScope = exactPositionScope(
+    "scope_observation",
+    "scope_document",
+    "scope_observation.account_id",
+    "scope_observation.as_of",
+  );
   const result = await client.query<AccountInventoryRow>(
     `${ACCOUNT_DESCRIPTOR_CTES},
      inventory_accounts AS MATERIALIZED (
@@ -1504,53 +1609,83 @@ async function listAccountInventory(
      ),
      inventory_review_sources AS MATERIALIZED (
        SELECT r.account_id, r.source_document_id,
-              bool_or(r.status = 'open') AS has_open
+              bool_or(r.status = 'open' AND r.kind <> 'document_unparsed')
+                AS has_blocking_open,
+              bool_or(r.status = 'open' AND r.kind = 'document_unparsed')
+                AS has_unparsed_open
          FROM review_items r
-         JOIN inventory_accounts ia ON ia.account_id = r.account_id
         WHERE r.source_document_id IS NOT NULL
         GROUP BY r.account_id, r.source_document_id
      ),
-     inventory_partial_source_dates AS MATERIALIZED (
-       SELECT pd.account_id, pd.doc_date AS as_of
+     inventory_scope_verdicts AS MATERIALIZED (
+       SELECT scope_observation.id, scope_observation.source_document_id,
+              scope_observation.account_id, scope_observation.as_of,
+              (${inventoryExactScope}) AS exact
+         FROM position_scope_observations scope_observation
+         JOIN documents scope_document
+           ON scope_document.id = scope_observation.source_document_id
+         JOIN inventory_accounts ia
+           ON ia.account_id = scope_observation.account_id
+        WHERE scope_document.superseded_by IS NULL
+     ),
+     inventory_document_dates AS MATERIALIZED (
+       SELECT pd.id AS source_document_id, pd.account_id, pd.doc_date AS as_of
          FROM documents pd
          JOIN inventory_accounts ia ON ia.account_id = pd.account_id
-        WHERE pd.parsed_ok = FALSE
-          AND pd.superseded_by IS NULL
-          AND pd.doc_date IS NOT NULL
+        WHERE pd.superseded_by IS NULL AND pd.doc_date IS NOT NULL
        UNION
-       SELECT partial_p.account_id, partial_p.as_of
-         FROM documents pd
-         JOIN inventory_position_source_dates partial_p
-           ON partial_p.source_document_id = pd.id
-         JOIN inventory_accounts ia ON ia.account_id = partial_p.account_id
-        WHERE pd.parsed_ok = FALSE
-          AND pd.superseded_by IS NULL
+       SELECT partial_p.source_document_id, partial_p.account_id, partial_p.as_of
+         FROM inventory_position_source_dates partial_p
        UNION
-       SELECT partial_r.account_id, pd.doc_date
-         FROM documents pd
-         JOIN inventory_review_sources partial_r
-           ON partial_r.source_document_id = pd.id
+       SELECT partial_r.source_document_id, partial_r.account_id, pd.doc_date
+         FROM inventory_review_sources partial_r
+         JOIN documents pd ON pd.id = partial_r.source_document_id
          JOIN inventory_accounts ia ON ia.account_id = partial_r.account_id
-        WHERE pd.parsed_ok = FALSE
-          AND pd.superseded_by IS NULL
-          AND pd.doc_date IS NOT NULL
+        WHERE partial_r.account_id IS NOT NULL
+          AND pd.superseded_by IS NULL AND pd.doc_date IS NOT NULL
+       UNION
+       SELECT source_document_id, account_id, as_of
+         FROM inventory_scope_verdicts
+     ),
+     inventory_partial_source_dates AS MATERIALIZED (
+       SELECT attributed.account_id, attributed.as_of
+         FROM inventory_document_dates attributed
+         JOIN documents pd ON pd.id = attributed.source_document_id
+        WHERE (
+          pd.parsed_ok = FALSE
+          OR EXISTS (
+            SELECT 1 FROM inventory_scope_verdicts known_scope
+             WHERE known_scope.source_document_id = attributed.source_document_id
+               AND known_scope.account_id = attributed.account_id
+               AND known_scope.as_of = attributed.as_of
+          )
+        )
+          AND NOT EXISTS (
+            SELECT 1 FROM inventory_scope_verdicts exact_scope
+             WHERE exact_scope.source_document_id = attributed.source_document_id
+               AND exact_scope.account_id = attributed.account_id
+               AND exact_scope.as_of = attributed.as_of
+               AND exact_scope.exact
+          )
      ),
      inventory_open_review_dates AS MATERIALIZED (
-       SELECT open_r.account_id, open_d.doc_date AS as_of
-         FROM inventory_review_sources open_r
-         JOIN documents open_d ON open_d.id = open_r.source_document_id
-        WHERE open_r.has_open
-          AND open_d.superseded_by IS NULL
-          AND open_d.doc_date IS NOT NULL
-       UNION
-       SELECT open_r.account_id, open_p.as_of
-         FROM inventory_review_sources open_r
-         JOIN documents open_d ON open_d.id = open_r.source_document_id
-         JOIN inventory_position_source_dates open_p
-           ON open_p.source_document_id = open_r.source_document_id
-          AND open_p.account_id = open_r.account_id
-        WHERE open_r.has_open
-          AND open_d.superseded_by IS NULL
+       SELECT attributed.account_id, attributed.as_of
+         FROM inventory_document_dates attributed
+         JOIN inventory_review_sources open_r
+           ON open_r.source_document_id = attributed.source_document_id
+          AND (open_r.account_id = attributed.account_id
+               OR open_r.account_id IS NULL)
+        WHERE open_r.has_blocking_open
+           OR (
+             open_r.has_unparsed_open
+             AND NOT EXISTS (
+               SELECT 1 FROM inventory_scope_verdicts exact_scope
+                WHERE exact_scope.source_document_id = attributed.source_document_id
+                  AND exact_scope.account_id = attributed.account_id
+                  AND exact_scope.as_of = attributed.as_of
+                  AND exact_scope.exact
+             )
+           )
      ),
      inventory_reconciliation_dates AS MATERIALIZED (
        SELECT pr.account_id, pr.period_end AS as_of,
@@ -1574,11 +1709,27 @@ async function listAccountInventory(
          JOIN inventory_accounts ia ON ia.account_id = p.account_id
         GROUP BY p.account_id, p.as_of
      ),
+     inventory_observed_position_dates AS MATERIALIZED (
+       SELECT * FROM inventory_position_dates
+       UNION ALL
+       SELECT exact_scope.account_id, exact_scope.as_of,
+              NULL::finance_numeric AS value, 0::bigint AS missing,
+              0::bigint AS currency_count, NULL::text AS currency,
+              0::bigint AS not_marked
+         FROM inventory_scope_verdicts exact_scope
+        WHERE exact_scope.exact
+          AND NOT EXISTS (
+            SELECT 1 FROM inventory_position_dates present
+             WHERE present.account_id = exact_scope.account_id
+               AND present.as_of = exact_scope.as_of
+          )
+        GROUP BY exact_scope.account_id, exact_scope.as_of
+     ),
      inventory_latest_holdings AS (
        SELECT DISTINCT ON (p.account_id)
               p.account_id, p.as_of, p.value, p.missing,
               p.currency_count, p.currency, p.not_marked
-         FROM inventory_position_dates p
+         FROM inventory_observed_position_dates p
          LEFT JOIN inventory_partial_source_dates partial
            ON partial.account_id = p.account_id AND partial.as_of = p.as_of
          LEFT JOIN inventory_open_review_dates open_review
@@ -1592,7 +1743,10 @@ async function listAccountInventory(
           AND coalesce(reconciliation.failed, FALSE) = FALSE
           AND coalesce(reconciliation.pending, FALSE) = FALSE
           AND p.missing = 0
-          AND p.currency_count = 1
+          AND (
+            p.currency_count = 1
+            OR (p.currency_count = 0 AND p.value IS NULL)
+          )
           AND p.not_marked = 0
         ORDER BY p.account_id, p.as_of DESC
      ),
@@ -1691,7 +1845,7 @@ async function listAccountInventory(
       ...(ranged
         ? { activityFrom: row.activity_from!, activityTo: row.activity_to! }
         : {}),
-      ...(ranged && row.latest_snapshot_as_of !== null
+      ...(row.latest_snapshot_as_of !== null
         ? { latestSnapshotAsOf: row.latest_snapshot_as_of }
         : {}),
       // FIN-FRESHNESS-1: the dates of balance rows that exist, never a
@@ -2083,6 +2237,12 @@ async function selectKnownHoldingsDate(
        SELECT p.as_of
          FROM positions p
         WHERE p.account_id = $1
+       UNION
+       SELECT observed.as_of
+         FROM position_scope_observations observed
+         JOIN documents observed_d ON observed_d.id = observed.source_document_id
+        WHERE observed.account_id = $1
+          AND observed_d.superseded_by IS NULL
        UNION
        SELECT d.doc_date AS as_of
          FROM documents d
@@ -2594,6 +2754,11 @@ async function holdingsAggregateEligibility(
        SELECT p.account_id, p.as_of
          FROM positions p
        UNION
+       SELECT observed.account_id, observed.as_of
+         FROM position_scope_observations observed
+         JOIN documents observed_d ON observed_d.id = observed.source_document_id
+        WHERE observed_d.superseded_by IS NULL
+       UNION
        SELECT d.account_id, d.doc_date
          FROM documents d
         WHERE d.account_id IS NOT NULL
@@ -2939,11 +3104,36 @@ async function aggregateMoney(
  * field name that column fills. Frozen and keyed by the id prefix this
  * surface itself mints: nothing a caller sends reaches the SQL below. */
 const RECORD_TABLES: Readonly<
-  Record<string, { table: string; money: string; field: string } | undefined>
+  Record<
+    string,
+    | {
+        table: string;
+        money: string;
+        field: string;
+        historyKind?: "position" | "balance" | "liability";
+      }
+    | undefined
+  >
 > = Object.freeze({
   txn: { table: "transactions", money: "amount", field: "amount" },
-  pos: { table: "positions", money: "market_value", field: "marketValue" },
-  bal: { table: "balances", money: "total_value", field: "totalValue" },
+  pos: {
+    table: "positions",
+    money: "market_value",
+    field: "marketValue",
+    historyKind: "position",
+  },
+  bal: {
+    table: "balances",
+    money: "total_value",
+    field: "totalValue",
+    historyKind: "balance",
+  },
+  liab: {
+    table: "liabilities",
+    money: "balance",
+    field: "balance",
+    historyKind: "liability",
+  },
 });
 
 async function getEvidence(
@@ -2962,7 +3152,8 @@ async function getEvidence(
     // archive has never heard of is a coverage gap, not a citation-free row.
     scope.withheld.add("source_gap");
   } else {
-    const found = await client.query<
+    const liability = record.table === "liabilities";
+    let found = await client.query<
       EvidenceRow & {
         quantity?: string | null;
         price?: string | null;
@@ -2975,12 +3166,35 @@ async function getEvidence(
               r.source_document_id, r.source_locator,
               ${EVIDENCE_COLUMNS}
          FROM ${record.table} r
-         JOIN accounts a ON a.id = r.account_id
-         JOIN institutions i ON i.id = a.institution_id
+         ${liability ? "LEFT JOIN" : "JOIN"} accounts a ON a.id = r.account_id
+         JOIN institutions i ON i.id = ${liability ? "coalesce(a.institution_id, r.institution_id)" : "a.institution_id"}
          LEFT JOIN documents d ON d.id = r.source_document_id
         WHERE r.id = $1`,
       [id],
     );
+    if (found.rows.length === 0 && record.historyKind !== undefined) {
+      found = await client.query<
+        EvidenceRow & {
+          quantity?: string | null;
+          price?: string | null;
+          cost_basis?: string | null;
+          unrealized?: string | null;
+        }
+      >(
+        `SELECT r.${record.historyKind === "liability" ? "liability_balance" : record.money} AS money,
+                r.currency,
+                ${record.historyKind === "position" ? "r.quantity, r.price, r.cost_basis, r.unrealized," : ""}
+                r.source_document_id, r.source_locator,
+                ${EVIDENCE_COLUMNS}
+           FROM holding_projection_assertions r
+           ${record.historyKind === "liability" ? "LEFT JOIN" : "JOIN"} accounts a ON a.id = r.account_id
+           JOIN institutions i ON i.id = ${record.historyKind === "liability" ? "coalesce(a.institution_id, r.institution_id)" : "a.institution_id"}
+           LEFT JOIN documents d ON d.id = r.source_document_id
+          WHERE r.assertion_kind = $2 AND r.record_id = $1
+            AND d.retained_sha256 = r.retained_sha256`,
+        [id, record.historyKind],
+      );
+    }
     const row = found.rows[0];
     const fields =
       record.table === "positions"
@@ -3216,6 +3430,11 @@ async function coverageRecords(
 ): Promise<FinanceCoverageRecord[]> {
   const request = filters;
   const kinds = filters.kinds;
+  const reviewExactScope = documentHasExactPositionScope(
+    "d",
+    "ri.account_id",
+    "d.doc_date",
+  );
 
   const sources = await client.query<SourceRow>(
     `SELECT i.id AS source_id,
@@ -3301,6 +3520,11 @@ async function coverageRecords(
        LEFT JOIN documents d ON d.id = ri.source_document_id
       WHERE ri.status = 'open'
         AND (d.id IS NULL OR d.superseded_by IS NULL)
+        AND NOT (
+          ri.kind = 'document_unparsed'
+          AND d.doc_date IS NOT NULL
+          AND ${reviewExactScope}
+        )
         AND ($1::text IS NULL OR i.id = $1)
         AND ($3::text IS NULL OR ri.account_id = $3)
       GROUP BY i.id

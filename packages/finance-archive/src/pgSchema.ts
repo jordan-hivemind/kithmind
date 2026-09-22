@@ -900,6 +900,341 @@ CREATE TABLE instrument_identifier_sources (
 );
 `;
 
+// A corrected holding projection replaces mutable current rows, but never
+// erases what an earlier publication asserted. Generations name each complete
+// three-table projection for one retained document. Assertions retain the
+// exact typed values, record id, locator and retained-byte provenance needed
+// to verify an old citation after the current mirror has moved on.
+//
+// UPDATE is forbidden on all three history relations. Source erasure still
+// works through the document-owned ON DELETE CASCADE graph; direct DELETE is
+// an application/role responsibility rather than a stronger claim this DDL
+// cannot distinguish from a cascading delete.
+const HOLDING_PROJECTION_GENERATIONS = `
+CREATE TABLE holding_projection_generations (
+  id TEXT PRIMARY KEY,
+  document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  generation_number BIGINT NOT NULL CHECK (generation_number > 0),
+  generation_kind TEXT NOT NULL CHECK (generation_kind IN ('baseline', 'published')),
+  retained_sha256 TEXT NOT NULL CHECK (retained_sha256 ~ '^[0-9a-f]{64}$'),
+  projection_digest TEXT NOT NULL CHECK (projection_digest ~ '^[0-9a-f]{64}$'),
+  candidate_projection_digest TEXT
+    CHECK (candidate_projection_digest IS NULL OR candidate_projection_digest ~ '^[0-9a-f]{64}$'),
+  candidate_digest TEXT CHECK (candidate_digest IS NULL OR candidate_digest ~ '^[0-9a-f]{64}$'),
+  candidate_manifest JSONB,
+  old_projection_digest TEXT CHECK (old_projection_digest IS NULL OR old_projection_digest ~ '^[0-9a-f]{64}$'),
+  approval_digest TEXT CHECK (approval_digest IS NULL OR approval_digest ~ '^[0-9a-f]{64}$'),
+  approved_by TEXT,
+  approved_at TIMESTAMPTZ,
+  completeness_attestation TEXT,
+  removals_authorized BOOLEAN,
+  empty_projection_authorized BOOLEAN,
+  approval_expected_active_generation_id TEXT,
+  expected_previous_generation_id TEXT,
+  created_at TIMESTAMPTZ NOT NULL,
+  activated_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (document_id, generation_number),
+  UNIQUE (document_id, id),
+  FOREIGN KEY (document_id, expected_previous_generation_id)
+    REFERENCES holding_projection_generations(document_id, id)
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (document_id, approval_expected_active_generation_id)
+    REFERENCES holding_projection_generations(document_id, id)
+    DEFERRABLE INITIALLY DEFERRED,
+  CHECK (
+    (generation_kind = 'baseline'
+      AND candidate_digest IS NULL
+      AND candidate_manifest IS NULL
+      AND candidate_projection_digest IS NULL
+      AND old_projection_digest IS NULL
+      AND approval_digest IS NULL
+      AND approved_by IS NULL AND approved_at IS NULL
+      AND completeness_attestation IS NULL
+      AND removals_authorized IS NULL
+      AND empty_projection_authorized IS NULL
+      AND approval_expected_active_generation_id IS NULL
+      AND expected_previous_generation_id IS NULL)
+    OR
+    (generation_kind = 'published'
+      AND candidate_digest IS NOT NULL
+      AND candidate_manifest IS NOT NULL
+      AND jsonb_typeof(candidate_manifest) = 'object'
+      AND candidate_manifest->>'kind' = 'holding_correction_candidate_v1'
+      AND candidate_manifest->>'documentId' = document_id
+      AND candidate_manifest->>'retainedSha256' = retained_sha256
+      AND candidate_manifest->>'oldProjectionDigest' = old_projection_digest
+      AND candidate_manifest->>'candidateProjectionDigest' = candidate_projection_digest
+      AND candidate_manifest->>'candidateDigest' = candidate_digest
+      AND candidate_manifest#>>'{completeness,state}' = 'unproven'
+      AND candidate_projection_digest IS NOT NULL
+      AND old_projection_digest IS NOT NULL
+      AND approval_digest IS NOT NULL
+      AND approved_by IS NOT NULL AND approved_by <> ''
+      AND char_length(approved_by) <= 200
+      AND approved_at IS NOT NULL
+      AND completeness_attestation IS NOT NULL
+      AND completeness_attestation = 'operator_verified_complete_projection'
+      AND removals_authorized IS NOT NULL
+      AND empty_projection_authorized IS NOT NULL
+      AND expected_previous_generation_id IS NOT NULL)
+  )
+);
+
+CREATE TABLE holding_projection_assertions (
+  assertion_kind TEXT NOT NULL
+    CHECK (assertion_kind IN ('position', 'balance', 'liability')),
+  record_id TEXT NOT NULL,
+  source_document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  retained_sha256 TEXT NOT NULL CHECK (retained_sha256 ~ '^[0-9a-f]{64}$'),
+  row_hash TEXT,
+  source_locator TEXT,
+  assertion_digest TEXT NOT NULL CHECK (assertion_digest ~ '^[0-9a-f]{64}$'),
+
+  account_id TEXT REFERENCES accounts(id),
+  institution_id TEXT REFERENCES institutions(id),
+  instrument_id TEXT REFERENCES instruments(id),
+  as_of DATE NOT NULL,
+  currency currency_code NOT NULL,
+
+  quantity finance_numeric,
+  price finance_numeric,
+  market_value finance_numeric,
+  cost_basis finance_numeric,
+  unrealized finance_numeric,
+  valuation_basis TEXT CHECK (valuation_basis IS NULL
+    OR valuation_basis IN ('market_price', 'last_round', 'cost', 'reported_nav')),
+  valuation_note TEXT,
+
+  total_value finance_numeric,
+  cash finance_numeric,
+  period_start_value finance_numeric,
+  period_end_value finance_numeric,
+
+  liability_kind TEXT,
+  display_name TEXT,
+  liability_balance finance_numeric,
+  rate finance_numeric,
+  collateral_note TEXT,
+
+  PRIMARY KEY (assertion_kind, record_id),
+  UNIQUE (source_document_id, assertion_kind, record_id),
+  CHECK (
+    (assertion_kind = 'position'
+      AND account_id IS NOT NULL
+      AND institution_id IS NULL
+      AND liability_kind IS NULL AND display_name IS NULL
+      AND liability_balance IS NULL AND rate IS NULL AND collateral_note IS NULL
+      AND total_value IS NULL AND cash IS NULL
+      AND period_start_value IS NULL AND period_end_value IS NULL)
+    OR
+    (assertion_kind = 'balance'
+      AND account_id IS NOT NULL
+      AND institution_id IS NULL AND instrument_id IS NULL
+      AND quantity IS NULL AND price IS NULL AND market_value IS NULL
+      AND cost_basis IS NULL AND unrealized IS NULL
+      AND valuation_basis IS NULL AND valuation_note IS NULL
+      AND liability_kind IS NULL AND display_name IS NULL
+      AND liability_balance IS NULL AND rate IS NULL AND collateral_note IS NULL)
+    OR
+    (assertion_kind = 'liability'
+      AND liability_kind IS NOT NULL
+      AND instrument_id IS NULL
+      AND quantity IS NULL AND price IS NULL AND market_value IS NULL
+      AND cost_basis IS NULL AND unrealized IS NULL
+      AND valuation_basis IS NULL AND valuation_note IS NULL
+      AND total_value IS NULL AND cash IS NULL
+      AND period_start_value IS NULL AND period_end_value IS NULL)
+  )
+);
+
+CREATE TABLE holding_projection_generation_memberships (
+  document_id TEXT NOT NULL,
+  generation_id TEXT NOT NULL,
+  assertion_kind TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  PRIMARY KEY (generation_id, assertion_kind, record_id),
+  FOREIGN KEY (document_id, generation_id)
+    REFERENCES holding_projection_generations(document_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (document_id, assertion_kind, record_id)
+    REFERENCES holding_projection_assertions(source_document_id, assertion_kind, record_id)
+      ON DELETE CASCADE
+);
+
+ALTER TABLE documents
+  ADD COLUMN active_holding_projection_generation_id TEXT,
+  ADD CONSTRAINT documents_active_holding_projection_generation_same_document
+    FOREIGN KEY (id, active_holding_projection_generation_id)
+    REFERENCES holding_projection_generations(document_id, id)
+    ON DELETE SET NULL (active_holding_projection_generation_id)
+    DEFERRABLE INITIALLY DEFERRED;
+
+CREATE FUNCTION reject_holding_projection_history_update()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'holding projection history is immutable';
+END;
+$$;
+
+REVOKE ALL ON FUNCTION reject_holding_projection_history_update() FROM PUBLIC;
+
+CREATE TRIGGER holding_projection_generations_immutable
+  BEFORE UPDATE ON holding_projection_generations
+  FOR EACH ROW EXECUTE FUNCTION reject_holding_projection_history_update();
+CREATE TRIGGER holding_projection_assertions_immutable
+  BEFORE UPDATE ON holding_projection_assertions
+  FOR EACH ROW EXECUTE FUNCTION reject_holding_projection_history_update();
+CREATE TRIGGER holding_projection_memberships_immutable
+  BEFORE UPDATE ON holding_projection_generation_memberships
+  FOR EACH ROW EXECUTE FUNCTION reject_holding_projection_history_update();
+`;
+
+// Positive source coverage is separate from the mutable current position
+// mirror. One observation records what one retained document proved for one
+// account/date; its memberships name the exact semantic position hashes that
+// parser emitted and retain that document's own evidence locator. A member is
+// intentionally not a foreign key to positions: another document may own the
+// globally deduplicated current row, and removing or replacing that row must
+// make the read predicate fail closed rather than delete source history.
+//
+// A versioned document binds an observation to the projection generation it
+// was replayed against. A later reviewed replacement therefore retires the
+// proof from reads without mutating it. Unversioned documents use the partial
+// unique index below and retain the conservative one-proof-version rule.
+const POSITION_SCOPE_OBSERVATIONS = `
+CREATE FUNCTION position_scope_has_complete_tables(value JSONB)
+RETURNS BOOLEAN
+LANGUAGE SQL
+IMMUTABLE
+STRICT
+AS $$
+  SELECT CASE
+    WHEN jsonb_typeof(value->'tables') = 'array' THEN
+      jsonb_array_length(value->'tables') > 0
+      AND NOT EXISTS (
+        SELECT 1
+          FROM jsonb_array_elements(value->'tables') AS table_entry
+         WHERE jsonb_typeof(table_entry) <> 'object'
+            OR CASE
+                 WHEN jsonb_typeof(table_entry->'headers') = 'array'
+                 THEN jsonb_array_length(table_entry->'headers') = 0
+                 ELSE TRUE
+               END
+            OR jsonb_typeof(table_entry->'end') IS DISTINCT FROM 'object'
+      )
+    ELSE FALSE
+  END
+$$;
+
+REVOKE ALL ON FUNCTION position_scope_has_complete_tables(JSONB) FROM PUBLIC;
+
+CREATE TABLE position_scope_observations (
+  id TEXT PRIMARY KEY,
+  source_document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  holding_projection_generation_id TEXT,
+  retained_sha256 TEXT NOT NULL CHECK (retained_sha256 ~ '^[0-9a-f]{64}$'),
+  account_id TEXT NOT NULL REFERENCES accounts(id),
+  as_of DATE NOT NULL,
+  proof_version TEXT NOT NULL CHECK (proof_version = 'position_scope_v1'),
+  status TEXT NOT NULL CHECK (status IN ('complete', 'partial')),
+  emitted_position_count BIGINT NOT NULL CHECK (emitted_position_count >= 0),
+  gap_codes TEXT[] NOT NULL,
+  zero_basis TEXT CHECK (zero_basis IS NULL OR zero_basis = 'source_stated_none'),
+  evidence JSONB NOT NULL CHECK (
+    jsonb_typeof(evidence) = 'object'
+    AND jsonb_typeof(evidence->'tables') IS NOT DISTINCT FROM 'array'
+  ),
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (source_document_id, id),
+  UNIQUE (source_document_id, id, account_id, as_of),
+  FOREIGN KEY (source_document_id, holding_projection_generation_id)
+    REFERENCES holding_projection_generations(document_id, id),
+  CHECK (gap_codes <@ ARRAY[
+    'unresolved_lots',
+    'missing_security_start',
+    'unsupported_table_header',
+    'unsupported_value_column',
+    'page_sequence_gap',
+    'unbounded_account_scope',
+    'unproven_empty'
+  ]::TEXT[]),
+  CHECK (
+    (status = 'complete' AND cardinality(gap_codes) = 0)
+    OR (status = 'partial' AND cardinality(gap_codes) > 0)
+  ),
+  CHECK (
+    (status = 'complete' AND emitted_position_count = 0
+      AND zero_basis = 'source_stated_none')
+    OR (status = 'complete' AND emitted_position_count > 0
+      AND zero_basis IS NULL)
+    OR (status = 'partial' AND zero_basis IS NULL)
+  ),
+  CHECK (
+    status <> 'complete'
+    OR (
+      jsonb_typeof(evidence->'scopeEnd') IS NOT DISTINCT FROM 'object'
+      AND (
+        (emitted_position_count = 0
+          AND jsonb_typeof(evidence->'explicitNone')
+            IS NOT DISTINCT FROM 'object')
+        OR (emitted_position_count > 0
+          AND position_scope_has_complete_tables(evidence))
+      )
+    )
+  )
+);
+
+CREATE UNIQUE INDEX position_scope_observations_unversioned_key
+  ON position_scope_observations
+    (source_document_id, account_id, as_of, proof_version)
+  WHERE holding_projection_generation_id IS NULL;
+
+CREATE UNIQUE INDEX position_scope_observations_versioned_key
+  ON position_scope_observations
+    (source_document_id, holding_projection_generation_id,
+     account_id, as_of, proof_version)
+  WHERE holding_projection_generation_id IS NOT NULL;
+
+CREATE TABLE position_scope_memberships (
+  source_document_id TEXT NOT NULL,
+  scope_id TEXT NOT NULL,
+  position_row_hash TEXT NOT NULL CHECK (position_row_hash ~ '^[0-9a-f]{64}$'),
+  account_id TEXT NOT NULL REFERENCES accounts(id),
+  as_of DATE NOT NULL,
+  instrument_id TEXT REFERENCES instruments(id),
+  quantity finance_numeric,
+  price finance_numeric,
+  market_value finance_numeric,
+  cost_basis finance_numeric,
+  unrealized finance_numeric,
+  currency currency_code NOT NULL,
+  valuation_basis TEXT CHECK (valuation_basis IS NULL
+    OR valuation_basis IN ('market_price', 'last_round', 'cost', 'reported_nav')),
+  valuation_note TEXT,
+  source_locator TEXT NOT NULL,
+  PRIMARY KEY (scope_id, position_row_hash),
+  FOREIGN KEY (source_document_id, scope_id, account_id, as_of)
+    REFERENCES position_scope_observations
+      (source_document_id, id, account_id, as_of)
+    ON DELETE CASCADE
+);
+
+CREATE TRIGGER position_scope_observations_immutable
+  BEFORE UPDATE ON position_scope_observations
+  FOR EACH ROW EXECUTE FUNCTION reject_holding_projection_history_update();
+CREATE TRIGGER position_scope_memberships_immutable
+  BEFORE UPDATE ON position_scope_memberships
+  FOR EACH ROW EXECUTE FUNCTION reject_holding_projection_history_update();
+
+CREATE TRIGGER finance_read_revision_bump
+  BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON position_scope_observations
+  FOR EACH STATEMENT EXECUTE FUNCTION bump_finance_read_revision();
+CREATE TRIGGER finance_read_revision_bump
+  BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON position_scope_memberships
+  FOR EACH STATEMENT EXECUTE FUNCTION bump_finance_read_revision();
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -967,6 +1302,16 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     name: "review_items.reason_code, a shared instrument-match identity index, and instrument_identifier_sources",
     sql: INSTRUMENT_MATCH_AUDIT,
   },
+  {
+    version: 14,
+    name: "immutable holding projection generations and current document pointer",
+    sql: HOLDING_PROJECTION_GENERATIONS,
+  },
+  {
+    version: 15,
+    name: "account-scoped position coverage observations and exact memberships",
+    sql: POSITION_SCOPE_OBSERVATIONS,
+  },
 ]);
 
 /** The version an archive reaches once every migration has been applied. */
@@ -992,6 +1337,11 @@ export const PG_TABLES: readonly string[] = Object.freeze([
   "instrument_identifier_sources",
   "retained_texts",
   "finance_read_revision",
+  "holding_projection_generations",
+  "holding_projection_assertions",
+  "holding_projection_generation_memberships",
+  "position_scope_observations",
+  "position_scope_memberships",
 ]);
 
 /**
