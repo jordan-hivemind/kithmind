@@ -95,6 +95,45 @@ export function todayIsoDate(now: Date = new Date()): string {
 }
 
 /**
+ * Plaid keeps up to 24 months of investment transactions before an Item was
+ * linked, available via `/investments/transactions/get`'s `start_date`. This
+ * is the full window a first pull requests for an item that has never had
+ * investment transactions pulled.
+ */
+export const INVESTMENT_TRANSACTIONS_FULL_HISTORY_MONTHS = 24;
+
+/**
+ * Every later pull re-requests from the item's stored watermark minus this
+ * many days, to catch transactions that post a few days after their own
+ * dated day.
+ */
+export const INVESTMENT_TRANSACTIONS_INCREMENTAL_OVERLAP_DAYS = 7;
+
+/**
+ * The `start_date` for `/investments/transactions/get`: the full 24-month
+ * window Plaid allows when `pulledThrough` is `null` (this item has never
+ * had investment transactions pulled), otherwise `pulledThrough` minus a
+ * 7-day overlap so a transaction that posts late is not missed.
+ */
+export function investmentTransactionsStartDate(
+  pulledThrough: string | null,
+  asOf: string,
+): string {
+  if (pulledThrough === null) {
+    const start = new Date(Date.parse(`${asOf}T00:00:00Z`));
+    start.setUTCMonth(
+      start.getUTCMonth() - INVESTMENT_TRANSACTIONS_FULL_HISTORY_MONTHS,
+    );
+    return start.toISOString().slice(0, 10);
+  }
+  const start = new Date(Date.parse(`${pulledThrough}T00:00:00Z`));
+  start.setUTCDate(
+    start.getUTCDate() - INVESTMENT_TRANSACTIONS_INCREMENTAL_OVERLAP_DAYS,
+  );
+  return start.toISOString().slice(0, 10);
+}
+
+/**
  * Plaid's ISO currency code when present, otherwise its unofficial one --
  * a crypto ticker, or a code longer than three letters -- trimmed and
  * uppercased, or `null` when neither is present. Migration

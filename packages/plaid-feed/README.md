@@ -107,8 +107,9 @@ node packages/plaid-feed/dist/cli.js pull
 For every `kith.plaid_items` row: reads the access token from the Keychain,
 then calls `/accounts/balance/get`, `/investments/holdings/get`,
 `/transactions/sync` (cursor persisted per item) and
-`/investments/transactions/get` for the last 30 days, and upserts everything.
-One dated snapshot per account per day is written to
+`/investments/transactions/get` (window depends on whether this item has been
+pulled before -- see "History depth" below), and upserts everything. One
+dated snapshot per account per day is written to
 `kith.plaid_balance_snapshots` and `kith.plaid_holding_snapshots` (unique per
 account per `as_of`, so a same-day re-run overwrites rather than duplicates).
 
@@ -140,7 +141,34 @@ plaid pull item=ins_... institution="Chase" status=ok accounts=2 balances=2 hold
 Exits non-zero if any item's status is not `ok` or it had any `row_failures`,
 so a launchd job's exit status is meaningful.
 
-## Tables (migrations `043_plaid_feed.sql`, `044_plaid_currency.sql`)
+## History depth
+
+The owner wants as much transaction history as Plaid will give, not just
+recent activity, but Plaid bounds the two transaction products differently:
+
+- **Banking transactions** (`/transactions/sync`): how far back Plaid keeps
+  history for an Item is set by `days_requested` on the *link token*, fixed
+  the moment the Item is created. `link` now requests **730 days** (Plaid's
+  documented maximum; the default is 90). This only affects an institution
+  linked *after* this change -- **an Item linked before this change keeps
+  its original banking window unless it is removed and re-linked** (Plaid
+  gives no way to widen an existing Item's window in place).
+- **Investment transactions** (`/investments/transactions/get`): Plaid keeps
+  up to **24 months** of these before the Item was linked, and every call
+  takes an explicit `start_date`/`end_date` rather than depending on the
+  link token. `pull` tracks how far each item's investment-transaction
+  history has been pulled in `kith.plaid_items.investment_transactions_pulled_through`
+  (migration `045_plaid_history.sql`). The first pull for an item (that
+  column is `NULL`) requests the full 24-month window, paging with
+  `count`/`offset` (500 per page, Plaid's maximum) until every transaction
+  in the window has been fetched. Every later pull requests only from that
+  column's value minus 7 days -- to catch transactions that post a few days
+  after their own dated day -- through today, and the column is only
+  updated once a window's pages all succeed, so a page that fails partway
+  through does not advance the watermark past transactions this pull never
+  actually saw.
+
+## Tables (migrations `043_plaid_feed.sql`, `044_plaid_currency.sql`, `045_plaid_history.sql`)
 
 `plaid_items`, `plaid_accounts`, `plaid_securities`,
 `plaid_balance_snapshots`, `plaid_holding_snapshots`, `plaid_transactions`,

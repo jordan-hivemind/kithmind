@@ -6,7 +6,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { pullItem } from "../dist/index.js";
+import {
+  investmentTransactionsStartDate,
+  pullItem,
+  todayIsoDate,
+} from "../dist/index.js";
 
 function fakePool(shouldFail = () => false) {
   const calls = [];
@@ -30,6 +34,9 @@ const item = {
   keychainService: "com.kithmind.plaid.item.chase",
   transactionsCursor: null,
   needsRelinkAt: null,
+  // null: this item has never had investment transactions pulled, so a
+  // pull for it is a "first pull" requesting the full 24-month window.
+  investmentTransactionsPulledThrough: null,
 };
 
 const account = {
@@ -377,4 +384,129 @@ test("a row failure with no other error still makes the caller's process exit no
   // exit code.
   assert.equal(result.status, "ok");
   assert.ok(result.rowFailures > 0);
+});
+
+// PLAID-3: pull as much investment-transaction history as Plaid allows, not
+// just the last 30 days -- and page until every transaction in the window
+// has actually been fetched, not just the first page of it.
+
+function investmentTransactionStub(id, overrides = {}) {
+  return {
+    investment_transaction_id: id,
+    account_id: "acc-2",
+    security_id: "sec-1",
+    date: "2024-10-01",
+    name: "Buy",
+    quantity: 1,
+    amount: -10,
+    price: 10,
+    fees: 0,
+    type: "buy",
+    subtype: "buy",
+    iso_currency_code: "USD",
+    unofficial_currency_code: null,
+    ...overrides,
+  };
+}
+
+test("a first pull for investment transactions requests the full 24-month window and pages until the total is reached", async () => {
+  const pool = fakePool();
+  const client = happyClient();
+  const offsetsSeen = [];
+  const startDatesSeen = [];
+  let calls = 0;
+  client.investmentsTransactionsGet = async ({ start_date, options }) => {
+    calls += 1;
+    offsetsSeen.push(options.offset);
+    startDatesSeen.push(start_date);
+    assert.equal(options.count, 500, "requests Plaid's maximum page size");
+    if (calls === 1) {
+      return {
+        data: {
+          securities: [],
+          investment_transactions: [investmentTransactionStub("itx-a")],
+          total_investment_transactions: 2,
+        },
+      };
+    }
+    return {
+      data: {
+        securities: [],
+        investment_transactions: [investmentTransactionStub("itx-b")],
+        total_investment_transactions: 2,
+      },
+    };
+  };
+
+  const result = await pullItem(client, pool, item, "access-token-1");
+  assert.equal(result.status, "ok");
+  assert.equal(calls, 2, "a second page was fetched because the first page did not reach the total");
+  assert.deepEqual(offsetsSeen, [0, 1]);
+  assert.equal(result.investmentTransactions, 2);
+
+  const today = todayIsoDate();
+  const expectedStart = investmentTransactionsStartDate(null, today);
+  assert.deepEqual(startDatesSeen, [expectedStart, expectedStart]);
+
+  const watermark = pool.calls.find((call) =>
+    call.text.startsWith("UPDATE kith.plaid_items") &&
+    call.text.includes("investment_transactions_pulled_through = $2"),
+  );
+  assert.ok(watermark, "the watermark was recorded after every page succeeded");
+  assert.deepEqual(watermark.params, ["item-1", today]);
+});
+
+test("an item with a stored investment-transactions watermark requests from that date minus 7 days", async () => {
+  const pool = fakePool();
+  const client = happyClient();
+  let startDate;
+  client.investmentsTransactionsGet = async ({ start_date }) => {
+    startDate = start_date;
+    return {
+      data: { securities: [], investment_transactions: [], total_investment_transactions: 0 },
+    };
+  };
+
+  const resumingItem = { ...item, investmentTransactionsPulledThrough: "2026-09-10" };
+  const result = await pullItem(client, pool, resumingItem, "access-token-1");
+  assert.equal(result.status, "ok");
+  assert.equal(startDate, "2026-09-03", "7 days before the stored watermark, to catch late postings");
+
+  const watermark = pool.calls.find((call) =>
+    call.text.includes("investment_transactions_pulled_through = $2"),
+  );
+  assert.deepEqual(watermark.params, ["item-1", todayIsoDate()]);
+});
+
+test("investmentTransactionsStartDate: first pull is 24 months before today, incremental is 7 days before the watermark", () => {
+  assert.equal(investmentTransactionsStartDate(null, "2026-09-22"), "2024-09-22");
+  assert.equal(investmentTransactionsStartDate("2026-09-10", "2026-09-22"), "2026-09-03");
+});
+
+test("a page that fails partway through an investment-transactions pull does not advance the watermark", async () => {
+  const pool = fakePool();
+  const client = happyClient();
+  let calls = 0;
+  client.investmentsTransactionsGet = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        data: {
+          securities: [],
+          investment_transactions: [investmentTransactionStub("itx-a")],
+          total_investment_transactions: 2,
+        },
+      };
+    }
+    throw new Error("ECONNRESET");
+  };
+
+  const result = await pullItem(client, pool, item, "access-token-1");
+  assert.equal(result.status, "failed");
+  assert.equal(calls, 2);
+
+  const watermark = pool.calls.find((call) =>
+    call.text.includes("investment_transactions_pulled_through = $2"),
+  );
+  assert.equal(watermark, undefined, "no watermark was recorded for an incomplete window");
 });
