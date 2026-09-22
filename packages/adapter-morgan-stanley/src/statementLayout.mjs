@@ -1941,6 +1941,151 @@ function parseHoldings(
     }
     return null;
   };
+  const adjacentSummaryBoundaryAfterCarried = (pending) => {
+    if (pending.footerPage !== pending.page + 1) return null;
+    if (
+      !printedPageRunContinuesThrough(
+        pending.page,
+        pending.footerPage,
+        printedByPage,
+        populatedPages,
+      )
+    ) {
+      return null;
+    }
+
+    // The next page must repeat the prior page's own running header exactly.
+    // This admits the provider's CLIENT STATEMENT / period / personal header
+    // and its account-title continuation without teaching the parser a broad
+    // "header-like" skip rule that could swallow a security or amount row.
+    const priorMarker = markerLines[pending.table.firstLineIndex];
+    if (
+      priorMarker === null ||
+      lines[priorMarker].page !== pending.page ||
+      accountKeys[priorMarker] !== pending.context.accountKey
+    ) {
+      return null;
+    }
+    let priorStart = -1;
+    for (let index = priorMarker; index >= 0; index -= 1) {
+      if (lines[index].page !== pending.page) break;
+      if (/^CLIENT STATEMENT\b/.test(lines[index].text.trim())) {
+        priorStart = index;
+        break;
+      }
+    }
+    if (priorStart < 0) return null;
+    let priorEnd = pending.table.firstLineIndex;
+    const explicitSection = explicitHoldingsSection(pending.context.section);
+    for (
+      let index = priorMarker + 1;
+      index < pending.table.firstLineIndex;
+      index += 1
+    ) {
+      const trimmed = lines[index].text.trim();
+      if (
+        trimmed === "HOLDINGS" ||
+        (explicitSection !== null &&
+          explicitHoldingsSection(trimmed) === explicitSection)
+      ) {
+        priorEnd = index;
+        break;
+      }
+    }
+    const expectedHeader = lines
+      .slice(priorStart, priorEnd)
+      .filter((line) => line.page === pending.page)
+      .map((line) => line.text.trim())
+      .filter((text) => !PAGE_FOOTER.test(text));
+    const expectedMarker = expectedHeader.findIndex((text) =>
+      BARE_ACCOUNT_LINE.test(text),
+    );
+    if (
+      expectedMarker < 0 ||
+      BARE_ACCOUNT_LINE.exec(expectedHeader[expectedMarker])?.[1] !==
+        pending.context.accountKey ||
+      !/^Account\s+[A-Za-z][A-Za-z .,&'-]*$/.test(
+        expectedHeader[expectedMarker + 1] ?? "",
+      )
+    ) {
+      return null;
+    }
+
+    let summaryIndex = -1;
+    for (
+      let index = pending.footerIndex + 1;
+      index < lines.length;
+      index += 1
+    ) {
+      if (lines[index].page !== pending.footerPage) return null;
+      if (/^Percentage\b/.test(lines[index].text.trim())) {
+        summaryIndex = index;
+        break;
+      }
+    }
+    if (summaryIndex < 0) return null;
+    const repeatedHeader = lines
+      .slice(pending.footerIndex + 1, summaryIndex)
+      .map((line) => line.text.trim());
+    if (
+      repeatedHeader.length !== expectedHeader.length ||
+      repeatedHeader.some((text, index) => text !== expectedHeader[index]) ||
+      accountKeys[summaryIndex] !== pending.context.accountKey
+    ) {
+      return null;
+    }
+    const secondSummaryLine = lines[summaryIndex + 1];
+    if (
+      secondSummaryLine === undefined ||
+      secondSummaryLine.page !== pending.footerPage ||
+      !/^of Holdings\b/.test(secondSummaryLine.text.trim()) ||
+      accountKeys[summaryIndex + 1] !== pending.context.accountKey
+    ) {
+      return null;
+    }
+
+    // Inspect the summary rows through their next positive boundary. A dated
+    // row is a security, not a summary total, and any unknown intervening
+    // content keeps the carried table partial.
+    for (let index = summaryIndex + 2; index < lines.length; index += 1) {
+      const line = lines[index];
+      if (line.page !== pending.footerPage) return null;
+      const trimmed = line.text.trim();
+      if (ACTIVITY_SECTION.test(trimmed)) {
+        if (accountKeys[index] !== pending.context.accountKey) return null;
+        return {
+          lineIndex: summaryIndex,
+          locator: lineSpanLocator(
+            lines[summaryIndex],
+            kind,
+            "holdings section summary boundary",
+            textMeta,
+          ),
+        };
+      }
+      if (PAGE_FOOTER.test(trimmed)) {
+        return {
+          lineIndex: summaryIndex,
+          locator: lineSpanLocator(
+            lines[summaryIndex],
+            kind,
+            "holdings section summary boundary",
+            textMeta,
+          ),
+        };
+      }
+      const { bound } = bindRow(line.text, pending.columns);
+      const percentage = bound.get("tradeDate")?.text;
+      if (
+        percentage === undefined ||
+        !/^\d+(?:\.\d+)?%$/.test(percentage) ||
+        TRADE_DATE_CELL.test(percentage)
+      ) {
+        return null;
+      }
+    }
+    return null;
+  };
   const flushCarried = (
     nextAccountKey = null,
     nextMarker = null,
@@ -1954,6 +2099,9 @@ function parseHoldings(
       }).position !== null;
     const activityBoundary = independentlyComplete
       ? activityBoundaryAfterCarried(carried)
+      : null;
+    const summaryBoundary = independentlyComplete
+      ? adjacentSummaryBoundaryAfterCarried(carried)
       : null;
     if (nextMarker !== null && nextAccountKey !== carried.context.accountKey) {
       carried.table.end = lineSpanLocator(
@@ -1999,6 +2147,9 @@ function parseHoldings(
       } else {
         carried.table.gapCodes.add("page_sequence_gap");
       }
+    } else if (summaryBoundary !== null) {
+      carried.table.end = summaryBoundary.locator;
+      carried.table.lastLineIndex = summaryBoundary.lineIndex;
     } else if (activityBoundary !== null) {
       carried.table.end = activityBoundary.locator;
       carried.table.lastLineIndex = activityBoundary.lineIndex;
