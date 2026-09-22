@@ -1279,6 +1279,123 @@ function adjacentCusipIdentity(text, columns) {
   return identifiers.length === 1 ? `cusip:${identifiers[0][1]}` : null;
 }
 
+function hasExactlyFields(bound, expected) {
+  return (
+    JSON.stringify([...bound.keys()].sort()) ===
+    JSON.stringify([...expected].sort())
+  );
+}
+
+/**
+ * One provider fixed-income layout wraps a variable-rate security over six
+ * physical lines. Its identifier is two lines below the security start, after
+ * a percentage-only description continuation. This is deliberately a proof of
+ * that whole printed shape, not generic CUSIP lookahead.
+ */
+function wrappedBondSecurityProof({
+  lines,
+  index,
+  columns,
+  accountKeys,
+  headerPage,
+  accountKey,
+}) {
+  const source = lines.slice(index, index + 6);
+  if (
+    source.length !== 6 ||
+    source.some(
+      (line, offset) =>
+        line.page !== headerPage ||
+        accountKeys[index + offset] !== accountKey ||
+        (offset > 0 &&
+          (HOLDINGS_HEADER.test(line.text) ||
+            TABLE_END.test(line.text.trim()) ||
+            ASSET_CLASS.test(line.text.trim()))),
+    )
+  ) {
+    return null;
+  }
+  const rows = source.map((line) => bindRow(line.text, columns));
+  if (rows.some((row) => row.conflictingCells)) return null;
+  const [start, percentage, descriptor, secondValue, total, totalValue] = rows;
+  const shapes = [
+    [start, ["description", "quantity", "unitCost", "price", "costBasis"]],
+    [
+      percentage,
+      ["description", "unitCost", "costBasis", "marketValue", "unrealized"],
+    ],
+    [descriptor, ["description", "price", "costBasis"]],
+    [secondValue, ["unitCost", "costBasis", "marketValue", "unrealized"]],
+    [total, ["tradeDate", "quantity", "costBasis"]],
+    [totalValue, ["costBasis", "marketValue", "unrealized"]],
+  ];
+  if (shapes.some(([row, fields]) => !hasExactlyFields(row.bound, fields))) {
+    return null;
+  }
+
+  const startDescription = start.bound.get("description").text;
+  if (
+    !/\bVAR\b/.test(startDescription) ||
+    !/\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/.test(startDescription)
+  ) {
+    return null;
+  }
+  const printedPercentage = percentage.bound.get("description").text;
+  const detail =
+    /^Coupon Rate (\d+(?:\.\d+)?)%; Perpetual Maturity; CUSIP ([A-Z0-9]{9}) (\d{1,2}\/\d{1,2}\/\d{2,4}) (\d{1,3}(?:,\d{3})+\.\d+) (\d+\.\d+)$/.exec(
+      descriptor.bound.get("description").text,
+    );
+  if (
+    detail === null ||
+    printedPercentage !== `${detail[1]}%` ||
+    !TRADE_DATE_CELL.test(detail[3]) ||
+    resolveStatementMoney(detail[4]).value === null ||
+    resolveStatementMoney(detail[5]).value === null ||
+    total.bound.get("tradeDate").text !== "Total"
+  ) {
+    return null;
+  }
+
+  const numericCells = rows.flatMap(({ bound }) =>
+    [...bound].flatMap(([name, cell]) =>
+      name === "description" || name === "tradeDate" ? [] : [cell],
+    ),
+  );
+  if (
+    numericCells.some((cell) => resolveStatementMoney(cell.text).value === null)
+  ) {
+    return null;
+  }
+  const startPrice = resolveStatementMoney(start.bound.get("price").text).value;
+  const detailPrice = resolveStatementMoney(
+    descriptor.bound.get("price").text,
+  ).value;
+  const firstMarket = resolveStatementMoney(
+    percentage.bound.get("marketValue").text,
+  ).value;
+  const secondMarket = resolveStatementMoney(
+    secondValue.bound.get("marketValue").text,
+  ).value;
+  const printedTotal = resolveStatementMoney(
+    totalValue.bound.get("marketValue").text,
+  ).value;
+  if (
+    startPrice !== detailPrice ||
+    addDecimal(firstMarket, secondMarket) !== printedTotal
+  ) {
+    return null;
+  }
+  return {
+    identity: `cusip:${detail[2]}`,
+    lineStarts: source.map((line) => line.start),
+    conflictingIdentity:
+      parenthesizedSecurityIdentity(startDescription) !== null ||
+      source.flatMap((line) => [
+        ...line.text.matchAll(/\bCUSIP\s+[A-Z0-9]{9}\b/g),
+      ]).length !== 1,
+  };
+}
+
 function resolveInstrument(description, detailText) {
   const labelled = CUSIP_LABEL.exec(detailText ?? "");
   const cusip = labelled === null ? null : labelled[1];
@@ -1319,6 +1436,37 @@ function positionCells(block, context) {
   // securities or a set of lots. A later Total cannot make that ambiguity go
   // away, so refuse the whole block before choosing an aggregate row.
   if (block.some((row) => row.ambiguousUndatedIdentity)) return null;
+  const wrappedProof = block[0]?.wrappedBondProof;
+  if (wrappedProof !== undefined) {
+    if (
+      block.length !== 6 ||
+      block.some((row, index) => row.start !== wrappedProof.lineStarts[index])
+    ) {
+      return null;
+    }
+    const [start, , , , total, totalValue] = block;
+    const withLine = (cell, row) => ({
+      ...cell,
+      lineStart: row.start,
+      page: row.page,
+    });
+    return {
+      row: total,
+      merged: new Map([
+        ["quantity", withLine(total.bound.get("quantity"), total)],
+        ["price", withLine(start.bound.get("price"), start)],
+        ["costBasis", withLine(total.bound.get("costBasis"), total)],
+        [
+          "marketValue",
+          withLine(totalValue.bound.get("marketValue"), totalValue),
+        ],
+        [
+          "unrealized",
+          withLine(totalValue.bound.get("unrealized"), totalValue),
+        ],
+      ]),
+    };
+  }
   const totalRow = block.find(
     ({ bound }) =>
       bound.has("description") === false &&
@@ -2359,6 +2507,10 @@ function parseHoldings(
         accountKeys[j] === accountKey &&
         purchasesVsEstimatedValueSummary(text);
       const tableEndCandidate = TABLE_END.test(trimmed);
+      const wrappedBondContinuation =
+        block[0]?.wrappedBondProof !== undefined &&
+        block.length < block[0].wrappedBondProof.lineStarts.length &&
+        block[0].wrappedBondProof.lineStarts[block.length] === lines[j].start;
       const tableEndBound = tableEndCandidate
         ? bindRow(text, columns)
         : { bound: new Map(), conflictingCells: false };
@@ -2368,7 +2520,9 @@ function parseHoldings(
         /^TOTAL\b/.test(tableEndBound.bound.get("description")?.text ?? "") &&
         TRADE_DATE_CELL.test(tableEndBound.bound.get("tradeDate")?.text ?? "");
       if (
-        (tableEndCandidate && !datedTotalSecurity) ||
+        (tableEndCandidate &&
+          !datedTotalSecurity &&
+          !wrappedBondContinuation) ||
         purchasesSummaryBoundary ||
         HOLDINGS_HEADER.test(text)
       ) {
@@ -2421,13 +2575,24 @@ function parseHoldings(
         accountKeys[j + 1] === accountKeys[j]
           ? adjacentCusipIdentity(nextLine.text, columns)
           : null;
+      const wrappedBondProof = wrappedBondSecurityProof({
+        lines,
+        index: j,
+        columns,
+        accountKeys,
+        headerPage: lines[headerIndex].page,
+        accountKey,
+      });
       const parenthesizedIdentity = parenthesizedSecurityIdentity(
         bound.get("description")?.text,
       );
-      const candidateIdentities = [
-        ...(parenthesizedIdentity === null ? [] : [parenthesizedIdentity]),
-        ...(adjacentCusip === null ? [] : [adjacentCusip]),
-      ];
+      const candidateIdentities = wrappedBondContinuation
+        ? []
+        : [
+            ...(parenthesizedIdentity === null ? [] : [parenthesizedIdentity]),
+            ...(adjacentCusip === null ? [] : [adjacentCusip]),
+            ...(wrappedBondProof === null ? [] : [wrappedBondProof.identity]),
+          ];
       const identifierBackedCandidate =
         !inSummary &&
         !conflictingCells &&
@@ -2471,7 +2636,10 @@ function parseHoldings(
       block.push({
         bound,
         conflictingCells,
-        ...(repeatedUndatedIdentity ? { ambiguousUndatedIdentity: true } : {}),
+        ...(repeatedUndatedIdentity || wrappedBondProof?.conflictingIdentity
+          ? { ambiguousUndatedIdentity: true }
+          : {}),
+        ...(wrappedBondProof === null ? {} : { wrappedBondProof }),
         page: lines[j].page,
         start: lines[j].start,
       });

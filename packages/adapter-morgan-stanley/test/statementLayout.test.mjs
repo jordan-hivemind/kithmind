@@ -19,6 +19,7 @@ import { buildMinimalPdf } from "../fixtures/pdf.mjs";
 import { STATEMENT_LINES } from "../fixtures/statementLines.mjs";
 import {
   ACTIVITY_SUMMARY_TEXT,
+  BOND_HEADER,
   lotsWithoutTotalLines,
   balanceSheetLines,
   bondBlockLines,
@@ -876,6 +877,205 @@ test("an identifier-shaped undated row cannot leave a section summary", () => {
     ),
     false,
   );
+});
+
+const BOND_TEST_COLUMNS = {
+  description: { start: 8 },
+  tradeDate: { end: 62 },
+  quantity: { end: 92 },
+  unitCost: { end: 106 },
+  price: { end: 120 },
+  costBasis: { end: 136 },
+  marketValue: { end: 152 },
+  unrealized: { end: 166 },
+};
+
+function wrappedBondRows({
+  startDescription = "SYNTHETIC FLOATING NOTE VAR 06/15/26",
+  percentage = "4.250%",
+  descriptor = "Coupon Rate 4.250%; Perpetual Maturity; CUSIP 00000WNF1 06/15/26 1,234.56 99.500",
+  startPrice = "$99.500",
+  detailPrice = "99.500",
+  firstMarket = "$100.00",
+  secondMarket = "200.00",
+  totalMarket = "300.00",
+  includeTotal = true,
+} = {}) {
+  const rows = [
+    place([
+      { text: startDescription, ...BOND_TEST_COLUMNS.description },
+      { text: "100.000", ...BOND_TEST_COLUMNS.quantity },
+      { text: "$98.000", ...BOND_TEST_COLUMNS.unitCost },
+      { text: startPrice, ...BOND_TEST_COLUMNS.price },
+      { text: "$90.00", ...BOND_TEST_COLUMNS.costBasis },
+    ]),
+    place([
+      { text: percentage, ...BOND_TEST_COLUMNS.description },
+      { text: "98.000", ...BOND_TEST_COLUMNS.unitCost },
+      { text: "90.00", ...BOND_TEST_COLUMNS.costBasis },
+      { text: firstMarket, ...BOND_TEST_COLUMNS.marketValue },
+      { text: "$10.00", ...BOND_TEST_COLUMNS.unrealized },
+    ]),
+    place([
+      { text: descriptor, ...BOND_TEST_COLUMNS.description },
+      { text: detailPrice, ...BOND_TEST_COLUMNS.price },
+      { text: "180.00", ...BOND_TEST_COLUMNS.costBasis },
+    ]),
+    place([
+      { text: "98.000", ...BOND_TEST_COLUMNS.unitCost },
+      { text: "180.00", ...BOND_TEST_COLUMNS.costBasis },
+      { text: secondMarket, ...BOND_TEST_COLUMNS.marketValue },
+      { text: "20.00", ...BOND_TEST_COLUMNS.unrealized },
+    ]),
+  ];
+  if (!includeTotal) return rows;
+  return rows.concat(
+    place([
+      { text: "Total", ...BOND_TEST_COLUMNS.tradeDate },
+      { text: "300.000", ...BOND_TEST_COLUMNS.quantity },
+      { text: "270.00", ...BOND_TEST_COLUMNS.costBasis },
+    ]),
+    place([
+      { text: "270.00", ...BOND_TEST_COLUMNS.costBasis },
+      { text: totalMarket, ...BOND_TEST_COLUMNS.marketValue },
+      { text: "30.00", ...BOND_TEST_COLUMNS.unrealized },
+    ]),
+  );
+}
+
+function wrappedBondStatement(rows = wrappedBondRows()) {
+  return identifierStartStatement(rows, BOND_HEADER).replace(
+    "        COMMON STOCKS",
+    "        CORPORATE FIXED INCOME",
+  );
+}
+
+test("the exact six-row wrapped bond uses its paired printed Total and exact evidence", () => {
+  const text = wrappedBondStatement();
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [position] = parsed.holdings.positions;
+  assert.equal(position.instrument.cusip, "00000WNF1");
+  assert.equal(
+    position.instrument.name,
+    "SYNTHETIC FLOATING NOTE VAR 06/15/26",
+  );
+  assert.equal(position.quantity, "300");
+  assert.equal(position.price, "99.5");
+  assert.equal(position.costBasis, "270");
+  assert.equal(position.marketValue, "300");
+  assert.equal(position.unrealized, "30");
+  assert.equal(
+    positiveCents("100") + positiveCents("200"),
+    positiveCents(position.marketValue),
+  );
+  for (const [field, quote] of [
+    ["quantity", "300.000"],
+    ["price", "$99.500"],
+    ["costBasis", "270.00"],
+    ["marketValue", "300.00"],
+  ]) {
+    const binding = position.locators[field].binding;
+    assert.equal(binding.quote, quote);
+    assert.equal(text.slice(binding.start, binding.end), quote);
+  }
+  assert.equal(position.locators.marketValue.calculation, undefined);
+  assert.equal(
+    Object.keys(position.locators).some((key) => key.includes(".lot.")),
+    false,
+  );
+  assert.doesNotMatch(position.valuationNote, /summed from/);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+});
+
+test("wrapped bond proof rejects descriptor, identity, topology, numeric and Total defects", () => {
+  const base = wrappedBondRows();
+  const cases = [
+    {
+      name: "arbitrary percentage continuation",
+      rows: wrappedBondRows({ percentage: "Synthetic continuation" }),
+    },
+    {
+      name: "different detail price",
+      rows: wrappedBondRows({ detailPrice: "98.500" }),
+    },
+    {
+      name: "dated-maturity descriptor instead of the proven perpetual form",
+      rows: wrappedBondRows({
+        descriptor: "Coupon Rate 4.250%; Maturity 06/15/31; CUSIP 00000WNF1",
+      }),
+    },
+    {
+      name: "unreadable descriptor suffix",
+      rows: wrappedBondRows({
+        descriptor:
+          "Coupon Rate 4.250%; Perpetual Maturity; CUSIP 00000WNF1 06/15/26 1,23O.56 99.500",
+      }),
+    },
+    {
+      name: "duplicate CUSIP",
+      rows: wrappedBondRows({
+        descriptor:
+          "Coupon Rate 4.250%; Perpetual Maturity; CUSIP 00000WNF1 CUSIP 00000WNF2 06/15/26 1,234.56 99.500",
+      }),
+    },
+    {
+      name: "competing CUSIP on the start row",
+      rows: wrappedBondRows({
+        startDescription: "NOTE VAR 06/15/26 CUSIP 111111111",
+      }),
+    },
+    {
+      name: "competing ticker identity on the start row",
+      rows: wrappedBondRows({
+        startDescription: "NOTE VAR 06/15/26 (BOND)",
+      }),
+    },
+    {
+      name: "competing security description",
+      rows: wrappedBondRows({ percentage: "OTHER FUND (OTHR)" }),
+    },
+    {
+      name: "physical page crossing",
+      rows: [...base.slice(0, 2), PAGE_SEPARATOR, ...base.slice(2)],
+    },
+    {
+      name: "header crossing",
+      rows: [...base.slice(0, 2), BOND_HEADER, ...base.slice(2)],
+    },
+    {
+      name: "account crossing",
+      rows: [
+        ...base.slice(0, 2),
+        `        ${CONSOLIDATED_ACCOUNT_TWO}`,
+        ...base.slice(2),
+      ],
+    },
+    {
+      name: "missing paired Total",
+      rows: wrappedBondRows({ includeTotal: false }),
+    },
+    {
+      name: "unreadable market amount",
+      rows: wrappedBondRows({ firstMarket: "$1O0.00" }),
+    },
+    {
+      name: "market sum disagreement",
+      rows: wrappedBondRows({ totalMarket: "301.00" }),
+    },
+  ];
+  for (const { name, rows } of cases) {
+    const parsed = parseStatementLines(wrappedBondStatement(rows), kind);
+    assert.deepEqual(parsed.holdings.positions, [], name);
+    assert.ok(
+      parsed.holdings.positionScopes[0].gapCodes.some((code) =>
+        ["missing_security_start", "unresolved_lots"].includes(code),
+      ),
+      name,
+    );
+  }
 });
 
 test("two cells bound to one lot column are refused instead of choosing the first", () => {
