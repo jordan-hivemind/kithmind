@@ -1023,11 +1023,11 @@ export async function setManualLink(
   plaidAccountId: string,
 ): Promise<void> {
   await pool.query(
-    `INSERT INTO kith.fin_account_link_overrides (archive_account_id, plaid_account_id)
-     VALUES ($1, $2)
+    `INSERT INTO kith.fin_account_link_overrides (id, archive_account_id, plaid_account_id)
+     VALUES ($1, $2, $3)
      ON CONFLICT (archive_account_id) DO UPDATE
        SET plaid_account_id = EXCLUDED.plaid_account_id, updated_at = transaction_timestamp()`,
-    [archiveAccountId, plaidAccountId],
+    [newKithId(), archiveAccountId, plaidAccountId],
   );
 }
 
@@ -1040,11 +1040,11 @@ export async function setManualLink(
  */
 export async function setManualUnlink(pool: Pool, archiveAccountId: string): Promise<void> {
   await pool.query(
-    `INSERT INTO kith.fin_account_link_overrides (archive_account_id, plaid_account_id)
-     VALUES ($1, NULL)
+    `INSERT INTO kith.fin_account_link_overrides (id, archive_account_id, plaid_account_id)
+     VALUES ($1, $2, NULL)
      ON CONFLICT (archive_account_id) DO UPDATE
        SET plaid_account_id = NULL, updated_at = transaction_timestamp()`,
-    [archiveAccountId],
+    [newKithId(), archiveAccountId],
   );
   await splitArchiveAccountFromFeedRow(pool, archiveAccountId);
 }

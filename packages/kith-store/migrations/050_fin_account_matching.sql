@@ -43,8 +43,18 @@ ALTER TABLE kith.fin_accounts
 -- clears the override (a future `--link` overwrites it; there is no
 -- separate "clear" command yet -- re-running `--link` is how the owner
 -- reverses an `--unlink`).
+--
+-- `id kith.kith_id PRIMARY KEY` rather than keying the table on
+-- `archive_account_id` directly: `postgres-proof.test.mjs`'s restore test
+-- rewinds a restored database by dropping every table with a `kith_id`
+-- domain column and replaying migrations from version 1 -- a table with no
+-- such column survives that rewind and collides with its own `CREATE TABLE`
+-- on replay (PR 420 hit the same thing). `archive_account_id` keeps the
+-- one-override-per-archive-account invariant as a plain UNIQUE constraint
+-- instead.
 CREATE TABLE kith.fin_account_link_overrides (
-  archive_account_id text PRIMARY KEY
+  id kith.kith_id PRIMARY KEY,
+  archive_account_id text NOT NULL UNIQUE
     CHECK (char_length(archive_account_id) BETWEEN 1 AND 200),
   plaid_account_id text
     CHECK (plaid_account_id IS NULL OR char_length(plaid_account_id) BETWEEN 1 AND 200),
