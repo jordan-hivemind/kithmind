@@ -58,6 +58,8 @@ checks and review evidence, and start final CI only after the review head is
 stable. For scheduler changes, test the affected end-to-end state transitions
 across mixed document types, queued work, legacy resume and deferred refresh.
 Do not substitute helper-only checks or unrelated suites for those transitions.
+Exercise newly queued selected items through publication, cleanup, next-item
+selection and restart. Publication alone does not prove scheduler acceptance.
 
 ## Parallel lanes
 
