@@ -119,6 +119,19 @@ const DOCUMENT_REFERENCES = [
   { table: "review_items", column: "last_seen_document_id", collisionKey: null },
 ];
 
+/**
+ * Immutable holding history binds one retained document revision. Moving it
+ * to another capture would rewrite provenance; leaving it on a row this
+ * script supersedes would make the active/history graph disagree about which
+ * document owns the assertion. These references are known but deliberately
+ * never repointed. A selected group touching either one is refused below.
+ */
+const PROTECTED_DOCUMENT_REFERENCES = [
+  { table: "holding_projection_generations", column: "document_id" },
+  { table: "holding_projection_assertions", column: "source_document_id" },
+  { table: "position_scope_observations", column: "source_document_id" },
+];
+
 /** `documents.superseded_by` is this script's own output, not something it
  * repoints. */
 const SELF_REFERENCE = { table: "documents", column: "superseded_by" };
@@ -139,7 +152,9 @@ async function assertReferencesKnown(client) {
         AND ccu.column_name = 'id'`,
   );
   const known = new Set(
-    [...DOCUMENT_REFERENCES, SELF_REFERENCE].map((ref) => `${ref.table}.${ref.column}`),
+    [...DOCUMENT_REFERENCES, ...PROTECTED_DOCUMENT_REFERENCES, SELF_REFERENCE].map(
+      (ref) => `${ref.table}.${ref.column}`,
+    ),
   );
   const unknown = rows
     .map((row) => `${row.table_name}.${row.column_name}`)
@@ -361,6 +376,30 @@ export async function collapseDuplicateDocuments(
        SELECT * FROM unnest($1::text[], $2::text[])`,
       [pairs.map((pair) => pair[0]), pairs.map((pair) => pair[1])],
     );
+
+    const protectedReference = await tx.query(
+      `SELECT EXISTS (
+         SELECT 1 FROM holding_projection_generations h
+          WHERE h.document_id IN (
+            SELECT duplicate_id FROM collapse_map
+            UNION SELECT canonical_id FROM collapse_map)
+         UNION ALL
+         SELECT 1 FROM holding_projection_assertions h
+          WHERE h.source_document_id IN (
+            SELECT duplicate_id FROM collapse_map
+            UNION SELECT canonical_id FROM collapse_map)
+         UNION ALL
+         SELECT 1 FROM position_scope_observations h
+          WHERE h.source_document_id IN (
+            SELECT duplicate_id FROM collapse_map
+            UNION SELECT canonical_id FROM collapse_map)
+       ) AS present`,
+    );
+    if (protectedReference.rows[0]?.present === true) {
+      throw new Error(
+        "cannot collapse a selected document group that owns immutable holding projection history or position scope history",
+      );
+    }
 
     for (const reference of DOCUMENT_REFERENCES) {
       const { table, column, collisionKey } = reference;

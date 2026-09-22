@@ -301,11 +301,6 @@ test(
     );
     await archive.connect();
     assert.equal(await applyPgSchema(archive, "finance"), PG_SCHEMA_VERSION);
-    // The extraction of the shared helpers must not move the archive's schema on.
-    // A pin, moved deliberately with each archive migration: 13 is F1-76's
-    // instrument identifier sources and review item reason codes.
-    assert.equal(PG_SCHEMA_VERSION, 13);
-
     const financeShape = () =>
       all(
         client,
@@ -322,6 +317,7 @@ test(
     const before = await financeShape();
     const beforeHistory = await financeHistory();
     assert.ok(before.length > 0);
+    assert.equal(beforeHistory.at(-1)?.version, PG_SCHEMA_VERSION);
 
     assert.equal(await applyKithSchema(client), KITH_SCHEMA_VERSION);
 

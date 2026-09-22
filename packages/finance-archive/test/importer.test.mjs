@@ -719,6 +719,502 @@ function position(overrides = {}) {
   };
 }
 
+function positionScope(overrides = {}) {
+  return {
+    accountId: ACCOUNT.id,
+    asOf: "2026-03-31",
+    proofVersion: "position_scope_v1",
+    status: "complete",
+    emittedPositionCount: 1,
+    gapCodes: [],
+    evidence: {
+      account: { source: "synthetic_statement", index: 1 },
+      tables: [
+        {
+          headers: [{ source: "synthetic_statement", index: 2 }],
+          end: { source: "synthetic_statement", index: 4 },
+        },
+      ],
+      scopeEnd: { source: "synthetic_statement", index: 5 },
+    },
+    ...overrides,
+  };
+}
+
+function retainedHoldingDocument(sha256, overrides = {}) {
+  return document(sha256, [], {
+    retainedSha256: sha256,
+    retainedByteLength: 512,
+    mediaType: "application/pdf",
+    captureId: `capture-${sha256.slice(0, 8)}`,
+    ...overrides,
+  });
+}
+
+test(
+  "position scope proofs persist exact source semantics, replay immutably, and may reference a foreign-owned canonical row",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    await client.query(
+      "INSERT INTO instruments (id, symbol, name) VALUES ('scope-instrument', 'SCOP', 'Synthetic Scope Fund')",
+    );
+    const firstSha = "91".padEnd(64, "0");
+    const secondSha = "92".padEnd(64, "0");
+    const firstPosition = position({
+      instrumentId: "scope-instrument",
+      sourceLocator: '{"row":{"source":"first","index":3}}',
+    });
+    const secondPosition = position({
+      instrumentId: "scope-instrument",
+      sourceLocator: '{"row":{"source":"second","index":7}}',
+    });
+
+    await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(firstSha, {
+            positions: [firstPosition],
+            positionScopes: [positionScope()],
+          }),
+        ],
+      },
+      NOW,
+    );
+    await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(secondSha, {
+            positions: [secondPosition],
+            positionScopes: [
+              positionScope({
+                evidence: {
+                  account: { source: "synthetic_statement", index: 6 },
+                  tables: [
+                    {
+                      headers: [{ source: "synthetic_statement", index: 7 }],
+                      end: { source: "synthetic_statement", index: 9 },
+                    },
+                  ],
+                  scopeEnd: { source: "synthetic_statement", index: 10 },
+                },
+              }),
+            ],
+          }),
+        ],
+      },
+      NOW,
+    );
+
+    assert.equal(await count(client, "positions"), 1);
+    assert.equal(await count(client, "position_scope_observations"), 2);
+    assert.equal(await count(client, "position_scope_memberships"), 2);
+    const canonical = await one(
+      client,
+      `SELECT d.sha256, p.source_locator
+         FROM positions p JOIN documents d ON d.id = p.source_document_id`,
+    );
+    assert.equal(canonical.sha256, firstSha);
+    assert.equal(canonical.source_locator, firstPosition.sourceLocator);
+    const foreignWitness = await one(
+      client,
+      `SELECT m.price::text AS price, m.unrealized::text AS unrealized,
+              m.valuation_note, m.source_locator, o.retained_sha256,
+              o.emitted_position_count::text AS emitted_position_count
+         FROM position_scope_memberships m
+         JOIN position_scope_observations o ON o.id = m.scope_id
+         JOIN documents d ON d.id = o.source_document_id
+        WHERE d.sha256 = $1`,
+      [secondSha],
+    );
+    assert.deepEqual(foreignWitness, {
+      price: "50",
+      unrealized: "100",
+      valuation_note: "Synthetic delayed market feed.",
+      source_locator: secondPosition.sourceLocator,
+      retained_sha256: secondSha,
+      emitted_position_count: "1",
+    });
+
+    // The already-parsed replay path must compare the immutable proof and
+    // leave exactly one observation/member for this document.
+    await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(secondSha, {
+            positions: [secondPosition],
+            positionScopes: [
+              positionScope({
+                evidence: {
+                  account: { source: "synthetic_statement", index: 6 },
+                  tables: [
+                    {
+                      headers: [{ source: "synthetic_statement", index: 7 }],
+                      end: { source: "synthetic_statement", index: 9 },
+                    },
+                  ],
+                  scopeEnd: { source: "synthetic_statement", index: 10 },
+                },
+              }),
+            ],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(await count(client, "position_scope_observations"), 2);
+
+    await assert.rejects(
+      importBatch(
+        client,
+        {
+          source: "synthetic-scope",
+          documents: [
+            retainedHoldingDocument(secondSha, {
+              positions: [secondPosition],
+              positionScopes: [
+                positionScope({
+                  evidence: {
+                    tables: [
+                      {
+                        headers: [
+                          { source: "synthetic_statement", index: 700 },
+                        ],
+                        end: {
+                          source: "synthetic_statement",
+                          index: 701,
+                        },
+                      },
+                    ],
+                    scopeEnd: {
+                      source: "synthetic_statement",
+                      index: 702,
+                    },
+                  },
+                }),
+              ],
+            }),
+          ],
+        },
+        NOW,
+      ),
+      /changed an immutable proof payload/,
+    );
+    assert.equal(await count(client, "position_scope_observations"), 2);
+  },
+);
+
+test(
+  "position scope mismatch is reviewed while explicit complete zero is retained as a positive observation",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const mismatchSha = "93".padEnd(64, "0");
+    const unprovedZeroSha = "95".padEnd(64, "0");
+    const zeroSha = "94".padEnd(64, "0");
+    const bothPositions = [
+      position(),
+      position({
+        accountId: OTHER_ACCOUNT.id,
+        sourceLocator: "holdings:other:1",
+      }),
+    ];
+    const otherScope = (overrides = {}) =>
+      positionScope({
+        accountId: OTHER_ACCOUNT.id,
+        evidence: {
+          account: { source: "synthetic_statement", index: 20 },
+          tables: [
+            {
+              headers: [{ source: "synthetic_statement", index: 21 }],
+              end: { source: "synthetic_statement", index: 23 },
+            },
+          ],
+          scopeEnd: { source: "synthetic_statement", index: 24 },
+        },
+        ...overrides,
+      });
+
+    const mismatch = await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(mismatchSha, {
+            positions: bothPositions,
+            positionScopes: [
+              positionScope(),
+              otherScope({ emittedPositionCount: 2 }),
+            ],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(mismatch.reviewItemsOpened, 1);
+    let mismatchReview = await one(
+      client,
+      `SELECT kind, account_id, raw_value, status
+         FROM review_items WHERE kind = 'position_scope_mismatch'`,
+    );
+    assert.deepEqual(mismatchReview, {
+      kind: "position_scope_mismatch",
+      account_id: OTHER_ACCOUNT.id,
+      raw_value: `${OTHER_ACCOUNT.id}:2026-03-31:position_scope_v1`,
+      status: "open",
+    });
+
+    // Replaying only the already-valid account cannot clear or hide the
+    // omitted account's mismatch on the same document/date/proof version.
+    const omittedOther = await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(mismatchSha, {
+            positions: bothPositions,
+            positionScopes: [positionScope()],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(omittedOther.reviewItemsResolved, 0);
+    assert.equal(
+      (
+        await one(
+          client,
+          `SELECT status FROM review_items
+            WHERE kind = 'position_scope_mismatch'`,
+        )
+      ).status,
+      "open",
+    );
+
+    const corrected = await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(mismatchSha, {
+            positions: bothPositions,
+            positionScopes: [positionScope(), otherScope()],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(corrected.reviewItemsResolved, 1);
+    mismatchReview = await one(
+      client,
+      `SELECT status, resolution_note
+         FROM review_items WHERE kind = 'position_scope_mismatch'`,
+    );
+    assert.equal(mismatchReview.status, "resolved");
+    assert.match(
+      mismatchReview.resolution_note,
+      /^resolved on reimport: every declared position scope validated and persisted exactly /,
+    );
+    assert.equal(await count(client, "position_scope_observations"), 2);
+
+    const regressed = await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(mismatchSha, {
+            positions: bothPositions,
+            positionScopes: [
+              positionScope(),
+              otherScope({ emittedPositionCount: 2 }),
+            ],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(regressed.reviewItemsOpened, 0);
+    assert.equal(regressed.reviewItemsUpdated, 1);
+    mismatchReview = await one(
+      client,
+      `SELECT status, resolved_at IS NOT NULL AS was_resolved,
+              resolution_note LIKE
+                'resolved on reimport: every declared position scope validated and persisted exactly%'
+                AS has_system_resolution
+         FROM review_items WHERE kind = 'position_scope_mismatch'`,
+    );
+    assert.deepEqual(mismatchReview, {
+      status: "open",
+      was_resolved: true,
+      has_system_resolution: true,
+    });
+    assert.equal(
+      await count(
+        client,
+        "review_items",
+        "WHERE kind = 'position_scope_mismatch'",
+      ),
+      1,
+    );
+
+    await client.query(
+      `UPDATE review_items
+          SET status = 'dismissed', resolved_at = now(),
+              resolution_note = 'reviewer accepted the synthetic discrepancy'
+        WHERE kind = 'position_scope_mismatch'`,
+    );
+    const dismissedReplay = await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(mismatchSha, {
+            positions: bothPositions,
+            positionScopes: [
+              positionScope(),
+              otherScope({ emittedPositionCount: 2 }),
+            ],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(dismissedReplay.reviewItemsOpened, 0);
+    assert.equal(dismissedReplay.reviewItemsUpdated, 0);
+    assert.equal(
+      (
+        await one(
+          client,
+          `SELECT status FROM review_items
+            WHERE kind = 'position_scope_mismatch'`,
+        )
+      ).status,
+      "dismissed",
+    );
+
+    await client.query(
+      `UPDATE review_items
+          SET status = 'resolved', resolution_note = 'manual resolution'
+        WHERE kind = 'position_scope_mismatch'`,
+    );
+    const manuallyResolvedReplay = await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(mismatchSha, {
+            positions: bothPositions,
+            positionScopes: [
+              positionScope(),
+              otherScope({ emittedPositionCount: 2 }),
+            ],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(manuallyResolvedReplay.reviewItemsOpened, 0);
+    assert.equal(manuallyResolvedReplay.reviewItemsUpdated, 0);
+    assert.deepEqual(
+      await one(
+        client,
+        `SELECT status, resolution_note FROM review_items
+          WHERE kind = 'position_scope_mismatch'`,
+      ),
+      { status: "resolved", resolution_note: "manual resolution" },
+    );
+
+    const unprovedZero = await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(unprovedZeroSha, {
+            positions: [],
+            positionScopes: [
+              positionScope({
+                emittedPositionCount: 0,
+                zeroBasis: "source_stated_none",
+                evidence: { tables: [] },
+              }),
+            ],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(unprovedZero.reviewItemsOpened, 1);
+    assert.equal(await count(client, "position_scope_observations"), 2);
+
+    await importBatch(
+      client,
+      {
+        source: "synthetic-scope",
+        documents: [
+          retainedHoldingDocument(zeroSha, {
+            positions: [],
+            positionScopes: [
+              positionScope({
+                status: "complete",
+                emittedPositionCount: 0,
+                zeroBasis: "source_stated_none",
+                evidence: {
+                  tables: [],
+                  explicitNone: {
+                    source: "synthetic_statement",
+                    index: 11,
+                  },
+                  scopeEnd: { source: "synthetic_statement", index: 12 },
+                },
+              }),
+            ],
+          }),
+        ],
+      },
+      NOW,
+    );
+    const zero = await one(
+      client,
+      `SELECT o.status, o.emitted_position_count::text AS emitted_position_count,
+              o.zero_basis, d.parsed_ok
+         FROM position_scope_observations o
+         JOIN documents d ON d.id = o.source_document_id
+        WHERE d.sha256 = $1`,
+      [zeroSha],
+    );
+    assert.deepEqual(zero, {
+      status: "complete",
+      emitted_position_count: "0",
+      zero_basis: "source_stated_none",
+      parsed_ok: false,
+    });
+    assert.equal(
+      Number(
+        (
+          await one(
+            client,
+            `SELECT count(*)::text AS n
+               FROM position_scope_memberships m
+               JOIN position_scope_observations o ON o.id = m.scope_id
+               JOIN documents d ON d.id = o.source_document_id
+              WHERE d.sha256 = $1`,
+            [zeroSha],
+          )
+        ).n,
+      ),
+      0,
+    );
+  },
+);
+
 test(
   "a position imports with valuation_basis populated and full provenance",
   { skip },

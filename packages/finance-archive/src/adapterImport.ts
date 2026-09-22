@@ -27,6 +27,7 @@ import type {
   ParsedInstrument,
   ParsedLiability,
   ParsedPosition,
+  ParsedPositionScope,
   ParsedRow,
 } from "./adapter.js";
 import { EMPTY_HOLDINGS, sha256Hex } from "./adapter.js";
@@ -42,6 +43,7 @@ import type {
   ImportDocument,
   ImportLiability,
   ImportPosition,
+  ImportPositionScope,
   ImportRow,
 } from "./importer.js";
 import { REVIEW_COLUMNS } from "./importer.js";
@@ -150,7 +152,10 @@ export type AdapterPull = {
  */
 type ReviewBuffer = AdapterReviewItem[];
 
-function openReviewItem(reviews: ReviewBuffer, fields: AdapterReviewItem): void {
+function openReviewItem(
+  reviews: ReviewBuffer,
+  fields: AdapterReviewItem,
+): void {
   reviews.push(fields);
 }
 
@@ -428,7 +433,8 @@ async function prefetchInstruments(
     if (institutionId === null) return;
     identifierStated.add(id);
     const known = vouching.get(id);
-    if (known === undefined) vouching.set(id, { institutionId, institutions: 1 });
+    if (known === undefined)
+      vouching.set(id, { institutionId, institutions: 1 });
     else if (known.institutionId !== institutionId) known.institutions += 1;
   }
   /**
@@ -613,7 +619,12 @@ async function prefetchInstruments(
       // name are the ordinary case this exists for (the same position
       // restated on a later document or reparse), not the ambiguous one a
       // reused ticker is.
-      if (!instrument.cusip && !instrument.isin && !instrument.symbol && instrument.name) {
+      if (
+        !instrument.cusip &&
+        !instrument.isin &&
+        !instrument.symbol &&
+        instrument.name
+      ) {
         const found = rows.find(
           (row) =>
             row.cusip === null &&
@@ -796,11 +807,15 @@ export async function accountIdsByExternalKey(
   institutionId: string,
 ): Promise<ReadonlyMap<string, string>> {
   const resolved = new Map<string, string>();
-  const aliases = await client.query<{ external_key: string; account_id: string }>(
+  const aliases = await client.query<{
+    external_key: string;
+    account_id: string;
+  }>(
     "SELECT external_key, account_id FROM account_aliases WHERE institution_id = $1",
     [institutionId],
   );
-  for (const row of aliases.rows) resolved.set(row.external_key, row.account_id);
+  for (const row of aliases.rows)
+    resolved.set(row.external_key, row.account_id);
   const accounts = await client.query<{ external_key: string; id: string }>(
     "SELECT external_key, id FROM accounts WHERE institution_id = $1 AND external_key IS NOT NULL",
     [institutionId],
@@ -829,11 +844,19 @@ type AccountAttributable = { readonly accountExternalKey?: string };
  * hashes to. Null only when nothing resolves and the pull itself names no
  * account (an institution-wide pull with an unattributable row).
  */
-function lookupRowAccountId(pull: AdapterPull, row: AccountAttributable): string | null {
-  if (row.accountExternalKey === undefined || pull.accountsByExternalKey === undefined) {
+function lookupRowAccountId(
+  pull: AdapterPull,
+  row: AccountAttributable,
+): string | null {
+  if (
+    row.accountExternalKey === undefined ||
+    pull.accountsByExternalKey === undefined
+  ) {
     return pull.accountId;
   }
-  return pull.accountsByExternalKey.get(row.accountExternalKey) ?? pull.accountId;
+  return (
+    pull.accountsByExternalKey.get(row.accountExternalKey) ?? pull.accountId
+  );
 }
 
 /**
@@ -1097,6 +1120,22 @@ function parsedPositionToImportPosition(
   };
 }
 
+function parsedPositionScopeToImportPositionScope(
+  scope: ParsedPositionScope,
+  accountId: string,
+): ImportPositionScope {
+  return {
+    accountId,
+    asOf: scope.asOf,
+    proofVersion: scope.proofVersion,
+    status: scope.status,
+    emittedPositionCount: scope.emittedPositionCount,
+    gapCodes: scope.gapCodes,
+    ...(scope.zeroBasis === undefined ? {} : { zeroBasis: scope.zeroBasis }),
+    evidence: scope.evidence,
+  };
+}
+
 function parsedBalanceToImportBalance(
   balance: ParsedBalance,
   accountId: string,
@@ -1285,6 +1324,9 @@ async function collectDocuments(
   const positionGroups = groupBySourceDocument(holdings.positions);
   const balanceGroups = groupBySourceDocument(holdings.balances);
   const liabilityGroups = groupBySourceDocument(holdings.liabilities);
+  const positionScopeGroups = groupBySourceDocument(
+    holdings.positionScopes ?? [],
+  );
   const reportedRowCount = pull.acquired.manifest.reportedRowCount;
 
   const reviews: ReviewBuffer = [];
@@ -1295,7 +1337,9 @@ async function collectDocuments(
     client,
     [...pull.rows, ...holdings.positions]
       .map((row) => row.instrument)
-      .filter((instrument): instrument is ParsedInstrument => instrument !== null),
+      .filter(
+        (instrument): instrument is ParsedInstrument => instrument !== null,
+      ),
     reviews,
     pull.institutionId,
   );
@@ -1348,6 +1392,7 @@ async function collectDocuments(
     ...positionGroups.keys(),
     ...balanceGroups.keys(),
     ...liabilityGroups.keys(),
+    ...positionScopeGroups.keys(),
   ]);
   // A document-tier pull the adapter could not parse (or a genuinely empty
   // one) has no rows to group by, but the retained file still has to be
@@ -1377,12 +1422,13 @@ async function collectDocuments(
         row,
       ),
     );
-    const positions = (positionGroups.get(sourceDocument) ?? []).map((position) =>
-      parsedPositionToImportPosition(
-        resolver,
-        position,
-        resolveRowAccountId(reviews, pull, position),
-      ),
+    const positions = (positionGroups.get(sourceDocument) ?? []).map(
+      (position) =>
+        parsedPositionToImportPosition(
+          resolver,
+          position,
+          resolveRowAccountId(reviews, pull, position),
+        ),
     );
     const balances = (balanceGroups.get(sourceDocument) ?? []).map((balance) =>
       parsedBalanceToImportBalance(
@@ -1390,11 +1436,19 @@ async function collectDocuments(
         resolveRowAccountId(reviews, pull, balance),
       ),
     );
-    const liabilities = (liabilityGroups.get(sourceDocument) ?? []).map((liability) =>
-      parsedLiabilityToImportLiability(
-        liability,
-        resolveRowAccountId(reviews, pull, liability),
-      ),
+    const liabilities = (liabilityGroups.get(sourceDocument) ?? []).map(
+      (liability) =>
+        parsedLiabilityToImportLiability(
+          liability,
+          resolveRowAccountId(reviews, pull, liability),
+        ),
+    );
+    const positionScopes = (positionScopeGroups.get(sourceDocument) ?? []).map(
+      (scope) =>
+        parsedPositionScopeToImportPositionScope(
+          scope,
+          resolveRowAccountId(reviews, pull, scope),
+        ),
     );
     const reviewItems = reviews.splice(openedBefore);
     documents.push({
@@ -1442,6 +1496,7 @@ async function collectDocuments(
       positions,
       balances,
       liabilities,
+      positionScopes,
     });
   }
   await flushInstruments(client, resolver, reviews, pull.institutionId);
