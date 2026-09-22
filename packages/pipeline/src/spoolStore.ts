@@ -9,9 +9,11 @@ import type {
 } from "./archiveCatalogTypes.js";
 import {
   inspectCapturedParserOutput,
+  inspectCapturedPdfSelectiveOutput,
   type ParserOutputRecoveryInput,
-  DurableParserOutputArtifacts,
-  ValidatedNormalizedBundleResult,
+  type DurableParserOutputArtifacts,
+  type DurableSelectiveParserOutputArtifacts,
+  type ValidatedNormalizedBundleResult,
 } from "./parserProcess.js";
 import type { BinaryParserProfileId } from "@repo/worker-protocol";
 
@@ -44,7 +46,8 @@ type OpenedFile = {
 };
 
 type ValidatedParserOutput = {
-  artifacts: DurableParserOutputArtifacts;
+  artifacts:
+    DurableParserOutputArtifacts | DurableSelectiveParserOutputArtifacts;
   validated: ValidatedNormalizedBundleResult;
 };
 
@@ -486,6 +489,11 @@ export async function inspectNormalizedBundleSpool(input: {
    * the validator that produced it. */
   parserRecovery: ParserOutputRecoveryInput & {
     profileId: BinaryParserProfileId;
+    selective?: {
+      originalPages: number[];
+      expectedArtifactFingerprint: string;
+      expectedSelectiveImplementationSha256: string;
+    };
   };
 }): Promise<ValidatedNormalizedBundleResult> {
   const root = await protectedRoot(input.spoolRoot);
@@ -495,7 +503,12 @@ export async function inspectNormalizedBundleSpool(input: {
   opaqueId(matched[1]);
   const target = join(root.path, input.spool.opaqueName);
   const inspected = await readExact(target, MAX_SPOOL_BYTES, input.spool);
-  const parserOutput = await inspectCapturedParserOutput(input.parserRecovery);
+  const parserOutput = input.parserRecovery.selective
+    ? await inspectCapturedPdfSelectiveOutput({
+        ...input.parserRecovery,
+        ...input.parserRecovery.selective,
+      })
+    : await inspectCapturedParserOutput(input.parserRecovery);
   const source = parserOutput.artifacts.normalizedBundle;
   if (
     inspected.bytes.length !== source.byteLength ||

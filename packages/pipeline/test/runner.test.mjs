@@ -8617,6 +8617,539 @@ for (const parserProfileId of ["pdf_docqa_v1", "spreadsheet_v1"]) {
   });
 }
 
+test("a selected K-1 creates one sparse primary-only batch with grounded closure", async () => {
+  const setup = await fixture(0);
+  const [captures, outputs, spool] = await Promise.all(
+    ["targeted-captures", "targeted-outputs", "targeted-spool"].map(
+      async (name) => {
+        const path = join(setup.base, name);
+        await mkdir(path, { mode: 0o700 });
+        return await realpath(path);
+      },
+    ),
+  );
+  const plan = pdfPlan({ discoveryState: "queued" });
+  const identity = {
+    sourceItemId: plan.sourceItemId,
+    observationEpoch: plan.observationEpoch,
+    processingEpoch: plan.processingEpoch,
+    sha256: plan.sha256,
+  };
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "intent",
+    preflightAction: undefined,
+    originalCatalogId: undefined,
+    expectedOriginalRevision: undefined,
+    processingCatalogId: undefined,
+    expectedProcessingRevision: undefined,
+    metadataFirst: {
+      version: 1,
+      triageStartIndex: 0,
+      refreshReady: false,
+      selected: [identity],
+      previewed: [identity],
+      previewGaps: [],
+      targetedTax: [
+        {
+          ...identity,
+          goalKind: "schedule_k1_key_fields_v1",
+          sourcePageCount: 140,
+        },
+      ],
+      targetedTaxClassified: [identity],
+      selectionReceipts: [],
+    },
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const original = {
+    originalCatalogId: randomUUID(),
+    rowRevision: 1,
+    origin: {
+      scanId: checkpoint.scanId,
+      observationEpoch: plan.observationEpoch,
+      sha256: plan.sha256,
+      byteLength: plan.byteLength,
+      mediaType: "application/pdf",
+    },
+    copies: {},
+    providerOriginal: {
+      referenceVersion: "provider_original_v2",
+      clientReferenceId: randomUUID(),
+      bindingId: randomUUID(),
+    },
+  };
+  let created;
+  const runner = new PipelineRunner(
+    {
+      ...setup.config,
+      pdfDocQa: {
+        captureDirectory: captures,
+        parserOutputRoot: outputs,
+        spoolDirectory: spool,
+        archive: { primary: {} },
+        providerOriginal: { rootAlias: "fixture" },
+      },
+    },
+    journal,
+    {
+      async call() {
+        throw new Error("network is not used");
+      },
+    },
+  );
+  runner.copyIntent = (subject, role) => ({
+    role,
+    clientReceiptId: randomUUID(),
+    archiveObjectId: randomUUID(),
+    objectName: `${randomUUID()}.age`,
+  });
+  runner.executeMetadataPreview = async (_item, windows) => {
+    const inspectedOriginalUnits = windows.flatMap(({ startPage, pageCount }) =>
+      Array.from({ length: pageCount }, (_, index) => startPage + index),
+    );
+    return {
+      sourceSha256: plan.sha256,
+      mediaType: "application/pdf",
+      sourceUnitCount: 140,
+      inspectedOriginalUnits,
+      unitStates: inspectedOriginalUnits.map(() => "text_available"),
+      unitTexts: inspectedOriginalUnits.map((page) =>
+        page === 137
+          ? "Schedule K-1 (Form 1065) Box 1 Ordinary business income. See attached statement"
+          : page === 138
+            ? "Schedule K-1 (Form 1065) continued"
+            : page === 139
+              ? "Schedule K-1 statement detail"
+              : page === 140
+                ? "Form 1099 supporting attachment"
+                : `cover or index page ${page}`,
+      ),
+      unitTextTruncated: inspectedOriginalUnits.map(() => false),
+      method: "pdf_native_text_v1",
+      methodFingerprint: HASH,
+    };
+  };
+  runner.archiveCatalog = {
+    findOriginalExact() {
+      return original;
+    },
+    findProcessingExact() {},
+    async createProcessingIntent(value) {
+      created = value;
+      return { ...value, rowRevision: 1 };
+    },
+  };
+  try {
+    const next = await runner.createArchivedIntents(checkpoint);
+    assert.deepEqual(next.targetedTaxRun.plannedPages, [137, 138, 139]);
+    assert.equal(next.targetedTaxRun.requestedRegionsClosed, true);
+    assert.equal(next.targetedTaxRun.continuationsClosed, true);
+    assert.deepEqual(created.targetedBatch.originalPages, [137, 138, 139]);
+    assert.deepEqual(Object.keys(created.copies), ["primary"]);
+    assert.equal(next.step, "preflight");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a sparse target begins, appends its first batch, and plans only the missing continuation", async () => {
+  const setup = await fixture(0);
+  const [captures, outputs, spool] = await Promise.all(
+    ["target-flow-captures", "target-flow-outputs", "target-flow-spool"].map(
+      async (name) => {
+        const path = join(setup.base, name);
+        await mkdir(path, { mode: 0o700 });
+        return await realpath(path);
+      },
+    ),
+  );
+  const plan = pdfPlan();
+  const processingCatalogId = randomUUID();
+  const originalCatalogId = randomUUID();
+  const targetId = "target-synthetic";
+  const firstPages = Array.from({ length: 12 }, (_, index) => index + 1);
+  const targetedTaxRun = {
+    goalKind: "schedule_k1_key_fields_v1",
+    sourcePageCount: 20,
+    plannedPages: [...firstPages, 13],
+    requestedRegionsClosed: true,
+    continuationsClosed: true,
+    batchOrdinal: 0,
+    processingCatalogIds: [processingCatalogId],
+  };
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "targeted_begin",
+    preflightAction: undefined,
+    originalCatalogId,
+    expectedOriginalRevision: 1,
+    processingCatalogId,
+    expectedProcessingRevision: 1,
+    targetedTaxRun,
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const original = {
+    originalCatalogId,
+    rowRevision: 1,
+    origin: {
+      scanId: checkpoint.scanId,
+      observationEpoch: plan.observationEpoch,
+      sha256: plan.sha256,
+      byteLength: plan.byteLength,
+      mediaType: "application/pdf",
+    },
+    copies: {},
+    providerOriginal: { referenceVersion: "provider_original_v2" },
+    cloud: {
+      sourceItemId: plan.sourceItemId,
+      sourceRevisionId: "revision-synthetic",
+      providerReferenceId: "provider-synthetic",
+      providerBindingEpoch: 1,
+    },
+  };
+  const selectiveOutput = {
+    artifactKind: "selective_pdf_pages_v1",
+    sourceSha256: plan.sha256,
+    parserFingerprint: plan.parserFingerprint,
+    extractionConfigurationFingerprint: plan.extractionConfigurationFingerprint,
+    extractionFingerprint: HASH,
+    coverage: {
+      schemaVersion: 1,
+      sourceSha256: plan.sha256,
+      selectedPdfSha256: "b".repeat(64),
+      sourcePageCount: 20,
+      originalPages: firstPages,
+      fingerprint: "c".repeat(64),
+    },
+    artifactFingerprint: "d".repeat(64),
+  };
+  let processing = {
+    processingCatalogId,
+    originalCatalogId,
+    rowRevision: 1,
+    currentObservation: {
+      scanId: checkpoint.scanId,
+      observationEpoch: plan.observationEpoch,
+      processingEpoch: plan.processingEpoch,
+    },
+    fingerprints: {},
+    targetedBatch: {
+      goalKind: targetedTaxRun.goalKind,
+      batchOrdinal: 0,
+      sourcePageCount: 20,
+      originalPages: firstPages,
+    },
+    parserOutput: selectiveOutput,
+    cloud: {
+      sourceItemId: plan.sourceItemId,
+      sourceRevisionId: original.cloud.sourceRevisionId,
+      parserArtifactId: "artifact-synthetic",
+      sourceTextVersionId: "text-synthetic",
+      processingGenerationId: "generation-synthetic",
+      ingestJobId: "job-synthetic",
+    },
+  };
+  const processings = [processing];
+  const requests = [];
+  const runner = new PipelineRunner(
+    {
+      ...setup.config,
+      pdfDocQa: {
+        captureDirectory: captures,
+        parserOutputRoot: outputs,
+        spoolDirectory: spool,
+        archive: { primary: {} },
+        providerOriginal: { rootAlias: "fixture" },
+      },
+    },
+    journal,
+    {
+      async call(request) {
+        requests.push(structuredClone(request));
+        if (request.operation === "extraction.beginTargetedTax")
+          return {
+            operation: request.operation,
+            targetId,
+            sourceItemId: plan.sourceItemId,
+            sourceRevisionId: original.cloud.sourceRevisionId,
+            goalKind: targetedTaxRun.goalKind,
+            status: "awaiting_pages",
+            inspectedOriginalPages: [],
+            unresolvedFields: request.requiredFields,
+            reused: false,
+          };
+        if (request.operation === "extraction.appendTargetedTaxBatch")
+          return {
+            operation: request.operation,
+            targetId,
+            sourceItemId: plan.sourceItemId,
+            sourceRevisionId: original.cloud.sourceRevisionId,
+            goalKind: targetedTaxRun.goalKind,
+            status: "running",
+            inspectedOriginalPages: firstPages,
+            unresolvedFields: [],
+            reused: false,
+          };
+        if (request.operation === "extraction.targetedTaxStatus")
+          return {
+            operation: request.operation,
+            targetId,
+            sourceItemId: plan.sourceItemId,
+            sourceRevisionId: original.cloud.sourceRevisionId,
+            goalKind: targetedTaxRun.goalKind,
+            status: "incomplete_resumable",
+            inspectedOriginalPages: firstPages,
+            unresolvedFields: ["box_20_other_information"],
+            reused: true,
+          };
+        throw new Error(`unexpected operation ${request.operation}`);
+      },
+    },
+  );
+  runner.copyIntent = (_subject, role) => ({
+    role,
+    clientReceiptId: randomUUID(),
+    archiveObjectId: randomUUID(),
+    objectName: `${randomUUID()}.age`,
+  });
+  runner.mappedProcessing = async () => ({
+    original,
+    processing,
+    declaration: {},
+    mapping: {
+      pages: firstPages.map((ordinal) => ({
+        ordinal: ordinal - 1,
+        textHash: String(ordinal).padStart(64, "0"),
+      })),
+      evidence: [],
+      documents: [],
+      chunks: [],
+    },
+  });
+  runner.archiveCatalog = {
+    listOriginals() {
+      return [original];
+    },
+    listProcessings() {
+      return processings;
+    },
+    findProcessingExact() {},
+    async createProcessingIntent(value) {
+      const created = { ...value, rowRevision: 1 };
+      processings.push(created);
+      return created;
+    },
+  };
+  try {
+    await runner.driveTargetedBegin();
+    assert.equal(journal.checkpoint.step, "parsed_reserve");
+    assert.equal(journal.checkpoint.targetedTaxRun.targetId, targetId);
+    await journal.transitionCheckpoint({
+      checkpoint: parseRunnerCheckpoint({
+        ...journal.checkpoint,
+        step: "targeted_append",
+      }),
+      credentialSessionActive: true,
+    });
+    await runner.driveTargetedAppend();
+    assert.equal(journal.checkpoint.step, "targeted_status");
+    assert.equal(
+      requests.find(
+        (request) => request.operation === "extraction.appendTargetedTaxBatch",
+      ).coverage.requestedRegionsClosed,
+      false,
+      "the first transport batch cannot claim final goal coverage",
+    );
+    await runner.driveTargetedStatus();
+    assert.equal(journal.checkpoint.step, "capture");
+    assert.equal(journal.checkpoint.targetedTaxRun.batchOrdinal, 1);
+    assert.deepEqual(processings[1].targetedBatch.originalPages, [13]);
+    assert.deepEqual(Object.keys(processings[1].copies), ["primary"]);
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a targeted status from another source cannot complete or clean up the batch", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const processingCatalogId = randomUUID();
+  const originalCatalogId = randomUUID();
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "targeted_status",
+    preflightAction: undefined,
+    originalCatalogId,
+    expectedOriginalRevision: 1,
+    processingCatalogId,
+    expectedProcessingRevision: 1,
+    targetedTaxRun: {
+      goalKind: "form_1040_totals_v1",
+      sourcePageCount: 2,
+      plannedPages: [1, 2],
+      requestedRegionsClosed: true,
+      continuationsClosed: true,
+      batchOrdinal: 0,
+      processingCatalogIds: [processingCatalogId],
+      targetId: "target-synthetic",
+      priorProcessingGenerationId: "generation-synthetic",
+    },
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const original = { originalCatalogId, rowRevision: 1 };
+  const processing = {
+    processingCatalogId,
+    originalCatalogId,
+    rowRevision: 1,
+    cloud: {
+      sourceItemId: plan.sourceItemId,
+      sourceRevisionId: "revision-synthetic",
+    },
+  };
+  let completed = false;
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call(request) {
+      assert.equal(request.operation, "extraction.targetedTaxStatus");
+      return {
+        operation: request.operation,
+        targetId: checkpoint.targetedTaxRun.targetId,
+        sourceItemId: "another-source",
+        sourceRevisionId: "another-revision",
+        goalKind: checkpoint.targetedTaxRun.goalKind,
+        status: "complete",
+        inspectedOriginalPages: [1, 2],
+        unresolvedFields: [],
+        reused: true,
+      };
+    },
+  });
+  runner.archiveCatalog = {
+    listOriginals() {
+      return [original];
+    },
+    listProcessings() {
+      return [processing];
+    },
+    async recordTargetedCompletion() {
+      completed = true;
+      assert.fail("a foreign status must not be persisted");
+    },
+  };
+  try {
+    await assert.rejects(
+      () => runner.driveTargetedStatus(),
+      (error) => error.code === "targeted_tax_parent_conflict",
+    );
+    assert.equal(journal.checkpoint.step, "targeted_status");
+    assert.equal(completed, false);
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("an answered targeted completion replays the same durable catalog timestamp", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const processingCatalogId = randomUUID();
+  const originalCatalogId = randomUUID();
+  const targetId = "target-replay";
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "targeted_status",
+    preflightAction: undefined,
+    originalCatalogId,
+    expectedOriginalRevision: 1,
+    processingCatalogId,
+    expectedProcessingRevision: 1,
+    targetedTaxRun: {
+      goalKind: "form_1040_totals_v1",
+      sourcePageCount: 2,
+      plannedPages: [1, 2],
+      requestedRegionsClosed: true,
+      continuationsClosed: true,
+      batchOrdinal: 0,
+      processingCatalogIds: [processingCatalogId],
+      targetId,
+      priorProcessingGenerationId: "generation-replay",
+    },
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const original = { originalCatalogId, rowRevision: 1 };
+  let processing = {
+    processingCatalogId,
+    originalCatalogId,
+    rowRevision: 1,
+    targetedBatch: { batchOrdinal: 0 },
+    cloud: {
+      sourceItemId: plan.sourceItemId,
+      sourceRevisionId: "revision-replay",
+    },
+  };
+  let transportCalls = 0;
+  let completionWrites = 0;
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call(request) {
+      transportCalls += 1;
+      return {
+        operation: request.operation,
+        targetId,
+        sourceItemId: processing.cloud.sourceItemId,
+        sourceRevisionId: processing.cloud.sourceRevisionId,
+        goalKind: checkpoint.targetedTaxRun.goalKind,
+        status: "complete",
+        inspectedOriginalPages: [1, 2],
+        unresolvedFields: [],
+        reused: false,
+      };
+    },
+  });
+  runner.archiveCatalog = {
+    listOriginals() {
+      return [original];
+    },
+    listProcessings() {
+      return [processing];
+    },
+    async recordTargetedCompletion(args) {
+      completionWrites += 1;
+      if (processing.targetedCompletion) {
+        assert.deepEqual(args.completion, processing.targetedCompletion);
+        return processing;
+      }
+      processing = {
+        ...processing,
+        rowRevision: processing.rowRevision + 1,
+        targetedCompletion: structuredClone(args.completion),
+      };
+      return processing;
+    },
+  };
+  const commit = journal.commitResult.bind(journal);
+  let interrupted = false;
+  journal.commitResult = async () => {
+    interrupted = true;
+    throw new Error("synthetic crash after catalog completion");
+  };
+  try {
+    await assert.rejects(
+      () => runner.driveTargetedStatus(),
+      /synthetic crash after catalog completion/,
+    );
+    assert.equal(interrupted, true);
+    assert.equal(journal.checkpoint.step, "targeted_status");
+    assert.equal(completionWrites, 1);
+    journal.commitResult = commit;
+    await runner.driveTargetedStatus();
+    assert.equal(journal.checkpoint.step, "cleanup");
+    assert.equal(completionWrites, 2);
+    assert.equal(transportCalls, 1, "the answered status is not sent again");
+  } finally {
+    journal.commitResult = commit;
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
 test("legacy future admission replays exactly, then renews and admits without repeating archive work", async () => {
   const setup = await fixture(0);
   const future = Date.UTC(2036, 0, 1);

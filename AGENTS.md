@@ -74,15 +74,15 @@ and its own conversation. One of them is the orchestrator. The rest are side
 lanes, started by the owner for out-of-band work such as UI polish, docs or
 cleanup. Every agent reads this section before starting.
 
-| Rule | Detail |
-| --- | --- |
-| One lane, one branch, one PR | Never commit to `main`. Open a draft PR early and list the files you expect to touch. That is your claim. |
-| Look before you start | Run `gh pr list` and read open PRs. Do not edit a file another open PR is changing. Ask the owner if you must. |
-| Only the orchestrator merges, migrates and deploys | A merge does not deploy. Migrations are positions in a list and the schema runner rejects gaps, so they go in series through one agent. |
-| Side lanes stay out of | `packages/kith-store/migrations`, `packages/pipeline`, `packages/worker-protocol`, `packages/kith-store/src/workers`, `packages/kith-store/src/identity`, `apps/web/src/lib/mcp`, auth and MCP routes, `docs/private`. Need a change there? Say so in your PR and stop. |
-| Shared UI components have one owner at a time | `apps/web/src/components/ui/*` is shared by every screen. Only one open PR may change it. Keep changes backward compatible. |
-| Finish cleanly | Record verification under the policy below. Remove containers and your own scratch files. Tell the owner the PR is ready. The orchestrator removes your worktree and branch at merge. |
-| Do not read the owner's data | No document text, database values or files under the watched folders. Counts, enums and booleans only. Use synthetic fixtures. |
+| Rule                                               | Detail                                                                                                                                                                                                                                                                  |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| One lane, one branch, one PR                       | Never commit to `main`. Open a draft PR early and list the files you expect to touch. That is your claim.                                                                                                                                                               |
+| Look before you start                              | Run `gh pr list` and read open PRs. Do not edit a file another open PR is changing. Ask the owner if you must.                                                                                                                                                          |
+| Only the orchestrator merges, migrates and deploys | A merge does not deploy. Migrations are positions in a list and the schema runner rejects gaps, so they go in series through one agent.                                                                                                                                 |
+| Side lanes stay out of                             | `packages/kith-store/migrations`, `packages/pipeline`, `packages/worker-protocol`, `packages/kith-store/src/workers`, `packages/kith-store/src/identity`, `apps/web/src/lib/mcp`, auth and MCP routes, `docs/private`. Need a change there? Say so in your PR and stop. |
+| Shared UI components have one owner at a time      | `apps/web/src/components/ui/*` is shared by every screen. Only one open PR may change it. Keep changes backward compatible.                                                                                                                                             |
+| Finish cleanly                                     | Record verification under the policy below. Remove containers and your own scratch files. Tell the owner the PR is ready. The orchestrator removes your worktree and branch at merge.                                                                                   |
+| Do not read the owner's data                       | No document text, database values or files under the watched folders. Counts, enums and booleans only. Use synthetic fixtures.                                                                                                                                          |
 
 For a stacked change, commit at least one unique task change before opening its
 draft PR. If the branch still equals its dependency, claim the work in the
@@ -94,12 +94,12 @@ PR merged when the dependency lands.
 Every model turn re-reads the whole conversation. An agent that checks
 "is CI done yet?" twenty times pays for its context twenty times.
 
-| Do | Do not |
-| --- | --- |
-| Wait inside ONE background shell command that loops and sleeps on its own (for example a script that polls `gh pr view` until the three checks finish, then merges). The model is woken once, when it exits. | Check status turn after turn, or run `sleep` in the foreground between model turns. |
-| Sub-agents: push, open the PR, report, stop. The orchestrator gates CI. | Sub-agents waiting for CI or for another agent. |
-| Hand long jobs (backfills, builds, deploys) to a background command and carry on with other work. | Scheduled wake-ups or loops "to see if anything changed". Act when a job finishes or the owner speaks. |
-| Start a fresh orchestrator session every day or two. The tracker and handoff files carry the state. | One endless conversation that carries every topic. |
+| Do                                                                                                                                                                                                           | Do not                                                                                                 |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
+| Wait inside ONE background shell command that loops and sleeps on its own (for example a script that polls `gh pr view` until the three checks finish, then merges). The model is woken once, when it exits. | Check status turn after turn, or run `sleep` in the foreground between model turns.                    |
+| Sub-agents: push, open the PR, report, stop. The orchestrator gates CI.                                                                                                                                      | Sub-agents waiting for CI or for another agent.                                                        |
+| Hand long jobs (backfills, builds, deploys) to a background command and carry on with other work.                                                                                                            | Scheduled wake-ups or loops "to see if anything changed". Act when a job finishes or the owner speaks. |
+| Start a fresh orchestrator session every day or two. The tracker and handoff files carry the state.                                                                                                          | One endless conversation that carries every topic.                                                     |
 
 To get a side-lane PR shipped, the owner tells the orchestrator "ship PR <n>".
 
@@ -112,13 +112,13 @@ commands before every review. Plan-specific acceptance tests still apply.
 The purpose is to find defects early and ship verified changes, without
 repeating unchanged work at each handoff.
 
-| Stage or change | Required evidence |
-| --- | --- |
-| Development and draft review | Run the focused tests for changed behavior and affected consumers. Share the diff for review promptly; do not wait for a full repository build to begin review. State what remains unverified. |
-| Final code release | Required CI must pass for the final merge candidate. CI runs `pnpm lint`, `pnpm check-types`, `pnpm test:once`, and `pnpm build`; its results satisfy those checks without another local full run. Run local checks for coverage or environments CI does not exercise. |
-| Prose-only documentation | Check the diff, links and consistency of instructions. No local application build or database suite is needed. Required CI remains binding until the workflow itself changes. Executable examples, generated inputs and configuration changes need their relevant checks. |
-| Review correction | Test the changed behavior and plausible regressions. Review the delta and verify earlier findings are resolved. Reopen unchanged areas only when the fix changes their assumptions. |
-| Deployment or data repair | Verify the changed live behavior and the owner's acceptance condition. A green build, successful reparse or healthy endpoint alone does not prove the requested data or UI outcome. |
+| Stage or change              | Required evidence                                                                                                                                                                                                                                                         |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Development and draft review | Run the focused tests for changed behavior and affected consumers. Share the diff for review promptly; do not wait for a full repository build to begin review. State what remains unverified.                                                                            |
+| Final code release           | Required CI must pass for the final merge candidate. CI runs `pnpm lint`, `pnpm check-types`, `pnpm test:once`, and `pnpm build`; its results satisfy those checks without another local full run. Run local checks for coverage or environments CI does not exercise.    |
+| Prose-only documentation     | Check the diff, links and consistency of instructions. No local application build or database suite is needed. Required CI remains binding until the workflow itself changes. Executable examples, generated inputs and configuration changes need their relevant checks. |
+| Review correction            | Test the changed behavior and plausible regressions. Review the delta and verify earlier findings are resolved. Reopen unchanged areas only when the fix changes their assumptions.                                                                                       |
+| Deployment or data repair    | Verify the changed live behavior and the owner's acceptance condition. A green build, successful reparse or healthy endpoint alone does not prove the requested data or UI outcome.                                                                                       |
 
 Record the tested commit, commands, results, database requirements and material
 coverage gaps in the PR. Reuse author or CI evidence when the relevant source,
@@ -143,6 +143,12 @@ changes, including the second-model security requirement below.
 Choose tests by failure risk, not by how many commands can be run. Before an
 expensive final batch, exercise parser boundaries, complete/partial/zero data,
 replay and recovery transitions, or realistic query cardinality as applicable.
+For a focused web test, use
+`pnpm --filter @repo/web exec vitest run <path>` and confirm the file count
+reported by Vitest. Supplying a filename after `test:once --` can still run the
+whole web suite. For a Node package, build the affected package and use
+`node --test --test-name-pattern=<pattern> <specific built-package test file>`.
+Do not use the root `test:once` command as a focused check.
 Performance regressions should distinguish the broken implementation from the
 fix under the supported runtime budget, without fragile tiny timing thresholds.
 Use synthetic fixtures; owner-authorized production diagnostics remain private.

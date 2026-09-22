@@ -24,6 +24,7 @@ import {
   DEFAULT_PARSER_PROCESS_LIMITS,
   createParserProfileWorkDirectory,
   inspectCapturedPdfParserOutput,
+  inspectCapturedPdfSelectiveOutput,
   inspectParserOutputIntent,
   parseBoundedParserJson,
   ParserProcessError,
@@ -677,7 +678,31 @@ test(
         result.selectiveBundle.path.endsWith("selective-bundle.json"),
         true,
       );
-      assert.equal("artifacts" in result, false);
+      assert.equal(result.artifacts.artifactKind, "selective_pdf_pages_v1");
+      assert.equal(
+        result.artifacts.normalizedBundle.path.endsWith(
+          "selective-bundle.json",
+        ),
+        true,
+      );
+      const recovered = await inspectCapturedPdfSelectiveOutput({
+        capture: common.capture,
+        outputRoot: f.outputRoot,
+        outputIntent: await inspectParserOutputIntent({
+          outputRoot: f.outputRoot,
+          outputId,
+          requireEmpty: false,
+        }),
+        expectedParserFingerprint: result.parserFingerprint,
+        expectedExtractionConfigurationFingerprint:
+          result.extractionConfigurationFingerprint,
+        expectedModelManifestSha256: result.modelManifestSha256,
+        originalPages,
+        expectedArtifactFingerprint: result.artifactFingerprint,
+        expectedSelectiveImplementationSha256:
+          result.selectiveImplementationSha256,
+      });
+      assert.deepEqual(recovered.artifacts.coverage.originalPages, originalPages);
 
       const wholeOutputId = randomUUID();
       const wholeOutput = await outputDirectory(f, wholeOutputId);

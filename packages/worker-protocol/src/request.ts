@@ -345,6 +345,53 @@ export const MAX_WORKER_PASS_COUNT = 100_000_000;
  */
 export const MAX_WORKER_SOURCE_ITEM_COUNT_ROOTS = 64;
 
+export const TARGETED_TAX_GOALS = [
+  "form_1040_totals_v1",
+  "schedule_k1_key_fields_v1",
+] as const;
+export type TargetedTaxGoalKind = (typeof TARGETED_TAX_GOALS)[number];
+export const MAX_TARGETED_TAX_BATCH_PAGES = 12;
+export const MAX_TARGETED_TAX_BATCH_TEXT_BYTES = 60_000;
+
+export type TargetedTaxPageInput = {
+  originalPage: number;
+  textHash: string;
+};
+
+export type TargetedTaxArtifactDeclaration = {
+  artifactKind: "selective_pdf_pages_v1";
+  sourceSha256: string;
+  selectedPdfSha256: string;
+  sourcePageCount: number;
+  originalPages: number[];
+  coverageFingerprint: string;
+  artifactFingerprint: string;
+  parserFingerprint: string;
+  extractionFingerprint: string;
+};
+
+export const TARGETED_TAX_FORM_FAMILIES = [
+  "form_1040",
+  "schedule_k1_1065",
+  "schedule_k1_1041",
+  "schedule_k1_1120s",
+  "unknown",
+] as const;
+export type TargetedTaxFormFamily =
+  (typeof TARGETED_TAX_FORM_FAMILIES)[number];
+
+/**
+ * Cumulative semantic coverage through this batch. These flags are not a
+ * claim that optional boxes contain values. They say the requested region
+ * and every continuation it points to have been inspected, so an absent box
+ * remains absent rather than becoming zero.
+ */
+export type TargetedTaxCoverageDeclaration = {
+  formFamily: TargetedTaxFormFamily;
+  requestedRegionsClosed: boolean;
+  continuationsClosed: boolean;
+};
+
 export type WorkerRequest =
   | (WorkerSourceRequest & {
       operation: "source.status";
@@ -535,6 +582,54 @@ export type WorkerRequest =
       requestId: string;
       identity: ArchivedWorkIdentity;
       preview: TriagePreviewDeclaration;
+    })
+  | (WorkerSourceRequest & {
+      operation: "extraction.beginTargetedTax";
+      requestId: string;
+      sourceItemId: string;
+      sourceRevisionId: string;
+      observedContentHash: string;
+      goalKind: TargetedTaxGoalKind;
+      instanceKey: string;
+      requiredFields: string[];
+      optionalFields: string[];
+      sourcePageCount: number;
+      requestDigest: string;
+    })
+  | (WorkerSourceRequest & {
+      operation: "extraction.appendTargetedTaxBatch";
+      requestId: string;
+      targetId: string;
+      sourceRevisionId: string;
+      batchOrdinal: number;
+      sourceTextVersionId: string;
+      processingGenerationId: string;
+      artifact: TargetedTaxArtifactDeclaration;
+      pages: TargetedTaxPageInput[];
+      coverage: TargetedTaxCoverageDeclaration;
+    })
+  | (WorkerSourceRequest & {
+      operation: "extraction.admitTargetedTaxBatch";
+      requestId: string;
+      targetId: string;
+      sourceRevisionId: string;
+      batchOrdinal: number;
+      priorProcessingGenerationId: string;
+      artifact: TargetedTaxArtifactDeclaration;
+      extractionConfigurationFingerprint: string;
+      parserArtifact: ParserArtifactSelection;
+      archives: ArchiveReceiptSelection[];
+      parsedText: ParsedTextDeclaration;
+      existingProviderOriginal: {
+        referenceId: string;
+        bindingEpoch: number;
+        referenceVersion: "provider_original_v2";
+      };
+    })
+  | (WorkerSourceRequest & {
+      operation: "extraction.targetedTaxStatus";
+      requestId: string;
+      targetId: string;
     })
   | (WorkerSourceRequest & {
       operation: "discovery.preflightArchived";
@@ -1015,6 +1110,40 @@ export type WorkerDiscoveryPreviewResult = {
   reused: boolean;
 };
 
+export type WorkerTargetedTaxStatus = {
+  operation:
+    | "extraction.beginTargetedTax"
+    | "extraction.appendTargetedTaxBatch"
+    | "extraction.targetedTaxStatus";
+  targetId: string;
+  sourceItemId: string;
+  sourceRevisionId: string;
+  goalKind: TargetedTaxGoalKind;
+  status:
+    | "awaiting_pages"
+    | "running"
+    | "complete"
+    | "incomplete_resumable"
+    | "conflict";
+  inspectedOriginalPages: number[];
+  unresolvedFields: string[];
+  reused: boolean;
+};
+
+export type WorkerTargetedTaxAdmissionResult = {
+  operation: "extraction.admitTargetedTaxBatch";
+  targetId: string;
+  sourceItemId: string;
+  sourceRevisionId: string;
+  batchOrdinal: number;
+  parserArtifactId: string;
+  sourceTextVersionId: string;
+  processingGenerationId: string;
+  ingestJobId: string;
+  state: "admitted";
+  reused: boolean;
+};
+
 export type WorkerArchivedPreflightResult = {
   operation: "discovery.preflightArchived";
   sourceItemId: string;
@@ -1423,6 +1552,8 @@ export type WorkerResult =
   | WorkerDiscoveryReserveResult
   | WorkerDiscoveryAdmitResult
   | WorkerDiscoveryPreviewResult
+  | WorkerTargetedTaxStatus
+  | WorkerTargetedTaxAdmissionResult
   | WorkerArchivedPreflightResult
   | WorkerArchivedFailResult
   | WorkerArchivedReserveResult
@@ -1561,6 +1692,97 @@ function paginationOptions(value: unknown): WorkerPaginationOptions {
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+const TARGETED_FIELD = /^[a-z][a-z0-9_]{0,63}$/;
+
+function targetedFields(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 128) invalid();
+  const fields = value.map((item) =>
+    string(item, { maxUtf16: 64, pattern: TARGETED_FIELD }),
+  );
+  if (new Set(fields).size !== fields.length) invalid();
+  return fields;
+}
+
+function targetedGoal(value: unknown): TargetedTaxGoalKind {
+  if (
+    typeof value !== "string" ||
+    !(TARGETED_TAX_GOALS as readonly string[]).includes(value)
+  ) invalid();
+  return value as TargetedTaxGoalKind;
+}
+
+function targetedArtifact(value: unknown): TargetedTaxArtifactDeclaration {
+  const input = object(value);
+  exactKeys(input, [
+    "artifactKind",
+    "sourceSha256",
+    "selectedPdfSha256",
+    "sourcePageCount",
+    "originalPages",
+    "coverageFingerprint",
+    "artifactFingerprint",
+    "parserFingerprint",
+    "extractionFingerprint",
+  ]);
+  if (input.artifactKind !== "selective_pdf_pages_v1") invalid();
+  if (!Array.isArray(input.originalPages)) invalid();
+  const sourcePageCount = integer(input.sourcePageCount, 1, 10_000);
+  const originalPages = input.originalPages.map((page) =>
+    integer(page, 1, sourcePageCount),
+  );
+  if (
+    originalPages.length < 1 ||
+    originalPages.length > MAX_TARGETED_TAX_BATCH_PAGES ||
+    originalPages.some((page, index) => index > 0 && page <= originalPages[index - 1]!)
+  ) invalid();
+  return {
+    artifactKind: "selective_pdf_pages_v1",
+    sourceSha256: string(input.sourceSha256, { maxUtf16: 64, pattern: SHA256 }),
+    selectedPdfSha256: string(input.selectedPdfSha256, { maxUtf16: 64, pattern: SHA256 }),
+    sourcePageCount,
+    originalPages,
+    coverageFingerprint: string(input.coverageFingerprint, { maxUtf16: 64, pattern: SHA256 }),
+    artifactFingerprint: string(input.artifactFingerprint, { maxUtf16: 64, pattern: SHA256 }),
+    parserFingerprint: string(input.parserFingerprint, { maxUtf8: 1024 }),
+    extractionFingerprint: string(input.extractionFingerprint, { maxUtf8: 1024 }),
+  };
+}
+
+function targetedCoverage(value: unknown): TargetedTaxCoverageDeclaration {
+  const input = object(value);
+  exactKeys(input, [
+    "formFamily",
+    "requestedRegionsClosed",
+    "continuationsClosed",
+  ]);
+  if (
+    typeof input.formFamily !== "string" ||
+    !(TARGETED_TAX_FORM_FAMILIES as readonly string[]).includes(input.formFamily) ||
+    typeof input.requestedRegionsClosed !== "boolean" ||
+    typeof input.continuationsClosed !== "boolean"
+  ) invalid();
+  return {
+    formFamily: input.formFamily as TargetedTaxFormFamily,
+    requestedRegionsClosed: input.requestedRegionsClosed,
+    continuationsClosed: input.continuationsClosed,
+  };
+}
+
+function targetedPages(value: unknown): TargetedTaxPageInput[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_TARGETED_TAX_BATCH_PAGES) invalid();
+  const pages = value.map((item) => {
+    const input = object(item);
+    exactKeys(input, ["originalPage", "textHash"]);
+    return {
+      originalPage: integer(input.originalPage, 1, 10_000),
+      textHash: string(input.textHash, { maxUtf16: 64, pattern: SHA256 }),
+    };
+  });
+  if (
+    pages.some((page, index) => index > 0 && page.originalPage <= pages[index - 1]!.originalPage)
+  ) invalid();
+  return pages;
+}
 /**
  * ADM-10 review. A worker process's heartbeat nonce: 128 bits as 32 lowercase
  * hex characters, matching the column's own CHECK in migration 031. A closed
@@ -2192,10 +2414,45 @@ function parsedTextDeclaration(value: unknown): ParsedTextDeclaration {
     "expectedEvidenceSpanCount",
     "expectedDocumentCount",
     "expectedChunkCount",
-  ]);
+  ], ["representation", "targetedCoverage"]);
   const hash = (value: unknown) =>
     string(value, { maxUtf16: 64, pattern: SHA256 });
+  const representation = input.representation === undefined
+    ? "parsed_pages_v1"
+    : input.representation;
+  if (representation !== "parsed_pages_v1" && representation !== "targeted_pages_v1") invalid();
+  let targetedCoverage;
+  if (representation === "targeted_pages_v1") {
+    const coverage = object(input.targetedCoverage);
+    exactKeys(coverage, [
+      "sourceSha256",
+      "selectedPdfSha256",
+      "sourcePageCount",
+      "originalPages",
+      "coverageFingerprint",
+      "artifactFingerprint",
+    ]);
+    if (!Array.isArray(coverage.originalPages)) invalid();
+    const sourcePageCount = integer(coverage.sourcePageCount, 1, 10_000);
+    const originalPages = coverage.originalPages.map((page) =>
+      integer(page, 1, sourcePageCount)
+    );
+    if (
+      originalPages.length < 1 || originalPages.length > MAX_TARGETED_TAX_BATCH_PAGES ||
+      originalPages.some((page, index) => index > 0 && page <= originalPages[index - 1]!)
+    ) invalid();
+    targetedCoverage = {
+      sourceSha256: hash(coverage.sourceSha256),
+      selectedPdfSha256: hash(coverage.selectedPdfSha256),
+      sourcePageCount,
+      originalPages,
+      coverageFingerprint: hash(coverage.coverageFingerprint),
+      artifactFingerprint: hash(coverage.artifactFingerprint),
+    };
+  } else if (input.targetedCoverage !== undefined) invalid();
   return {
+    ...(input.representation === undefined ? {} : { representation }),
+    ...(targetedCoverage === undefined ? {} : { targetedCoverage }),
     extractionFingerprint: hash(input.extractionFingerprint),
     textHash: hash(input.textHash),
     byteLength: integer(input.byteLength, 1, 1_024 * 1_024),
@@ -2780,6 +3037,153 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         requestId: requestId(input.requestId),
         identity: archivedWorkIdentity(input.identity),
         preview: triagePreview(input.preview),
+      };
+    case "extraction.beginTargetedTax": {
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "sourceItemId",
+        "sourceRevisionId",
+        "observedContentHash",
+        "goalKind",
+        "instanceKey",
+        "requiredFields",
+        "optionalFields",
+        "sourcePageCount",
+        "requestDigest",
+      ]);
+      const requiredFields = targetedFields(input.requiredFields);
+      const optionalFields = targetedFields(input.optionalFields);
+      if (
+        requiredFields.length < 1 ||
+        optionalFields.some((field) => requiredFields.includes(field))
+      ) invalid();
+      return {
+        ...base,
+        operation: "extraction.beginTargetedTax",
+        requestId: requestId(input.requestId),
+        sourceItemId: string(input.sourceItemId, { maxUtf16: 256 }),
+        sourceRevisionId: string(input.sourceRevisionId, { maxUtf16: 256 }),
+        observedContentHash: string(input.observedContentHash, { maxUtf16: 64, pattern: SHA256 }),
+        goalKind: targetedGoal(input.goalKind),
+        instanceKey: string(input.instanceKey, { maxUtf8: 256 }),
+        requiredFields,
+        optionalFields,
+        sourcePageCount: integer(input.sourcePageCount, 1, 10_000),
+        requestDigest: string(input.requestDigest, { maxUtf16: 64, pattern: SHA256 }),
+      };
+    }
+    case "extraction.admitTargetedTaxBatch": {
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "targetId",
+        "sourceRevisionId",
+        "batchOrdinal",
+        "priorProcessingGenerationId",
+        "artifact",
+        "extractionConfigurationFingerprint",
+        "parserArtifact",
+        "archives",
+        "parsedText",
+        "existingProviderOriginal",
+      ]);
+      if (!Array.isArray(input.archives) || input.archives.length !== 1)
+        invalid();
+      const archives = input.archives.map(archiveReceiptSelection);
+      if (
+        archives[0]!.subjectKind !== "parser_output" ||
+        archives[0]!.copyRole !== "primary"
+      ) invalid();
+      const provider = object(input.existingProviderOriginal);
+      exactKeys(provider, [
+        "referenceId",
+        "bindingEpoch",
+        "referenceVersion",
+      ]);
+      if (provider.referenceVersion !== "provider_original_v2") invalid();
+      const parsedText = parsedTextDeclaration(input.parsedText);
+      const artifact = targetedArtifact(input.artifact);
+      if (
+        parsedText.representation !== "targeted_pages_v1" ||
+        parsedText.targetedCoverage === undefined ||
+        parsedText.extractionFingerprint !== artifact.extractionFingerprint ||
+        parsedText.targetedCoverage.sourceSha256 !== artifact.sourceSha256 ||
+        parsedText.targetedCoverage.selectedPdfSha256 !==
+          artifact.selectedPdfSha256 ||
+        parsedText.targetedCoverage.sourcePageCount !== artifact.sourcePageCount ||
+        parsedText.targetedCoverage.coverageFingerprint !==
+          artifact.coverageFingerprint ||
+        parsedText.targetedCoverage.artifactFingerprint !==
+          artifact.artifactFingerprint ||
+        JSON.stringify(parsedText.targetedCoverage.originalPages) !==
+          JSON.stringify(artifact.originalPages)
+      ) invalid();
+      return {
+        ...base,
+        operation: "extraction.admitTargetedTaxBatch",
+        requestId: requestId(input.requestId),
+        targetId: string(input.targetId, { maxUtf16: 256 }),
+        sourceRevisionId: string(input.sourceRevisionId, { maxUtf16: 256 }),
+        batchOrdinal: integer(input.batchOrdinal, 1, 10_000),
+        priorProcessingGenerationId: string(input.priorProcessingGenerationId, {
+          maxUtf16: 256,
+        }),
+        artifact,
+        extractionConfigurationFingerprint: string(
+          input.extractionConfigurationFingerprint,
+          { maxUtf16: 64, pattern: SHA256 },
+        ),
+        parserArtifact: parserArtifactSelection(input.parserArtifact),
+        archives,
+        parsedText,
+        existingProviderOriginal: {
+          referenceId: string(provider.referenceId, { maxUtf16: 256 }),
+          bindingEpoch: integer(provider.bindingEpoch, 0, Number.MAX_SAFE_INTEGER),
+          referenceVersion: "provider_original_v2",
+        },
+      };
+    }
+    case "extraction.appendTargetedTaxBatch": {
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "targetId",
+        "sourceRevisionId",
+        "batchOrdinal",
+        "sourceTextVersionId",
+        "processingGenerationId",
+        "artifact",
+        "pages",
+        "coverage",
+      ]);
+      const artifact = targetedArtifact(input.artifact);
+      const pages = targetedPages(input.pages);
+      if (
+        pages.length !== artifact.originalPages.length ||
+        pages.some((page, index) => page.originalPage !== artifact.originalPages[index])
+      ) invalid();
+      return {
+        ...base,
+        operation: "extraction.appendTargetedTaxBatch",
+        requestId: requestId(input.requestId),
+        targetId: string(input.targetId, { maxUtf16: 256 }),
+        sourceRevisionId: string(input.sourceRevisionId, { maxUtf16: 256 }),
+        batchOrdinal: integer(input.batchOrdinal, 0, 10_000),
+        sourceTextVersionId: string(input.sourceTextVersionId, { maxUtf16: 256 }),
+        processingGenerationId: string(input.processingGenerationId, { maxUtf16: 256 }),
+        artifact,
+        pages,
+        coverage: targetedCoverage(input.coverage),
+      };
+    }
+    case "extraction.targetedTaxStatus":
+      exactKeys(input, [...baseKeys, "requestId", "targetId"]);
+      return {
+        ...base,
+        operation: "extraction.targetedTaxStatus",
+        requestId: requestId(input.requestId),
+        targetId: string(input.targetId, { maxUtf16: 256 }),
       };
     case "discovery.preflightArchived":
       exactKeys(input, [

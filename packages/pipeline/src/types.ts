@@ -77,6 +77,8 @@ export type PdfDocQaConfig = {
     expectedPythonSha256: string;
     launcherPath: string;
     expectedLauncherSha256: string;
+    selectiveLauncherPath?: string;
+    expectedSelectiveLauncherSha256?: string;
     packageRoot: string;
     modelAssetsPath: string;
     modelLockPath: string;

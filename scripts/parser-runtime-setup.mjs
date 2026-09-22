@@ -3,6 +3,7 @@
 //
 // The pipeline config pins the parser by path and by sha256 (`pythonExecutable`
 // and `expectedPythonSha256`, `launcherPath` and `expectedLauncherSha256`,
+// `selectiveLauncherPath` and `expectedSelectiveLauncherSha256`,
 // `modelLockPath` and `expectedModelLockSha256`) and pins the identities the
 // parser computes (`profile.parserFingerprint`,
 // `profile.extractionConfigurationFingerprint`). Every one of those changes
@@ -157,6 +158,8 @@ export function configBlock(profile, paths, digests, options = {}) {
       expectedPythonSha256: digests.python,
       launcherPath: paths.launcherPath,
       expectedLauncherSha256: digests.launcher,
+      selectiveLauncherPath: paths.selectiveLauncherPath,
+      expectedSelectiveLauncherSha256: digests.selectiveLauncher,
       packageRoot: paths.packageRoot,
       modelAssetsPath: paths.modelAssetsPath,
       modelLockPath: paths.modelLockPath,
@@ -226,6 +229,12 @@ export async function runParserSetup(args) {
     // All three names are the same interpreter and the same digest.
     pythonExecutable: join(root, ".venv", "bin", PYTHON_LINK_NAME),
     launcherPath: join(root, "src", "parser_eval", "production_launcher.py"),
+    selectiveLauncherPath: join(
+      root,
+      "src",
+      "parser_eval",
+      "selective_production_launcher.py",
+    ),
     packageRoot: join(root, "src"),
     modelAssetsPath: join(root, "artifacts", "models"),
     modelLockPath: join(root, "model-assets.lock.json"),
@@ -307,15 +316,16 @@ export async function runParserSetup(args) {
       `${paths.pythonExecutable} is not a single symlink hop to its target; the runner will refuse it`,
     );
   }
-  const [python, launcher, modelLock] = await Promise.all([
+  const [python, launcher, selectiveLauncher, modelLock] = await Promise.all([
     digestOf(paths.pythonExecutable),
     digestOf(paths.launcherPath),
+    digestOf(paths.selectiveLauncherPath),
     digestOf(paths.modelLockPath),
   ]);
   return configBlock(
     profile,
     paths,
-    { python, launcher, modelLock },
+    { python, launcher, selectiveLauncher, modelLock },
     {
       ...(args.tableStructure === undefined
         ? {}

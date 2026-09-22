@@ -1452,6 +1452,79 @@ function recordedPreview(value: Record<string, unknown>): void {
   boolean(value.reused, "reused");
 }
 
+function targetedTaxStatus(value: Record<string, unknown>): void {
+  exact(value, [
+    "operation",
+    "targetId",
+    "sourceItemId",
+    "sourceRevisionId",
+    "goalKind",
+    "status",
+    "inspectedOriginalPages",
+    "unresolvedFields",
+    "reused",
+  ]);
+  id(value.targetId, "targetId");
+  id(value.sourceItemId, "sourceItemId");
+  id(value.sourceRevisionId, "sourceRevisionId");
+  if (
+    value.goalKind !== "form_1040_totals_v1" &&
+    value.goalKind !== "schedule_k1_key_fields_v1"
+  )
+    failure("targeted tax goal is invalid");
+  if (
+    value.status !== "awaiting_pages" &&
+    value.status !== "running" &&
+    value.status !== "complete" &&
+    value.status !== "incomplete_resumable" &&
+    value.status !== "conflict"
+  )
+    failure("targeted tax status is invalid");
+  if (
+    !Array.isArray(value.inspectedOriginalPages) ||
+    value.inspectedOriginalPages.some(
+      (page) => !Number.isSafeInteger(page) || Number(page) < 1,
+    ) ||
+    !Array.isArray(value.unresolvedFields) ||
+    value.unresolvedFields.some(
+      (field) =>
+        typeof field !== "string" || field.length < 1 || field.length > 128,
+    )
+  )
+    failure("targeted tax coverage is invalid");
+  boolean(value.reused, "reused");
+}
+
+function targetedTaxAdmission(value: Record<string, unknown>): void {
+  exact(value, [
+    "operation",
+    "targetId",
+    "sourceItemId",
+    "sourceRevisionId",
+    "batchOrdinal",
+    "parserArtifactId",
+    "sourceTextVersionId",
+    "processingGenerationId",
+    "ingestJobId",
+    "state",
+    "reused",
+  ]);
+  for (const field of [
+    "targetId",
+    "sourceItemId",
+    "sourceRevisionId",
+    "parserArtifactId",
+    "sourceTextVersionId",
+    "processingGenerationId",
+    "ingestJobId",
+  ] as const)
+    id(value[field], field);
+  integer(value.batchOrdinal, "batchOrdinal");
+  if (value.state !== "admitted")
+    failure("targeted tax admit state is invalid");
+  boolean(value.reused, "reused");
+}
+
 export function parseWorkerResponse(
   value: string,
   expectedOperation: string,
@@ -1586,6 +1659,14 @@ export function parseWorkerResponse(
       break;
     case "jobs.activateParsed":
       parsedActivate(result);
+      break;
+    case "extraction.beginTargetedTax":
+    case "extraction.appendTargetedTaxBatch":
+    case "extraction.targetedTaxStatus":
+      targetedTaxStatus(result);
+      break;
+    case "extraction.admitTargetedTaxBatch":
+      targetedTaxAdmission(result);
       break;
     case "jobs.renew":
     case "jobs.stageUtf8":

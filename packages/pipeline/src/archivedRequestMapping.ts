@@ -92,11 +92,11 @@ export function digestArchiveIntent(input: {
         ]
       : input.original.providerOriginal
         ? [
-          copyIntent(input.original.copies.primary!),
-          input.original.providerOriginal.clientReferenceId,
-          input.original.providerOriginal.bindingId,
-          copyIntent(input.original.providerOriginal.locator),
-        ]
+            copyIntent(input.original.copies.primary!),
+            input.original.providerOriginal.clientReferenceId,
+            input.original.providerOriginal.bindingId,
+            copyIntent(input.original.providerOriginal.locator),
+          ]
         : [
             copyIntent(input.original.copies.primary!),
             copyIntent(input.original.copies.independent_backup!),
@@ -128,12 +128,14 @@ export function digestRetainedProviderV1ArchiveIntent(input: {
     Pick<ProcessingCatalogRow, "legacyIndependentBackup">;
 }): string {
   const provider = input.original.providerOriginal;
-  const primary = provider?.referenceVersion === "provider_original_v2"
-    ? provider.legacyPrimary
-    : undefined;
-  const locator = provider?.referenceVersion === "provider_original_v2"
-    ? provider.legacyLocator
-    : undefined;
+  const primary =
+    provider?.referenceVersion === "provider_original_v2"
+      ? provider.legacyPrimary
+      : undefined;
+  const locator =
+    provider?.referenceVersion === "provider_original_v2"
+      ? provider.legacyLocator
+      : undefined;
   const parserBackup = input.processing.legacyIndependentBackup;
   if (!provider || !primary || !locator || !parserBackup) {
     throw new Error("Retained provider v1 intent is incomplete");
@@ -329,5 +331,19 @@ export function parsedTextDeclaration(input: {
     expectedEvidenceSpanCount: input.mapping.evidence.length,
     expectedDocumentCount: input.mapping.documents.length,
     expectedChunkCount: input.mapping.chunks.length,
+    ...("artifactKind" in output &&
+    output.artifactKind === "selective_pdf_pages_v1"
+      ? {
+          representation: "targeted_pages_v1" as const,
+          targetedCoverage: {
+            sourceSha256: output.coverage.sourceSha256,
+            selectedPdfSha256: output.coverage.selectedPdfSha256,
+            sourcePageCount: output.coverage.sourcePageCount,
+            originalPages: output.coverage.originalPages,
+            coverageFingerprint: output.coverage.fingerprint,
+            artifactFingerprint: output.artifactFingerprint,
+          },
+        }
+      : {}),
   };
 }

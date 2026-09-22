@@ -518,6 +518,8 @@ export type IngestJobRow = {
   workerDiscoveryWorkId: string | null;
   workerObservationEpoch: number | null;
   workerProcessingMode: string | null;
+  targetedExtractionId: string | null;
+  targetedBatchOrdinal: number | null;
 };
 
 export function camelizeIngestJob(raw: Record<string, unknown>): IngestJobRow {
@@ -526,6 +528,7 @@ export function camelizeIngestJob(raw: Record<string, unknown>): IngestJobRow {
     "attempts",
     "leaseEpoch",
     "workerObservationEpoch",
+    "targetedBatchOrdinal",
   ]);
 }
 

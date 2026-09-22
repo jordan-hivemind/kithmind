@@ -146,9 +146,9 @@ The first version supports exactly two goals. The goal and its version are part
 of the durable request digest. A later field-set change is a new goal version,
 not a silent reinterpretation of a completed result.
 
-| Goal | Form instances | Requested field set |
-| --- | --- | --- |
-| `form_1040_totals_v1` | One Form 1040 filing version and each applicable front Schedule 1, 2, 3, A, D or E | Form identity and every semantic total in `FEDERAL_INDIVIDUAL_RETURN`. Identity is `tax_year`, `return_version`, `filing_status` and `jurisdiction`. The total set is the checked-in Form 1040 and schedule total catalog. Names, preparer, signature and filing channel remain optional descriptive fields and do not keep page discovery alive. |
+| Goal                        | Form instances                                                                            | Requested field set                                                                                                                                                                                                                                                                                                                                        |
+| --------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `form_1040_totals_v1`       | One Form 1040 filing version and each applicable front Schedule 1, 2, 3, A, D or E        | Form identity and every semantic total in `FEDERAL_INDIVIDUAL_RETURN`. Identity is `tax_year`, `return_version`, `filing_status` and `jurisdiction`. The total set is the checked-in Form 1040 and schedule total catalog. Names, preparer, signature and filing channel remain optional descriptive fields and do not keep page discovery alive.          |
 | `schedule_k1_key_fields_v1` | One Schedule K-1 form instance, identified by form family, tax year, entity and recipient | Parts I and II identity; amended, final, PTP, partner type, domestic/foreign and K-3 flags; beginning and ending profit, loss and capital percentages; nonrecourse, qualified nonrecourse and recourse liabilities; all six Part L capital movements; Part III boxes 1, 2, 3, 4a-c, 5, 6a-b, 7, 8, 9a-c and 10; and coded values in boxes 11-15 and 17-20. |
 
 The K-1 seed currently has only partnership, tax year, recipient and eight
@@ -191,6 +191,27 @@ field is resolved, and continuation statements referenced by requested coded
 boxes are closed. A contents-page mention, cover letter, first-page heading or
 model assertion cannot close a form.
 
+The first controller implements this conservatively. Distinct positive Form
+1040 page-one and page-two headings and an explicit following form boundary or
+source end are required; contents entries, duplicate page-one headings and an
+unlabelled page between them leave coverage open. A 1065 K-1 must expose Part
+III, a numbered box or a supported key-field label in inspected source text.
+The generic "Partner's Share" form title alone does not prove key-box coverage.
+When that form references an attached
+statement, at least one explicitly labelled statement page and its boundary or
+source end are required. Unknown header drift leaves the target
+`incomplete_resumable`. Reaching the last planned transport batch is not a
+completion signal. The controller persists these closure judgments in its
+checkpoint and sends them only with the final planned batch.
+
+Required readings remain intentionally smaller than the complete optional
+catalog. Form 1040 completion requires its filing identity and core comparison
+totals. K-1 completion requires its form identity and positive coverage of the
+key-box region. Available key figures are cited, while a readable blank remains
+blank and is never invented as zero. This permits a legitimately blank box
+region without allowing a first-page identity-only extraction to claim the
+form was inspected completely.
+
 Supporting brokerage statements, worksheets, duplicate attachments and K-1
 continuations unrelated to the requested boxes remain deferred. CPU, memory,
 page and token limits are operational budgets. Reaching one before semantic
@@ -211,20 +232,18 @@ Reuse the existing source revision, provider reference, parser artifact,
 parsed-staging, text-version, page, evidence, event, observation and deferred
 work tables. Add only the following persisted fields and table:
 
-| Change | Contract |
-| --- | --- |
-| `source_text_versions.coverage_kind` | Closed to `full_document` and `targeted_tax_v1`. Existing rows backfill to `full_document`. |
-| `source_text_versions.source_unit_count` and `inspected_original_units` | The PDF page count and, for a targeted version, a strictly increasing bounded list of exact original pages. A full version has `source_unit_count = page_count` and does not need to enumerate every unit. |
-| `source_pages.original_unit_number` | One-based original PDF page number. Dense staging ordinal remains internal ordering. Evidence and user-facing citations use this number. |
-| `kith.targeted_extraction_results` | One revision-bound result per goal version, opaque instance key and request digest. Status is closed to `running`, `complete`, `incomplete_resumable` or `conflict`; the only in-place lifecycle is `running` to one terminal state. The row stores source item/revision/text version/generation, requested fields, discovered forms, inspected original units, unresolved codes, event and observation keys, parser/extractor fingerprints and timestamps. Payloads are closed and bounded. |
-| `deferred_work.kind` | Add only `targeted_tax_extraction`. Its payload names space, source item, source revision, processing generation and goal digest. The existing lease, retry and dedupe behavior remains unchanged. |
+| Change                                | Contract                                                                                                                                                                                                                                                                                                                                                                         |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source_text_versions.representation` | Adds `targeted_pages_v1`. Each transport batch creates one sealed non-active text version. Its `source_pages.ordinal` retains the zero-based original PDF page, so evidence and user-facing citations preserve the source page without changing full-document rows.                                                                                                              |
+| `kith.document_targeted_extractions`  | One revision-bound result per goal version, opaque instance key and request digest. It stores a bounded manifest of immutable batch text versions and original-page hashes, requested fields, cited outcomes, unresolved codes, parser/extractor fingerprints and timestamps. Status is closed to `awaiting_pages`, `running`, `complete`, `incomplete_resumable` or `conflict`. |
+| `deferred_work.kind`                  | Add only `targeted_tax_extraction`. Its payload names space, source item, source revision, processing generation and goal digest. The existing lease, retry and dedupe behavior remains unchanged.                                                                                                                                                                               |
 
 The separate result table is necessary because `document_extractions` is unique
 on `source_item_id`. One assembled source can yield a Form 1040 result and
 several K-1 form-instance results. Reusing that row would either overwrite one
 goal with another or collapse distinct counterparties into one extraction.
 
-The targeted generation is sealed and auditable but does not produce a
+Each targeted batch is sealed and auditable but does not produce a
 whole-document retrieval or embedding claim and is never written to
 `source_items.active_generation_id`. If no full generation exists, document
 reads may expose its cited tax result and explicit partial coverage, but search
@@ -250,27 +269,55 @@ completion arm that seals the generation without setting the source item's
 active generation. No second ingestion service or queue is added.
 
 Targeted completion queues the existing deferred worker with
-`targeted_tax_extraction`. The handler writes the result row, event,
-observations and cited statements in one transaction after rechecking current
-source revision, goal digest, parser fingerprint and evidence. `get_document`
+`targeted_tax_extraction`. The handler writes the result's typed outcomes and
+cited evidence in one transaction after rechecking current source revision,
+goal digest, parser fingerprint and evidence. Targeted outcomes do not enter
+the general observation projection until a later, separately reviewed tax
+projection defines that meaning. `get_document`
 adds the goal status, resolved/unresolved coverage, inspected original pages and
-cited statements. This read-contract change bumps the advertised standalone and
-hosted MCP server versions under the repository version policy. No new MCP tool
-or UI is part of this slice.
+cited statements. This read-contract change bumps the advertised hosted MCP
+server version under the repository version policy. The standalone finance
+server does not expose document reads and is unchanged. No new MCP tool or UI
+is part of this slice.
 
 ### Implementation slices and ownership
 
-| Slice | Owner | Deliverable |
-| --- | --- | --- |
-| 1. Selective PDF artifact | Pipeline/parser | Accept an exact bounded set of original PDF pages, bind it into the parser fingerprint, preserve the original-page map in normalized output, and checkpoint only revision-bound tax goals. |
-| 2. Partial coverage admission | Worker protocol and Kith store | Apply the migration above, extend existing archived admission and parsed staging, reject stale/cross-source/mismatched coverage, and keep targeted text out of whole-document search claims. Apply the migration development-first. |
-| 3. Goal controller and extraction | Pipeline and Kith extraction | Discover form boundaries, request additional pages only for closed continuation reasons, extend the K-1 catalog, gate field outcomes, and atomically store the result with existing evidence and observations. |
-| 4. Read and recovery proof | Document read and focused integration tests | Expose partial coverage through `get_document`; prove restart, same-request replay, revision invalidation, forget and later full-generation coexistence. |
+| Slice                             | Owner                                       | Deliverable                                                                                                                                                                                                                         |
+| --------------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. Selective PDF artifact         | Pipeline/parser                             | Accept an exact bounded set of original PDF pages, bind it into the parser fingerprint, preserve the original-page map in normalized output, and checkpoint only revision-bound tax goals.                                          |
+| 2. Partial coverage admission     | Worker protocol and Kith store              | Apply the migration above, extend existing archived admission and parsed staging, reject stale/cross-source/mismatched coverage, and keep targeted text out of whole-document search claims. Apply the migration development-first. |
+| 3. Goal controller and extraction | Pipeline and Kith extraction                | Discover form boundaries, request additional pages only for closed continuation reasons, extend the K-1 catalog, gate field outcomes, and atomically store the result with existing evidence and observations.                      |
+| 4. Read and recovery proof        | Document read and focused integration tests | Expose partial coverage through `get_document`; prove restart, same-request replay, revision invalidation, forget and later full-generation coexistence.                                                                            |
 
 These are implementation PRs with one final acceptance, not research phases.
 Schema and worker-protocol work require the repository's independent tier-2
 review. Pipeline and schema owners coordinate migration numbering and shared
 files before implementation.
+
+PR #408 was automatically marked merged when its branch still pointed at the
+already-merged selective-artifact commit. It shipped no goal controller. The
+replacement implementation must have its own commit and review receipt before
+this acceptance can be marked complete.
+
+PR #410 is the replacement implementation. It promotes current selected tax
+identities from new previews and performs a one-time capability re-preview of
+legacy selected, unactivated identities whose earlier preview did not retain a
+supported form title. A spent whole-document parser budget does not suppress
+that bounded reclassification. Activated identities remain settled. The route
+then admits sealed `targeted_pages_v1` batches without activating them as full
+text, reuses exact page hashes across continuation batches, and exposes the
+revision-bound result through `get_document`.
+
+Validate every new CI or parser-launcher command in a clean environment. A
+developer environment with an editable package install can otherwise hide a
+missing import path or undeclared fixture dependency.
+
+The supported parser runtime setup command prints both the unchanged
+whole-document launcher path/hash and the selective launcher path/hash. Worker
+adoption adds the selective pair to `pdfDocQa.parser`; it does not replace or
+re-fingerprint the whole-document launcher. The journal adopts that additive
+configuration fingerprint only between passes, with no pending request or
+in-flight scan, and preserves the existing checkpoint and catalog.
 
 ### Final acceptance
 

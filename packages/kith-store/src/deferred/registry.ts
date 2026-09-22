@@ -34,6 +34,7 @@ import {
   type EmbeddingFetch,
 } from "../embeddings/provider.js";
 import { runDocumentExtractionJob } from "../extraction/model.js";
+import { runTargetedTaxExtractionJob } from "../extraction/targetedTax.js";
 import {
   providerExtractionModel,
   type ExtractionModel,
@@ -156,6 +157,11 @@ export function defaultRegistry(
     scope: "pool",
     run: (pool, payload, job) =>
       runDocumentExtractionJob(pool, payload, job, extract).then(() => undefined),
+  });
+  registry.set("targeted_tax_extraction", {
+    scope: "pool",
+    run: (pool, payload, job) =>
+      runTargetedTaxExtractionJob(pool, payload, job, extract),
   });
   // `investment_link` is registered by ADM-8c. Its schedulers are the three
   // triggers in `../admin/investmentLinkWork.ts` -- a stored extraction, an

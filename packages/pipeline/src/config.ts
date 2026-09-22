@@ -507,8 +507,17 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
       "modelLockPath",
       "expectedModelLockSha256",
     ],
-    ["tableStructure", "tableStructureBypass"],
+    [
+      "tableStructure",
+      "tableStructureBypass",
+      "selectiveLauncherPath",
+      "expectedSelectiveLauncherSha256",
+    ],
   );
+  if (
+    (parserInput.selectiveLauncherPath === undefined) !==
+    (parserInput.expectedSelectiveLauncherSha256 === undefined)
+  ) fail("pdfDocQa.parser selective launcher fields must be provided together");
   const tableStructure: PdfDocQaConfig["parser"]["tableStructure"] =
     parserInput.tableStructure === undefined
       ? undefined
@@ -542,6 +551,18 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
       parserInput.expectedLauncherSha256,
       "pdfDocQa.parser.expectedLauncherSha256",
     ),
+    ...(parserInput.selectiveLauncherPath === undefined
+      ? {}
+      : {
+          selectiveLauncherPath: absolutePath(
+            parserInput.selectiveLauncherPath,
+            "pdfDocQa.parser.selectiveLauncherPath",
+          ),
+          expectedSelectiveLauncherSha256: sha256(
+            parserInput.expectedSelectiveLauncherSha256,
+            "pdfDocQa.parser.expectedSelectiveLauncherSha256",
+          ),
+        }),
     packageRoot: absolutePath(
       parserInput.packageRoot,
       "pdfDocQa.parser.packageRoot",
@@ -836,6 +857,9 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
   const executablePaths = [
     parser.pythonExecutable,
     parser.launcherPath,
+    ...(parser.selectiveLauncherPath === undefined
+      ? []
+      : [parser.selectiveLauncherPath]),
     parser.modelLockPath,
     absolutePath(archiveInput.ageBinary, "pdfDocQa.archive.ageBinary"),
     ...(independentBackup === undefined

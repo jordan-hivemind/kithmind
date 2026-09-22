@@ -318,6 +318,14 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "manual tax payments with exact identifiers, evidence and status history",
     url: new URL("../migrations/041_tax_payments.sql", import.meta.url),
   },
+  {
+    version: 42,
+    name: "goal-aware tax extraction over immutable selective-page batches",
+    url: new URL(
+      "../migrations/042_targeted_tax_extractions.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

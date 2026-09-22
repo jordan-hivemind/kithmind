@@ -41,7 +41,11 @@ export type SourceRevisionShape = {
 };
 
 export type SourceTextVersionShape = {
-  representation?: "inline_text_v1" | "parsed_pages_v1" | null;
+  representation?:
+    | "inline_text_v1"
+    | "parsed_pages_v1"
+    | "targeted_pages_v1"
+    | null;
   extractionFingerprint: string;
   text?: string | null;
   textHash: string;
@@ -75,6 +79,15 @@ export type ParsedSourceTextRepresentation =
     }
   | {
       kind: "parsed_pages_v1";
+      parserArtifactId: string;
+      utf16Length: number;
+      pageCount: number;
+      mappingManifestHash: string;
+      hashAuthority?: "server_verified_retained_text";
+      sealed: boolean;
+    }
+  | {
+      kind: "targeted_pages_v1";
       parserArtifactId: string;
       utf16Length: number;
       pageCount: number;
@@ -318,14 +331,21 @@ export function parseSourceTextRepresentation(
     };
   }
 
-  if (value.representation !== "parsed_pages_v1") {
+  if (
+    value.representation !== "parsed_pages_v1" &&
+    value.representation !== "targeted_pages_v1"
+  ) {
     throw new Error("Unknown source text representation");
   }
 
   if (
     value.text != null ||
-    typeof value.parserArtifactId !== "string" ||
-    value.parserArtifactId.length === 0 ||
+    (value.representation === "parsed_pages_v1" &&
+      (typeof value.parserArtifactId !== "string" ||
+        value.parserArtifactId.length === 0)) ||
+    (value.representation === "targeted_pages_v1" &&
+      (typeof value.parserArtifactId !== "string" ||
+        value.parserArtifactId.length === 0)) ||
     value.utf16Length == null ||
     value.pageCount == null ||
     value.mappingManifestHash == null
@@ -358,15 +378,16 @@ export function parseSourceTextRepresentation(
     MAX_PARSED_TEXT_PAGES,
   );
   requireSha256(value.mappingManifestHash, "Normalized mapping manifest hash");
-  return {
-    kind: "parsed_pages_v1",
-    parserArtifactId: value.parserArtifactId,
+  const common = {
     utf16Length: value.utf16Length,
     pageCount: value.pageCount,
     mappingManifestHash: value.mappingManifestHash,
     hashAuthority: value.textHashAuthority ?? undefined,
     sealed: value.evidenceSealed,
   };
+  return value.representation === "parsed_pages_v1"
+    ? { kind: "parsed_pages_v1", parserArtifactId: value.parserArtifactId!, ...common }
+    : { kind: "targeted_pages_v1", parserArtifactId: value.parserArtifactId!, ...common };
 }
 
 export function requireInlineSourceTextVersion(

@@ -65,6 +65,7 @@ export const DEFERRED_WORK_KINDS = [
   "card_queue_tick",
   "document_extraction",
   "investment_link",
+  "targeted_tax_extraction",
 ] as const;
 
 export type DeferredWorkKind = (typeof DEFERRED_WORK_KINDS)[number];

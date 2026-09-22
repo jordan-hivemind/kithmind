@@ -327,7 +327,8 @@ export async function grantProofAppRole(
   // `kith.event_versions` and `kith.observations` the same job writes are
   // already granted above with the records group.
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
-    kith.document_extractions TO "${appRole}"`);
+    kith.document_extractions, kith.document_targeted_extractions
+    TO "${appRole}"`);
   // The worker protocol's own tables (ADM-9, and its independent review).
   //
   // The comment further down said these would be granted "when the operations

@@ -16,9 +16,12 @@ import {
   type ParserArtifactSelection,
 } from "@repo/worker-protocol";
 import {
+  MAX_TARGETED_TAX_BATCH_PAGES,
   MAX_WORKER_SCAN_ENTRIES,
   parseWorkerRequest,
   type SourceRootReportState,
+  type TargetedTaxArtifactDeclaration,
+  type TargetedTaxGoalKind,
   type WorkerSourceRoot,
 } from "@repo/worker-protocol/request";
 
@@ -54,6 +57,7 @@ import type {
   ArchiveCopyRole,
   ArchiveSubject,
   DurableParserOutput,
+  DurableSelectiveParserOutput,
   OriginalCatalogRow,
   ProcessingCatalogRow,
 } from "./archiveCatalogTypes.js";
@@ -107,17 +111,20 @@ import {
 import {
   createParserProfileWorkDirectory,
   inspectCapturedParserOutput,
+  inspectCapturedPdfSelectiveOutput,
   inspectParserOutputIntent,
   preparePdfDocQaProfile,
   reclaimStaleParserOutputDirectory,
   removeParserProfileWorkDirectoryExact,
   removeParserOutputExact,
   runCapturedPdfParser,
+  runCapturedPdfSelectiveArtifact,
   runCapturedWorkbookParser,
   runDocumentPreview,
   ParserProcessError,
   type DocumentPreviewResult,
   type DurableParserOutputArtifacts,
+  type DurableSelectiveParserOutputArtifacts,
   type ParserOutputIntent,
   type ParserOutputRecoveryInput,
   type PreparedPdfDocQaProfile,
@@ -129,6 +136,13 @@ import {
   previewDeclaration,
   stablePreviewRequestId,
 } from "./previewMetadata.js";
+import {
+  inspectTargetedTaxPages,
+  targetedTaxCoverage,
+  targetedTaxFields,
+  targetedTaxNavigationClosed,
+  type TargetedTaxHeaderPage,
+} from "./targetedTaxController.js";
 import {
   mapParsedBundle,
   mapSpreadsheetWorkbook,
@@ -744,6 +758,50 @@ function sha256Json(value: unknown): string {
     .digest("hex");
 }
 
+function targetedGoalDigest(input: {
+  sourceItemId: string;
+  sourceRevisionId: string;
+  observedContentHash: string;
+  goalKind: TargetedTaxGoalKind;
+  instanceKey: string;
+  requiredFields: readonly string[];
+  optionalFields: readonly string[];
+  sourcePageCount: number;
+}): string {
+  return createHash("sha256")
+    .update("kith-targeted-tax-goal:v1\0", "utf8")
+    .update(
+      JSON.stringify([
+        input.sourceItemId,
+        input.sourceRevisionId,
+        input.observedContentHash,
+        input.goalKind,
+        input.instanceKey,
+        input.requiredFields,
+        input.optionalFields,
+        input.sourcePageCount,
+      ]),
+      "utf8",
+    )
+    .digest("hex");
+}
+
+function targetedArtifact(
+  output: DurableSelectiveParserOutput,
+): TargetedTaxArtifactDeclaration {
+  return {
+    artifactKind: "selective_pdf_pages_v1",
+    sourceSha256: output.coverage.sourceSha256,
+    selectedPdfSha256: output.coverage.selectedPdfSha256,
+    sourcePageCount: output.coverage.sourcePageCount,
+    originalPages: output.coverage.originalPages,
+    coverageFingerprint: output.coverage.fingerprint,
+    artifactFingerprint: output.artifactFingerprint,
+    parserFingerprint: output.parserFingerprint,
+    extractionFingerprint: output.extractionFingerprint,
+  };
+}
+
 /** The class's media type. Both sides derive it from the class, never both. */
 function planMediaType(plan: PdfFilePlan): BinaryMediaType {
   return BINARY_CLASSES[plan.parserProfileId].mediaType;
@@ -946,8 +1004,9 @@ export function parserOutputIntentCore(
 }
 
 export function parserOutputCatalogRecord(
-  artifacts: DurableParserOutputArtifacts,
-): DurableParserOutput {
+  artifacts:
+    DurableParserOutputArtifacts | DurableSelectiveParserOutputArtifacts,
+): DurableParserOutput | DurableSelectiveParserOutput {
   const { path: rawPath, ...rawArtifact } = artifacts.rawArtifact;
   const { path: bundlePath, ...normalizedBundle } = artifacts.normalizedBundle;
   return {
@@ -2003,6 +2062,29 @@ export class PipelineRunner {
       );
   }
 
+  private hasCompletedTargetedTax(plan: PdfFilePlan): boolean {
+    const original = this.matchingOriginal(plan);
+    if (!original) return false;
+    const fingerprints = this.processingFingerprints(plan);
+    return this.requireCatalog()
+      .listProcessings()
+      .some(
+        (row) =>
+          row.originalCatalogId === original.originalCatalogId &&
+          row.currentObservation.processingEpoch === plan.processingEpoch &&
+          row.targetedBatch !== undefined &&
+          row.targetedCompletion !== undefined &&
+          row.fingerprints.parserFingerprint ===
+            fingerprints.parserFingerprint &&
+          row.fingerprints.extractionConfigurationFingerprint ===
+            fingerprints.extractionConfigurationFingerprint &&
+          row.fingerprints.discoveryProfileFingerprint ===
+            fingerprints.discoveryProfileFingerprint &&
+          row.fingerprints.correctionFingerprint ===
+            fingerprints.correctionFingerprint,
+      );
+  }
+
   private async processingArtifactsPresent(
     processing: ProcessingCatalogRow,
     mediaType: BinaryMediaType,
@@ -2110,6 +2192,7 @@ export class PipelineRunner {
   }
 
   private async pdfNeedsArchivedWork(plan: PdfFilePlan): Promise<boolean> {
+    if (this.hasCompletedTargetedTax(plan)) return false;
     const matches = this.matchingProcessingRows(plan);
     // A `queued` entry is the server saying it has not settled this failure
     // yet, and the only thing that settles it is one more report carrying
@@ -2240,6 +2323,9 @@ export class PipelineRunner {
   ): Promise<RunnerCheckpoint> {
     const previewed = new Set(routing.previewed.map(metadataIdentityKey));
     const gapped = new Set(routing.previewGaps.map(metadataIdentityKey));
+    const targetedClassified = new Set(
+      (routing.targetedTaxClassified ?? []).map(metadataIdentityKey),
+    );
     const nextStep = async (
       plan: PdfFilePlan,
       alreadyPreviewed: boolean,
@@ -2278,7 +2364,20 @@ export class PipelineRunner {
         throw new PipelineWorkerError("metadata_first_identity_conflict");
       }
       const plan = checkpoint.files[index]! as PdfFilePlan;
-      const step = await nextStep(plan, previewed.has(selectedKey));
+      const needsTargetedClassification =
+        previewed.has(selectedKey) &&
+        !targetedClassified.has(selectedKey) &&
+        !this.matchingProcessingRows(plan).some(
+          (row) => row.activation !== undefined,
+        );
+      const targeted = (routing.targetedTax ?? []).some(
+        (candidate) => metadataIdentityKey(candidate) === selectedKey,
+      );
+      const step = needsTargetedClassification
+        ? "preview"
+        : targeted && !this.hasCompletedTargetedTax(plan)
+          ? "intent"
+          : await nextStep(plan, previewed.has(selectedKey));
       if (step === null) continue;
       return this.metadataArchivedCheckpoint(
         checkpoint,
@@ -2423,6 +2522,73 @@ export class PipelineRunner {
         };
   }
 
+  private targetedTaxRoute(checkpoint: ArchivedCheckpoint, plan: PdfFilePlan) {
+    const key = metadataIdentityKey(metadataIdentity(plan));
+    return checkpoint.metadataFirst?.targetedTax?.find(
+      (candidate) => metadataIdentityKey(candidate) === key,
+    );
+  }
+
+  private async discoverTargetedTaxPages(
+    plan: PdfFilePlan,
+    goalKind: TargetedTaxGoalKind,
+    sourcePageCount: number,
+  ): Promise<ReturnType<typeof inspectTargetedTaxPages>> {
+    const headers: TargetedTaxHeaderPage[] = [];
+    for (let startPage = 1; startPage <= sourcePageCount; startPage += 8) {
+      const preview = await this.executeMetadataPreview(plan, [
+        {
+          startPage,
+          pageCount: Math.min(8, sourcePageCount - startPage + 1),
+        },
+      ]);
+      if (
+        preview.sourceSha256 !== plan.sha256 ||
+        preview.sourceUnitCount !== sourcePageCount ||
+        preview.mediaType !== "application/pdf"
+      )
+        throw new PipelineWorkerError("archived_source_changed");
+      for (const [
+        index,
+        originalPage,
+      ] of preview.inspectedOriginalUnits.entries()) {
+        headers.push({
+          originalPage,
+          text: preview.unitTexts[index] ?? "",
+        });
+      }
+      if (targetedTaxNavigationClosed(goalKind, headers, sourcePageCount))
+        break;
+    }
+    const pagePlan = inspectTargetedTaxPages(
+      goalKind,
+      headers,
+      sourcePageCount,
+    );
+    if (pagePlan.originalPages.length === 0)
+      throw new PipelineWorkerError("targeted_tax_pages_not_found");
+    return pagePlan;
+  }
+
+  private targetedProcessingFingerprints(
+    plan: PdfFilePlan,
+    goalKind: TargetedTaxGoalKind,
+    batchOrdinal: number,
+    originalPages: readonly number[],
+  ) {
+    const base = this.processingFingerprints(plan);
+    return {
+      ...base,
+      processingPolicyFingerprint: sha256Json([
+        "targeted-tax-processing:v1",
+        base.processingPolicyFingerprint,
+        goalKind,
+        batchOrdinal,
+        originalPages,
+      ]),
+    };
+  }
+
   private async createArchivedIntents(
     checkpoint: ArchivedCheckpoint,
   ): Promise<ArchivedCheckpoint> {
@@ -2491,7 +2657,47 @@ export class PipelineRunner {
         createdAt,
       });
     }
-    const fingerprints = this.processingFingerprints(plan);
+    const route = this.targetedTaxRoute(checkpoint, plan);
+    if (route && plan.parserProfileId !== "pdf_docqa_v1")
+      throw new PipelineWorkerError("targeted_tax_profile_invalid");
+    if (
+      route &&
+      original.providerOriginal?.referenceVersion !== "provider_original_v2"
+    )
+      throw new PipelineWorkerError("targeted_tax_provider_v2_required");
+    const targetedTaxRun: ArchivedCheckpoint["targetedTaxRun"] = route
+      ? (checkpoint.targetedTaxRun ??
+        (await (async () => {
+          const pagePlan = await this.discoverTargetedTaxPages(
+            plan,
+            route.goalKind,
+            route.sourcePageCount,
+          );
+          return {
+            goalKind: route.goalKind,
+            sourcePageCount: route.sourcePageCount,
+            plannedPages: pagePlan.originalPages,
+            requestedRegionsClosed: pagePlan.requestedRegionsClosed,
+            continuationsClosed: pagePlan.continuationsClosed,
+            batchOrdinal: 0,
+            processingCatalogIds: [] as string[],
+          };
+        })()))
+      : undefined;
+    const batchPages = targetedTaxRun?.plannedPages.slice(
+      targetedTaxRun.batchOrdinal * MAX_TARGETED_TAX_BATCH_PAGES,
+      (targetedTaxRun.batchOrdinal + 1) * MAX_TARGETED_TAX_BATCH_PAGES,
+    );
+    if (targetedTaxRun && (!batchPages || batchPages.length === 0))
+      throw new PipelineWorkerError("targeted_tax_pages_exhausted");
+    const fingerprints = targetedTaxRun
+      ? this.targetedProcessingFingerprints(
+          plan,
+          targetedTaxRun.goalKind,
+          targetedTaxRun.batchOrdinal,
+          batchPages!,
+        )
+      : this.processingFingerprints(plan);
     const processingProbe = {
       originalCatalogId: original.originalCatalogId,
       currentObservation: {
@@ -2500,9 +2706,19 @@ export class PipelineRunner {
         processingEpoch: identity.processingEpoch,
       },
       fingerprints,
+      ...(targetedTaxRun
+        ? {
+            targetedBatch: {
+              goalKind: targetedTaxRun.goalKind,
+              batchOrdinal: targetedTaxRun.batchOrdinal,
+              sourcePageCount: targetedTaxRun.sourcePageCount,
+              originalPages: batchPages!,
+            },
+          }
+        : {}),
     };
     let processing = catalog.findProcessingExact(processingProbe);
-    if (!processing && plan.discoveryState === "unchanged") {
+    if (!processing && !targetedTaxRun && plan.discoveryState === "unchanged") {
       const prior = this.matchingProcessingRows(plan);
       processing = this.reusableProcessingRow(prior, original);
     }
@@ -2558,6 +2774,16 @@ export class PipelineRunner {
         createdAt,
       });
     }
+    const processingCatalogIds = targetedTaxRun
+      ? targetedTaxRun.processingCatalogIds.includes(
+          processing.processingCatalogId,
+        )
+        ? targetedTaxRun.processingCatalogIds
+        : [
+            ...targetedTaxRun.processingCatalogIds,
+            processing.processingCatalogId,
+          ]
+      : undefined;
     return archivedBase(checkpoint, {
       step: processing.activation ? "cleanup" : "preflight",
       preflightAction: processing.activation ? undefined : "initial",
@@ -2566,6 +2792,135 @@ export class PipelineRunner {
       expectedOriginalRevision: original.rowRevision,
       processingCatalogId: processing.processingCatalogId,
       expectedProcessingRevision: processing.rowRevision,
+      ...(targetedTaxRun
+        ? {
+            targetedTaxRun: {
+              ...targetedTaxRun,
+              processingCatalogIds: processingCatalogIds!,
+            },
+          }
+        : {}),
+    });
+  }
+
+  private async createTargetedContinuationIntent(
+    checkpoint: ArchivedCheckpoint,
+  ): Promise<ArchivedCheckpoint> {
+    const target = checkpoint.targetedTaxRun;
+    if (
+      !target?.targetId ||
+      !target.priorProcessingGenerationId ||
+      target.batchOrdinal < 1 ||
+      !checkpoint.originalCatalogId
+    )
+      throw new PipelineWorkerError("targeted_tax_state_invalid");
+    const catalog = this.requireCatalog();
+    const pdf = this.requirePdfConfig();
+    const plan = this.archivedPlan(checkpoint);
+    const original = catalog
+      .listOriginals()
+      .find((row) => row.originalCatalogId === checkpoint.originalCatalogId);
+    if (
+      !original?.cloud ||
+      original.providerOriginal?.referenceVersion !== "provider_original_v2"
+    )
+      throw new PipelineWorkerError("targeted_tax_provider_v2_required");
+    const originalPages = target.plannedPages.slice(
+      target.batchOrdinal * MAX_TARGETED_TAX_BATCH_PAGES,
+      (target.batchOrdinal + 1) * MAX_TARGETED_TAX_BATCH_PAGES,
+    );
+    if (originalPages.length === 0)
+      throw new PipelineWorkerError("targeted_tax_pages_exhausted");
+    const fingerprints = this.targetedProcessingFingerprints(
+      plan,
+      target.goalKind,
+      target.batchOrdinal,
+      originalPages,
+    );
+    const identity = archivedIdentity(checkpoint, plan);
+    const targetedBatch = {
+      goalKind: target.goalKind,
+      batchOrdinal: target.batchOrdinal,
+      sourcePageCount: target.sourcePageCount,
+      originalPages,
+    };
+    const currentObservation = {
+      scanId: checkpoint.scanId,
+      observationEpoch: identity.observationEpoch,
+      processingEpoch: identity.processingEpoch,
+    };
+    let processing = catalog.findProcessingExact({
+      originalCatalogId: original.originalCatalogId,
+      currentObservation,
+      fingerprints,
+      targetedBatch,
+    });
+    if (!processing) {
+      const processingId = stableUuid(
+        original.originalCatalogId,
+        currentObservation,
+        fingerprints,
+        targetedBatch,
+        "processing",
+      );
+      const outputId = stableUuid(processingId, "parser-output");
+      const outputPath = join(pdf.parserOutputRoot, outputId);
+      await mkdir(outputPath, { mode: 0o700 }).catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      });
+      const [captureDirectory, outputRoot, outputDirectory, spoolRoot] =
+        await Promise.all([
+          privateDirectoryIdentity(pdf.captureDirectory),
+          privateDirectoryIdentity(pdf.parserOutputRoot),
+          privateDirectoryIdentity(outputPath),
+          inspectSpoolRoot(pdf.spoolDirectory),
+        ]);
+      processing = await catalog.createProcessingIntent({
+        processingCatalogId: processingId,
+        originalCatalogId: original.originalCatalogId,
+        currentObservation,
+        fingerprints,
+        targetedBatch,
+        captureIntent: {
+          captureId: stableUuid(processingId, "capture"),
+          directory: captureDirectory,
+        },
+        parserIntent: {
+          outputId,
+          outputRoot,
+          outputDirectory,
+          parserArtifactClientId: stableUuid(processingId, "parser-artifact"),
+        },
+        spoolIntent: {
+          spoolId: stableUuid(processingId, "spool"),
+          root: spoolRoot,
+        },
+        copies: {
+          primary: this.copyIntent("parser_output", "primary", processingId),
+        },
+        createdAt: Date.now(),
+      });
+    }
+    return archivedBase(checkpoint, {
+      step: "capture",
+      processingCatalogId: processing.processingCatalogId,
+      expectedProcessingRevision: processing.rowRevision,
+      targetedTaxRun: {
+        ...target,
+        processingCatalogIds: target.processingCatalogIds.includes(
+          processing.processingCatalogId,
+        )
+          ? target.processingCatalogIds
+          : [...target.processingCatalogIds, processing.processingCatalogId],
+      },
+      countPublication: false,
+      preflightAction: undefined,
+      discoveryLease: undefined,
+      parserReuse: undefined,
+      jobLease: undefined,
+      stageId: undefined,
+      stagePhase: undefined,
+      stageOrdinal: undefined,
     });
   }
 
@@ -3270,6 +3625,135 @@ export class PipelineRunner {
           };
           if (equalJson(body, legacy)) return;
         }
+        break;
+      }
+      case "extraction.beginTargetedTax": {
+        if (
+          checkpoint.phase !== "archived" ||
+          checkpoint.step !== "targeted_begin" ||
+          !checkpoint.targetedTaxRun
+        )
+          throw new PipelineWorkerError("journal_phase_conflict");
+        const { processing } = this.archivedRows(checkpoint);
+        if (!processing.cloud)
+          throw new PipelineWorkerError("journal_phase_conflict");
+        const fields = targetedTaxFields(checkpoint.targetedTaxRun.goalKind);
+        const goal = {
+          sourceItemId: processing.cloud.sourceItemId,
+          sourceRevisionId: processing.cloud.sourceRevisionId,
+          observedContentHash: this.archivedPlan(checkpoint).sha256,
+          goalKind: checkpoint.targetedTaxRun.goalKind,
+          instanceKey: stableUuid(
+            processing.cloud.sourceRevisionId,
+            checkpoint.targetedTaxRun.goalKind,
+            "automatic-instance-v1",
+          ),
+          ...fields,
+          sourcePageCount: checkpoint.targetedTaxRun.sourcePageCount,
+        };
+        expected = request(this.config, operation, {
+          requestId,
+          ...goal,
+          requestDigest: targetedGoalDigest(goal),
+        });
+        break;
+      }
+      case "extraction.admitTargetedTaxBatch": {
+        if (
+          checkpoint.phase !== "archived" ||
+          checkpoint.step !== "targeted_admit" ||
+          !checkpoint.targetedTaxRun?.targetId ||
+          !checkpoint.targetedTaxRun.priorProcessingGenerationId
+        )
+          throw new PipelineWorkerError("journal_phase_conflict");
+        const mapped = await this.mappedProcessing(checkpoint);
+        const output = mapped.processing.parserOutput;
+        const provider = mapped.original.cloud;
+        if (
+          !output ||
+          !("artifactKind" in output) ||
+          output.artifactKind !== "selective_pdf_pages_v1" ||
+          !provider ||
+          !("providerReferenceId" in provider)
+        )
+          throw new PipelineWorkerError("journal_phase_conflict");
+        expected = request(this.config, operation, {
+          requestId,
+          targetId: checkpoint.targetedTaxRun.targetId,
+          sourceRevisionId: provider.sourceRevisionId,
+          batchOrdinal: checkpoint.targetedTaxRun.batchOrdinal,
+          priorProcessingGenerationId:
+            checkpoint.targetedTaxRun.priorProcessingGenerationId,
+          artifact: targetedArtifact(output),
+          extractionConfigurationFingerprint:
+            output.extractionConfigurationFingerprint,
+          parserArtifact: createParserArtifactSelection(mapped.processing),
+          archives: [
+            createArchiveReceiptSelection(
+              "parser_output",
+              mapped.processing,
+              "primary",
+            ),
+          ],
+          parsedText: mapped.declaration,
+          existingProviderOriginal: {
+            referenceId: provider.providerReferenceId,
+            bindingEpoch: provider.providerBindingEpoch,
+            referenceVersion: "provider_original_v2",
+          },
+        });
+        break;
+      }
+      case "extraction.appendTargetedTaxBatch": {
+        if (
+          checkpoint.phase !== "archived" ||
+          checkpoint.step !== "targeted_append" ||
+          !checkpoint.targetedTaxRun?.targetId
+        )
+          throw new PipelineWorkerError("journal_phase_conflict");
+        const mapped = await this.mappedProcessing(checkpoint);
+        const output = mapped.processing.parserOutput;
+        const cloud = mapped.processing.cloud;
+        if (
+          !output ||
+          !("artifactKind" in output) ||
+          output.artifactKind !== "selective_pdf_pages_v1" ||
+          !cloud
+        )
+          throw new PipelineWorkerError("journal_phase_conflict");
+        expected = request(this.config, operation, {
+          requestId,
+          targetId: checkpoint.targetedTaxRun.targetId,
+          sourceRevisionId: cloud.sourceRevisionId,
+          batchOrdinal: checkpoint.targetedTaxRun.batchOrdinal,
+          sourceTextVersionId: cloud.sourceTextVersionId,
+          processingGenerationId: cloud.processingGenerationId,
+          artifact: targetedArtifact(output),
+          pages: mapped.mapping.pages.map((page, index) => ({
+            originalPage: output.coverage.originalPages[index]!,
+            textHash: page.textHash,
+          })),
+          coverage: targetedTaxCoverage(
+            checkpoint.targetedTaxRun.goalKind,
+            checkpoint.targetedTaxRun,
+            (checkpoint.targetedTaxRun.batchOrdinal + 1) *
+              MAX_TARGETED_TAX_BATCH_PAGES >=
+              checkpoint.targetedTaxRun.plannedPages.length,
+          ),
+        });
+        break;
+      }
+      case "extraction.targetedTaxStatus": {
+        if (
+          checkpoint.phase !== "archived" ||
+          checkpoint.step !== "targeted_status" ||
+          !checkpoint.targetedTaxRun?.targetId
+        )
+          throw new PipelineWorkerError("journal_phase_conflict");
+        expected = request(this.config, operation, {
+          requestId,
+          targetId: checkpoint.targetedTaxRun.targetId,
+        });
         break;
       }
       case "jobs.reserveParsed": {
@@ -4359,6 +4843,14 @@ export class PipelineRunner {
                 carry?.previewGaps.filter((gap) =>
                   currentIdentities.has(metadataIdentityKey(gap)),
                 ) ?? [],
+              targetedTax:
+                carry?.targetedTax?.filter((identity) =>
+                  currentIdentities.has(metadataIdentityKey(identity)),
+                ) ?? [],
+              targetedTaxClassified:
+                carry?.targetedTaxClassified?.filter((identity) =>
+                  currentIdentities.has(metadataIdentityKey(identity)),
+                ) ?? [],
               selectionReceipts: carry?.selectionReceipts ?? [],
             };
             const initial: ArchivedCheckpoint = {
@@ -5053,7 +5545,15 @@ export class PipelineRunner {
         );
         const automaticallySelected =
           !alreadySelected &&
-          automaticPreviewRoute(pendingBody.preview) === "deep_priority";
+          automaticPreviewRoute(pendingBody.preview) === "deep_priority" &&
+          pendingBody.preview.sourceUnitCount !== null;
+        const targetedSelected =
+          automaticPreviewRoute(pendingBody.preview) === "deep_priority" &&
+          pendingBody.preview.sourceUnitCount !== null;
+        const targetedGoal =
+          pendingBody.preview.provisionalMetadata.title === "Form 1040"
+            ? ("form_1040_totals_v1" as const)
+            : ("schedule_k1_key_fields_v1" as const);
         const routing: MetadataFirstRouting = {
           ...current.metadataFirst,
           selected: automaticallySelected
@@ -5064,6 +5564,31 @@ export class PipelineRunner {
           )
             ? current.metadataFirst.previewed
             : [...current.metadataFirst.previewed, currentIdentity],
+          targetedTax:
+            targetedSelected &&
+            !(current.metadataFirst.targetedTax ?? []).some(
+              (candidate) => metadataIdentityKey(candidate) === key,
+            )
+              ? [
+                  ...(current.metadataFirst.targetedTax ?? []),
+                  {
+                    ...currentIdentity,
+                    goalKind: targetedGoal,
+                    sourcePageCount: pendingBody.preview.sourceUnitCount!,
+                  },
+                ]
+              : current.metadataFirst.targetedTax,
+          targetedTaxClassified:
+            !alreadySelected && !automaticallySelected
+              ? current.metadataFirst.targetedTaxClassified
+              : (current.metadataFirst.targetedTaxClassified ?? []).some(
+                    (candidate) => metadataIdentityKey(candidate) === key,
+                  )
+                ? current.metadataFirst.targetedTaxClassified
+                : [
+                    ...(current.metadataFirst.targetedTaxClassified ?? []),
+                    currentIdentity,
+                  ],
           selectionReceipts: automaticallySelected
             ? [
                 ...current.metadataFirst.selectionReceipts,
@@ -5580,7 +6105,11 @@ export class PipelineRunner {
             verified,
           });
       return archivedBase(checkpoint, {
-        step: "parser_archive",
+        step:
+          checkpoint.targetedTaxRun?.batchOrdinal &&
+          checkpoint.targetedTaxRun.batchOrdinal > 0
+            ? "targeted_admit"
+            : "parser_archive",
         preflightAction: undefined,
         expectedOriginalRevision: next.rowRevision,
       });
@@ -5597,7 +6126,11 @@ export class PipelineRunner {
     }
     await this.journal.transitionCheckpoint({
       checkpoint: archivedBase(checkpoint, {
-        step: "reserve",
+        step:
+          checkpoint.targetedTaxRun?.batchOrdinal &&
+          checkpoint.targetedTaxRun.batchOrdinal > 0
+            ? "targeted_admit"
+            : "reserve",
         preflightAction: undefined,
       }),
       credentialSessionActive: true,
@@ -6129,7 +6662,14 @@ export class PipelineRunner {
     original: OriginalCatalogRow,
     processing: ProcessingCatalogRow,
     profileId: BinaryParserProfileId,
-  ): ParserOutputRecoveryInput & { profileId: BinaryParserProfileId } {
+  ): ParserOutputRecoveryInput & {
+    profileId: BinaryParserProfileId;
+    selective?: {
+      originalPages: number[];
+      expectedArtifactFingerprint: string;
+      expectedSelectiveImplementationSha256: string;
+    };
+  } {
     const pdf = this.requirePdfConfig();
     const modelManifestSha256 =
       profileId === "spreadsheet_v1"
@@ -6138,6 +6678,12 @@ export class PipelineRunner {
     if (modelManifestSha256 === undefined) {
       throw new PipelineWorkerError("parser_profile_unverified");
     }
+    const targeted =
+      processing.parserOutput !== undefined &&
+      "artifactKind" in processing.parserOutput &&
+      processing.parserOutput.artifactKind === "selective_pdf_pages_v1"
+        ? processing.parserOutput
+        : undefined;
     return {
       capture: captureFromRows(pdf, original, processing),
       outputRoot: pdf.parserOutputRoot,
@@ -6147,7 +6693,31 @@ export class PipelineRunner {
         processing.fingerprints.extractionConfigurationFingerprint,
       expectedModelManifestSha256: modelManifestSha256,
       profileId,
+      ...(targeted === undefined
+        ? {}
+        : {
+            selective: {
+              originalPages: targeted.coverage.originalPages,
+              expectedArtifactFingerprint: targeted.artifactFingerprint,
+              expectedSelectiveImplementationSha256:
+                targeted.selectiveImplementationSha256,
+            },
+          }),
     };
+  }
+
+  private async inspectProcessingParserOutput(
+    original: OriginalCatalogRow,
+    processing: ProcessingCatalogRow,
+    profileId: BinaryParserProfileId,
+  ) {
+    const recovery = this.parserRecovery(original, processing, profileId);
+    return recovery.selective
+      ? await inspectCapturedPdfSelectiveOutput({
+          ...recovery,
+          ...recovery.selective,
+        })
+      : await inspectCapturedParserOutput(recovery);
   }
 
   private async driveArchivedParse(): Promise<void> {
@@ -6160,9 +6730,7 @@ export class PipelineRunner {
     const profileId = this.archivedPlan(checkpoint).parserProfileId;
     let processing = current;
     if (processing.parserOutput) {
-      await inspectCapturedParserOutput(
-        this.parserRecovery(original, processing, profileId),
-      );
+      await this.inspectProcessingParserOutput(original, processing, profileId);
     } else {
       const intent = await inspectParserOutputIntent({
         outputRoot: pdf.parserOutputRoot,
@@ -6176,8 +6744,12 @@ export class PipelineRunner {
         pdf.parserOutputRoot,
         processing.parserIntent.outputId,
       );
+      const targetedBatch = processing.targetedBatch;
+      const outputNames = targetedBatch
+        ? ["selective-lossless.json", "selective-bundle.json"]
+        : ["lossless.json", "bundle.json"];
       const outputPresence = await Promise.all(
-        ["lossless.json", "bundle.json"].map((name) =>
+        outputNames.map((name) =>
           lstat(join(outputDirectory, name))
             .then(() => true)
             .catch((error: unknown) => {
@@ -6205,24 +6777,50 @@ export class PipelineRunner {
         });
       }
       const output = outputPresence[0]
-        ? await inspectCapturedParserOutput(
-            this.parserRecovery(original, processing, profileId),
+        ? await this.inspectProcessingParserOutput(
+            original,
+            processing,
+            profileId,
           )
-        : profileId === "spreadsheet_v1"
-          ? // The sibling lane: the same capture in, the same artifact pair
-            // out, and no sandbox, model manifest or Python runtime, because
-            // the reader is this process.
-            await runCapturedWorkbookParser({
-              capture: captureFromRows(pdf, original, processing),
-              outputDirectory,
-              outputId: processing.parserIntent.outputId,
-            })
-          : await runCapturedPdfParser({
-              capture: captureFromRows(pdf, original, processing),
-              outputDirectory,
-              outputId: processing.parserIntent.outputId,
-              ...pdf.parser,
-            });
+        : targetedBatch
+          ? pdf.parser.selectiveLauncherPath &&
+            pdf.parser.expectedSelectiveLauncherSha256
+            ? await runCapturedPdfSelectiveArtifact({
+                capture: captureFromRows(pdf, original, processing),
+                outputDirectory,
+                outputId: processing.parserIntent.outputId,
+                originalPages: targetedBatch.originalPages,
+                selectiveLauncherPath: pdf.parser.selectiveLauncherPath,
+                expectedSelectiveLauncherSha256:
+                  pdf.parser.expectedSelectiveLauncherSha256,
+                pythonExecutable: pdf.parser.pythonExecutable,
+                expectedPythonSha256: pdf.parser.expectedPythonSha256,
+                packageRoot: pdf.parser.packageRoot,
+                modelAssetsPath: pdf.parser.modelAssetsPath,
+                modelLockPath: pdf.parser.modelLockPath,
+                expectedModelLockSha256: pdf.parser.expectedModelLockSha256,
+                tableStructure: pdf.parser.tableStructure,
+              })
+            : (() => {
+                throw new PipelineWorkerError(
+                  "selective_parser_configuration_missing",
+                );
+              })()
+          : profileId === "spreadsheet_v1"
+            ? // The sibling lane: the same capture in, the same artifact pair
+              // out, and no sandbox, model manifest or Python runtime, because
+              // the reader is this process.
+              await runCapturedWorkbookParser({
+                capture: captureFromRows(pdf, original, processing),
+                outputDirectory,
+                outputId: processing.parserIntent.outputId,
+              })
+            : await runCapturedPdfParser({
+                capture: captureFromRows(pdf, original, processing),
+                outputDirectory,
+                outputId: processing.parserIntent.outputId,
+                ...pdf.parser,
+              });
       processing = await this.requireCatalog().recordParserOutput({
         catalogId: processing.processingCatalogId,
         expectedRevision: processing.rowRevision,
@@ -6259,8 +6857,10 @@ export class PipelineRunner {
         throw new PipelineWorkerError("parser_output_missing");
       }
       if (!processing.spoolPrepared) {
-        const parserOutput = await inspectCapturedParserOutput(
-          this.parserRecovery(original, processing, profileId),
+        const parserOutput = await this.inspectProcessingParserOutput(
+          original,
+          processing,
+          profileId,
         );
         const prepared = await prepareNormalizedBundleSpool({
           spoolRoot: pdf.spoolDirectory,
@@ -6295,7 +6895,11 @@ export class PipelineRunner {
     }
     await this.journal.transitionCheckpoint({
       checkpoint: archivedBase(checkpoint, {
-        step: "lookup_processing",
+        step:
+          checkpoint.targetedTaxRun?.batchOrdinal &&
+          checkpoint.targetedTaxRun.batchOrdinal > 0
+            ? "parser_archive"
+            : "lookup_processing",
         expectedProcessingRevision: processing.rowRevision,
       }),
       credentialSessionActive: true,
@@ -6553,7 +7157,11 @@ export class PipelineRunner {
           });
         }
         return archivedBase(current, {
-          step: processing.activation ? "cleanup" : "parsed_reserve",
+          step: processing.targetedBatch
+            ? "targeted_begin"
+            : processing.activation
+              ? "cleanup"
+              : "parsed_reserve",
           expectedOriginalRevision: original.rowRevision,
           expectedProcessingRevision: processing.rowRevision,
           reservationRound: 0,
@@ -7063,7 +7671,7 @@ export class PipelineRunner {
           });
         }
         return archivedBase(current, {
-          step: "parsed_reserve",
+          step: processing.targetedBatch ? "targeted_begin" : "parsed_reserve",
           expectedOriginalRevision: original.rowRevision,
           expectedProcessingRevision: processing.rowRevision,
           discoveryLease: undefined,
@@ -7152,6 +7760,70 @@ export class PipelineRunner {
     ) {
       throw new PipelineRetryableError("parsed_job_deferred");
     }
+  }
+
+  private async driveTargetedBegin(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (
+      checkpoint.phase !== "archived" ||
+      checkpoint.step !== "targeted_begin" ||
+      !checkpoint.targetedTaxRun
+    )
+      throw new PipelineWorkerError("journal_phase_conflict");
+    const { processing } = this.archivedRows(checkpoint);
+    if (!processing.cloud || !processing.targetedBatch)
+      throw new PipelineWorkerError("targeted_tax_admission_missing");
+    const target = checkpoint.targetedTaxRun;
+    const fields = targetedTaxFields(target.goalKind);
+    const instanceKey = stableUuid(
+      processing.cloud.sourceRevisionId,
+      target.goalKind,
+      "automatic-instance-v1",
+    );
+    const goal = {
+      sourceItemId: processing.cloud.sourceItemId,
+      sourceRevisionId: processing.cloud.sourceRevisionId,
+      observedContentHash: this.archivedPlan(checkpoint).sha256,
+      goalKind: target.goalKind,
+      instanceKey,
+      ...fields,
+      sourcePageCount: target.sourcePageCount,
+    };
+    const result = await this.mutation(
+      "extraction.beginTargetedTax",
+      () =>
+        request(this.config, "extraction.beginTargetedTax", {
+          requestId: randomUUID(),
+          ...goal,
+          requestDigest: targetedGoalDigest(goal),
+        }),
+      (current, response) => {
+        if (
+          current.phase !== "archived" ||
+          current.step !== "targeted_begin" ||
+          !current.targetedTaxRun
+        )
+          throw new PipelineWorkerError("journal_phase_conflict");
+        const code = errorCode(response);
+        if (code) return scanTerminal(current, "failed", code, true);
+        const value = object(response, "extraction.beginTargetedTax");
+        if (
+          value.sourceItemId !== processing.cloud!.sourceItemId ||
+          value.sourceRevisionId !== processing.cloud!.sourceRevisionId ||
+          value.goalKind !== target.goalKind ||
+          value.status === "conflict"
+        )
+          throw new PipelineWorkerError("targeted_tax_parent_conflict");
+        return archivedBase(current, {
+          step: "parsed_reserve",
+          targetedTaxRun: {
+            ...current.targetedTaxRun,
+            targetId: text(value.targetId, "target_id"),
+          },
+        });
+      },
+    );
+    if (errorCode(result)) throw new PipelineWorkerError(errorCode(result)!);
   }
 
   private parsedLeaseRecovery(
@@ -7475,7 +8147,7 @@ export class PipelineRunner {
           throw new PipelineWorkerError("parsed_seal_parent_conflict");
         }
         return archivedBase(current, {
-          step: "parsed_activate",
+          step: current.targetedTaxRun ? "targeted_append" : "parsed_activate",
           stagePhase: "staged",
           stageOrdinal: 0,
           jobLease: { ...lease, state: "staged" },
@@ -7570,12 +8242,350 @@ export class PipelineRunner {
     }
   }
 
+  private async driveTargetedAppend(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (
+      checkpoint.phase !== "archived" ||
+      checkpoint.step !== "targeted_append" ||
+      !checkpoint.targetedTaxRun?.targetId
+    )
+      throw new PipelineWorkerError("journal_phase_conflict");
+    const { processing } = this.archivedRows(checkpoint);
+    const output = processing.parserOutput;
+    if (
+      !processing.cloud ||
+      !output ||
+      !("artifactKind" in output) ||
+      output.artifactKind !== "selective_pdf_pages_v1"
+    )
+      throw new PipelineWorkerError("targeted_tax_admission_missing");
+    const mapped = await this.mappedProcessing(checkpoint);
+    const originalPages = output.coverage.originalPages;
+    if (mapped.mapping.pages.length !== originalPages.length)
+      throw new PipelineWorkerError("targeted_tax_page_map_conflict");
+    const target = checkpoint.targetedTaxRun;
+    const pages = mapped.mapping.pages.map((page, index) => ({
+      originalPage: originalPages[index]!,
+      textHash: page.textHash,
+    }));
+    const result = await this.mutation(
+      "extraction.appendTargetedTaxBatch",
+      () =>
+        request(this.config, "extraction.appendTargetedTaxBatch", {
+          requestId: randomUUID(),
+          targetId: target.targetId!,
+          sourceRevisionId: processing.cloud!.sourceRevisionId,
+          batchOrdinal: target.batchOrdinal,
+          sourceTextVersionId: processing.cloud!.sourceTextVersionId,
+          processingGenerationId: processing.cloud!.processingGenerationId,
+          artifact: targetedArtifact(output),
+          pages,
+          coverage: targetedTaxCoverage(
+            target.goalKind,
+            target,
+            (target.batchOrdinal + 1) * MAX_TARGETED_TAX_BATCH_PAGES >=
+              target.plannedPages.length,
+          ),
+        }),
+      (current, response) => {
+        if (
+          current.phase !== "archived" ||
+          current.step !== "targeted_append" ||
+          !current.targetedTaxRun?.targetId
+        )
+          throw new PipelineWorkerError("journal_phase_conflict");
+        const code = errorCode(response);
+        if (code) return scanTerminal(current, "failed", code, true);
+        const value = object(response, "extraction.appendTargetedTaxBatch");
+        if (
+          value.targetId !== current.targetedTaxRun.targetId ||
+          value.sourceItemId !== processing.cloud!.sourceItemId ||
+          value.sourceRevisionId !== processing.cloud!.sourceRevisionId ||
+          value.goalKind !== current.targetedTaxRun.goalKind
+        )
+          throw new PipelineWorkerError("targeted_tax_parent_conflict");
+        return archivedBase(current, {
+          step: "targeted_status",
+          targetedTaxRun: {
+            ...current.targetedTaxRun,
+            priorProcessingGenerationId:
+              processing.cloud!.processingGenerationId,
+          },
+          jobLease: undefined,
+          resumeStep: undefined,
+          stageId: undefined,
+          stagePhase: undefined,
+          stageOrdinal: undefined,
+        });
+      },
+    );
+    if (errorCode(result)) throw new PipelineWorkerError(errorCode(result)!);
+  }
+
+  private async driveTargetedAdmit(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (
+      checkpoint.phase !== "archived" ||
+      checkpoint.step !== "targeted_admit" ||
+      !checkpoint.targetedTaxRun?.targetId ||
+      !checkpoint.targetedTaxRun.priorProcessingGenerationId
+    )
+      throw new PipelineWorkerError("journal_phase_conflict");
+    let { original, processing } = this.archivedRows(checkpoint);
+    const output = processing.parserOutput;
+    if (
+      !processing.targetedBatch ||
+      !output ||
+      !("artifactKind" in output) ||
+      output.artifactKind !== "selective_pdf_pages_v1" ||
+      !original.cloud ||
+      original.providerOriginal?.referenceVersion !== "provider_original_v2" ||
+      !processing.copies.primary.published
+    )
+      throw new PipelineWorkerError("targeted_tax_admission_missing");
+    const mapped = await this.mappedProcessing(checkpoint);
+    const target = checkpoint.targetedTaxRun;
+    const result = await this.mutation(
+      "extraction.admitTargetedTaxBatch",
+      () =>
+        request(this.config, "extraction.admitTargetedTaxBatch", {
+          requestId: randomUUID(),
+          targetId: target.targetId!,
+          sourceRevisionId: original.cloud!.sourceRevisionId,
+          batchOrdinal: target.batchOrdinal,
+          priorProcessingGenerationId: target.priorProcessingGenerationId!,
+          artifact: targetedArtifact(output),
+          extractionConfigurationFingerprint:
+            output.extractionConfigurationFingerprint,
+          parserArtifact: createParserArtifactSelection(processing),
+          archives: [
+            createArchiveReceiptSelection(
+              "parser_output",
+              processing,
+              "primary",
+            ),
+          ],
+          parsedText: mapped.declaration,
+          existingProviderOriginal: {
+            referenceId: original.cloud!.providerReferenceId,
+            bindingEpoch: original.cloud!.providerBindingEpoch,
+            referenceVersion: "provider_original_v2",
+          },
+        }),
+      async (current, response, pending) => {
+        if (
+          current.phase !== "archived" ||
+          current.step !== "targeted_admit" ||
+          !current.targetedTaxRun?.targetId
+        )
+          throw new PipelineWorkerError("journal_phase_conflict");
+        const code = errorCode(response);
+        if (code) return scanTerminal(current, "failed", code, true);
+        const value = object(response, "extraction.admitTargetedTaxBatch");
+        if (
+          value.targetId !== current.targetedTaxRun.targetId ||
+          value.sourceItemId !== original.cloud!.sourceItemId ||
+          value.sourceRevisionId !== original.cloud!.sourceRevisionId ||
+          value.batchOrdinal !== current.targetedTaxRun.batchOrdinal ||
+          value.state !== "admitted"
+        )
+          throw new PipelineWorkerError("targeted_tax_parent_conflict");
+        if (!processing.cloud) {
+          processing = await this.requireCatalog().recordProcessingCloud({
+            catalogId: processing.processingCatalogId,
+            expectedRevision: processing.rowRevision,
+            cloud: {
+              sourceItemId: text(value.sourceItemId, "source_item_id"),
+              sourceRevisionId: text(
+                value.sourceRevisionId,
+                "source_revision_id",
+              ),
+              parserArtifactId: text(
+                value.parserArtifactId,
+                "parser_artifact_id",
+              ),
+              sourceTextVersionId: text(
+                value.sourceTextVersionId,
+                "source_text_version_id",
+              ),
+              processingGenerationId: text(
+                value.processingGenerationId,
+                "processing_generation_id",
+              ),
+              ingestJobId: text(value.ingestJobId, "ingest_job_id"),
+              processingFingerprint: output.extractionFingerprint,
+              admissionRequestDigest: pending.requestDigest,
+              admittedAt: pending.receivedAt,
+            },
+          });
+        }
+        return archivedBase(current, {
+          step: "parsed_reserve",
+          expectedProcessingRevision: processing.rowRevision,
+          reservationRound: 0,
+        });
+      },
+    );
+    if (errorCode(result)) throw new PipelineWorkerError(errorCode(result)!);
+    void original;
+  }
+
+  private async driveTargetedStatus(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (
+      checkpoint.phase !== "archived" ||
+      checkpoint.step !== "targeted_status" ||
+      !checkpoint.targetedTaxRun?.targetId
+    )
+      throw new PipelineWorkerError("journal_phase_conflict");
+    const targetId = checkpoint.targetedTaxRun.targetId;
+    const { processing: admittedProcessing } = this.archivedRows(checkpoint);
+    if (!admittedProcessing.cloud)
+      throw new PipelineWorkerError("targeted_tax_admission_missing");
+    const result = await this.mutation(
+      "extraction.targetedTaxStatus",
+      () =>
+        request(this.config, "extraction.targetedTaxStatus", {
+          requestId: randomUUID(),
+          targetId,
+        }),
+      async (current, response, pending) => {
+        if (
+          current.phase !== "archived" ||
+          current.step !== "targeted_status" ||
+          !current.targetedTaxRun?.targetId
+        )
+          throw new PipelineWorkerError("journal_phase_conflict");
+        const code = errorCode(response);
+        if (code) return scanTerminal(current, "failed", code, true);
+        const value = object(response, "extraction.targetedTaxStatus");
+        if (
+          value.targetId !== current.targetedTaxRun.targetId ||
+          value.goalKind !== current.targetedTaxRun.goalKind ||
+          value.sourceItemId !== admittedProcessing.cloud!.sourceItemId ||
+          value.sourceRevisionId !==
+            admittedProcessing.cloud!.sourceRevisionId ||
+          !Array.isArray(value.inspectedOriginalPages) ||
+          !Array.isArray(value.unresolvedFields)
+        )
+          throw new PipelineWorkerError("targeted_tax_parent_conflict");
+        if (value.status === "awaiting_pages" || value.status === "running")
+          return current;
+        if (
+          value.status !== "complete" &&
+          value.status !== "incomplete_resumable" &&
+          value.status !== "conflict"
+        )
+          throw new PipelineWorkerError("targeted_tax_parent_conflict");
+        const hasMorePages =
+          (current.targetedTaxRun.batchOrdinal + 1) *
+            MAX_TARGETED_TAX_BATCH_PAGES <
+          current.targetedTaxRun.plannedPages.length;
+        if (value.status === "incomplete_resumable" && hasMorePages) {
+          return await this.createTargetedContinuationIntent(
+            archivedBase(current, {
+              targetedTaxRun: {
+                ...current.targetedTaxRun,
+                batchOrdinal: current.targetedTaxRun.batchOrdinal + 1,
+              },
+            }),
+          );
+        }
+        const { processing } = this.archivedRows(current);
+        const updated = await this.requireCatalog().recordTargetedCompletion({
+          catalogId: processing.processingCatalogId,
+          expectedRevision: processing.rowRevision,
+          completion: {
+            targetId: current.targetedTaxRun.targetId,
+            status: value.status,
+            completedAt: pending.receivedAt,
+          },
+        });
+        return archivedBase(current, {
+          step: "cleanup",
+          expectedProcessingRevision: updated.rowRevision,
+          countPublication: value.status === "complete",
+        });
+      },
+    );
+    if (errorCode(result)) throw new PipelineWorkerError(errorCode(result)!);
+    if (
+      this.journal.checkpoint.phase === "archived" &&
+      this.journal.checkpoint.step === "targeted_status"
+    )
+      throw new PipelineRetryableError("targeted_tax_deferred");
+  }
+
   private async driveArchivedCleanup(): Promise<void> {
     const checkpoint = this.journal.checkpoint;
     if (checkpoint.phase !== "archived" || checkpoint.step !== "cleanup") {
       throw new PipelineWorkerError("journal_phase_conflict");
     }
     const { original, processing } = this.archivedRows(checkpoint);
+    if (checkpoint.targetedTaxRun) {
+      if (!processing.targetedCompletion)
+        throw new PipelineWorkerError("targeted_tax_completion_missing");
+      const pdf = this.requirePdfConfig();
+      const rows = this.requireCatalog().listProcessings();
+      for (const processingCatalogId of checkpoint.targetedTaxRun
+        .processingCatalogIds) {
+        const batch = rows.find(
+          (candidate) => candidate.processingCatalogId === processingCatalogId,
+        );
+        if (
+          !batch?.spool ||
+          !batch.parserOutput ||
+          !batch.capture ||
+          !batch.targetedBatch
+        )
+          throw new PipelineWorkerError("cleanup_parent_missing");
+        await removeNormalizedBundleSpoolExact({
+          spoolRoot: pdf.spoolDirectory,
+          expectedRoot: batch.spoolIntent.root,
+          spool: batch.spool,
+        });
+        await removeParserOutputExact({
+          outputRoot: pdf.parserOutputRoot,
+          outputIntent: parserOutputIntentCore(batch.parserIntent),
+          artifacts: {
+            ...batch.parserOutput,
+            rawArtifact: {
+              ...batch.parserOutput.rawArtifact,
+              path: join(
+                pdf.parserOutputRoot,
+                batch.parserIntent.outputId,
+                batch.parserOutput.rawArtifact.opaqueName,
+              ),
+            },
+            normalizedBundle: {
+              ...batch.parserOutput.normalizedBundle,
+              path: join(
+                pdf.parserOutputRoot,
+                batch.parserIntent.outputId,
+                batch.parserOutput.normalizedBundle.opaqueName,
+              ),
+            },
+          },
+        });
+        await removeCapturedPdfExact(captureFromRows(pdf, original, batch));
+      }
+      if (
+        processing.targetedCompletion.status === "complete" &&
+        original.admissionBlock
+      )
+        await this.requireCatalog().clearAdmissionBlock({
+          catalogId: original.originalCatalogId,
+          expectedRevision: original.rowRevision,
+        });
+      await this.journal.transitionCheckpoint({
+        checkpoint: await this.afterArchivedItem(
+          checkpoint,
+          processing.targetedCompletion.status === "complete" ? 1 : 0,
+        ),
+        credentialSessionActive: true,
+      });
+      return;
+    }
     this.requireCatalog().requireProcessingActivation(
       processing.processingCatalogId,
     );
@@ -8217,6 +9227,10 @@ export class PipelineRunner {
         return await this.driveArchivedReserve();
       case "admit":
         return await this.driveArchivedAdmit();
+      case "targeted_begin":
+        return await this.driveTargetedBegin();
+      case "targeted_admit":
+        return await this.driveTargetedAdmit();
       case "parsed_reserve":
         return await this.driveParsedReserve();
       case "parsed_renew":
@@ -8229,6 +9243,10 @@ export class PipelineRunner {
         return await this.driveParsedSeal();
       case "parsed_activate":
         return await this.driveParsedActivate();
+      case "targeted_append":
+        return await this.driveTargetedAppend();
+      case "targeted_status":
+        return await this.driveTargetedStatus();
       case "cleanup":
         return await this.driveArchivedCleanup();
       case "deferred_idle":

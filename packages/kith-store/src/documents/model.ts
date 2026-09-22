@@ -36,7 +36,9 @@ import type { ClientBase, QueryResultRow } from "pg";
 
 import {
   readDocumentExtraction,
+  readTargetedTaxExtractions,
   type DocumentExtraction,
+  type TargetedTaxExtraction,
 } from "../extraction/read.js";
 import {
   parseSourceRevisionRepresentation,
@@ -880,6 +882,7 @@ export type GetDocumentResult = {
    * human corrected reads corrected, with the model's original beside it.
    */
   extraction?: DocumentExtraction;
+  targetedExtractions?: TargetedTaxExtraction[];
 };
 
 export async function getDocument(
@@ -969,6 +972,14 @@ export async function getDocument(
     document.spaceId,
     chain.item.id,
   );
+  const targetedExtractions = ceiling === "restricted"
+    ? await readTargetedTaxExtractions(
+        client,
+        [document.spaceId],
+        chain.item.id,
+        chain.revision.id,
+      )
+    : [];
   return {
     spaceId: document.spaceId,
     sourceAccountId: chain.account.id,
@@ -1000,6 +1011,7 @@ export async function getDocument(
     // under the caller's wider `spaceIds`: a source item in another space
     // returns nothing rather than that space's reading.
     ...(extraction ? { extraction } : {}),
+    ...(targetedExtractions.length > 0 ? { targetedExtractions } : {}),
   };
 }
 
@@ -1014,7 +1026,11 @@ export async function getDocumentsForSourceItem(
   spaceIds: readonly string[],
   sourceItemId: string,
   ceiling: SensitivityLevel = "restricted",
-): Promise<{ sourceItemId: string; documents: GetDocumentResult[] }> {
+): Promise<{
+  sourceItemId: string;
+  documents: GetDocumentResult[];
+  targetedExtractions?: TargetedTaxExtraction[];
+}> {
   validateSpaces(spaceIds);
   if (spaceIds.length === 0) return { sourceItemId, documents: [] };
   const ids = (
@@ -1037,11 +1053,15 @@ export async function getDocumentsForSourceItem(
   const resolved = await Promise.all(
     ids.map((row) => getDocument(client, spaceIds, row.id, false, ceiling)),
   );
+  const targetedExtractions = ceiling === "restricted"
+    ? await readTargetedTaxExtractions(client, spaceIds, sourceItemId)
+    : [];
   return {
     sourceItemId,
     documents: resolved.filter(
       (document): document is GetDocumentResult => document !== null,
     ),
+    ...(targetedExtractions.length > 0 ? { targetedExtractions } : {}),
   };
 }
 

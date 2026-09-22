@@ -590,7 +590,19 @@ export type ProviderOriginalDeclarationV2 = {
 export type ProviderOriginalDeclaration =
   ProviderOriginalDeclarationV1 | ProviderOriginalDeclarationV2;
 
+export type TargetedPagesCoverage = {
+  sourceSha256: string;
+  selectedPdfSha256: string;
+  sourcePageCount: number;
+  originalPages: number[];
+  coverageFingerprint: string;
+  artifactFingerprint: string;
+};
+
 export type ParsedTextDeclaration = {
+  /** Absent is the legacy whole-document `parsed_pages_v1` declaration. */
+  representation?: "parsed_pages_v1" | "targeted_pages_v1";
+  targetedCoverage?: TargetedPagesCoverage;
   extractionFingerprint: string;
   textHash: string;
   byteLength: number;

@@ -11,3 +11,4 @@ export * from "./spanSweep.js";
 export * from "./corrections.js";
 export * from "./read.js";
 export * from "./repair.js";
+export * from "./targetedTax.js";

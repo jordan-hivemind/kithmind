@@ -283,6 +283,41 @@ const archivedIdentity = {
   correctionRevision: "correction:1",
 };
 
+test("scan.appendPage preserves the ready binary parser fingerprint contract", () => {
+  const request = {
+    ...source,
+    operation: "scan.appendPage",
+    scanId: archivedIdentity.scanId,
+    requestId: "binary-page-1",
+    ordinal: 0,
+    entries: [
+      {
+        externalId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c199",
+        uri: "fs://synthetic/synthetic.pdf",
+        sourceModifiedAt: 1_758_196_800_000,
+        title: "Synthetic PDF",
+        docType: "pdf",
+        content: {
+          status: "ready_binary_v1",
+          sha256: archivedIdentity.contentHash,
+          byteLength: archivedIdentity.byteLength,
+          mediaType: archivedIdentity.mediaType,
+          parserProfileId: archivedIdentity.parserProfileId,
+          parserFingerprint: archivedIdentity.parserFingerprint,
+          extractionConfigurationFingerprint:
+            archivedIdentity.extractionConfigurationFingerprint,
+          extractorFingerprint: archivedIdentity.extractorFingerprint,
+          recordSchemaFingerprint: archivedIdentity.recordSchemaFingerprint,
+          normalizationFingerprint: archivedIdentity.normalizationFingerprint,
+          chunkerFingerprint: archivedIdentity.chunkerFingerprint,
+          correctionRevision: archivedIdentity.correctionRevision,
+        },
+      },
+    ],
+  };
+  assert.deepEqual(parseWorkerRequest(request), request);
+});
+
 test("discovery.recordPreview accepts bounded provisional metadata without a document page cap", () => {
   const request = {
     ...source,
@@ -369,6 +404,65 @@ test("discovery.recordPreview rejects ambiguous unit coverage and open metadata"
   }
 });
 
+test("targeted tax batches are closed, original-page bound and transport bounded", () => {
+  const begin = {
+    ...source,
+    operation: "extraction.beginTargetedTax",
+    requestId: "target-begin",
+    sourceItemId: "j1234567890123456789012345678903",
+    sourceRevisionId: "j1234567890123456789012345678904",
+    observedContentHash: "a".repeat(64),
+    goalKind: "form_1040_totals_v1",
+    instanceKey: "primary-return",
+    requiredFields: ["tax_year", "total_tax"],
+    optionalFields: ["amount_owed"],
+    sourcePageCount: 500,
+    requestDigest: "b".repeat(64),
+  };
+  assert.deepEqual(parseWorkerRequest(begin), begin);
+  const artifact = {
+    artifactKind: "selective_pdf_pages_v1",
+    sourceSha256: "a".repeat(64),
+    selectedPdfSha256: "c".repeat(64),
+    sourcePageCount: 500,
+    originalPages: [137, 138],
+    coverageFingerprint: "d".repeat(64),
+    artifactFingerprint: "e".repeat(64),
+    parserFingerprint: "parser-v1",
+    extractionFingerprint: "extract-v1",
+  };
+  const append = {
+    ...source,
+    operation: "extraction.appendTargetedTaxBatch",
+    requestId: "target-append",
+    targetId: "j1234567890123456789012345678905",
+    sourceRevisionId: begin.sourceRevisionId,
+    batchOrdinal: 0,
+    sourceTextVersionId: "j1234567890123456789012345678906",
+    processingGenerationId: "j1234567890123456789012345678907",
+    artifact,
+    coverage: {
+      formFamily: "form_1040",
+      requestedRegionsClosed: false,
+      continuationsClosed: false,
+    },
+    pages: [
+      { originalPage: 137, textHash: "f".repeat(64) },
+      { originalPage: 138, textHash: "0".repeat(64) },
+    ],
+  };
+  assert.deepEqual(parseWorkerRequest(append), append);
+  for (const bad of [
+    { ...append, artifact: { ...artifact, originalPages: [138, 137] } },
+    { ...append, pages: [...append.pages].reverse() },
+    { ...append, pages: [{ ...append.pages[0], originalPage: true }] },
+    { ...append, coverage: { ...append.coverage, continuationsClosed: "yes" } },
+    { ...append, pages: append.pages.concat(Array(11).fill(append.pages[1])) },
+    { ...begin, requiredFields: ["tax_year"], optionalFields: ["tax_year"] },
+    { ...begin, goalKind: "generic_tax_v1" },
+  ]) assert.throws(() => parseWorkerRequest(bad), WorkerProtocolParseError);
+});
+
 const archivedAdmissionReceipt = (subjectKind, copyRole, suffix) => ({
   kind: "create",
   subjectKind,
@@ -429,6 +523,89 @@ const providerV2Admission = {
     createdAt: 1_758_196_800_000,
   },
 };
+
+test("targeted continuation admission is provider-bound and coverage-exact", () => {
+  const artifact = {
+    artifactKind: "selective_pdf_pages_v1",
+    sourceSha256: "d".repeat(64),
+    selectedPdfSha256: "8".repeat(64),
+    sourcePageCount: 500,
+    originalPages: [137, 138],
+    coverageFingerprint: "7".repeat(64),
+    artifactFingerprint: "6".repeat(64),
+    parserFingerprint: "selective-pdf-test-v1",
+    extractionFingerprint: "5".repeat(64),
+  };
+  const request = {
+    ...source,
+    operation: "extraction.admitTargetedTaxBatch",
+    requestId: "target-admit-1",
+    targetId: "j1234567890123456789012345678905",
+    sourceRevisionId: "j1234567890123456789012345678906",
+    batchOrdinal: 1,
+    priorProcessingGenerationId: "j1234567890123456789012345678907",
+    artifact,
+    extractionConfigurationFingerprint: "4".repeat(64),
+    parserArtifact: {
+      kind: "create",
+      clientArtifactId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c150",
+      outputHash: artifact.selectedPdfSha256,
+      outputByteLength: 20,
+      outputMediaType: "application/vnd.docling+json",
+      createdAt: 1_758_196_800_000,
+    },
+    archives: [archivedAdmissionReceipt("parser_output", "primary", "51")],
+    parsedText: {
+      representation: "targeted_pages_v1",
+      targetedCoverage: {
+        sourceSha256: artifact.sourceSha256,
+        selectedPdfSha256: artifact.selectedPdfSha256,
+        sourcePageCount: artifact.sourcePageCount,
+        originalPages: artifact.originalPages,
+        coverageFingerprint: artifact.coverageFingerprint,
+        artifactFingerprint: artifact.artifactFingerprint,
+      },
+      extractionFingerprint: artifact.extractionFingerprint,
+      textHash: "3".repeat(64),
+      byteLength: 8,
+      utf16Length: 8,
+      pageCount: 2,
+      mappingManifestHash: "2".repeat(64),
+      normalizedBundleDigest: "1".repeat(64),
+      expectedEvidenceSpanCount: 2,
+      expectedDocumentCount: 1,
+      expectedChunkCount: 2,
+    },
+    existingProviderOriginal: {
+      referenceVersion: "provider_original_v2",
+      referenceId: "j1234567890123456789012345678908",
+      bindingEpoch: 0,
+    },
+  };
+  assert.deepEqual(parseWorkerRequest(request), request);
+  for (const bad of [
+    { ...request, batchOrdinal: 0 },
+    { ...request, archives: [] },
+    {
+      ...request,
+      parsedText: {
+        ...request.parsedText,
+        representation: "parsed_pages_v1",
+        targetedCoverage: undefined,
+      },
+    },
+    {
+      ...request,
+      parsedText: {
+        ...request.parsedText,
+        targetedCoverage: {
+          ...request.parsedText.targetedCoverage,
+          originalPages: [137, 139],
+        },
+      },
+    },
+  ]) assert.throws(() => parseWorkerRequest(bad), WorkerProtocolParseError);
+});
 
 test("provider original v2 admits exactly one parser primary and no locator bundle", () => {
   assert.deepEqual(parseWorkerRequest(providerV2Admission), providerV2Admission);

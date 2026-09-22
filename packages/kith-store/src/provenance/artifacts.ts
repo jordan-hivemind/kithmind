@@ -43,6 +43,7 @@ export type ParserArtifactInput = {
   sourceRevisionId: string;
   clientArtifactId: string;
   parserFingerprint: string;
+  targetedSelectionFingerprint?: string;
   outputHash: string;
   outputByteLength: number;
   outputMediaType: string;
@@ -131,13 +132,25 @@ export async function createOrGetParserArtifact(
 ): Promise<SourceParserArtifactRow> {
   await requireArtifactParents(client, input);
   requireBoundedUtf8(input.parserFingerprint, "Parser fingerprint", MAX_FINGERPRINT_BYTES);
+  if (input.targetedSelectionFingerprint !== undefined)
+    requireSha256(
+      input.targetedSelectionFingerprint,
+      "Targeted parser selection fingerprint",
+    );
   requireSha256(input.outputHash, "Parser artifact output hash");
   requireSafeInteger(input.outputByteLength, "Parser artifact output byte length", 1, MAX_PARSER_ARTIFACT_BYTES);
   requireBoundedString(input.outputMediaType, "Parser artifact media type", MAX_MEDIA_TYPE_CHARS);
 
   const byIdentity = await client.query<QueryResultRow>(
-    `SELECT * FROM kith.source_parser_artifacts WHERE source_revision_id = $1 AND parser_fingerprint = $2 LIMIT 2`,
-    [input.sourceRevisionId, input.parserFingerprint],
+    `SELECT * FROM kith.source_parser_artifacts
+      WHERE source_revision_id = $1 AND parser_fingerprint = $2
+        AND targeted_selection_fingerprint IS NOT DISTINCT FROM $3
+      LIMIT 2`,
+    [
+      input.sourceRevisionId,
+      input.parserFingerprint,
+      input.targetedSelectionFingerprint ?? null,
+    ],
   );
   const byClientId = await client.query<QueryResultRow>(
     `SELECT * FROM kith.source_parser_artifacts WHERE source_account_id = $1 AND client_artifact_id = $2 LIMIT 2`,
@@ -157,6 +170,8 @@ export async function createOrGetParserArtifact(
     existing.sourceRevisionId === input.sourceRevisionId &&
     existing.clientArtifactId === input.clientArtifactId &&
     existing.parserFingerprint === input.parserFingerprint &&
+    existing.targetedSelectionFingerprint ===
+      (input.targetedSelectionFingerprint ?? null) &&
     existing.outputHash === input.outputHash &&
     existing.outputByteLength === input.outputByteLength &&
     existing.outputMediaType === input.outputMediaType &&
@@ -172,9 +187,11 @@ export async function createOrGetParserArtifact(
   const result = await client.query<QueryResultRow>(
     `INSERT INTO kith.source_parser_artifacts
        (id, space_id, created_at, source_account_id, source_item_id, source_revision_id, client_artifact_id,
-        parser_fingerprint, output_hash, output_byte_length, output_media_type, hash_authority,
+        parser_fingerprint, targeted_selection_fingerprint, output_hash,
+        output_byte_length, output_media_type, hash_authority,
         user_id, actor_credential_id, created_at_field)
-     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,$10,'worker_asserted',$11,$12,$13)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,$10,$11,
+             'worker_asserted',$12,$13,$14)
      RETURNING *`,
     [
       id,
@@ -184,6 +201,7 @@ export async function createOrGetParserArtifact(
       input.sourceRevisionId,
       input.clientArtifactId,
       input.parserFingerprint,
+      input.targetedSelectionFingerprint ?? null,
       input.outputHash,
       input.outputByteLength,
       input.outputMediaType,
