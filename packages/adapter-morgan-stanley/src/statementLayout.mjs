@@ -1932,7 +1932,8 @@ function parseHoldings(
         PAGE_FOOTER.test(trimmed) ||
         /^CLIENT STATEMENT\b/.test(trimmed) ||
         BARE_ACCOUNT_LINE.test(line.text) ||
-        /^Account\b/.test(trimmed)
+        (markerLines[i] === i - 1 &&
+          /^Account\s+[A-Za-z][A-Za-z .,&'-]*$/.test(trimmed))
       ) {
         continue;
       }
@@ -2128,7 +2129,6 @@ function parseHoldings(
         flush();
         inSummary = true;
         summaryBoundaryIndex = j;
-        summaryHasUnresolvedSecurity = false;
         i = j;
         table.lastLineIndex = j;
         continue;
@@ -2146,6 +2146,7 @@ function parseHoldings(
           TRADE_DATE_CELL.test(bound.get("tradeDate").text)
         ) {
           summaryHasUnresolvedSecurity = true;
+          table.gapCodes.add("missing_security_start");
         }
         i = j;
         table.lastLineIndex = j;

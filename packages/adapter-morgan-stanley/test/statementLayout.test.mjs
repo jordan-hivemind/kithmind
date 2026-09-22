@@ -1265,6 +1265,7 @@ test("a dated row without a security description after a summary remains partial
       ...equityBlockLines(),
       ...sectionSummaryLines(),
       missingDescription,
+      ...sectionSummaryLines(),
     ].join("\n"),
     [
       "        Page 2 of 2",
@@ -1278,7 +1279,7 @@ test("a dated row without a security description after a summary remains partial
   assert.equal(parsed.holdings.positions.length, 1);
   const [scope] = parsed.holdings.positionScopes;
   assert.equal(scope.status, "partial");
-  assert.ok(scope.gapCodes.includes("page_sequence_gap"));
+  assert.ok(scope.gapCodes.includes("missing_security_start"));
 });
 
 test("an adjacent anchored ACTIVITY section closes an independently complete carried position", () => {
@@ -1357,6 +1358,31 @@ test("another account's ACTIVITY marker cannot close a carried table", () => {
   );
   assert.equal(firstScope.status, "partial");
   assert.ok(firstScope.gapCodes.includes("page_sequence_gap"));
+});
+
+test("Account-prefixed value content is not page furniture before ACTIVITY", () => {
+  const text = [
+    [
+      "        Page 1 of 2",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Synthetic Household",
+      "        HOLDINGS",
+      ...equityBlockLines(),
+    ].join("\n"),
+    [
+      "        Page 2 of 2",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      CONSOLIDATED_ACCOUNT_ONE,
+      "        Account Value $74,310.25",
+      "        ACTIVITY",
+    ].join("\n"),
+  ].join(`\n${PAGE_SEPARATOR}\n`);
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "partial");
+  assert.ok(scope.gapCodes.includes("page_sequence_gap"));
 });
 
 test("a new account page-one reset cannot hide the prior account's missing page", () => {
