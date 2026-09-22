@@ -1980,7 +1980,7 @@ test(
       ]);
       assert.deepEqual(client.getServerVersion(), {
         name: "kith-finance-archive",
-        version: "2.0.2",
+        version: "2.0.3",
       });
       const tools = await client.listTools();
       const financeRead = tools.tools.find(
@@ -4137,6 +4137,121 @@ test(
       asOf: "2026-04-30",
       source: "positions",
     });
+  },
+);
+
+test(
+  "list_account_inventory dates complete reported NAV without treating it as a market value",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const accountId = seeded.settled.accountIds[0];
+    const inventory = async () =>
+      (
+        await serve(r, { operation: "list_account_inventory", limit: 100 })
+      ).items.find((item) => item.account.accountId === accountId);
+
+    await moneyRows(owner, accountId, {
+      positions: [
+        ["2026-03-31", "100", "USD", "market_price"],
+        ["2026-04-30", "60", "USD", "reported_nav"],
+        ["2026-04-30", "40", "EUR", "reported_nav"],
+      ],
+    });
+    let row = await inventory();
+    assert.equal(row.latestSnapshotAsOf, "2026-04-30");
+    assert.equal(
+      row.currentValue,
+      undefined,
+      "NAV never becomes currentValue and never resurrects an older market total",
+    );
+
+    const aggregate = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      accountId,
+    });
+    assert.deepEqual(aggregate.items, []);
+    assert.ok(aggregate.coverage.reasons.includes("unsupported_value"));
+
+    // An unpriced or unclassified newer date is not the explicit valued
+    // observation this freshness field claims. The prior market snapshot and
+    // its own dated value remain truthful.
+    for (const candidate of [
+      ["2026-04-30", null, "USD", "reported_nav"],
+      ["2026-04-30", "110", "USD", null],
+      ["2026-04-30", "110", "USD", "cost"],
+      ["2026-04-30", "110", "USD", "last_round"],
+    ]) {
+      await moneyRows(owner, accountId, {
+        positions: [["2026-03-31", "100", "USD", "market_price"], candidate],
+      });
+      row = await inventory();
+      assert.equal(row.latestSnapshotAsOf, "2026-03-31", String(candidate[3]));
+      assert.deepEqual(row.currentValue, {
+        value: { decimal: "100", currency: "USD" },
+        asOf: "2026-03-31",
+        source: "positions",
+      });
+    }
+  },
+);
+
+test(
+  "reported NAV keeps every source and review gate before it advances freshness",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const accountId = seeded.settled.accountIds[0];
+    const priorDoc = await document(
+      owner,
+      seeded.settled.id,
+      accountId,
+      "2026-03-31",
+    );
+    const navDoc = await document(
+      owner,
+      seeded.settled.id,
+      accountId,
+      "2026-04-30",
+    );
+    const inventory = async () =>
+      (
+        await serve(r, { operation: "list_account_inventory", limit: 100 })
+      ).items.find((item) => item.account.accountId === accountId);
+    await moneyRows(owner, accountId, {
+      positions: [
+        ["2026-03-31", "100", "USD", "market_price", priorDoc],
+        ["2026-04-30", "110", "USD", "reported_nav", navDoc],
+      ],
+    });
+
+    await owner.query("UPDATE documents SET parsed_ok = FALSE WHERE id = $1", [
+      navDoc,
+    ]);
+    let row = await inventory();
+    assert.equal(row.latestSnapshotAsOf, "2026-03-31");
+
+    await owner.query("UPDATE documents SET parsed_ok = TRUE WHERE id = $1", [
+      navDoc,
+    ]);
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES ('nav-snapshot-review', 'ambiguous_valuation_basis', $1, $2,
+               'reported value', 'synthetic review remains open', 'open')`,
+      [accountId, navDoc],
+    );
+    row = await inventory();
+    assert.equal(row.latestSnapshotAsOf, "2026-03-31");
+
+    await owner.query(
+      "UPDATE review_items SET status = 'resolved' WHERE id = 'nav-snapshot-review'",
+    );
+    row = await inventory();
+    assert.equal(row.latestSnapshotAsOf, "2026-04-30");
+    assert.equal(row.currentValue, undefined);
   },
 );
 

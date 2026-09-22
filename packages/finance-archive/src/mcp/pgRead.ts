@@ -1704,7 +1704,11 @@ async function listAccountInventory(
               min(p.currency::text) AS currency,
               count(*) FILTER (
                 WHERE p.valuation_basis IS DISTINCT FROM 'market_price'
-              ) AS not_marked
+              ) AS not_marked,
+              count(*) FILTER (
+                WHERE p.valuation_basis IS DISTINCT FROM 'market_price'
+                  AND p.valuation_basis IS DISTINCT FROM 'reported_nav'
+              ) AS unsupported_snapshot_basis
          FROM positions p
          JOIN inventory_accounts ia ON ia.account_id = p.account_id
         GROUP BY p.account_id, p.as_of
@@ -1715,7 +1719,8 @@ async function listAccountInventory(
        SELECT exact_scope.account_id, exact_scope.as_of,
               NULL::finance_numeric AS value, 0::bigint AS missing,
               0::bigint AS currency_count, NULL::text AS currency,
-              0::bigint AS not_marked
+              0::bigint AS not_marked,
+              0::bigint AS unsupported_snapshot_basis
          FROM inventory_scope_verdicts exact_scope
         WHERE exact_scope.exact
           AND NOT EXISTS (
@@ -1743,11 +1748,12 @@ async function listAccountInventory(
           AND coalesce(reconciliation.failed, FALSE) = FALSE
           AND coalesce(reconciliation.pending, FALSE) = FALSE
           AND p.missing = 0
-          AND (
-            p.currency_count = 1
-            OR (p.currency_count = 0 AND p.value IS NULL)
-          )
-          AND p.not_marked = 0
+          -- Snapshot freshness is a dated source-observation claim, not a
+          -- market-value aggregate. A complete, fully valued reported-NAV
+          -- snapshot may therefore establish the date, even across currencies.
+          -- currentValueOf still refuses NAV, mixed currencies and zero-row
+          -- observations, and aggregate_money keeps its independent market gate.
+          AND p.unsupported_snapshot_basis = 0
         ORDER BY p.account_id, p.as_of DESC
      ),
      inventory_open_review_counts AS MATERIALIZED (
