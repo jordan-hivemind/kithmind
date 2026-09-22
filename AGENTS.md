@@ -149,6 +149,27 @@ candidate's required CI instead of waiting for incompatible halves to pass
 independently. Record which commits and reviews the combined release includes.
 Do not duplicate a full review or test run when unchanged evidence applies.
 
+## MCP server versions
+
+Every release that changes an MCP server must bump its advertised server
+version in the same PR. This includes tool definitions, descriptions, read or
+write behavior, and changes to underlying code that alter MCP results. The
+hosted gateway declares its version in `apps/web/src/lib/mcp/server.ts`; the
+standalone finance server declares its version in
+`packages/finance-archive/src/mcp/server.ts`. Bump each affected server.
+Use a patch increment for compatible fixes, a minor increment for additive
+capabilities, and a major increment for breaking contracts. Coordinate parallel
+PRs against the latest merged version so a later release never reuses or lowers
+an already released version. One coordinated release can share one bump.
+
+Record the old and new versions in the PR. During the existing deployment
+verification, confirm the MCP initialize response advertises the intended
+version. A version bump does not guarantee that an already connected client
+refreshes its cached tool manifest; verify tool discovery separately when the
+release changes tools. Documentation-only edits outside the MCP surface do not
+require a bump. Reuse existing checks rather than adding a full test run solely
+for a version edit.
+
 ## Cross-workstream coordination
 
 Mainline and the financial archive workstream coordinate through
