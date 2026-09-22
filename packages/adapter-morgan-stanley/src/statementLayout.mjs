@@ -2060,11 +2060,26 @@ function parseHoldings(
     const pendingSection = explicitHoldingsSection(pending.context.section);
     if (pendingSection !== null) knownSections.add(pendingSection);
 
+    const summaryPercentage = (line) => {
+      const { bound } = bindRow(line.text, pending.columns);
+      const percentage = bound.get("tradeDate")?.text;
+      return {
+        bound,
+        isPercentage:
+          percentage !== undefined &&
+          /^\d+(?:\.\d+)?%$/.test(percentage) &&
+          !TRADE_DATE_CELL.test(percentage),
+      };
+    };
+
     // Inspect the summary rows through their next positive boundary. The
     // provider may interleave a standalone asset-class label already proved
-    // by one of this account's parsed tables. New headings and dated rows are
-    // still source content and keep the carried table partial. TOTAL is the
-    // parser's established positive table boundary.
+    // by one of this account's parsed tables. A summary-only class is also
+    // admitted when it is one value-free all-caps cell strictly between two
+    // percentage rows. That local grammar cannot skip an isolated new
+    // heading. Dated rows remain source content, and TOTAL is the parser's
+    // established positive table boundary.
+    let previousWasPercentage = false;
     for (let index = summaryIndex + 2; index < lines.length; index += 1) {
       const line = lines[index];
       if (line.page !== pending.footerPage) return null;
@@ -2092,7 +2107,7 @@ function parseHoldings(
           ),
         };
       }
-      const { bound } = bindRow(line.text, pending.columns);
+      const { bound, isPercentage } = summaryPercentage(line);
       if (
         /^TOTAL\b/.test(trimmed) &&
         !TRADE_DATE_CELL.test(bound.get("tradeDate")?.text ?? "")
@@ -2107,15 +2122,26 @@ function parseHoldings(
           ),
         };
       }
-      if (knownSections.has(explicitHoldingsSection(trimmed))) continue;
-      const percentage = bound.get("tradeDate")?.text;
-      if (
-        percentage === undefined ||
-        !/^\d+(?:\.\d+)?%$/.test(percentage) ||
-        TRADE_DATE_CELL.test(percentage)
-      ) {
-        return null;
+      if (knownSections.has(explicitHoldingsSection(trimmed))) {
+        previousWasPercentage = false;
+        continue;
       }
+      if (isPercentage) {
+        previousWasPercentage = true;
+        continue;
+      }
+      const next = lines[index + 1];
+      const summaryOnlyClass =
+        previousWasPercentage &&
+        explicitHoldingsSection(trimmed) !== null &&
+        splitCells(line.text).length === 1 &&
+        !/\d|%/.test(trimmed) &&
+        next !== undefined &&
+        next.page === pending.footerPage &&
+        accountKeys[index + 1] === pending.context.accountKey &&
+        summaryPercentage(next).isPercentage;
+      if (!summaryOnlyClass) return null;
+      previousWasPercentage = false;
     }
     return null;
   };

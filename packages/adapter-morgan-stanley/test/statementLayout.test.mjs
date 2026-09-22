@@ -1429,6 +1429,25 @@ test("a successor summary accepts proved section labels and its TOTAL boundary",
   assert.deepEqual(scope.gapCodes, []);
 });
 
+test("a summary-only class is bounded by percentage rows on both sides", () => {
+  const percentage = sectionSummaryLines()[2];
+  const parsed = parseStatementLines(
+    adjacentSummaryText({
+      afterSummaryHeader: [
+        percentage,
+        "        SYNTHETIC SUMMARY CLASS",
+        percentage,
+        "        TOTAL HOLDINGS",
+      ],
+    }),
+    kind,
+  );
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+});
+
 test("adjacent summary closure refuses topology, account, header and security changes", () => {
   const datedSecurity = equityBlockLines()[2];
   const cases = [
