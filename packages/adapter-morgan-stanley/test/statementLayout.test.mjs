@@ -752,16 +752,30 @@ test("repeated undated identity stays unresolved even when a Total follows", () 
   const repeated = undatedTickerRow({
     description: "SYNTHETIC REPEATED FUND (RPTD)",
   });
-  const text = identifierStartStatement([
-    repeated,
-    repeated.replace("$100.00", "$120.00"),
-    equityTotalRow({ marketValue: "220.00" }),
-  ]);
-  const parsed = parseStatementLines(text, kind);
-  assert.deepEqual(parsed.holdings.positions, []);
-  assert.ok(
-    parsed.holdings.positionScopes[0].gapCodes.includes("unresolved_lots"),
-  );
+  const second = repeated.replace("$100.00", "$120.00");
+  const conflicting = `${second.slice(0, 83)}1   ${second.slice(87)}`;
+  for (const [name, repeatedRow] of [
+    ["readable repeated row", second],
+    ["unreadable repeated price", second.replace("$20.000", "$2O.000")],
+    ["conflicting repeated quantity cells", conflicting],
+  ]) {
+    const text = identifierStartStatement([
+      repeated,
+      repeatedRow,
+      equityTotalRow({
+        quantity: "10.000",
+        costBasis: "180.00",
+        marketValue: "220.00",
+        unrealized: "20.00",
+      }),
+    ]);
+    const parsed = parseStatementLines(text, kind);
+    assert.deepEqual(parsed.holdings.positions, [], name);
+    assert.ok(
+      parsed.holdings.positionScopes[0].gapCodes.includes("unresolved_lots"),
+      name,
+    );
+  }
 
   const bond = bondBlockLines();
   const undatedBond = bond[2].replace(

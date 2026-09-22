@@ -2437,7 +2437,12 @@ function parseHoldings(
         resolveStatementMoney(bound.get("price").text).value !== null &&
         candidateIdentities.length > 0;
       const repeatedUndatedIdentity =
-        identifierBackedCandidate &&
+        !inSummary &&
+        bound.has("description") &&
+        !bound.has("tradeDate") &&
+        [...bound].some(
+          ([name, cell]) => name !== "description" && statesValue(cell),
+        ) &&
         candidateIdentities.some((identity) =>
           securityIdentities.includes(identity),
         );
