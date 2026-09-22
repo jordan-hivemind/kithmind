@@ -113,6 +113,36 @@ test("preview-selected requires one config and one private manifest path", () =>
     assert.throws(() => argumentsFor(args));
 });
 
+test("adopt-metadata-first requires one config and one private manifest path", () => {
+  assert.deepEqual(
+    argumentsFor([
+      "adopt-metadata-first",
+      "--manifest",
+      "/tmp/selection.json",
+      "--config",
+      "/tmp/config.json",
+    ]),
+    {
+      command: "adopt-metadata-first",
+      configPath: "/tmp/config.json",
+      manifestPath: "/tmp/selection.json",
+    },
+  );
+  for (const args of [
+    ["adopt-metadata-first", "--config", "/tmp/config.json"],
+    ["adopt-metadata-first", "--manifest", "/tmp/selection.json"],
+    [
+      "adopt-metadata-first",
+      "--config",
+      "/tmp/config.json",
+      "--manifest",
+      "/tmp/selection.json",
+      "--json",
+    ],
+  ])
+    assert.throws(() => argumentsFor(args));
+});
+
 test("adopt-preview-launcher requires exact previous and proposed configs", () => {
   assert.deepEqual(
     argumentsFor([
