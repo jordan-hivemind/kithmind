@@ -51,6 +51,14 @@ backlog completion or folder membership. Keep low-value bulk histories at
 metadata-only unless an explicit goal needs their contents. Preserve deferred
 items so a later exact-identity selection can promote them safely.
 
+Before a repair release, run a bounded candidate or acceptance probe against
+the affected read path. A successful parse or publication is not acceptance.
+Inspect every contributing source and current-generation proof. Reuse focused
+checks and review evidence, and start final CI only after the review head is
+stable. For scheduler changes, test the affected end-to-end state transitions
+across mixed document types, queued work, legacy resume and deferred refresh.
+Do not substitute helper-only checks or unrelated suites for those transitions.
+
 ## Parallel lanes
 
 Several agents may work in this repository at once, each in its own worktree

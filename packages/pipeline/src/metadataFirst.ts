@@ -122,7 +122,7 @@ function selectionReceipt(
         Buffer.from(`${left.sourceItemId}\0${left.sha256}`),
         Buffer.from(`${right.sourceItemId}\0${right.sha256}`),
       ),
-  );
+    );
   return {
     selectorSha256: manifestSha256,
     reason: manifest.reason,
@@ -246,9 +246,11 @@ export async function adoptMetadataFirstJournal(args: {
     refreshReady: false,
     selected: identities,
     previewed: [],
-    selectionReceipts: [
-      selectionReceipt(args.manifest, args.manifestSha256, identities),
-    ],
+    previewGaps: [],
+    selectionReceipts:
+      identities.length === 0
+        ? []
+        : [selectionReceipt(args.manifest, args.manifestSha256, identities)],
   };
   await args.journal.transitionCheckpoint({
     checkpoint: { ...checkpoint, metadataFirst },
@@ -269,7 +271,9 @@ export async function adoptMetadataFirstFromPaths(
 ): Promise<MetadataFirstResult> {
   let manifestSha256: string | undefined;
   try {
-    const loaded = await loadPriorityManifest(manifestPath);
+    const loaded = await loadPriorityManifest(manifestPath, {
+      allowEmptyTargets: true,
+    });
     manifestSha256 = loaded.manifestSha256;
     const config = await loadPipelineConfig(configPath);
     const credential = requireCredential(config);

@@ -11,6 +11,7 @@ import {
   metadataFirstIdentity,
 } from "../dist/metadataFirst.js";
 import { PipelineRunner, journalCodec } from "../dist/runner.js";
+import { ParserProcessError } from "../dist/parserProcess.js";
 import { parseRunnerCheckpoint } from "../dist/runnerState.js";
 import { parsePriorityManifest } from "../dist/reprioritize.js";
 import {
@@ -250,6 +251,56 @@ test("adoption preserves the completed prefix/current and selects active suffix 
   }
 });
 
+test("adoption accepts an empty selection without weakening reprioritize manifests", async () => {
+  const current = plan("empty-current", "1");
+  const future = plan("empty-future", "2");
+  const initial = parseRunnerCheckpoint({
+    ...checkpoint([current, future], 0),
+    step: "intent",
+    metadataFirst: undefined,
+  });
+  assert.throws(
+    () =>
+      parsePriorityManifest({
+        version: 1,
+        reason: "active_goal",
+        targets: [],
+      }),
+    /manifest_invalid/,
+  );
+  const empty = parsePriorityManifest(
+    { version: 1, reason: "active_goal", targets: [] },
+    { allowEmptyTargets: true },
+  );
+  const state = await fixture(initial);
+  try {
+    const result = await adoptMetadataFirstJournal({
+      journal: state.journal,
+      manifest: empty,
+      manifestSha256: "a".repeat(64),
+      settleAnsweredArchivedRequest: async () => assert.fail("no pending"),
+    });
+    assert.deepEqual(result, {
+      state: "adopted",
+      manifestSha256: "a".repeat(64),
+      selectedCount: 0,
+      previewedCount: 0,
+      deferredCount: 0,
+    });
+    assert.equal(state.journal.checkpoint.pdfIndex, 0);
+    assert.equal(state.journal.checkpoint.step, "intent");
+    assert.equal(state.journal.checkpoint.metadataFirst.triageStartIndex, 1);
+    assert.deepEqual(state.journal.checkpoint.metadataFirst.selected, []);
+    assert.deepEqual(
+      state.journal.checkpoint.metadataFirst.selectionReceipts,
+      [],
+    );
+  } finally {
+    await state.journal.close();
+    await rm(state.directory, { recursive: true, force: true });
+  }
+});
+
 test("an empty new scan can bootstrap selected work before background preview", async () => {
   const first = plan("first", "1");
   const background = plan("background", "2");
@@ -375,7 +426,7 @@ test("selected preview enters deep intent while FIFO routing precedes background
   );
   try {
     await worker.driveArchived();
-    assert.deepEqual(windows, [{ startPage: 1, pageCount: 1 }]);
+    assert.deepEqual(windows, [{ startPage: 1, pageCount: 2 }]);
     assert.equal(state.journal.checkpoint.step, "intent");
     assert.equal(state.journal.checkpoint.pdfIndex, 1);
     assert.equal(JSON.stringify(requests).includes("Form 1040"), false);
@@ -432,7 +483,106 @@ test("a positive tax heading durably auto-selects its exact revision", async () 
   }
 });
 
-test("answered preview replay does not rerun the executor and ends metadata_only_deferred", async () => {
+test("the bounded opening window recognizes a return behind a cover page", async () => {
+  const item = plan("covered-return", "5");
+  const state = await fixture(checkpoint([item], 0));
+  let windows;
+  const worker = runner(
+    { spaceId: "space", sourceAccountId: "source" },
+    state.journal,
+    transport([]),
+    async (_item, selectedWindows) => {
+      windows = selectedWindows;
+      return {
+        ...previewFor(item),
+        inspectedOriginalUnits: [1, 2],
+        unitStates: ["text_available", "text_available"],
+        unitTexts: [
+          "Synthetic cover letter",
+          "Form 1040 U.S. Individual Income Tax Return",
+        ],
+        unitTextTruncated: [false, false],
+      };
+    },
+  );
+  try {
+    await worker.driveArchived();
+    assert.deepEqual(windows, [{ startPage: 1, pageCount: 2 }]);
+    assert.equal(state.journal.checkpoint.step, "intent");
+    assert.equal(
+      state.journal.checkpoint.metadataFirst.selectionReceipts[0].reason,
+      "automatic_policy",
+    );
+  } finally {
+    await state.journal.close();
+    await rm(state.directory, { recursive: true, force: true });
+  }
+});
+
+test("a document-specific preview refusal is surfaced and the next item advances", async () => {
+  const invalid = {
+    ...plan("invalid-workbook", "4"),
+    parserProfileId: "spreadsheet_v1",
+  };
+  const valid = plan("valid-after-gap", "5");
+  const state = await fixture(checkpoint([invalid, valid], 0));
+  const requests = [];
+  const worker = runner(
+    { spaceId: "space", sourceAccountId: "source" },
+    state.journal,
+    transport(requests),
+    async (item) => {
+      if (item.sourceItemId === invalid.sourceItemId) {
+        throw new ParserProcessError("workbook_invalid", "synthetic refusal");
+      }
+      return previewFor(item);
+    },
+  );
+  worker.preparePdfProfile = async () => {};
+  worker.sourceStatus = async () => ({ sourceAccountId: "source" });
+  worker.driveDiscoveryReserve = async () => {
+    const current = state.journal.checkpoint;
+    assert.equal(current.phase, "discovery_reserve");
+    await state.journal.transitionCheckpoint({
+      checkpoint: checkpoint([invalid, valid], 0, {
+        step: "deferred_idle",
+        archivedPublished: current.archivedPublished,
+        metadataFirst: current.metadataFirstCarry,
+      }),
+      credentialSessionActive: true,
+    });
+  };
+  try {
+    const result = await worker.runPass();
+    assert.deepEqual(result, {
+      state: "incomplete",
+      code: "metadata_only_deferred",
+      scanned: 2,
+      published: 4,
+      previewGaps: 1,
+      previewGapCodes: ["workbook_invalid"],
+    });
+    assert.deepEqual(
+      state.journal.checkpoint.metadataFirst.previewGaps.map((gap) => ({
+        sourceItemId: gap.sourceItemId,
+        code: gap.code,
+      })),
+      [{ sourceItemId: invalid.sourceItemId, code: "workbook_invalid" }],
+    );
+    assert.deepEqual(state.journal.checkpoint.metadataFirst.previewed, [
+      metadataFirstIdentity(valid),
+    ]);
+    assert.deepEqual(
+      requests.map((request) => request.identity.sourceItemId),
+      [valid.sourceItemId],
+    );
+  } finally {
+    await state.journal.close();
+    await rm(state.directory, { recursive: true, force: true });
+  }
+});
+
+test("answered preview replay does not rerun the executor before discovery drain", async () => {
   const item = plan("deferred", "7");
   const initial = checkpoint([item], 0);
   const state = await fixture(initial);
@@ -475,13 +625,10 @@ test("answered preview replay does not rerun the executor and ends metadata_only
     );
     await resumed.driveArchived();
     assert.equal(state.journal.pending, undefined);
-    assert.equal(state.journal.checkpoint.step, "deferred_idle");
-    assert.deepEqual(await resumed.driveCheckpoint(), {
-      state: "incomplete",
-      code: "metadata_only_deferred",
-      scanned: 1,
-      published: 4,
-    });
+    assert.equal(state.journal.checkpoint.phase, "discovery_reserve");
+    assert.deepEqual(state.journal.checkpoint.metadataFirstCarry.previewed, [
+      metadataFirstIdentity(item),
+    ]);
   } finally {
     await state.journal.close().catch(() => undefined);
     await rm(state.directory, { recursive: true, force: true });
@@ -593,17 +740,25 @@ test("refresh reuses unchanged previews, previews changed/new identities, and pr
     await worker.driveArchived();
     assert.equal(state.journal.checkpoint.pdfIndex, 2);
     await worker.driveArchived();
-    assert.equal(state.journal.checkpoint.step, "deferred_idle");
+    assert.equal(state.journal.checkpoint.phase, "discovery_reserve");
     assert.deepEqual(
       requests.map((request) => request.identity.sourceItemId),
       [changed.sourceItemId, added.sourceItemId],
     );
     assert.equal(
-      state.journal.checkpoint.metadataFirst.previewed.some(
+      state.journal.checkpoint.metadataFirstCarry.previewed.some(
         (identity) => identity.sha256 === oldChanged.sha256,
       ),
       false,
     );
+    await state.journal.transitionCheckpoint({
+      checkpoint: checkpoint([unchanged, changed, added], 0, {
+        step: "deferred_idle",
+        archivedPublished: 0,
+        metadataFirst: state.journal.checkpoint.metadataFirstCarry,
+      }),
+      credentialSessionActive: true,
+    });
     const result = await adoptMetadataFirstJournal({
       journal: state.journal,
       manifest: manifest([unchanged], "explicit_user_request"),
@@ -616,6 +771,52 @@ test("refresh reuses unchanged previews, previews changed/new identities, and pr
     assert.deepEqual(state.journal.checkpoint.metadataFirst.selected, [
       metadataFirstIdentity(unchanged),
     ]);
+  } finally {
+    await state.journal.close();
+    await rm(state.directory, { recursive: true, force: true });
+  }
+});
+
+test("a serialized legacy reconcile keeps deep intent without an adoption marker", async () => {
+  const item = plan("legacy-active-scan", "6");
+  const initial = parseRunnerCheckpoint({
+    version: 1,
+    phase: "reconcile",
+    mode: "normal",
+    scanId: "legacy-scan",
+    inventoryEpoch: 3,
+    manifestVersion: 4,
+    missingBindings: [],
+    files: [item],
+    ordinal: 0,
+    reviewSeen: false,
+  });
+  const state = await fixture(initial);
+  const worker = runner(
+    { spaceId: "space", sourceAccountId: "source" },
+    state.journal,
+    {
+      async call(request) {
+        assert.equal(request.operation, "scan.reconcile");
+        return {
+          operation: "scan.reconcile",
+          scanId: initial.scanId,
+          state: "enumerated",
+          inspected: 1,
+          unavailable: 0,
+          done: true,
+          reused: false,
+        };
+      },
+    },
+    async () => assert.fail("legacy scan must not preview"),
+  );
+  worker.nextPdfWorkIndex = async () => 0;
+  try {
+    await worker.driveReconcile();
+    assert.equal(state.journal.checkpoint.phase, "archived");
+    assert.equal(state.journal.checkpoint.step, "intent");
+    assert.equal(state.journal.checkpoint.metadataFirst, undefined);
   } finally {
     await state.journal.close();
     await rm(state.directory, { recursive: true, force: true });

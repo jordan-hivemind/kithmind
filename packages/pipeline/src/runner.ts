@@ -166,6 +166,7 @@ import {
   type InventoryIdentity,
   type JobLease,
   type MetadataFirstIdentity,
+  type MetadataFirstPreviewGap,
   type MetadataFirstRouting,
   type ParserArtifactReuse,
   type RunnerCheckpoint,
@@ -333,7 +334,7 @@ const SAFE_PARSER_FAILURE_CODES = new Set([
  * remaining `SAFE_PARSER_FAILURE_CODES` (sandbox, resource, and executable
  * problems) stay run-fatal because they are not specific to one file.
  */
-const DOCUMENT_PARSER_FAILURE_CODES = new Set<string>([
+const DOCUMENT_PARSER_FAILURE_CODES = new Set<MetadataFirstPreviewGap["code"]>([
   "conversion_failed",
   "conversion_output_invalid",
   "page_limit_exceeded",
@@ -345,6 +346,14 @@ const DOCUMENT_PARSER_FAILURE_CODES = new Set<string>([
   "workbook_unsupported",
   "workbook_oversized",
 ]);
+
+function isDocumentParserFailureCode(
+  code: string,
+): code is MetadataFirstPreviewGap["code"] {
+  return DOCUMENT_PARSER_FAILURE_CODES.has(
+    code as MetadataFirstPreviewGap["code"],
+  );
+}
 
 function parseAttemptsSpent(rows: readonly ProcessingCatalogRow[]): number {
   return rows.reduce(
@@ -1108,14 +1117,14 @@ function parserArtifactReuse(
   const row = offered as Record<string, unknown>;
   const backup =
     row.backupReceiptId === undefined
-    ? undefined
-    : {
-        backupReceiptId: text(row.backupReceiptId, "backup_receipt_id"),
-        backupBindingEpoch: integer(
-          row.backupBindingEpoch,
-          "backup_binding_epoch",
-        ),
-      };
+      ? undefined
+      : {
+          backupReceiptId: text(row.backupReceiptId, "backup_receipt_id"),
+          backupBindingEpoch: integer(
+            row.backupBindingEpoch,
+            "backup_binding_epoch",
+          ),
+        };
   if (
     (row.backupReceiptId === undefined) !==
     (row.backupBindingEpoch === undefined)
@@ -1564,6 +1573,9 @@ function processingTerminal(
     published: checkpoint.published,
     bindings: checkpoint.bindings,
     ...(assessmentId === undefined ? {} : { assessmentId }),
+    ...(checkpoint.metadataFirstDeferred === undefined
+      ? {}
+      : { metadataFirstCarry: checkpoint.metadataFirstDeferred.metadataFirst }),
   };
 }
 
@@ -1572,12 +1584,73 @@ function processingBase(checkpoint: {
   scanned: number;
   published: number;
   bindings: IdentityBinding[];
+  metadataFirstDeferred?: Extract<
+    RunnerCheckpoint,
+    { phase: "jobs_reserve" }
+  >["metadataFirstDeferred"];
 }) {
   return {
     scanId: checkpoint.scanId,
     scanned: checkpoint.scanned,
     published: checkpoint.published,
     bindings: checkpoint.bindings,
+    ...(checkpoint.metadataFirstDeferred === undefined
+      ? {}
+      : { metadataFirstDeferred: checkpoint.metadataFirstDeferred }),
+  };
+}
+
+function metadataFirstDeferred(
+  checkpoint: Extract<RunnerCheckpoint, { phase: "discovery_reserve" }>,
+) {
+  const routing = checkpoint.metadataFirstCarry;
+  if (!routing) return undefined;
+  return {
+    mode: checkpoint.mode,
+    inventoryEpoch: checkpoint.inventoryEpoch,
+    manifestVersion: checkpoint.manifestVersion,
+    files: checkpoint.files,
+    missingBindings: checkpoint.missingBindings,
+    pdfIndex: routing.triageStartIndex,
+    archivedPublished: checkpoint.archivedPublished ?? 0,
+    metadataFirst: routing,
+  };
+}
+
+function deferredArchivedCheckpoint(
+  checkpoint: Extract<
+    RunnerCheckpoint,
+    {
+      phase:
+        | "jobs_reserve"
+        | "jobs_renew"
+        | "jobs_stage"
+        | "jobs_activate"
+        | "jobs_fail"
+        | "assess_status"
+        | "assess_begin"
+        | "assess_page";
+    }
+  >,
+): RunnerCheckpoint {
+  const deferred = checkpoint.metadataFirstDeferred;
+  if (!deferred) {
+    throw new PipelineWorkerError("journal_phase_conflict");
+  }
+  return {
+    version: 1,
+    phase: "archived",
+    mode: deferred.mode,
+    scanId: checkpoint.scanId,
+    inventoryEpoch: deferred.inventoryEpoch,
+    manifestVersion: deferred.manifestVersion,
+    files: deferred.files,
+    missingBindings: deferred.missingBindings,
+    pdfIndex: deferred.pdfIndex,
+    step: "deferred_idle",
+    reservationRound: 0,
+    archivedPublished: checkpoint.published,
+    metadataFirst: { ...deferred.metadataFirst, refreshReady: false },
   };
 }
 
@@ -2140,10 +2213,12 @@ export class PipelineRunner {
     checkpoint: ArchivedCheckpoint,
     routing: MetadataFirstRouting,
     archivedPublished: number,
-  ): Promise<ArchivedCheckpoint> {
+  ): Promise<RunnerCheckpoint> {
     const previewed = new Set(routing.previewed.map(metadataIdentityKey));
+    const gapped = new Set(routing.previewGaps.map(metadataIdentityKey));
     for (const selected of routing.selected) {
       const selectedKey = metadataIdentityKey(selected);
+      if (gapped.has(selectedKey)) continue;
       const index = checkpoint.files.findIndex(
         (candidate) =>
           isPdfPlan(candidate) &&
@@ -2184,7 +2259,8 @@ export class PipelineRunner {
       if (
         plan &&
         isPdfPlan(plan) &&
-        !previewed.has(metadataIdentityKey(metadataIdentity(plan)))
+        !previewed.has(metadataIdentityKey(metadataIdentity(plan))) &&
+        !gapped.has(metadataIdentityKey(metadataIdentity(plan)))
       ) {
         return this.metadataArchivedCheckpoint(
           checkpoint,
@@ -2195,13 +2271,16 @@ export class PipelineRunner {
         );
       }
     }
-    return this.metadataArchivedCheckpoint(
-      checkpoint,
-      { ...routing, refreshReady: false },
-      checkpoint.pdfIndex,
-      "deferred_idle",
+    return {
+      version: 1,
+      phase: "discovery_reserve",
+      ...activeScanBase({
+        ...checkpoint,
+        metadataFirstCarry: { ...routing, refreshReady: false },
+      }),
+      round: 0,
       archivedPublished,
-    );
+    };
   }
 
   /**
@@ -3615,11 +3694,18 @@ export class PipelineRunner {
       (this.journal.checkpoint.phase === "terminal"
         ? this.journal.checkpoint.bindings
         : []);
-    const metadataFirstCarry =
-      metadataFirstOverride ??
+    const metadataFirstCarry = metadataFirstOverride ??
       (this.journal.checkpoint.phase === "terminal"
         ? this.journal.checkpoint.metadataFirstCarry
-        : undefined);
+        : undefined) ?? {
+        version: 1,
+        triageStartIndex: 0,
+        refreshReady: false,
+        selected: [],
+        previewed: [],
+        previewGaps: [],
+        selectionReceipts: [],
+      };
     const plans = await this.discoverPlans(roots);
     const byPath = new Map(prior.map((binding) => [fileKey(binding), binding]));
     await this.attachProviderFileIds(plans, byPath);
@@ -4188,6 +4274,21 @@ export class PipelineRunner {
             return scanTerminal(current, "failed", error.code, true);
           }
           if (pdfIndex >= 0) {
+            // Checkpoints written before metadata-first adoption have no
+            // marker. Finish that already-open scan with its original deep
+            // behavior; only a fresh cycle or the explicit archived-phase
+            // adoption command may opt a scan into preview routing.
+            if (current.metadataFirstCarry === undefined) {
+              return {
+                version: 1,
+                phase: "archived",
+                ...reconciledActiveScanBase(current),
+                pdfIndex,
+                step: "intent",
+                reservationRound: 0,
+                archivedPublished: 0,
+              };
+            }
             const base = reconciledActiveScanBase(current);
             const currentIdentities = new Set(
               current.files
@@ -4213,6 +4314,10 @@ export class PipelineRunner {
               previewed:
                 carry?.previewed.filter((identity) =>
                   currentIdentities.has(metadataIdentityKey(identity)),
+                ) ?? [],
+              previewGaps:
+                carry?.previewGaps.filter((gap) =>
+                  currentIdentities.has(metadataIdentityKey(gap)),
                 ) ?? [],
               selectionReceipts: carry?.selectionReceipts ?? [],
             };
@@ -4286,6 +4391,9 @@ export class PipelineRunner {
             published: current.archivedPublished ?? 0,
             bindings: bindingsFromScan(current),
             round: 0,
+            ...(metadataFirstDeferred(current) === undefined
+              ? {}
+              : { metadataFirstDeferred: metadataFirstDeferred(current) }),
           };
         }
         if (current.round >= MAX_RESERVATION_ROUNDS) {
@@ -4330,6 +4438,9 @@ export class PipelineRunner {
           phase: "discovery_reserve",
           ...activeScanBase(checkpoint),
           round: checkpoint.round + 1,
+          ...(checkpoint.archivedPublished === undefined
+            ? {}
+            : { archivedPublished: checkpoint.archivedPublished }),
         },
         credentialSessionActive: true,
       });
@@ -4729,13 +4840,13 @@ export class PipelineRunner {
           this.archivedPlan(checkpoint),
         );
         const expected = request(this.config, "discovery.preflightArchived", {
-            requestId: text(body.requestId, "request_id"),
+          requestId: text(body.requestId, "request_id"),
+          identity,
+          archiveIntentDigest: digestRetainedProviderV1ArchiveIntent({
             identity,
-            archiveIntentDigest: digestRetainedProviderV1ArchiveIntent({
-              identity,
-              original: rows.original,
-              processing: rows.processing,
-            }),
+            original: rows.original,
+            processing: rows.processing,
+          }),
         });
         if (!equalJson(body, expected))
           throw new PipelineWorkerError("journal_phase_conflict");
@@ -4849,7 +4960,7 @@ export class PipelineRunner {
     if (!this.journal.pending) {
       const windows: PreviewWindow[] =
         planMediaType(plan) === "application/pdf"
-          ? [{ startPage: 1, pageCount: 1 }]
+          ? [{ startPage: 1, pageCount: 2 }]
           : [];
       const preview = await this.executeMetadataPreview(plan, windows);
       if (
@@ -4944,6 +5055,42 @@ export class PipelineRunner {
     if (code && this.journal.checkpoint.phase === "archived") {
       throw new PipelineWorkerError(code);
     }
+  }
+
+  /**
+   * A preview refusal caused by the selected bytes is a durable triage gap,
+   * not a reason to retry the same file forever. Infrastructure and sandbox
+   * failures never enter this path and remain run-fatal.
+   */
+  private async recordMetadataPreviewGap(
+    checkpoint: ArchivedCheckpoint,
+    code: MetadataFirstPreviewGap["code"],
+  ): Promise<void> {
+    if (
+      checkpoint.step !== "preview" ||
+      checkpoint.metadataFirst === undefined ||
+      !isDocumentParserFailureCode(code)
+    ) {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    const identity = metadataIdentity(this.archivedPlan(checkpoint));
+    const key = metadataIdentityKey(identity);
+    const routing: MetadataFirstRouting = {
+      ...checkpoint.metadataFirst,
+      previewGaps: checkpoint.metadataFirst.previewGaps.some(
+        (gap) => metadataIdentityKey(gap) === key,
+      )
+        ? checkpoint.metadataFirst.previewGaps
+        : [...checkpoint.metadataFirst.previewGaps, { ...identity, code }],
+    };
+    await this.journal.transitionCheckpoint({
+      checkpoint: await this.nextMetadataCheckpoint(
+        checkpoint,
+        routing,
+        checkpoint.archivedPublished,
+      ),
+      credentialSessionActive: true,
+    });
   }
 
   private async driveArchivedPreflight(): Promise<void> {
@@ -6258,10 +6405,10 @@ export class PipelineRunner {
             ? []
             : [
                 [
-                "original_bytes",
-                original,
-                "primary",
-                "originalPrimaryReceiptId",
+                  "original_bytes",
+                  original,
+                  "primary",
+                  "originalPrimaryReceiptId",
                 ] as const,
               ]),
           ...(provider
@@ -6279,10 +6426,10 @@ export class PipelineRunner {
             ? []
             : [
                 [
-                "parser_output",
-                processing,
-                "independent_backup",
-                "parserBackupReceiptId",
+                  "parser_output",
+                  processing,
+                  "independent_backup",
+                  "parserBackupReceiptId",
                 ] as const,
               ]),
         ] as const;
@@ -6777,9 +6924,9 @@ export class PipelineRunner {
             ? []
             : [
                 [
-                "original_bytes",
-                "primary",
-                "originalPrimaryReceiptId",
+                  "original_bytes",
+                  "primary",
+                  "originalPrimaryReceiptId",
                 ] as const,
               ]),
           ...(!viaProvider
@@ -6796,9 +6943,9 @@ export class PipelineRunner {
             ? []
             : [
                 [
-                "parser_output",
-                "independent_backup",
-                "parserBackupReceiptId",
+                  "parser_output",
+                  "independent_backup",
+                  "parserBackupReceiptId",
                 ] as const,
               ]),
         ] as const) {
@@ -7894,12 +8041,9 @@ export class PipelineRunner {
           };
         }
         if (value.state === "complete") {
-          return processingTerminal(
-            current,
-            "complete",
-            undefined,
-            assessmentId,
-          );
+          return current.metadataFirstDeferred
+            ? deferredArchivedCheckpoint(current)
+            : processingTerminal(current, "complete", undefined, assessmentId);
         }
         return processingTerminal(
           current,
@@ -7975,12 +8119,14 @@ export class PipelineRunner {
           };
         }
         if (value.state === "complete") {
-          return processingTerminal(
-            current,
-            "complete",
-            undefined,
-            current.assessmentId,
-          );
+          return current.metadataFirstDeferred
+            ? deferredArchivedCheckpoint(current)
+            : processingTerminal(
+                current,
+                "complete",
+                undefined,
+                current.assessmentId,
+              );
         }
         return processingTerminal(
           current,
@@ -8095,7 +8241,7 @@ export class PipelineRunner {
                   refreshReady: true,
                 },
               },
-              credentialSessionActive: true,
+              credentialSessionActive: false,
             });
           }
           return {
@@ -8103,6 +8249,18 @@ export class PipelineRunner {
             code: "metadata_only_deferred",
             scanned: checkpoint.files.length,
             published: checkpoint.archivedPublished,
+            ...(checkpoint.metadataFirst.previewGaps.length === 0
+              ? {}
+              : {
+                  previewGaps: checkpoint.metadataFirst.previewGaps.length,
+                  previewGapCodes: [
+                    ...new Set(
+                      checkpoint.metadataFirst.previewGaps.map(
+                        (gap) => gap.code,
+                      ),
+                    ),
+                  ].sort(),
+                }),
           };
         }
         await this.driveArchived();
@@ -8273,7 +8431,17 @@ export class PipelineRunner {
         const checkpoint = this.journal.checkpoint;
         if (
           error instanceof ParserProcessError &&
-          DOCUMENT_PARSER_FAILURE_CODES.has(error.code) &&
+          isDocumentParserFailureCode(error.code) &&
+          checkpoint.phase === "archived" &&
+          checkpoint.step === "preview" &&
+          !this.journal.pending
+        ) {
+          await this.recordMetadataPreviewGap(checkpoint, error.code);
+          continue;
+        }
+        if (
+          error instanceof ParserProcessError &&
+          isDocumentParserFailureCode(error.code) &&
           checkpoint.phase === "archived" &&
           checkpoint.step === "parse"
         ) {

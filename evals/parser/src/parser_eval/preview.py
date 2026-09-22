@@ -176,8 +176,13 @@ def _preview_pdf(
 
         with pdfplumber.open(BytesIO(data)) as document:
             page_count = len(document.pages)
-            if any(page > page_count for page in pages):
+            requested_starts = [window["startPage"] for window in windows]
+            if any(start > page_count for start in requested_starts):
                 raise _PreviewFailure("invalid_preview_request")
+            # A bounded window may extend past the end of a short document.
+            # Keep the actual original pages that exist. A window whose first
+            # page does not exist remains an invalid request.
+            pages = [page for page in pages if page <= page_count]
             units: list[dict[str, Any]] = []
             remaining_bytes = MAX_TOTAL_TEXT_BYTES
             remaining_characters = MAX_TOTAL_TEXT_CHARACTERS

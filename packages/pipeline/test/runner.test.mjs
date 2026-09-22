@@ -34,7 +34,7 @@ import {
   providerCatalogVerification,
 } from "../dist/runner.js";
 import { ParserProcessError } from "../dist/parserProcess.js";
-import { canonicalRoots, discoverFiles } from "../dist/filesystem.js";
+import { canonicalRoots, discoverFiles, toFsUri } from "../dist/filesystem.js";
 import { persistProviderBinding } from "../dist/providerRegistry.js";
 import {
   formatReconcileResult,
@@ -1313,6 +1313,125 @@ test("publishes a bounded multi-page scan and stores only metadata after complet
   }
 });
 
+test("a deferred PDF still lets a UTF-8 sibling publish before the parked result", async () => {
+  const setup = await fixture(1);
+  const utfPath = join(setup.root, "file-0.txt");
+  const bytes = await readFile(utfPath);
+  const entry = await lstat(utfPath);
+  const utf = {
+    rootAlias: "fixture",
+    relativePath: "file-0.txt",
+    sourceModifiedAt: Math.trunc(entry.mtimeMs),
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    byteLength: bytes.length,
+    externalId: randomUUID(),
+  };
+  const pdf = pdfPlan({
+    relativePath: "unknown.pdf",
+    sourceItemId: "source-pdf",
+    observationEpoch: 1,
+    processingEpoch: 1,
+    discoveryState: "queued",
+  });
+  const checkpoint = parseRunnerCheckpoint({
+    version: 1,
+    phase: "archived",
+    mode: "normal",
+    scanId: "scan_1",
+    inventoryEpoch: 1,
+    manifestVersion: 1,
+    missingBindings: [],
+    files: [pdf, utf],
+    pdfIndex: 0,
+    step: "preview",
+    reservationRound: 0,
+    archivedPublished: 0,
+    metadataFirst: {
+      version: 1,
+      triageStartIndex: 0,
+      refreshReady: false,
+      selected: [],
+      previewed: [],
+      selectionReceipts: [],
+    },
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const cloud = new CompleteCloud();
+  cloud.scanId = "scan_1";
+  cloud.inventoryEpoch = 1;
+  cloud.manifestVersion = 1;
+  cloud.enumerated = true;
+  cloud.discoveryQueue.push({
+    workId: "work-utf8",
+    jobId: "job-utf8",
+    sourceItemId: "source-utf8",
+    uri: toFsUri(utf.rootAlias, utf.relativePath),
+    contentHash: utf.sha256,
+    byteLength: utf.byteLength,
+  });
+  const transport = {
+    async call(request) {
+      if (request.operation === "discovery.recordPreview") {
+        cloud.operations.push(request.operation);
+        return {
+          operation: "discovery.recordPreview",
+          previewId: randomUUID(),
+          sourceItemId: request.identity.sourceItemId,
+          observedContentHash: request.identity.contentHash,
+          previewFingerprint: request.preview.previewFingerprint,
+          state: "provisional",
+          reused: false,
+        };
+      }
+      return await cloud.call(request);
+    },
+  };
+  const runner = new PipelineRunner(
+    setup.config,
+    journal,
+    transport,
+    undefined,
+    undefined,
+    undefined,
+    async () => ({
+      sourceSha256: pdf.sha256,
+      mediaType: "application/pdf",
+      sourceUnitCount: 3,
+      inspectedOriginalUnits: [1, 2],
+      unitStates: ["text_available", "text_available"],
+      unitTexts: ["Synthetic cover", "Synthetic unknown document"],
+      unitTextTruncated: [false, false],
+      method: "pdf_native_text_v1",
+      methodFingerprint: "e".repeat(64),
+    }),
+  );
+  try {
+    let result;
+    for (let step = 0; step < 40 && !result; step += 1) {
+      result = await runner.driveCheckpoint();
+    }
+    assert.deepEqual(result, {
+      state: "incomplete",
+      code: "metadata_only_deferred",
+      scanned: 2,
+      published: 1,
+    });
+    assert.equal(journal.checkpoint.phase, "archived");
+    assert.equal(journal.checkpoint.step, "deferred_idle");
+    assert.equal(journal.checkpoint.metadataFirst.refreshReady, true);
+    const stored = JSON.parse(
+      await readFile(join(setup.journalDir, "state.json"), "utf8"),
+    );
+    assert.equal(stored.pending, undefined);
+    assert.equal(stored.credentialSessionActive, false);
+    assert.ok(cloud.operations.includes("discovery.admitUtf8"));
+    assert.ok(cloud.operations.includes("jobs.activate"));
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
 // P2-80h: a settled parse failure is parked, not a reason to keep reporting
 // `incomplete`. The pass ends `complete` with no code, so a scheduled watcher
 // stops rerunning the same documents. `PipelineRunResult` carries no counts, so
@@ -2336,7 +2455,10 @@ test("provider v2 transition restarts after catalog persistence without weakenin
       noTransport,
     ).prepareProviderV2Transition();
     assert.equal(first.step, "parser_archive");
-    assert.ok(journal.pending?.result, "journal half was intentionally not committed");
+    assert.ok(
+      journal.pending?.result,
+      "journal half was intentionally not committed",
+    );
     const converted = await openArchiveCatalog({ journal });
     const convertedOriginal = converted.listOriginals()[0];
     const convertedProcessing = converted.listProcessings()[0];
@@ -2550,7 +2672,10 @@ test("legacy provider verification cannot bypass the explicit v2 transition", as
         ),
       (error) => error.code === "provider_v2_transition_required",
     );
-    assert.equal(catalog.listOriginals()[0].providerOriginal.verified, undefined);
+    assert.equal(
+      catalog.listOriginals()[0].providerOriginal.verified,
+      undefined,
+    );
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });
@@ -3047,7 +3172,11 @@ test("provider v2 admission replay carries only the parser primary artifact", as
     };
     return runner;
   };
-  const builder = configure({ async call() { throw new Error("unused"); } });
+  const builder = configure({
+    async call() {
+      throw new Error("unused");
+    },
+  });
   const provider = builder.admissionProvider(checkpoint, rows.original, false);
   const selections = builder.admissionSelections(
     checkpoint,
@@ -3061,7 +3190,10 @@ test("provider v2 admission replay carries only the parser primary artifact", as
     ]),
     [["parser_output", "primary"]],
   );
-  assert.equal(provider.providerOriginal.referenceVersion, "provider_original_v2");
+  assert.equal(
+    provider.providerOriginal.referenceVersion,
+    "provider_original_v2",
+  );
   assert.equal("locatorBundle" in provider.providerOriginal, false);
   const requestId = randomUUID();
   const body = {
@@ -3907,7 +4039,7 @@ test("a dead activation is never reused for an original the server re-admitted",
       "archived",
       "the document is treated as needing work, not as published",
     );
-    assert.equal(f.journal.checkpoint.step, "preview");
+    assert.equal(f.journal.checkpoint.step, "intent");
   } finally {
     await f.journal.close();
     await rm(f.setup.base, { recursive: true, force: true });
@@ -4035,7 +4167,7 @@ test("a parked document lets the next file publish in the same pass, with no req
     // The pass walks straight on to the second file.
     assert.equal(journal.checkpoint.phase, "archived");
     assert.equal(journal.checkpoint.pdfIndex, 1);
-    assert.equal(journal.checkpoint.step, "preview");
+    assert.equal(journal.checkpoint.step, "intent");
     // PR 277's lesson: the answered page is settled, not left owing.
     assert.equal(journal.pending, undefined);
     // Nothing was sent, so no discovery attempt was spent on the parked file.

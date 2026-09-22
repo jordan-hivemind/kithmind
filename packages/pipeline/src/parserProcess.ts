@@ -3405,7 +3405,7 @@ function previewInteger(value: unknown, maximum: number): number {
   return value as number;
 }
 
-function validateDocumentPreviewResult(
+export function validateDocumentPreviewResult(
   value: Record<string, unknown>,
   input: Pick<
     RunDocumentPreviewInput,
@@ -3441,9 +3441,13 @@ function validateDocumentPreviewResult(
     )
       fail("output_invalid", "PDF preview shape is invalid");
     const pageCount = previewInteger(value.pageCount, Number.MAX_SAFE_INTEGER);
-    const requested = input.windows.flatMap(({ startPage, pageCount }) =>
-      Array.from({ length: pageCount }, (_, index) => startPage + index),
-    );
+    if (input.windows.some(({ startPage }) => startPage > pageCount))
+      fail("output_invalid", "PDF preview window starts past the source");
+    const requested = input.windows
+      .flatMap(({ startPage, pageCount }) =>
+        Array.from({ length: pageCount }, (_, index) => startPage + index),
+      )
+      .filter((page) => page <= pageCount);
     const inspected = value.inspectedPageNumbers.map((item) =>
       previewInteger(item, pageCount),
     );

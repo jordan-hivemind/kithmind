@@ -119,6 +119,18 @@ class PdfPreviewTests(unittest.TestCase):
         )
         self.assertEqual(len(result["method"]["fingerprint"]), 64)
 
+    def test_opening_window_clips_to_a_one_page_document(self) -> None:
+        result = _preview(
+            _pdf(1),
+            PDF_MEDIA_TYPE,
+            [{"startPage": 1, "pageCount": 2}],
+        )
+
+        self.assertEqual(result["state"], "complete")
+        self.assertEqual(result["pageCount"], 1)
+        self.assertEqual(result["inspectedPageNumbers"], [1])
+        self.assertEqual(len(result["units"]), 1)
+
     def test_request_bounds_duplicates_and_missing_pages_are_refused(self) -> None:
         data = _pdf(4)
         requests = [
