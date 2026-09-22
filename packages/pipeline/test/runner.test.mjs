@@ -31,6 +31,7 @@ import {
   initialCheckpoint,
   journalCodec,
   PipelineRunner,
+  providerCatalogVerification,
 } from "../dist/runner.js";
 import { ParserProcessError } from "../dist/parserProcess.js";
 import { canonicalRoots, discoverFiles } from "../dist/filesystem.js";
@@ -44,6 +45,53 @@ import { parseRunnerCheckpoint } from "../dist/runnerState.js";
 import { MAX_WORKER_SCAN_PAGES } from "@repo/worker-protocol/request";
 
 const HASH = "a".repeat(64);
+
+test("provider verification projects only the archive catalog closed shape", () => {
+  const projected = providerCatalogVerification(
+    {
+      metadata: {
+        referenceVersion: "provider_original_v1",
+        providerKind: "dropbox_v1",
+        providerAccountIdHash: "1".repeat(64),
+        providerRootDirectoryIdHash: "2".repeat(64),
+        providerFileIdHash: "3".repeat(64),
+        providerRevision: "rev1",
+        providerContentHash: "4".repeat(64),
+        sourceContentHash: "5".repeat(64),
+        sourceByteLength: 100,
+        verifiedAt: 10,
+      },
+      binding: {
+        bindingId: randomUUID(),
+        providerAccountId: "dbid:account",
+        providerRootDirectoryId: "id:root",
+        providerFileId: "id:file",
+        providerRevision: "rev1",
+        relativePath: "Folder/file.pdf",
+      },
+    },
+    {
+      bindingId: randomUUID(),
+      manifestPath: "/protected/provider.json",
+      manifestFingerprint: "6".repeat(64),
+      manifestByteLength: 512,
+    },
+  );
+  assert.deepEqual(Object.keys(projected).sort(), [
+    "manifestByteLength",
+    "manifestFingerprint",
+    "providerAccountIdHash",
+    "providerContentHash",
+    "providerFileIdHash",
+    "providerRevision",
+    "providerRootDirectoryIdHash",
+    "sourceByteLength",
+    "sourceContentHash",
+    "verifiedAt",
+  ]);
+  assert.equal("referenceVersion" in projected, false);
+  assert.equal("providerKind" in projected, false);
+});
 
 function pdfPlan(overrides = {}) {
   return {

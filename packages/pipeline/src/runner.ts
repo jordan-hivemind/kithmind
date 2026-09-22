@@ -84,10 +84,12 @@ import {
   lookupDropboxFileIds,
   validRelativePath,
   verifyDropboxOriginal,
+  type VerifiedDropboxOriginal,
 } from "./dropboxOriginal.js";
 import {
   loadProviderBinding,
   persistProviderBinding,
+  type PersistedProviderBinding,
 } from "./providerRegistry.js";
 
 import {
@@ -455,6 +457,25 @@ function providerProofFresh(
   return (times as number[]).every(
     (at) => at >= now - 9 * 60_000 && at <= now + 4 * 60_000,
   );
+}
+
+export function providerCatalogVerification(
+  loaded: VerifiedDropboxOriginal,
+  persisted: PersistedProviderBinding,
+): NonNullable<NonNullable<OriginalCatalogRow["providerOriginal"]>["verified"]> {
+  return {
+    providerAccountIdHash: loaded.metadata.providerAccountIdHash,
+    providerRootDirectoryIdHash:
+      loaded.metadata.providerRootDirectoryIdHash,
+    providerFileIdHash: loaded.metadata.providerFileIdHash,
+    providerRevision: loaded.metadata.providerRevision,
+    providerContentHash: loaded.metadata.providerContentHash,
+    sourceContentHash: loaded.metadata.sourceContentHash,
+    sourceByteLength: loaded.metadata.sourceByteLength,
+    verifiedAt: loaded.metadata.verifiedAt,
+    manifestFingerprint: persisted.manifestFingerprint,
+    manifestByteLength: persisted.manifestByteLength,
+  };
 }
 
 /**
@@ -4925,11 +4946,7 @@ export class PipelineRunner {
       registryDirectory: provider.registryDirectory,
       verified: loaded,
     });
-    return {
-      ...loaded.metadata,
-      manifestFingerprint: persisted.manifestFingerprint,
-      manifestByteLength: persisted.manifestByteLength,
-    };
+    return providerCatalogVerification(loaded, persisted);
   }
 
   private async driveProviderOriginal(
