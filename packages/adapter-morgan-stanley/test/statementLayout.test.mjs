@@ -32,6 +32,7 @@ import {
   equityBlockLines,
   navFundBlockLines,
   pageSplitEquityPages,
+  place,
   privateHoldingsBlockLines,
   sectionSummaryLines,
   SHORT_CASH_LAYOUT_TEXT,
@@ -440,6 +441,187 @@ test("an undated extra value row cannot silently enter a lot sum", () => {
   const parsed = parseStatementLines(noTotalStatement({}, [extraRow]), kind);
   assert.deepEqual(parsed.holdings.positions, []);
   assert.match(parsed.parseNote, /holdings block\(s\) left unparsed/);
+});
+
+const purchasesEstimatedValueSummary = (label) =>
+  place([
+    { text: label, start: 8 },
+    { text: "$100.00", end: 134 },
+    { text: "$120.00", end: 150 },
+  ]);
+
+function purchasesSummaryStatement(
+  label = "Total Purchases vs Estimated Value",
+) {
+  const [section, header, datedRow] = lotsWithoutTotalLines();
+  return [
+    "        Page 1 of 1",
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+    "        Synthetic Active Assets Account    123-456789-012",
+    "        HOLDINGS",
+    section,
+    header,
+    datedRow,
+    purchasesEstimatedValueSummary(label),
+    place([{ text: "$6.00", end: 134 }]),
+    place([{ text: "$7.00", end: 150 }]),
+  ].join("\n");
+}
+
+test("the exact purchases-versus-estimated-value summary closes the final security", () => {
+  const text = purchasesSummaryStatement();
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [position] = parsed.holdings.positions;
+  assert.equal(position.instrument.name, "CAIRN SYNTHETIC HOLDINGS");
+  assert.equal(position.quantity, "5");
+  assert.equal(position.marketValue, "100");
+  assert.equal(position.locators.marketValue.binding.quote, "$100.00");
+  assert.equal(
+    text.slice(
+      position.locators.marketValue.binding.start,
+      position.locators.marketValue.binding.end,
+    ),
+    "$100.00",
+  );
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+  assert.equal(
+    scope.evidence.tables[0].end.binding.quote,
+    purchasesEstimatedValueSummary("Total Purchases vs Estimated Value").trim(),
+  );
+});
+
+test("similar totals, ordinary Total rows, TOTAL-named securities and true lots remain rows", () => {
+  const unknown = parseStatementLines(
+    purchasesSummaryStatement("Total Purchases and Estimated Value"),
+    kind,
+  );
+  assert.deepEqual(unknown.holdings.positions, []);
+  assert.ok(
+    unknown.holdings.positionScopes[0].gapCodes.includes("unresolved_lots"),
+  );
+
+  const ordinaryTotal = parseStatementLines(
+    purchasesSummaryStatement().replace(
+      lotsWithoutTotalLines()[2],
+      equityBlockLines().slice(2, 5).join("\n"),
+    ),
+    kind,
+  );
+  assert.equal(ordinaryTotal.holdings.positions.length, 1);
+  assert.equal(ordinaryTotal.holdings.positions[0].marketValue, "3184");
+
+  const datedTotalName = parseStatementLines(
+    purchasesSummaryStatement().replace(
+      "CAIRN SYNTHETIC HOLDINGS (CSHZ)",
+      "TOTAL RETURN FUND (TRNF)".padEnd(
+        "CAIRN SYNTHETIC HOLDINGS (CSHZ)".length,
+      ),
+    ),
+    kind,
+  );
+  assert.equal(datedTotalName.holdings.positions.length, 1);
+  assert.equal(datedTotalName.holdings.positions[0].instrument.symbol, "TRNF");
+
+  const completeLots = parseStatementLines(noTotalStatement(), kind);
+  assert.equal(completeLots.holdings.positions.length, 1);
+  assert.equal(completeLots.holdings.positions[0].marketValue, "240");
+});
+
+const sameSectionSubtotal = ({
+  label = "COMMON STOCKS",
+  tradeDate = null,
+} = {}) =>
+  place([
+    { text: label, start: 8 },
+    ...(tradeDate === null ? [] : [{ text: tradeDate, end: 62 }]),
+    { text: "$100.00", end: 134 },
+    { text: "$120.00", end: 150 },
+    { text: "$20.00", end: 164 },
+    { text: "$3.00", end: 180 },
+    { text: "2.5%", end: 188 },
+  ]);
+
+function sameSectionSubtotalStatement({
+  includeAssetClass = true,
+  label,
+  tradeDate,
+  marketValue = "$100.00",
+} = {}) {
+  const [section, header, datedRow] = lotsWithoutTotalLines({
+    first: { marketValue },
+  });
+  return [
+    "        Page 1 of 1",
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+    "        Synthetic Active Assets Account    123-456789-012",
+    "        HOLDINGS",
+    section,
+    header,
+    datedRow,
+    ...(includeAssetClass
+      ? ["        Next Dividend Payable 04/2026; Asset Class: Equities"]
+      : []),
+    sameSectionSubtotal({ label, tradeDate }),
+    place([{ text: "$6.00 ST", end: 164 }]),
+    place([{ text: "$7.00 ST", end: 164 }]),
+    place([
+      { text: "Unrealized", end: 164 },
+      { text: "Current", end: 180 },
+    ]),
+  ].join("\n");
+}
+
+test("an exact same-section subtotal after Asset Class closes a complete security", () => {
+  const text = sameSectionSubtotalStatement();
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  const [position] = parsed.holdings.positions;
+  assert.equal(position.instrument.symbol, "CSHZ");
+  assert.equal(position.marketValue, "100");
+  assert.equal(position.locators.marketValue.binding.quote, "$100.00");
+  const [scope] = parsed.holdings.positionScopes;
+  assert.equal(scope.status, "complete");
+  assert.deepEqual(scope.gapCodes, []);
+  assert.equal(
+    scope.evidence.tables[0].end.binding.quote,
+    sameSectionSubtotal().trim(),
+  );
+});
+
+test("same-section subtotal recognition requires its marker, section, undated shape and complete predecessor", () => {
+  for (const [name, options] of [
+    ["no Asset Class marker", { includeAssetClass: false }],
+    ["mismatched section", { label: "CORPORATE FIXED INCOME" }],
+  ]) {
+    const parsed = parseStatementLines(
+      sameSectionSubtotalStatement(options),
+      kind,
+    );
+    assert.deepEqual(parsed.holdings.positions, [], name);
+    assert.ok(
+      parsed.holdings.positionScopes[0].gapCodes.includes("unresolved_lots"),
+      name,
+    );
+  }
+
+  const dated = parseStatementLines(
+    sameSectionSubtotalStatement({ tradeDate: "03/01/26" }),
+    kind,
+  );
+  assert.equal(dated.holdings.positions.length, 2);
+  assert.equal(dated.holdings.positions[1].instrument.name, "COMMON STOCKS");
+
+  const incomplete = parseStatementLines(
+    sameSectionSubtotalStatement({ marketValue: "" }),
+    kind,
+  );
+  assert.notEqual(
+    incomplete.holdings.positionScopes[0].evidence.tables[0].end.binding.quote,
+    sameSectionSubtotal().trim(),
+  );
 });
 
 test("two cells bound to one lot column are refused instead of choosing the first", () => {
