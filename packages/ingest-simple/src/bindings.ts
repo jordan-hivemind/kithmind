@@ -83,7 +83,8 @@ function asString(
  * `jobs_reserve`/`jobs_renew`/`jobs_stage`/`jobs_activate`/`jobs_fail`
  * family, see `RunnerCheckpoint` in `runnerState.ts`) carry a flat
  * `bindings` array -- the registry of identities the worker has resolved.
- * `missingBindings`, present on scan-phase checkpoints, is deliberately not
+ * Scan-phase checkpoints carry the same identities on `files[]`, read as a
+ * fallback. `missingBindings`, present on scan-phase checkpoints, is deliberately not
  * read here: those are identities the worker had *not* yet resolved, not
  * ones safe to bind a file to. A checkpoint phase with no `bindings` field
  * (for example `idle`, or mid-scan) yields zero entries, not an error --
@@ -94,11 +95,24 @@ function findBindingEntries(parsed: unknown, path: string): unknown[] {
   const root = asObject(parsed, path, "the file");
   const checkpoint =
     "checkpoint" in root ? asObject(root.checkpoint, path, "checkpoint") : root;
-  if (!("bindings" in checkpoint)) return [];
-  const value = checkpoint.bindings;
-  if (!Array.isArray(value)) invalid(path, "checkpoint.bindings is not an array");
-  if (value.length > MAX_ENTRIES) invalid(path, "checkpoint.bindings has too many entries");
-  return value;
+  // Scan-phase checkpoints (the phase the owner's worker was paused in)
+  // carry the same identities on `files[]` entries, each also holding
+  // `sourceItemId`, `sha256` and the parser fingerprints. Only the identity
+  // keys are read from them.
+  const key = "bindings" in checkpoint ? "bindings" : "files" in checkpoint ? "files" : null;
+  if (key === null) return [];
+  const value = checkpoint[key];
+  if (!Array.isArray(value)) invalid(path, `checkpoint.${key} is not an array`);
+  if (value.length > MAX_ENTRIES) invalid(path, `checkpoint.${key} has too many entries`);
+  if (key === "bindings") return value;
+  return value.map((entry) => {
+    const row = asObject(entry, path, "a file entry");
+    const picked: Record<string, unknown> = {};
+    for (const k of ["rootAlias", "relativePath", "externalId", "providerFileId"]) {
+      if (k in row) picked[k] = row[k];
+    }
+    return picked;
+  });
 }
 
 /**
