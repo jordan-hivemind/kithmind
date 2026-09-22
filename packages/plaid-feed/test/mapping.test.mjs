@@ -13,6 +13,7 @@ import {
   itemKeychainService,
   mapAccount,
   mapBalanceSnapshot,
+  mapCurrency,
   mapHoldingSnapshot,
   mapInvestmentTransaction,
   mapRemovedTransactionId,
@@ -224,4 +225,31 @@ test("itemKeychainService namespaces the slug under the fixed Keychain prefix", 
     itemKeychainService("Morgan Stanley"),
     "com.kithmind.plaid.item.morgan-stanley",
   );
+});
+
+// PLAID-2: the first real pull hit an institution whose securities carried
+// a null iso_currency_code with an unofficial_currency_code (a crypto
+// ticker, or a code longer than three letters), which the old
+// `^[A-Z]{3}$` CHECK rejected outright. mapCurrency is the fallback that
+// feeds the relaxed migration-044 CHECK.
+test("mapCurrency prefers the ISO code when both are present", () => {
+  assert.equal(mapCurrency("USD", "XYZ"), "USD");
+});
+
+test("mapCurrency falls back to the unofficial code when there is no ISO one", () => {
+  assert.equal(mapCurrency(null, "BTC-USD"), "BTC-USD");
+});
+
+test("mapCurrency is null when neither code is present", () => {
+  assert.equal(mapCurrency(null, null), null);
+  assert.equal(mapCurrency(undefined, undefined), null);
+});
+
+test("mapCurrency uppercases a lowercase code", () => {
+  assert.equal(mapCurrency("usd", null), "USD");
+  assert.equal(mapCurrency(null, "eth"), "ETH");
+});
+
+test("mapCurrency passes through a code longer than three letters, trimmed", () => {
+  assert.equal(mapCurrency(null, "  DOGE1  "), "DOGE1");
 });

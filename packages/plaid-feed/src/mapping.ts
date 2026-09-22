@@ -94,6 +94,29 @@ export function todayIsoDate(now: Date = new Date()): string {
   return now.toISOString().slice(0, 10);
 }
 
+/**
+ * Plaid's ISO currency code when present, otherwise its unofficial one --
+ * a crypto ticker, or a code longer than three letters -- trimmed and
+ * uppercased, or `null` when neither is present. Migration
+ * 044_plaid_currency.sql relaxed every `currency` CHECK from an ISO-4217
+ * shape (`^[A-Z]{3}$`) to a bounded length specifically so this value is
+ * never rejected: the first real pull hit an institution whose securities
+ * carried a null `iso_currency_code` with an `unofficial_currency_code`,
+ * and the old regex aborted the whole item's pull partway through.
+ *
+ * Guarded with `typeof` rather than trusting the Plaid SDK's types, so an
+ * unexpected shape (not a string) degrades to `null` instead of throwing.
+ */
+export function mapCurrency(
+  isoCurrencyCode: string | null | undefined,
+  unofficialCurrencyCode: string | null | undefined,
+): string | null {
+  const code = isoCurrencyCode ?? unofficialCurrencyCode ?? null;
+  if (typeof code !== "string") return null;
+  const normalized = code.trim().toUpperCase();
+  return normalized.length > 0 ? normalized : null;
+}
+
 export function mapAccount(
   account: AccountBase | InvestmentAccount,
   itemId: string,
@@ -106,10 +129,10 @@ export function mapAccount(
     mask: account.mask,
     type: String(account.type),
     subtype: account.subtype === null ? null : String(account.subtype),
-    currency:
-      account.balances.iso_currency_code ??
-      account.balances.unofficial_currency_code ??
-      null,
+    currency: mapCurrency(
+      account.balances.iso_currency_code,
+      account.balances.unofficial_currency_code,
+    ),
   };
 }
 
@@ -123,10 +146,10 @@ export function mapBalanceSnapshot(
     current: account.balances.current,
     available: account.balances.available,
     limitAmount: account.balances.limit,
-    currency:
-      account.balances.iso_currency_code ??
-      account.balances.unofficial_currency_code ??
-      null,
+    currency: mapCurrency(
+      account.balances.iso_currency_code,
+      account.balances.unofficial_currency_code,
+    ),
     raw: account,
   };
 }
@@ -139,7 +162,7 @@ export function mapSecurity(security: Security): PlaidSecurityRow {
     type: security.type,
     closePrice: security.close_price,
     closePriceAsOf: security.close_price_as_of,
-    currency: security.iso_currency_code ?? security.unofficial_currency_code ?? null,
+    currency: mapCurrency(security.iso_currency_code, security.unofficial_currency_code),
   };
 }
 
@@ -155,7 +178,7 @@ export function mapHoldingSnapshot(
     price: holding.institution_price,
     value: holding.institution_value,
     costBasis: holding.cost_basis,
-    currency: holding.iso_currency_code ?? holding.unofficial_currency_code ?? null,
+    currency: mapCurrency(holding.iso_currency_code, holding.unofficial_currency_code),
     raw: holding,
   };
 }
@@ -173,10 +196,10 @@ export function mapTransaction(
     name: transaction.name,
     merchantName: transaction.merchant_name ?? null,
     amount: transaction.amount,
-    currency:
-      transaction.iso_currency_code ??
-      transaction.unofficial_currency_code ??
-      null,
+    currency: mapCurrency(
+      transaction.iso_currency_code,
+      transaction.unofficial_currency_code,
+    ),
     pending: transaction.pending,
     category: transaction.personal_finance_category?.primary ?? null,
     removedAt: null,
@@ -205,10 +228,10 @@ export function mapInvestmentTransaction(
     fees: transaction.fees,
     type: String(transaction.type),
     subtype: String(transaction.subtype),
-    currency:
-      transaction.iso_currency_code ??
-      transaction.unofficial_currency_code ??
-      null,
+    currency: mapCurrency(
+      transaction.iso_currency_code,
+      transaction.unofficial_currency_code,
+    ),
     raw: transaction,
   };
 }

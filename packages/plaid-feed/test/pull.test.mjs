@@ -8,12 +8,16 @@ import test from "node:test";
 
 import { pullItem } from "../dist/index.js";
 
-function fakePool() {
+function fakePool(shouldFail = () => false) {
   const calls = [];
   return {
     calls,
     async query(text, params) {
-      calls.push({ text: text.trim(), params });
+      const trimmed = text.trim();
+      calls.push({ text: trimmed, params });
+      if (shouldFail(trimmed, params)) {
+        throw new Error("simulated_row_failure");
+      }
       return { rows: [] };
     },
   };
@@ -321,4 +325,56 @@ test("an item with no product list on its Item still attempts investments (toler
   assert.equal(result.status, "ok");
   assert.equal(holdingsCalled, true, "an unknown product list is not treated as 'no investments'");
   assert.equal(result.holdings, 0);
+});
+
+// PLAID-2: the first real pull hit an institution with 23 accounts and
+// failed partway through on a single security's currency CHECK. A per-row
+// upsert failure for a security or a holding must be counted, not thrown,
+// so the rest of that item -- including transactions fetched afterward --
+// still gets written, while the item's exit is still non-zero overall.
+test("a security row upsert failure is counted, not thrown, and the rest of the item still writes", async () => {
+  const pool = fakePool((text) => text.startsWith("INSERT INTO kith.plaid_securities"));
+  const client = happyClient();
+
+  const result = await pullItem(client, pool, item, "access-token-1");
+  assert.equal(result.status, "ok");
+  // happyClient's security cache-refresh appears in both the holdings
+  // response and the investment-transactions response, so this one
+  // security fails its upsert twice -- once per call site -- both counted.
+  assert.equal(result.rowFailures, 2);
+  assert.equal(result.error, null);
+  // Balances (fetched before the failing security) and transactions
+  // (fetched after it) both still wrote.
+  assert.equal(result.balances, 1);
+  assert.equal(result.transactionsAdded, 1);
+  assert.equal(result.investmentTransactions, 1);
+
+  const success = pool.calls.find((call) =>
+    call.text.includes("SET last_pulled_at = transaction_timestamp(),\n            last_pull_error = NULL"),
+  );
+  assert.ok(success, "the item is still recorded as a success");
+});
+
+test("a holding row upsert failure is counted, not thrown, and the rest of the item still writes", async () => {
+  const pool = fakePool((text) => text.startsWith("INSERT INTO kith.plaid_holding_snapshots"));
+  const client = happyClient();
+
+  const result = await pullItem(client, pool, item, "access-token-1");
+  assert.equal(result.status, "ok");
+  assert.equal(result.rowFailures, 1);
+  assert.equal(result.holdings, 0, "the failed holding was not counted as written");
+  assert.equal(result.transactionsAdded, 1);
+  assert.equal(result.investmentTransactions, 1);
+});
+
+test("a row failure with no other error still makes the caller's process exit non-zero", async () => {
+  const pool = fakePool((text) => text.startsWith("INSERT INTO kith.plaid_securities"));
+  const client = happyClient();
+
+  const result = await pullItem(client, pool, item, "access-token-1");
+  // Mirrors pullAll's own anyFailed computation: status alone would say
+  // "ok", but rowFailures must still be visible to a caller deciding the
+  // exit code.
+  assert.equal(result.status, "ok");
+  assert.ok(result.rowFailures > 0);
 });
