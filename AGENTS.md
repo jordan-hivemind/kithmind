@@ -60,6 +60,12 @@ across mixed document types, queued work, legacy resume and deferred refresh.
 Do not substitute helper-only checks or unrelated suites for those transitions.
 Exercise newly queued selected items through publication, cleanup, next-item
 selection and restart. Publication alone does not prove scheduler acceptance.
+Before a finance repair, inspect both legacy unversioned scope proofs and the
+active generation's versioned proofs. They are immutable and require a new
+generation when corrected source evidence changes their payload or membership.
+Clean disposable proof containers in a `finally` block or shell trap. If an
+interrupted run leaves one behind, label it with the owner PID and mounts so
+the orchestrator can verify and remove only the orphaned container.
 
 ## Parallel lanes
 
@@ -77,6 +83,11 @@ cleanup. Every agent reads this section before starting.
 | Shared UI components have one owner at a time | `apps/web/src/components/ui/*` is shared by every screen. Only one open PR may change it. Keep changes backward compatible. |
 | Finish cleanly | Record verification under the policy below. Remove containers and your own scratch files. Tell the owner the PR is ready. The orchestrator removes your worktree and branch at merge. |
 | Do not read the owner's data | No document text, database values or files under the watched folders. Counts, enums and booleans only. Use synthetic fixtures. |
+
+For a stacked change, commit at least one unique task change before opening its
+draft PR. If the branch still equals its dependency, claim the work in the
+task or issue until the first diff exists; GitHub can mark a zero-diff stacked
+PR merged when the dependency lands.
 
 ### Waiting costs tokens
 

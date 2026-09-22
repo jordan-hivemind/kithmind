@@ -1206,6 +1206,13 @@ type AccountInventoryRow = AccountDescriptorRow & {
   activity_from: string | null;
   activity_to: string | null;
   latest_snapshot_as_of: string | null;
+  latest_observed_as_of: string | null;
+  observed_source_complete: boolean | null;
+  observed_fully_valued: boolean | null;
+  observed_supported_basis: boolean | null;
+  observed_open_review: boolean | null;
+  observed_reconciliation_failed: boolean | null;
+  observed_reconciliation_pending: boolean | null;
   open_review_count: string;
   balance_as_of: string | null;
   balance_value: string | null;
@@ -1257,6 +1264,7 @@ function exactPositionScope(
   document: string,
   account: string,
   asOf: string,
+  positionRelation = "positions",
 ): string {
   return `${observation}.account_id = ${account}
     AND ${observation}.as_of = ${asOf}
@@ -1270,13 +1278,13 @@ function exactPositionScope(
           = ${observation}.emitted_position_count
     AND NOT EXISTS (
       SELECT 1 FROM position_scope_memberships expected_member
-      LEFT JOIN positions represented_position
+      LEFT JOIN ${positionRelation} represented_position
         ON ${positionMatchesScopeMember("represented_position", "expected_member")}
        WHERE expected_member.scope_id = ${observation}.id
          AND represented_position.id IS NULL
     )
     AND NOT EXISTS (
-      SELECT 1 FROM positions current_position
+      SELECT 1 FROM ${positionRelation} current_position
        WHERE current_position.account_id = ${account}
          AND current_position.as_of = ${asOf}
          AND NOT EXISTS (
@@ -1299,114 +1307,137 @@ function documentHasExactPositionScope(
   )`;
 }
 
-/**
- * The durable facts that can disqualify one account/date from being called a
- * complete holdings snapshot. Keep these predicates in one place: inventory,
- * direct snapshot reads and holdings aggregates must not disagree about the
- * same stored state.
- *
- * A document can belong to an account directly, through a contributed
- * position, or through review attribution. The last form matters for
- * consolidated statements whose document-level account_id is null. Review
- * status deliberately does not affect partial-source attribution: resolving
- * a review does not make a parser produce rows it previously omitted.
- */
-function holdingsDatePredicates(account: string, asOf: string) {
-  const exactScope = documentHasExactPositionScope("pd", account, asOf);
-  const openReviewExactScope = documentHasExactPositionScope(
-    "open_d",
-    account,
-    asOf,
-  );
-  return {
-    partialSource: `EXISTS (
-      SELECT 1 FROM documents pd
-       WHERE pd.superseded_by IS NULL
-         AND (
-           (pd.account_id = ${account} AND pd.doc_date = ${asOf})
-           OR EXISTS (
-             SELECT 1 FROM positions partial_p
-              WHERE partial_p.source_document_id = pd.id
-                AND partial_p.account_id = ${account}
-                AND partial_p.as_of = ${asOf}
-           )
-           OR (pd.doc_date = ${asOf} AND EXISTS (
-             SELECT 1 FROM review_items partial_r
-             WHERE partial_r.source_document_id = pd.id
-                AND partial_r.account_id = ${account}
-           ))
-           OR EXISTS (
-             SELECT 1 FROM position_scope_observations attributed_scope
-              WHERE attributed_scope.source_document_id = pd.id
-                AND attributed_scope.account_id = ${account}
-                AND attributed_scope.as_of = ${asOf}
-           )
-         )
-         AND (
-           (pd.parsed_ok = FALSE AND NOT ${exactScope})
-           OR (
-             EXISTS (
-               SELECT 1 FROM position_scope_observations known_scope
-                WHERE known_scope.source_document_id = pd.id
-                  AND known_scope.account_id = ${account}
-                  AND known_scope.as_of = ${asOf}
-             )
-             AND NOT ${exactScope}
-           )
-         )
-    )`,
-    openReview: `EXISTS (
-      SELECT 1 FROM review_items open_r
-      JOIN documents open_d ON open_d.id = open_r.source_document_id
-       WHERE open_r.status = 'open'
-         AND open_d.superseded_by IS NULL
-         AND (open_r.account_id = ${account} OR open_r.account_id IS NULL)
-         AND (
-           open_d.doc_date = ${asOf}
-           OR EXISTS (
-             SELECT 1 FROM positions open_p
-              WHERE open_p.source_document_id = open_r.source_document_id
-                AND open_p.account_id = ${account}
-                AND open_p.as_of = ${asOf}
-           )
-           OR EXISTS (
-             SELECT 1 FROM position_scope_observations open_scope
-              WHERE open_scope.source_document_id = open_r.source_document_id
-                AND open_scope.account_id = ${account}
-                AND open_scope.as_of = ${asOf}
-           )
-         )
-         AND NOT (
-           open_r.kind = 'document_unparsed'
-           AND ${openReviewExactScope}
-         )
-    )`,
-    failedReconciliation: `EXISTS (
-      SELECT 1 FROM position_reconciliations failed_pr
-       WHERE failed_pr.account_id = ${account}
-         AND failed_pr.period_end = ${asOf}
-         AND failed_pr.status = 'fail'
-    )`,
-    pendingReconciliation: `EXISTS (
-      SELECT 1 FROM position_reconciliations pending_pr
-       WHERE pending_pr.account_id = ${account}
-         AND pending_pr.period_end = ${asOf}
-         AND pending_pr.status = 'unverified'
-    )`,
-  };
-}
-
 async function assessHoldingsDate(
   client: pg.ClientBase,
   accountId: string,
   asOf: string,
 ): Promise<HoldingsDateAssessment> {
-  const predicates = holdingsDatePredicates("$1", "$2::date");
+  const exactScope = exactPositionScope(
+    "exact_scope",
+    "exact_document",
+    "$1",
+    "$2::date",
+    "date_positions",
+  );
   const result = await client.query<HoldingsDateAssessment>(
-    `SELECT ${predicates.partialSource} AS partial_source,
-            ${predicates.openReview} AS open_review,
-            ${predicates.failedReconciliation} AS failed_reconciliation,
-            ${predicates.pendingReconciliation} AS pending_reconciliation,
+    `WITH date_positions AS MATERIALIZED (
+       SELECT p.* FROM positions p
+        WHERE p.account_id = $1 AND p.as_of = $2::date
+     ),
+     date_scopes AS MATERIALIZED (
+       SELECT observed.*
+         FROM position_scope_observations observed
+         JOIN documents observed_document
+           ON observed_document.id = observed.source_document_id
+        WHERE observed.account_id = $1
+          AND observed.as_of = $2::date
+          AND observed_document.superseded_by IS NULL
+     ),
+     exact_scope_documents AS MATERIALIZED (
+       SELECT DISTINCT exact_scope.source_document_id
+         FROM date_scopes exact_scope
+         JOIN documents exact_document
+           ON exact_document.id = exact_scope.source_document_id
+        WHERE exact_scope.status = 'complete'
+          AND cardinality(exact_scope.gap_codes) = 0
+          AND exact_scope.retained_sha256 = exact_document.retained_sha256
+          AND exact_scope.holding_projection_generation_id
+                IS NOT DISTINCT FROM
+                exact_document.active_holding_projection_generation_id
+          AND ${exactScope}
+     ),
+     partial_review_sources AS MATERIALIZED (
+       SELECT DISTINCT partial_r.source_document_id
+         FROM review_items partial_r
+         JOIN documents partial_d ON partial_d.id = partial_r.source_document_id
+        WHERE partial_r.account_id = $1
+          AND CASE
+                WHEN partial_r.projection_scope_kind = 'activity'
+                  THEN partial_d.doc_date
+                ELSE coalesce(
+                  partial_r.projection_scope_as_of,
+                  partial_d.doc_date
+                )
+              END = $2::date
+     ),
+     attributed_documents AS MATERIALIZED (
+       SELECT direct_d.id AS source_document_id
+         FROM documents direct_d
+        WHERE direct_d.account_id = $1 AND direct_d.doc_date = $2::date
+       UNION
+       SELECT date_p.source_document_id
+         FROM date_positions date_p
+        WHERE date_p.source_document_id IS NOT NULL
+       UNION
+       SELECT partial_r.source_document_id FROM partial_review_sources partial_r
+       UNION
+       SELECT date_scope.source_document_id FROM date_scopes date_scope
+     ),
+     open_reviews AS MATERIALIZED (
+       SELECT open_r.kind, open_r.source_document_id
+         FROM review_items open_r
+         JOIN documents open_d ON open_d.id = open_r.source_document_id
+        WHERE open_r.status = 'open'
+          AND open_d.superseded_by IS NULL
+          AND (open_r.account_id = $1 OR open_r.account_id IS NULL)
+          AND (
+            (open_r.projection_scope_kind <> 'activity'
+             AND open_r.projection_scope_as_of = $2::date)
+            OR (
+              (open_r.projection_scope_as_of IS NULL
+               OR open_r.projection_scope_kind = 'activity')
+              AND (
+                open_d.doc_date = $2::date
+                OR EXISTS (
+                  SELECT 1 FROM date_positions open_p
+                   WHERE open_p.source_document_id = open_r.source_document_id
+                )
+                OR EXISTS (
+                  SELECT 1 FROM date_scopes open_scope
+                   WHERE open_scope.source_document_id = open_r.source_document_id
+                )
+              )
+            )
+          )
+     )
+     SELECT EXISTS (
+              SELECT 1
+                FROM attributed_documents attributed
+                JOIN documents partial_d
+                  ON partial_d.id = attributed.source_document_id
+               WHERE partial_d.superseded_by IS NULL
+                 AND (
+                   partial_d.parsed_ok = FALSE
+                   OR EXISTS (
+                     SELECT 1 FROM date_scopes known_scope
+                      WHERE known_scope.source_document_id = partial_d.id
+                   )
+                 )
+                 AND NOT EXISTS (
+                   SELECT 1 FROM exact_scope_documents exact_d
+                    WHERE exact_d.source_document_id = partial_d.id
+                 )
+            ) AS partial_source,
+            EXISTS (
+              SELECT 1 FROM open_reviews open_r
+               WHERE open_r.kind <> 'document_unparsed'
+                  OR NOT EXISTS (
+                    SELECT 1 FROM exact_scope_documents exact_d
+                     WHERE exact_d.source_document_id = open_r.source_document_id
+                  )
+            ) AS open_review,
+            EXISTS (
+              SELECT 1 FROM position_reconciliations failed_pr
+               WHERE failed_pr.account_id = $1
+                 AND failed_pr.period_end = $2::date
+                 AND failed_pr.status = 'fail'
+            ) AS failed_reconciliation,
+            EXISTS (
+              SELECT 1 FROM position_reconciliations pending_pr
+               WHERE pending_pr.account_id = $1
+                 AND pending_pr.period_end = $2::date
+                 AND pending_pr.status = 'unverified'
+            ) AS pending_reconciliation,
             count(p.*)::text AS position_count,
             count(*) FILTER (WHERE p.market_value IS NULL)::text
               AS missing_market_value,
@@ -1416,8 +1447,7 @@ async function assessHoldingsDate(
               WHERE p.valuation_basis IS DISTINCT FROM 'market_price'
             )::text AS non_market_value,
             count(DISTINCT p.currency)::text AS currency_count
-       FROM positions p
-      WHERE p.account_id = $1 AND p.as_of = $2::date`,
+       FROM date_positions p`,
     [accountId, asOf],
   );
   return result.rows[0]!;
@@ -1610,14 +1640,16 @@ async function listAccountInventory(
         WHERE p.source_document_id IS NOT NULL
      ),
      inventory_review_sources AS MATERIALIZED (
-       SELECT r.account_id, r.source_document_id,
+       SELECT r.account_id, r.source_document_id, r.projection_scope_kind,
+              r.projection_scope_as_of,
               bool_or(r.status = 'open' AND r.kind <> 'document_unparsed')
                 AS has_blocking_open,
               bool_or(r.status = 'open' AND r.kind = 'document_unparsed')
                 AS has_unparsed_open
-         FROM review_items r
-        WHERE r.source_document_id IS NOT NULL
-        GROUP BY r.account_id, r.source_document_id
+        FROM review_items r
+       WHERE r.source_document_id IS NOT NULL
+        GROUP BY r.account_id, r.source_document_id, r.projection_scope_kind,
+                 r.projection_scope_as_of
      ),
      inventory_scope_verdicts AS MATERIALIZED (
        SELECT scope_observation.id, scope_observation.source_document_id,
@@ -1639,12 +1671,22 @@ async function listAccountInventory(
        SELECT partial_p.source_document_id, partial_p.account_id, partial_p.as_of
          FROM inventory_position_source_dates partial_p
        UNION
-       SELECT partial_r.source_document_id, partial_r.account_id, pd.doc_date
+       SELECT partial_r.source_document_id, partial_r.account_id,
+              CASE
+                WHEN partial_r.projection_scope_kind = 'activity'
+                  THEN pd.doc_date
+                ELSE coalesce(partial_r.projection_scope_as_of, pd.doc_date)
+              END
          FROM inventory_review_sources partial_r
          JOIN documents pd ON pd.id = partial_r.source_document_id
          JOIN inventory_accounts ia ON ia.account_id = partial_r.account_id
         WHERE partial_r.account_id IS NOT NULL
-          AND pd.superseded_by IS NULL AND pd.doc_date IS NOT NULL
+          AND pd.superseded_by IS NULL
+          AND CASE
+                WHEN partial_r.projection_scope_kind = 'activity'
+                  THEN pd.doc_date
+                ELSE coalesce(partial_r.projection_scope_as_of, pd.doc_date)
+              END IS NOT NULL
        UNION
        SELECT source_document_id, account_id, as_of
          FROM inventory_scope_verdicts
@@ -1674,9 +1716,12 @@ async function listAccountInventory(
        SELECT attributed.account_id, attributed.as_of
          FROM inventory_document_dates attributed
          JOIN inventory_review_sources open_r
-           ON open_r.source_document_id = attributed.source_document_id
+          ON open_r.source_document_id = attributed.source_document_id
           AND (open_r.account_id = attributed.account_id
                OR open_r.account_id IS NULL)
+          AND (open_r.projection_scope_as_of IS NULL
+               OR open_r.projection_scope_kind = 'activity'
+               OR open_r.projection_scope_as_of = attributed.as_of)
         WHERE open_r.has_blocking_open
            OR (
              open_r.has_unparsed_open
@@ -1731,6 +1776,47 @@ async function listAccountInventory(
                AND present.as_of = exact_scope.as_of
           )
         GROUP BY exact_scope.account_id, exact_scope.as_of
+     ),
+     inventory_diagnostic_position_dates AS (
+       SELECT account_id, as_of, missing, unsupported_snapshot_basis
+         FROM inventory_observed_position_dates
+       UNION ALL
+       -- A partial current-generation scope can describe a statement date
+       -- without having emitted any usable row. Unknown valuation is NULL,
+       -- never a fabricated zero position or a financial observation.
+       SELECT s.account_id, s.as_of, NULL::bigint, NULL::bigint
+         FROM inventory_scope_verdicts s
+         JOIN position_scope_observations observation ON observation.id = s.id
+         JOIN documents current_document ON current_document.id = s.source_document_id
+        WHERE observation.retained_sha256 = current_document.retained_sha256
+          AND observation.holding_projection_generation_id
+                IS NOT DISTINCT FROM current_document.active_holding_projection_generation_id
+          AND NOT EXISTS (
+          SELECT 1 FROM inventory_observed_position_dates p
+           WHERE p.account_id = s.account_id AND p.as_of = s.as_of
+        )
+        GROUP BY s.account_id, s.as_of
+     ),
+     -- Diagnostic metadata includes the latest actual observation even when
+     -- it fails financial eligibility. The eligible date and value below
+     -- retain every existing gate independently.
+     inventory_latest_observation AS (
+       SELECT DISTINCT ON (p.account_id)
+              p.account_id, p.as_of,
+              partial.account_id IS NULL AS source_complete,
+              p.missing = 0 AS fully_valued,
+              p.unsupported_snapshot_basis = 0 AS supported_basis,
+              open_review.account_id IS NOT NULL AS open_review,
+              coalesce(reconciliation.failed, FALSE) AS reconciliation_failed,
+              coalesce(reconciliation.pending, FALSE) AS reconciliation_pending
+         FROM inventory_diagnostic_position_dates p
+         LEFT JOIN inventory_partial_source_dates partial
+           ON partial.account_id = p.account_id AND partial.as_of = p.as_of
+         LEFT JOIN inventory_open_review_dates open_review
+           ON open_review.account_id = p.account_id AND open_review.as_of = p.as_of
+         LEFT JOIN inventory_reconciliation_dates reconciliation
+           ON reconciliation.account_id = p.account_id AND reconciliation.as_of = p.as_of
+        ORDER BY p.account_id, p.as_of DESC
      ),
      inventory_latest_holdings AS (
        SELECT DISTINCT ON (p.account_id)
@@ -1788,6 +1874,13 @@ async function listAccountInventory(
               (SELECT max(b.as_of) FROM balances b WHERE b.account_id = d.account_id)
             )::text AS activity_to,
             hs.as_of::text AS latest_snapshot_as_of,
+            observed.as_of::text AS latest_observed_as_of,
+            observed.source_complete AS observed_source_complete,
+            observed.fully_valued AS observed_fully_valued,
+            observed.supported_basis AS observed_supported_basis,
+            observed.open_review AS observed_open_review,
+            observed.reconciliation_failed AS observed_reconciliation_failed,
+            observed.reconciliation_pending AS observed_reconciliation_pending,
             coalesce(review_counts.open_review_count, '0') AS open_review_count,
             lb.as_of::text AS balance_as_of,
             lb.total_value::text AS balance_value,
@@ -1834,6 +1927,7 @@ async function listAccountInventory(
        -- above. This join selects the latest eligible summary without running
        -- source-attribution subqueries once per historical position date.
        LEFT JOIN inventory_latest_holdings hs ON hs.account_id = d.account_id
+       LEFT JOIN inventory_latest_observation observed ON observed.account_id = d.account_id
       ORDER BY d.account_id
       `,
     [cursorKey?.[0] ?? null, request.limit + 1],
@@ -1855,6 +1949,23 @@ async function listAccountInventory(
         : {}),
       ...(row.latest_snapshot_as_of !== null
         ? { latestSnapshotAsOf: row.latest_snapshot_as_of }
+        : {}),
+      ...(row.latest_observed_as_of != null
+        ? {
+            latestHoldingsObservation: {
+              asOf: row.latest_observed_as_of,
+              sourceComplete: row.observed_source_complete === true,
+              fullyValued: row.observed_fully_valued === true,
+              supportedValuationBasis: row.observed_supported_basis === true,
+              hasBlockingReview: row.observed_open_review !== false,
+              reconciliation:
+                row.observed_reconciliation_failed === true
+                  ? ("failed" as const)
+                  : row.observed_reconciliation_pending === true
+                    ? ("pending" as const)
+                    : ("no_issue_recorded" as const),
+            },
+          }
         : {}),
       // FIN-FRESHNESS-1: the dates of balance rows that exist, never a
       // cadence or an expected date. The consumer infers cadence from them.
@@ -2256,23 +2367,24 @@ async function selectKnownHoldingsDate(
          FROM documents d
         WHERE d.doc_date IS NOT NULL
           AND d.superseded_by IS NULL
-          AND (
-            d.account_id = $1
-            OR EXISTS (
-              SELECT 1 FROM review_items attributed_r
-               WHERE attributed_r.source_document_id = d.id
-                 AND attributed_r.account_id = $1
-            )
-          )
-          AND (
-            d.parsed_ok = FALSE
-            OR EXISTS (
-              SELECT 1 FROM review_items open_r
-               WHERE open_r.source_document_id = d.id
-                 AND open_r.account_id = $1
-                 AND open_r.status = 'open'
-            )
-          )
+          AND d.account_id = $1
+          AND d.parsed_ok = FALSE
+       UNION
+       SELECT CASE
+                WHEN attributed_r.projection_scope_kind = 'activity'
+                  THEN d.doc_date
+                ELSE coalesce(attributed_r.projection_scope_as_of, d.doc_date)
+              END
+         FROM review_items attributed_r
+         JOIN documents d ON d.id = attributed_r.source_document_id
+        WHERE attributed_r.account_id = $1
+          AND d.superseded_by IS NULL
+          AND CASE
+                WHEN attributed_r.projection_scope_kind = 'activity'
+                  THEN d.doc_date
+                ELSE coalesce(attributed_r.projection_scope_as_of, d.doc_date)
+              END IS NOT NULL
+          AND (d.parsed_ok = FALSE OR attributed_r.status = 'open')
        UNION
        SELECT pr.period_end AS as_of
          FROM position_reconciliations pr
@@ -2782,11 +2894,20 @@ async function holdingsAggregateEligibility(
             )
           )
        UNION
-       SELECT attributed_r.account_id, d.doc_date
+       SELECT attributed_r.account_id,
+              CASE
+                WHEN attributed_r.projection_scope_kind = 'activity'
+                  THEN d.doc_date
+                ELSE coalesce(attributed_r.projection_scope_as_of, d.doc_date)
+              END
          FROM review_items attributed_r
          JOIN documents d ON d.id = attributed_r.source_document_id
         WHERE attributed_r.account_id IS NOT NULL
-          AND d.doc_date IS NOT NULL
+          AND CASE
+                WHEN attributed_r.projection_scope_kind = 'activity'
+                  THEN d.doc_date
+                ELSE coalesce(attributed_r.projection_scope_as_of, d.doc_date)
+              END IS NOT NULL
           AND d.superseded_by IS NULL
           AND (d.parsed_ok = FALSE OR attributed_r.status = 'open')
        UNION
@@ -3519,9 +3640,13 @@ async function coverageRecords(
   const reviews = await client.query<ReviewRow>(
     `SELECT i.id AS source_id,
             count(*)::text AS open,
-            min(d.doc_date)::text AS first_date,
-            max(d.doc_date)::text AS last_date,
-            count(*) FILTER (WHERE d.doc_date IS NULL)::text AS undated
+            min(coalesce(ri.projection_scope_as_of, d.doc_date))::text
+              AS first_date,
+            max(coalesce(ri.projection_scope_as_of, d.doc_date))::text
+              AS last_date,
+            count(*) FILTER (
+              WHERE coalesce(ri.projection_scope_as_of, d.doc_date) IS NULL
+            )::text AS undated
        FROM review_items ri
        JOIN accounts a ON a.id = ri.account_id
        JOIN institutions i ON i.id = a.institution_id

@@ -1190,6 +1190,120 @@ test(
 );
 
 test(
+  "a scoped projection review blocks only its exact account and date while generic reviews stay broad",
+  { skip },
+  async (t) => {
+    const { owner, reader: r } = await fixture(t);
+    const source = await institution(owner, "scoped-review-source", {
+      accounts: 2,
+    });
+    const [unaffectedAccount, affectedAccount] = source.accountIds;
+    const sourceDoc = await document(
+      owner,
+      source.id,
+      unaffectedAccount,
+      "2026-03-31",
+    );
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, quantity, market_value, cost_basis, currency,
+          valuation_basis, source_document_id)
+       VALUES
+         ('scoped-review-unaffected', $1, DATE '2026-03-31', 1, 100, 90,
+          'USD', 'market_price', $3),
+         ('scoped-review-affected', $2, DATE '2026-02-28', 1, 200, 180,
+          'USD', 'market_price', $3)`,
+      [unaffectedAccount, affectedAccount, sourceDoc],
+    );
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status,
+          projection_scope_kind, projection_scope_as_of)
+       VALUES ('scoped-review', 'reparse_projection_mismatch', $1, $2,
+               'positions', 'synthetic system mismatch', 'open',
+               'positions', DATE '2026-02-28')`,
+      [affectedAccount, sourceDoc],
+    );
+
+    const inventory = async () =>
+      (await serve(r, { operation: "list_account_inventory", limit: 100 }))
+        .items;
+    let items = await inventory();
+    const unaffected = items.find(
+      (item) => item.account.accountId === unaffectedAccount,
+    );
+    const affected = items.find(
+      (item) => item.account.accountId === affectedAccount,
+    );
+    assert.equal(unaffected.latestSnapshotAsOf, "2026-03-31");
+    assert.equal(unaffected.currentValue.value.decimal, "100");
+    assert.equal(unaffected.openReviewCount, 0);
+    assert.equal(affected.latestSnapshotAsOf, undefined);
+    assert.equal(affected.currentValue, undefined);
+    assert.equal(affected.openReviewCount, 1);
+
+    const unaffectedAggregate = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      accountId: unaffectedAccount,
+    });
+    assert.equal(unaffectedAggregate.items[0].total.decimal, "100");
+    assert.equal(
+      unaffectedAggregate.coverage.reasons.includes("failed_import"),
+      false,
+    );
+    const affectedAggregate = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      accountId: affectedAccount,
+    });
+    assert.deepEqual(affectedAggregate.items, []);
+    assert.ok(affectedAggregate.coverage.reasons.includes("failed_import"));
+
+    // Activity process dates are retained in their typed review identity for
+    // audit, but they are not holdings valuation dates. The activity review
+    // still blocks the source document conservatively at its real holdings
+    // date instead of manufacturing a later empty snapshot.
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status,
+          projection_scope_kind, projection_scope_as_of)
+       VALUES ('activity-scope', 'reparse_activity_projection_mismatch', $1,
+               $2, 'activity', 'synthetic activity mismatch', 'open',
+               'activity', DATE '2026-04-30')`,
+      [unaffectedAccount, sourceDoc],
+    );
+    const activityBlockedSnapshot = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId: unaffectedAccount,
+      snapshot: { mode: "latest" },
+    });
+    assert.equal(activityBlockedSnapshot.selectedSnapshot.asOf, "2026-03-31");
+    assert.equal(activityBlockedSnapshot.summary.reason, "incomplete_source");
+    await owner.query("DELETE FROM review_items WHERE id = 'activity-scope'");
+
+    // A legacy or human-authored generic row has no typed scope and therefore
+    // retains the old source-document attribution behavior.
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES ('generic-review', 'reparse_projection_mismatch', $1, $2,
+               'legacy', 'human-authored broad review', 'open')`,
+      [unaffectedAccount, sourceDoc],
+    );
+    items = await inventory();
+    const newlyBlocked = items.find(
+      (item) => item.account.accountId === unaffectedAccount,
+    );
+    assert.equal(newlyBlocked.latestSnapshotAsOf, undefined);
+    assert.equal(newlyBlocked.currentValue, undefined);
+    assert.equal(newlyBlocked.openReviewCount, 1);
+  },
+);
+
+test(
   "exact account scopes admit only their full semantic snapshot and preserve ordinary review gates",
   { skip },
   async (t) => {
@@ -1356,6 +1470,25 @@ test(
     assert.equal(
       completeAggregate.coverage.reasons.includes("failed_import"),
       false,
+    );
+
+    // A genuinely un-attributable system mismatch uses a null account and
+    // stays document-wide. Even this exact complete account scope cannot
+    // reinterpret that unknown liability as belonging only to the document's
+    // nominal account.
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES ('scope-broad-projection-mismatch',
+               'reparse_projection_mismatch', NULL, $1, 'holdings',
+               'synthetic un-attributable liability mismatch', 'open')`,
+      [consolidatedDoc],
+    );
+    complete = await snapshot(completeAccount);
+    assert.equal(complete.summary.status, "unavailable");
+    assert.equal(complete.summary.reason, "incomplete_source");
+    await owner.query(
+      "DELETE FROM review_items WHERE id = 'scope-broad-projection-mismatch'",
     );
 
     const partial = await snapshot(partialAccount);
@@ -1588,6 +1721,14 @@ test(
       (item) => item.account.accountId === accountId,
     );
     assert.equal(inventoryRow.latestSnapshotAsOf, asOf);
+    assert.deepEqual(inventoryRow.latestHoldingsObservation, {
+      asOf,
+      sourceComplete: true,
+      fullyValued: true,
+      supportedValuationBasis: true,
+      hasBlockingReview: false,
+      reconciliation: "no_issue_recorded",
+    });
     assert.equal(inventoryRow.currentValue, undefined);
     assert.equal(inventoryRow.activityFrom, "2026-07-31");
     assert.equal(inventoryRow.activityTo, "2026-07-31");
@@ -1602,6 +1743,60 @@ test(
     });
     assert.deepEqual(aggregate.items, []);
     assert.equal(aggregate.coverage.reasons.includes("failed_import"), false);
+    // A separate source with only a partial zero-row proof must expose its
+    // observed date without inventing a snapshot or valuation.
+    const partialSource = await institution(owner, "zero-row-partial");
+    const partialAccount = partialSource.accountIds[0];
+    const partialDoc = await document(
+      owner,
+      partialSource.id,
+      partialAccount,
+      asOf,
+    );
+    await makeDocumentCitable(owner, partialDoc);
+    await owner.query("UPDATE documents SET parsed_ok = FALSE WHERE id = $1", [
+      partialDoc,
+    ]);
+    const partialRetained = (
+      await one(owner, "SELECT retained_sha256 FROM documents WHERE id = $1", [
+        partialDoc,
+      ])
+    ).retained_sha256;
+    await owner.query(
+      `INSERT INTO position_scope_observations
+      (id, source_document_id, retained_sha256, account_id, as_of, proof_version,
+       status, emitted_position_count, gap_codes, evidence, created_at)
+      VALUES ('zero-row-partial-scope', $1, $2, $3, $4::date, 'position_scope_v1',
+        'partial', 0, ARRAY['unresolved_lots'], '{"tables":[]}', now())`,
+      [partialDoc, partialRetained, partialAccount, asOf],
+    );
+    const partialInventory = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 100,
+    });
+    const partialRow = partialInventory.items.find(
+      (item) => item.account.accountId === partialAccount,
+    );
+    assert.equal(partialRow.recordCount, 0);
+    assert.equal(partialRow.latestSnapshotAsOf, undefined);
+    assert.equal(partialRow.currentValue, undefined);
+    assert.equal(partialRow.latestHoldingsObservation.asOf, asOf);
+    assert.equal(partialRow.latestHoldingsObservation.sourceComplete, false);
+    assert.equal(partialRow.latestHoldingsObservation.fullyValued, false);
+    await owner.query(
+      "UPDATE documents SET retained_sha256 = $2 WHERE id = $1",
+      [partialDoc, "a".repeat(64)],
+    );
+    const mismatched = await serve(r, {
+      operation: "list_account_inventory",
+      limit: 100,
+    });
+    assert.equal(
+      mismatched.items.find((item) => item.account.accountId === partialAccount)
+        .latestHoldingsObservation,
+      undefined,
+      "a partial proof from different retained bytes is not a current observation",
+    );
   },
 );
 
@@ -1638,6 +1833,8 @@ test(
     assert.equal(inventoryRow.latestSnapshotAsOf, undefined);
     assert.equal(inventoryRow.currentValue, undefined);
 
+    assert.equal(inventoryRow.latestHoldingsObservation.asOf, "2026-06-30");
+    assert.equal(inventoryRow.latestHoldingsObservation.fullyValued, false);
     let snapshot = await serve(r, {
       operation: "get_holdings_snapshot",
       accountId,
@@ -1998,7 +2195,7 @@ test(
       ]);
       assert.deepEqual(client.getServerVersion(), {
         name: "kith-finance-archive",
-        version: "2.0.4",
+        version: "2.1.1",
       });
       const tools = await client.listTools();
       const financeRead = tools.tools.find(
@@ -4068,6 +4265,14 @@ test(
       source: "positions",
     });
     assert.equal(row.openReviewCount, 0);
+    assert.deepEqual(row.latestHoldingsObservation, {
+      asOf: "2026-04-30",
+      sourceComplete: false,
+      fullyValued: true,
+      supportedValuationBasis: true,
+      hasBlockingReview: false,
+      reconciliation: "no_issue_recorded",
+    });
 
     await owner.query(
       "UPDATE review_items SET status = 'dismissed' WHERE id = 'snapshot-review-latest'",
@@ -4145,6 +4350,21 @@ test(
       source: "positions",
     });
 
+    assert.deepEqual(row.latestHoldingsObservation, {
+      asOf: "2026-04-30",
+      sourceComplete: true,
+      fullyValued: true,
+      supportedValuationBasis: true,
+      hasBlockingReview: false,
+      reconciliation: "pending",
+    });
+    await owner.query(
+      "UPDATE position_reconciliations SET status = 'fail' WHERE id = 'snapshot-gate-unverified'",
+    );
+    row = await inventory();
+    assert.equal(row.latestHoldingsObservation.reconciliation, "failed");
+    assert.equal(row.latestSnapshotAsOf, "2026-03-31");
+    assert.equal(row.currentValue.asOf, "2026-03-31");
     await owner.query(
       "UPDATE position_reconciliations SET status = 'pass' WHERE id = 'snapshot-gate-unverified'",
     );

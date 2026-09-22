@@ -282,6 +282,14 @@ balance record and evidence. Reconciliation uses the explicit formula
 with canonical decimal arithmetic. Missing or ambiguous totals and incomplete
 position coverage cannot produce a final reconciliation.
 
+The account/date safety assessment materializes the selected positions,
+attributed source documents, current exact-scope verdicts and relevant reviews
+once per read. Historical immutable scope generations remain auditable but are
+filtered before exact membership comparison. This query shape is required to
+stay within the reader's existing five-second statement limit; it does not
+raise that limit or weaken source completeness, open-review, value or
+reconciliation gates.
+
 All continuations are stateless HMAC-SHA256 tokens using a stable deployment
 secret of at least 32 bytes. The signed binding covers the authenticated
 principal, space, operation, normalized request and limit, dataset revision,
@@ -368,6 +376,11 @@ Compatibility rules for existing clients:
   `resolvedInstrumentCount` for a client that only wants "identities I can
   use".
 
+Known follow-up: the snapshot serializer currently labels any linked
+instrument `resolved`, including a name-only instrument. The contract reserves
+that state for CUSIP or ISIN evidence. Correct that identity classification in
+a separate change; do not treat a name-only link as identifier proof.
+
 The rule's evidence is `instrument_identifier_sources`: one row per
 (instrument, institution) whose parsed descriptor stated a cusip or isin. An
 instrument no institution is on record for is refused, so an archive migrated
@@ -426,6 +439,24 @@ design. The supported repair is to prepare, review and publish a new scoped or
 whole-document generation bound to the retained bytes and exact prior state.
 Operators do not loop ordinary reparses to try to mutate an active proof.
 
+### Account/date attribution for reparse mismatches
+
+Migration 17 records the actual account, date and projection kind affected by
+a system-generated holding or activity projection mismatch. A scoped holding
+mismatch blocks only that account/date in finance reads. An activity mismatch
+is account scoped and retains its process date for audit, but holdings readers
+continue to attribute it through the source document's actual holdings dates.
+They do not treat the activity process date as a holdings valuation date.
+
+Attribution is fail closed. A mismatch stays document-wide when any contributing
+stored row, candidate row or conflicting foreign row lacks a valid account/date,
+or when the mismatch cannot be tied to rows at all. Existing unscoped reviews
+also remain document-wide. A reparse may supersede an open generic row only when
+its exact reason proves the importer created it and every mismatch is attributed;
+dismissed rows, manually resolved rows and unknown legacy reasons retain their
+history and behavior. The scoped review rows carry independent identities so a
+later reparse can resolve or reopen one account/date without rewriting another.
+
 The generated note `Market Value|NAV column of the <SECTION> holdings table`
 records two different things. The column label states the valuation basis; the
 section label records where that source printed the row. Exact scope comparison
@@ -435,3 +466,71 @@ dated-lot suffix, as well as equal quantity, price, value, cost, unrealized,
 currency, row hash, account and date. Literal notes, nulls and disclaimers stay
 exact. Each source's original note and locator remain immutable evidence; no
 canonical row is rewritten or rehomed.
+
+### Additions from a partial source proof
+
+Migration 18 adds a separate positions-only publication contract for a source
+that proves new rows while its account/date scope remains partial. It does not
+reuse the whole-document or complete-scope attestations. The candidate names
+explicit partial scopes and explicit row hashes, binds the retained SHA and
+current generation, and audits the old and composed projection digests. Its
+manifest fixes changed and removed row counts at zero. Approval attests only to
+the selected source additions.
+
+Publication carries every prior assertion ID, digest, locator and semantic
+value into the next full generation. It appends selected source-owned positions
+and does not replace current rows. An exact canonical row owned by another
+document remains that document's row and may appear only as a semantically
+equal membership reference. A selected row that already exists, has an
+unreadable typed value, or collides with an existing source-owned evidence
+boundary is refused.
+
+A selected row with no market value is eligible only when both its printed
+price and market-value cells bind exact, nonempty source tokens from the closed
+no-value grammar. A parser-failure note or an unbound blank does not qualify.
+
+The new generation records each selected observation with its actual `partial`
+status, gap codes, evidence and complete emitted membership. Unselected parser
+differences remain partial membership evidence and cannot rewrite a reviewed
+assertion. Nonselected scope proofs carry forward unchanged. For a document
+without an active generation, the publisher first records the current rows as
+an immutable baseline, then moves legacy unversioned proofs into the published
+generation without updating or deleting their history. It leaves `parsed_ok`
+and review status unchanged, so holdings freshness and aggregation continue to
+fail closed.
+
+The existing operator commands accept an additive selection file through
+`--scope-selection`:
+
+```json
+{
+  "kind": "holding_additive_position_selection_v1",
+  "scopes": [
+    {
+      "scopeKind": "positions",
+      "accountId": "synthetic-account",
+      "asOf": "2026-06-30",
+      "proofVersion": "position_scope_v1"
+    }
+  ],
+  "selectedRowHashes": [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ]
+}
+```
+
+Candidate preparation runs under the archive writer lock and rolls back all
+adapter mapping writes. Publication rebuilds the candidate from the same
+retained bytes and uses the ordinary writer lock, document row lock, active
+generation compare-and-swap and one database transaction. A stale approval,
+changed retained bytes, canonical ownership change, selected evidence conflict
+or assertion mismatch leaves the archive unchanged.
+
+The package exports `prepareHoldingPartialPositionScopes` for the preceding
+rollback-only inspection step. An operator diagnostic uses `withArchiveTransaction`
+for the outer transaction, takes the writer lock, and runs retained parsing and
+mapping inside its savepoint. Do not substitute a raw SQL `BEGIN`: nested archive
+helpers must share the transaction registry to avoid an inner commit. Throw a
+private rollback sentinel after recording the diagnostic result. Call the helper for the
+chosen account/date scopes, and uses its row hashes to prepare the selection
+file. The helper makes no write and does not turn a partial scope complete.

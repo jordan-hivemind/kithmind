@@ -10,13 +10,14 @@ import {
   type HoldingProjectionTable,
   holdingProjectionCurrentDigest,
   prepareHoldingBalanceScopes,
+  prepareHoldingPartialPositionScopes,
   prepareHoldingPositionScopes,
   prepareHoldingCorrectionCandidate,
   readStoredHoldingProjection,
   type StoredHoldingProjection,
   type StoredHoldingRow,
 } from "./holdingCorrectionCandidate.js";
-import type { ImportDocument } from "./importer.js";
+import type { ImportDocument, ImportPosition } from "./importer.js";
 import type { PositionChange } from "./positionReconciliation.js";
 import { runPositionReconciliationGate } from "./positionReconciliation.js";
 import { toNumericText } from "./pgNumeric.js";
@@ -172,6 +173,78 @@ export function holdingScopedProjectionApprovalDigest(
   return digest("kith-finance-holding-scoped-approval:v1", approval);
 }
 
+export type HoldingAdditivePositionSelection = HoldingPositionScopeSelector & {
+  readonly scopeKind: "positions";
+};
+
+export type HoldingAdditiveCorrectionManifest = {
+  readonly schemaVersion: 1;
+  readonly kind: "holding_additive_correction_candidate_v1";
+  readonly documentId: string;
+  readonly retainedSha256: string;
+  readonly expectedActiveGenerationId: string | null;
+  readonly oldProjectionDigest: string;
+  readonly candidateProjectionDigest: string;
+  readonly selectedCurrentDigest: string;
+  readonly selectedRowsDigest: string;
+  readonly selectedRowCount: number;
+  readonly selectedScopes: readonly {
+    readonly scopeKind: "positions";
+    readonly accountId: string;
+    readonly asOf: string;
+    readonly proofVersion: "position_scope_v1";
+    readonly status: "partial";
+    readonly emittedRowCount: number;
+    readonly gapCodes: readonly string[];
+    readonly scopeDigest: string;
+    readonly sourceOwnedAdditions: number;
+    readonly carriedSourceOwnedRows: number;
+    readonly exactForeignReferences: number;
+    readonly unmatchedPartialMembers: number;
+  }[];
+  readonly rows: {
+    readonly oldSourceOwnedRows: number;
+    readonly candidateSourceOwnedRows: number;
+    readonly sourceOwnedAdditions: number;
+    readonly changedRows: 0;
+    readonly removedRows: 0;
+  };
+  readonly completeness: {
+    readonly state: "partial_source_additions";
+    readonly changesAuthorized: false;
+    readonly removalsAuthorized: false;
+  };
+  readonly candidateDigest: string;
+};
+
+export type HoldingAdditiveProjectionApproval = {
+  readonly schemaVersion: 1;
+  readonly kind: "holding_additive_projection_approval_v1";
+  readonly documentId: string;
+  readonly retainedSha256: string;
+  readonly expectedActiveGenerationId: string | null;
+  readonly oldProjectionDigest: string;
+  readonly candidateProjectionDigest: string;
+  readonly selectedCurrentDigest: string;
+  readonly selectedRowsDigest: string;
+  readonly selectedScopes: readonly HoldingAdditivePositionSelection[];
+  readonly selectedRowHashes: readonly string[];
+  readonly candidateDigest: string;
+  readonly completenessAttestation: "operator_verified_source_additions_only";
+  readonly authorizeSourceOwnedAdditions: true;
+  readonly authorizeChanges: false;
+  readonly authorizeRemovals: false;
+  readonly approvedBy: string;
+  readonly approvedAt: string;
+  readonly approvalDigest: string;
+};
+
+export function holdingAdditiveProjectionApprovalDigest(
+  approval: Omit<HoldingAdditiveProjectionApproval, "approvalDigest">,
+): string {
+  return digest("kith-finance-holding-additive-approval:v1", approval);
+}
+
 type Assertion = {
   readonly kind: AssertionKind;
   readonly recordId: string;
@@ -210,6 +283,14 @@ export type PreparedScopedCorrection = {
   readonly sourceOwnedBalances: readonly CandidateHoldingRow[];
   readonly foreignReferencedPositionHashes: ReadonlySet<string>;
   readonly foreignReferencedBalanceHashes: ReadonlySet<string>;
+};
+
+export type PreparedAdditiveCorrection = {
+  readonly manifest: HoldingAdditiveCorrectionManifest;
+  readonly selectedPositionScopes: ReturnType<
+    typeof prepareHoldingPartialPositionScopes
+  >;
+  readonly sourceOwnedAdditions: readonly CandidateHoldingRow[];
 };
 
 function canonical(value: unknown): string {
@@ -892,6 +973,304 @@ export async function prepareHoldingScopedPositionCorrection(input: {
   };
 }
 
+function additiveCandidateProjectionDigest(input: {
+  readonly stored: StoredHoldingProjection;
+  readonly additions: readonly CandidateHoldingRow[];
+}): string {
+  return digest("kith-finance-holding-additive-position-projection:v1", {
+    carried: TABLES.map((table) => [
+      table,
+      [...input.stored[table]]
+        .sort((left, right) => left.id.localeCompare(right.id))
+        .map((row) => [row.id, row.rowHash, row.sourceLocator, row.semantic]),
+    ]),
+    additions: [...input.additions]
+      .sort((left, right) => left.rowHash.localeCompare(right.rowHash))
+      .map((row) => [row.rowHash, row.sourceLocator, row.semantic]),
+  });
+}
+
+function selectedRawPosition(
+  candidate: ImportDocument,
+  scope: HoldingPositionScopeSelector,
+  prepared: CandidateHoldingRow,
+): ImportPosition {
+  const matches = (candidate.positions ?? []).filter(
+    (row) =>
+      (row.accountId ?? candidate.accountId) === scope.accountId &&
+      row.asOf === scope.asOf &&
+      row.sourceLocator === prepared.sourceLocator,
+  );
+  if (matches.length !== 1) {
+    refuse("a selected addition does not have one exact source row");
+  }
+  const row = matches[0]!;
+  const semantic = prepared.semantic;
+  const nullableNumericPairs = [
+    [row.quantity, semantic[3]],
+    [row.price, semantic[4]],
+    [row.costBasis, semantic[6]],
+    [row.unrealized, semantic[7]],
+  ] as const;
+  if (
+    nullableNumericPairs.some(
+      ([raw, normalized]) => raw !== null && normalized === null,
+    ) ||
+    (row.marketValueText !== null && semantic[5] === null) ||
+    (row.valuationBasis !== null && semantic[9] === null)
+  ) {
+    refuse("a selected addition contains an unreadable typed value");
+  }
+  if (
+    semantic[5] === null &&
+    (row.marketValueText !== null ||
+      row.marketValueNote === null ||
+      row.marketValueNote.length === 0 ||
+      typeof row.valuationNote !== "string" ||
+      row.valuationNote.length === 0 ||
+      !hasExplicitUnavailableValueEvidence(row))
+  ) {
+    refuse(
+      "a selected addition with no market value lacks source-stated evidence",
+    );
+  }
+  return row;
+}
+
+const EXPLICIT_NO_VALUE_TOKENS = new Set(["—", "–", "-", "N/A", "NA"]);
+
+function boundRawValue(locator: unknown): string | null {
+  if (locator === null || typeof locator !== "object") return null;
+  const binding = (locator as { binding?: unknown }).binding;
+  if (binding === null || typeof binding !== "object") return null;
+  const typed = binding as {
+    format?: unknown;
+    quote?: unknown;
+    rawValue?: unknown;
+  };
+  if (
+    typed.format === "retained_text_span_v1" &&
+    typeof typed.quote === "string"
+  ) {
+    return typed.quote;
+  }
+  if (
+    (typed.format === "json_pointer_v1" ||
+      typed.format === "delimited_row_v1") &&
+    typeof typed.rawValue === "string"
+  ) {
+    return typed.rawValue;
+  }
+  return null;
+}
+
+function hasExplicitUnavailableValueEvidence(row: ImportPosition): boolean {
+  if (row.price !== null) return false;
+  let locators: unknown;
+  try {
+    locators = JSON.parse(row.sourceLocator) as unknown;
+  } catch {
+    return false;
+  }
+  if (locators === null || typeof locators !== "object") return false;
+  const fields = locators as Record<string, unknown>;
+  const priceToken = boundRawValue(fields.price);
+  const marketValueToken = boundRawValue(fields.marketValue);
+  if (
+    priceToken === null ||
+    marketValueToken === null ||
+    !EXPLICIT_NO_VALUE_TOKENS.has(priceToken.trim()) ||
+    !EXPLICIT_NO_VALUE_TOKENS.has(marketValueToken.trim())
+  ) {
+    return false;
+  }
+  return (
+    row.marketValueNote ===
+    `no value stated (${JSON.stringify(marketValueToken.trim())})`
+  );
+}
+
+/**
+ * Prepares an additions-only generation from explicit rows inside truthful
+ * partial source scopes. Parser drift outside the selected rows remains
+ * visible in those partial memberships but cannot replace an active assertion.
+ */
+export async function prepareHoldingAdditivePositionCorrection(input: {
+  readonly client: ArchiveClient;
+  readonly documentId: string;
+  readonly retainedSha256: string;
+  readonly expectedActiveGenerationId: string | null;
+  readonly stored: StoredHoldingProjection;
+  readonly candidate: ImportDocument;
+  readonly selectors: readonly HoldingAdditivePositionSelection[];
+  readonly selectedRowHashes: readonly string[];
+}): Promise<PreparedAdditiveCorrection> {
+  if (input.selectors.length === 0) refuse("no partial position scopes were selected");
+  const selectors = input.selectors.map((selector) => {
+    if (
+      selector === null ||
+      typeof selector !== "object" ||
+      canonical(Object.keys(selector).sort()) !==
+        canonical(["accountId", "asOf", "proofVersion", "scopeKind"]) ||
+      selector.scopeKind !== "positions"
+    ) {
+      refuse("additive position scope selector is invalid");
+    }
+    const { accountId, asOf, proofVersion } = selector;
+    return { accountId, asOf, proofVersion };
+  });
+  if (input.selectedRowHashes.length === 0) {
+    refuse("no source-owned additions were selected");
+  }
+  const selectedHashes = new Set<string>();
+  for (const rowHash of input.selectedRowHashes) {
+    if (!SHA256.test(rowHash)) refuse("selected position row hash is invalid");
+    if (selectedHashes.has(rowHash)) {
+      refuse("selected position row hash is duplicated");
+    }
+    selectedHashes.add(rowHash);
+  }
+
+  const selectedPositionScopes = prepareHoldingPartialPositionScopes({
+    documentId: input.documentId,
+    retainedSha256: input.retainedSha256,
+    candidate: input.candidate,
+    selectors,
+  });
+  const members = selectedPositionScopes.flatMap((scope) =>
+    scope.positions.map((row) => ({ scope, row })),
+  );
+  const selectedMembers = members.filter(({ row }) =>
+    selectedHashes.has(row.rowHash),
+  );
+  if (selectedMembers.length !== selectedHashes.size) {
+    refuse("a selected addition is absent from the selected partial scopes");
+  }
+  for (const { scope, row } of selectedMembers) {
+    selectedRawPosition(input.candidate, scope.selector, row);
+  }
+
+  const canonicalPositions = await readCanonicalSelectedPositions(
+    input.client,
+    selectors,
+  );
+  const canonicalByHash = new Map(
+    canonicalPositions
+      .filter((row) => row.rowHash !== null)
+      .map((row) => [row.rowHash!, row] as const),
+  );
+  const oldLocatorRows = new Map(
+    input.stored.positions
+      .filter(
+        (row): row is StoredHoldingRow & { sourceLocator: string } =>
+          row.sourceLocator !== null && row.sourceLocator.length > 0,
+      )
+      .map((row) => [row.sourceLocator, row] as const),
+  );
+  const sourceOwnedAdditions: CandidateHoldingRow[] = [];
+  for (const { row } of selectedMembers) {
+    if (canonicalByHash.has(row.rowHash)) {
+      refuse("a selected addition already exists in the canonical projection");
+    }
+    const sameEvidence = oldLocatorRows.get(row.sourceLocator);
+    if (sameEvidence !== undefined) {
+      refuse(
+        "a selected addition conflicts with an existing source-owned evidence boundary",
+      );
+    }
+    sourceOwnedAdditions.push(row);
+  }
+  if (sourceOwnedAdditions.length === 0) {
+    refuse("the additive candidate contains no new source-owned positions");
+  }
+
+  const sourceOwnedAdditionHashes = new Set(
+    sourceOwnedAdditions.map((row) => row.rowHash),
+  );
+  const scopeSummaries = selectedPositionScopes.map((scope) => {
+    let carriedSourceOwnedRows = 0;
+    let exactForeignReferences = 0;
+    let unmatchedPartialMembers = 0;
+    let sourceOwnedScopeAdditions = 0;
+    for (const row of scope.positions) {
+      if (sourceOwnedAdditionHashes.has(row.rowHash)) {
+        sourceOwnedScopeAdditions += 1;
+        continue;
+      }
+      const current = canonicalByHash.get(row.rowHash);
+      if (
+        current === undefined ||
+        !positionSemanticsEquivalent(current.semantic, row.semantic)
+      ) {
+        unmatchedPartialMembers += 1;
+      } else if (current.sourceDocumentId === input.documentId) {
+        carriedSourceOwnedRows += 1;
+      } else {
+        exactForeignReferences += 1;
+      }
+    }
+    return {
+      scopeKind: "positions" as const,
+      ...scope.selector,
+      status: "partial" as const,
+      emittedRowCount: scope.declaration.emittedPositionCount,
+      gapCodes: [...scope.declaration.gapCodes].sort(),
+      scopeDigest: scope.scopeDigest,
+      sourceOwnedAdditions: sourceOwnedScopeAdditions,
+      carriedSourceOwnedRows,
+      exactForeignReferences,
+      unmatchedPartialMembers,
+    };
+  });
+  const selectedRowsDigest = digest(
+    "kith-finance-holding-additive-selected-rows:v1",
+    [...sourceOwnedAdditions]
+      .sort((left, right) => left.rowHash.localeCompare(right.rowHash))
+      .map((row) => [row.rowHash, row.sourceLocator, row.semantic]),
+  );
+  const withoutDigest = {
+    schemaVersion: 1 as const,
+    kind: "holding_additive_correction_candidate_v1" as const,
+    documentId: input.documentId,
+    retainedSha256: input.retainedSha256,
+    expectedActiveGenerationId: input.expectedActiveGenerationId,
+    oldProjectionDigest: holdingProjectionCurrentDigest(input.stored),
+    candidateProjectionDigest: additiveCandidateProjectionDigest({
+      stored: input.stored,
+      additions: sourceOwnedAdditions,
+    }),
+    selectedCurrentDigest: canonicalScopedCurrentDigest({
+      positions: canonicalPositions,
+      balances: [],
+      includesBalanceScopes: false,
+    }),
+    selectedRowsDigest,
+    selectedRowCount: sourceOwnedAdditions.length,
+    selectedScopes: scopeSummaries,
+    rows: {
+      oldSourceOwnedRows: input.stored.positions.length,
+      candidateSourceOwnedRows:
+        input.stored.positions.length + sourceOwnedAdditions.length,
+      sourceOwnedAdditions: sourceOwnedAdditions.length,
+      changedRows: 0 as const,
+      removedRows: 0 as const,
+    },
+    completeness: {
+      state: "partial_source_additions" as const,
+      changesAuthorized: false as const,
+      removalsAuthorized: false as const,
+    },
+  };
+  const manifest = {
+    ...withoutDigest,
+    candidateDigest: digest(
+      "kith-finance-holding-additive-manifest:v1",
+      withoutDigest,
+    ),
+  };
+  return { manifest, selectedPositionScopes, sourceOwnedAdditions };
+}
+
 function assertionValues(item: Assertion): readonly unknown[] {
   const value = (index: number): string | null => item.semantic[index] ?? null;
   const required = (index: number): string => {
@@ -1464,6 +1843,102 @@ function validateScopedApproval(
   }
 }
 
+function validateAdditiveApproval(
+  approval: HoldingAdditiveProjectionApproval,
+  manifest: HoldingAdditiveCorrectionManifest,
+): void {
+  const expectedKeys = [
+    "approvalDigest",
+    "approvedAt",
+    "approvedBy",
+    "authorizeChanges",
+    "authorizeRemovals",
+    "authorizeSourceOwnedAdditions",
+    "candidateDigest",
+    "candidateProjectionDigest",
+    "completenessAttestation",
+    "documentId",
+    "expectedActiveGenerationId",
+    "kind",
+    "oldProjectionDigest",
+    "retainedSha256",
+    "schemaVersion",
+    "selectedCurrentDigest",
+    "selectedRowHashes",
+    "selectedRowsDigest",
+    "selectedScopes",
+  ];
+  if (
+    approval === null ||
+    typeof approval !== "object" ||
+    canonical(Object.keys(approval).sort()) !== canonical(expectedKeys) ||
+    approval.schemaVersion !== 1 ||
+    approval.kind !== "holding_additive_projection_approval_v1" ||
+    approval.completenessAttestation !==
+      "operator_verified_source_additions_only" ||
+    approval.authorizeSourceOwnedAdditions !== true ||
+    approval.authorizeChanges !== false ||
+    approval.authorizeRemovals !== false ||
+    typeof approval.documentId !== "string" ||
+    typeof approval.retainedSha256 !== "string" ||
+    (approval.expectedActiveGenerationId !== null &&
+      typeof approval.expectedActiveGenerationId !== "string") ||
+    typeof approval.oldProjectionDigest !== "string" ||
+    typeof approval.candidateProjectionDigest !== "string" ||
+    typeof approval.selectedCurrentDigest !== "string" ||
+    typeof approval.selectedRowsDigest !== "string" ||
+    !Array.isArray(approval.selectedScopes) ||
+    !Array.isArray(approval.selectedRowHashes) ||
+    typeof approval.candidateDigest !== "string" ||
+    typeof approval.approvedBy !== "string" ||
+    typeof approval.approvedAt !== "string" ||
+    typeof approval.approvalDigest !== "string"
+  ) {
+    refuse("additive approval contract is invalid");
+  }
+  const manifestSelectors = manifest.selectedScopes.map(
+    ({ scopeKind, accountId, asOf, proofVersion }) => ({
+      scopeKind,
+      accountId,
+      asOf,
+      proofVersion,
+    }),
+  );
+  if (
+    approval.documentId !== manifest.documentId ||
+    approval.retainedSha256 !== manifest.retainedSha256 ||
+    approval.expectedActiveGenerationId !==
+      manifest.expectedActiveGenerationId ||
+    approval.oldProjectionDigest !== manifest.oldProjectionDigest ||
+    approval.candidateProjectionDigest !== manifest.candidateProjectionDigest ||
+    approval.selectedCurrentDigest !== manifest.selectedCurrentDigest ||
+    approval.selectedRowsDigest !== manifest.selectedRowsDigest ||
+    canonical(approval.selectedScopes) !== canonical(manifestSelectors) ||
+    canonical([...approval.selectedRowHashes].sort()) !==
+      canonical(
+        [...approval.selectedRowHashes]
+          .filter((rowHash) => SHA256.test(rowHash))
+          .sort(),
+      ) ||
+    new Set(approval.selectedRowHashes).size !== manifest.selectedRowCount ||
+    approval.candidateDigest !== manifest.candidateDigest
+  ) {
+    refuse("additive approval does not bind the selected candidate and state");
+  }
+  if (
+    approval.approvedBy.length === 0 ||
+    approval.approvedBy.length > 200 ||
+    !Number.isFinite(Date.parse(approval.approvedAt)) ||
+    new Date(approval.approvedAt).toISOString() !== approval.approvedAt ||
+    !SHA256.test(approval.approvalDigest) ||
+    holdingAdditiveProjectionApprovalDigest(
+      (({ approvalDigest: _approvalDigest, ...rest }) => rest)(approval),
+    ) !== approval.approvalDigest
+  ) {
+    refuse("additive approval attribution or digest is invalid");
+  }
+}
+
 async function insertGeneration(
   client: ArchiveClient,
   input: {
@@ -1478,10 +1953,14 @@ async function insertGeneration(
     candidateManifest:
       | HoldingCorrectionCandidateManifest
       | HoldingScopedCorrectionManifest
+      | HoldingAdditiveCorrectionManifest
       | null;
     oldProjectionDigest: string | null;
     approval:
-      HoldingProjectionApproval | HoldingScopedProjectionApproval | null;
+      | HoldingProjectionApproval
+      | HoldingScopedProjectionApproval
+      | HoldingAdditiveProjectionApproval
+      | null;
     previousGenerationId: string | null;
     now: string;
   },
@@ -1492,6 +1971,10 @@ async function insertGeneration(
       : null;
   const fullApproval =
     input.approval?.kind === "holding_projection_approval_v1"
+      ? input.approval
+      : null;
+  const additiveApproval =
+    input.approval?.kind === "holding_additive_projection_approval_v1"
       ? input.approval
       : null;
   await client.query(
@@ -1522,9 +2005,11 @@ async function insertGeneration(
       input.approval?.completenessAttestation ?? null,
       fullApproval?.authorizeRemovals ??
         scopedApproval?.authorizeSelectedRemovals ??
+        additiveApproval?.authorizeRemovals ??
         null,
       fullApproval?.authorizeEmptyProjection ??
         scopedApproval?.authorizeEmptySelectedScopes ??
+        (additiveApproval === null ? null : false) ??
         null,
       input.approval?.expectedActiveGenerationId ?? null,
       input.previousGenerationId,
@@ -1654,6 +2139,38 @@ async function replaceCurrentProjection(
         item.sourceLocator,
         item.rowHash,
       ]),
+  );
+}
+
+async function appendCurrentPositions(
+  client: ArchiveClient,
+  documentId: string,
+  assertions: readonly Assertion[],
+): Promise<void> {
+  if (assertions.some((item) => item.kind !== "position")) {
+    refuse("an additive publication attempted to append a non-position row");
+  }
+  await insertRows(
+    client,
+    "positions",
+    POSITION_COLUMNS,
+    assertions.map((item) => [
+      item.recordId,
+      item.semantic[0],
+      item.semantic[1],
+      item.semantic[2],
+      item.semantic[3],
+      item.semantic[4],
+      item.semantic[5],
+      item.semantic[6],
+      item.semantic[7],
+      item.semantic[8],
+      item.semantic[9],
+      item.semantic[10],
+      documentId,
+      item.sourceLocator,
+      item.rowHash,
+    ]),
   );
 }
 
@@ -2599,6 +3116,246 @@ export async function publishHoldingScopedPositionCorrection(
         cashPassed: cashReconciliations.passed,
         cashFailed: cashReconciliations.failed,
         cashUnverified: cashReconciliations.unverified,
+        positionsPassed: positionReconciliations.passed,
+        positionsFailed: positionReconciliations.failed,
+        positionsUnverified: positionReconciliations.unverified,
+      },
+    };
+  });
+}
+
+/**
+ * Publishes explicit source-owned position additions while carrying every
+ * prior assertion unchanged. The selected scopes remain partial and therefore
+ * cannot make a freshness or completeness claim.
+ */
+export async function publishHoldingAdditivePositionCorrection(
+  client: ArchiveClient,
+  input: {
+    readonly candidate: ImportDocument;
+    readonly approval: HoldingAdditiveProjectionApproval;
+  },
+  now: Date = new Date(),
+): Promise<HoldingProjectionPublication> {
+  return withArchiveTransaction(client, async (tx) => {
+    await lockArchiveForWrite(tx);
+    const selectedDocument = await tx.query<DocumentRow>(
+      `SELECT id, retained_sha256, active_holding_projection_generation_id,
+              superseded_by
+         FROM documents WHERE id = $1 FOR UPDATE`,
+      [input.approval.documentId],
+    );
+    const document = selectedDocument.rows[0];
+    if (document === undefined) refuse("selected document does not exist");
+    if (document.superseded_by !== null) {
+      refuse("superseded documents cannot publish a holding projection");
+    }
+    if (
+      document.retained_sha256 === null ||
+      document.retained_sha256 !== input.approval.retainedSha256 ||
+      input.candidate.retainedSha256 !== document.retained_sha256 ||
+      input.candidate.sha256 !== document.retained_sha256
+    ) {
+      refuse("selected retained bytes do not match the approval and candidate");
+    }
+
+    const stored = await readStoredHoldingProjection(tx, document.id);
+    const prepared = await prepareHoldingAdditivePositionCorrection({
+      client: tx,
+      documentId: document.id,
+      retainedSha256: document.retained_sha256,
+      expectedActiveGenerationId:
+        document.active_holding_projection_generation_id,
+      stored,
+      candidate: input.candidate,
+      selectors: input.approval.selectedScopes,
+      selectedRowHashes: input.approval.selectedRowHashes,
+    });
+    validateAdditiveApproval(input.approval, prepared.manifest);
+
+    const oldAssertions = assertionsForStored(
+      stored,
+      document.id,
+      document.retained_sha256,
+    );
+    const additions = assertionsForCandidate(
+      {
+        positions: prepared.sourceOwnedAdditions,
+        balances: [],
+        liabilities: [],
+      },
+      [],
+      document.id,
+      document.retained_sha256,
+    );
+    const nextAssertions = [...oldAssertions, ...additions.assertions];
+
+    let previousGenerationId = document.active_holding_projection_generation_id;
+    const priorScopeGenerationId = previousGenerationId;
+    const sequence = await tx.query<{ generation_number: string | null }>(
+      `SELECT max(generation_number)::text AS generation_number
+         FROM holding_projection_generations WHERE document_id = $1`,
+      [document.id],
+    );
+    let generationNumber = Number(sequence.rows[0]?.generation_number ?? 0);
+    if (!Number.isSafeInteger(generationNumber) || generationNumber < 0) {
+      refuse("generation sequence is invalid");
+    }
+    if (previousGenerationId === null) {
+      previousGenerationId = randomUUID();
+      generationNumber += 1;
+      await insertAssertions(tx, oldAssertions);
+      await insertGeneration(tx, {
+        id: previousGenerationId,
+        documentId: document.id,
+        generationNumber,
+        kind: "baseline",
+        retainedSha256: document.retained_sha256,
+        projectionDigest: prepared.manifest.oldProjectionDigest,
+        candidateProjectionDigest: null,
+        candidateDigest: null,
+        candidateManifest: null,
+        oldProjectionDigest: null,
+        approval: null,
+        previousGenerationId: null,
+        now: now.toISOString(),
+      });
+      await insertMemberships(tx, previousGenerationId, oldAssertions);
+    } else {
+      const active = await tx.query<{
+        retained_sha256: string;
+        projection_digest: string;
+      }>(
+        `SELECT retained_sha256, projection_digest
+           FROM holding_projection_generations
+          WHERE document_id = $1 AND id = $2`,
+        [document.id, previousGenerationId],
+      );
+      if (
+        active.rows[0]?.retained_sha256 !== document.retained_sha256 ||
+        active.rows[0]?.projection_digest !==
+          prepared.manifest.oldProjectionDigest
+      ) {
+        refuse("active generation does not bind the current projection");
+      }
+      const historical = await readGenerationProjection(
+        tx,
+        document.id,
+        previousGenerationId,
+      );
+      if (
+        canonical(sortedProjection(historical)) !==
+        canonical(sortedProjection(stored))
+      ) {
+        refuse("current projection does not match its active generation");
+      }
+    }
+
+    await insertAssertions(tx, additions.assertions);
+    const activeGenerationId = randomUUID();
+    generationNumber += 1;
+    await insertGeneration(tx, {
+      id: activeGenerationId,
+      documentId: document.id,
+      generationNumber,
+      kind: "published",
+      retainedSha256: document.retained_sha256,
+      projectionDigest: holdingProjectionCurrentDigest(
+        storedProjectionFromAssertions(nextAssertions),
+      ),
+      candidateProjectionDigest: prepared.manifest.candidateProjectionDigest,
+      candidateDigest: prepared.manifest.candidateDigest,
+      candidateManifest: prepared.manifest,
+      oldProjectionDigest: prepared.manifest.oldProjectionDigest,
+      approval: input.approval,
+      previousGenerationId,
+      now: now.toISOString(),
+    });
+    await insertMemberships(tx, activeGenerationId, nextAssertions);
+    await appendCurrentPositions(
+      tx,
+      document.id,
+      additions.assertions,
+    );
+
+    const selectedScopeKeys = new Set(
+      prepared.selectedPositionScopes.map((scope) => scopeKey(scope.selector)),
+    );
+    await carryForwardPositionScopes(tx, {
+      documentId: document.id,
+      retainedSha256: document.retained_sha256,
+      previousGenerationId: priorScopeGenerationId,
+      activeGenerationId,
+      selected: selectedScopeKeys,
+      now: now.toISOString(),
+    });
+    for (const scope of prepared.selectedPositionScopes) {
+      await insertVersionedPositionScope(tx, {
+        documentId: document.id,
+        generationId: activeGenerationId,
+        retainedSha256: document.retained_sha256,
+        accountId: scope.selector.accountId,
+        asOf: scope.selector.asOf,
+        proofVersion: scope.selector.proofVersion,
+        status: "partial",
+        emittedPositionCount: scope.declaration.emittedPositionCount,
+        gapCodes: scope.declaration.gapCodes,
+        zeroBasis: null,
+        evidence: scope.declaration.evidence,
+        members: scope.positions,
+        now: now.toISOString(),
+      });
+    }
+
+    const positionChanges: PositionChange[] = [];
+    for (const row of prepared.sourceOwnedAdditions) {
+      const accountId = row.semantic[0] ?? null;
+      const date = row.semantic[1] ?? null;
+      const instrumentId = row.semantic[2] ?? null;
+      if (accountId !== null && date !== null && instrumentId !== null) {
+        positionChanges.push({ accountId, date, instrumentId });
+      }
+    }
+    const positionReconciliations = await runPositionReconciliationGate(
+      tx,
+      undefined,
+      { snapshots: positionChanges, activity: [] },
+    );
+
+    const updated = await tx.query(
+      `UPDATE documents
+          SET active_holding_projection_generation_id = $2
+        WHERE id = $1
+          AND active_holding_projection_generation_id IS NOT DISTINCT FROM $3`,
+      [
+        document.id,
+        activeGenerationId,
+        input.approval.expectedActiveGenerationId,
+      ],
+    );
+    if (updated.rowCount !== 1) {
+      refuse("active generation changed during publication");
+    }
+
+    return {
+      documentId: document.id,
+      previousGenerationId,
+      activeGenerationId,
+      generationNumber,
+      retainedIds: oldAssertions.length,
+      mintedIds: additions.mintedIds,
+      rows: {
+        positions: nextAssertions.filter((item) => item.kind === "position")
+          .length,
+        balances: stored.balances.length,
+        liabilities: stored.liabilities.length,
+      },
+      candidateDigest: prepared.manifest.candidateDigest,
+      approvalDigest: input.approval.approvalDigest,
+      reconciliations: {
+        cashPassed: 0,
+        cashFailed: 0,
+        cashUnverified: 0,
         positionsPassed: positionReconciliations.passed,
         positionsFailed: positionReconciliations.failed,
         positionsUnverified: positionReconciliations.unverified,

@@ -746,3 +746,85 @@ describe("grouping", () => {
     ]);
   });
 });
+
+describe("grouping data-quality warnings", () => {
+  test("a mixed stale and review group names both problems without changing totals", () => {
+    const value = {
+      value: { decimal: "100", currency: "USD" },
+      asOf: "2026-08-31",
+      source: "balance",
+    };
+    const group = groupInstitutions(
+      [
+        record({
+          account: account({ accountId: "old", displayLabel: "Overdue" }),
+          latestSnapshotAsOf: "2026-04-30",
+          balanceDates: ["2026-08-31"],
+          latestBalanceHoldsSecurities: true,
+          currentValue: value,
+        }),
+        record({
+          account: account({ accountId: "review", displayLabel: "Review" }),
+          latestSnapshotAsOf: "2026-04-30",
+          balanceDates: ["2026-08-31"],
+          latestBalanceHoldsSecurities: true,
+          currentValue: value,
+          latestHoldingsObservation: {
+            asOf: "2026-08-31",
+            sourceComplete: true,
+            fullyValued: true,
+            supportedValuationBasis: true,
+            hasBlockingReview: false,
+            reconciliation: "failed",
+          },
+        }),
+      ],
+      NOW,
+    )[0]!;
+    expect(group.status).toBe("stale");
+    expect(group.statusDetail).toContain("accounts need review");
+    expect(group.statusDetail).toContain(
+      "historical trade quantities do not reconcile",
+    );
+    expect(group.currentValue).toBe(200);
+  });
+
+  test("review status stays visible and never removes an account from a group value", () => {
+    const value = (decimal: string) => ({
+      value: { decimal, currency: "USD" },
+      asOf: "2026-08-31",
+      source: "balance",
+    });
+    const rows = groupInstitutions(
+      [
+        record({
+          account: account({ accountId: "quality-account" }),
+          latestSnapshotAsOf: "2025-12-31",
+          balanceDates: ["2026-08-31", "2026-07-31"],
+          latestBalanceHoldsSecurities: true,
+          currentValue: value("100"),
+          latestHoldingsObservation: {
+            asOf: "2026-08-31",
+            sourceComplete: true,
+            fullyValued: true,
+            supportedValuationBasis: true,
+            hasBlockingReview: false,
+            reconciliation: "failed",
+          },
+        }),
+        record({
+          account: account({ accountId: "current-account" }),
+          currentValue: value("200"),
+        }),
+      ],
+      NOW,
+    );
+    expect(rows[0]!.status).toBe("needs_review");
+    expect(rows[0]!.currentValue).toBe(300);
+    expect(rows[0]!.latestHoldingsObservedAsOf).toBe("2026-08-31");
+    expect(rows[0]!.children![0]!.latestSnapshotAsOf).toBe("2025-12-31");
+    expect(rows[0]!.statusDetail).toContain(
+      "historical trade quantities do not reconcile",
+    );
+  });
+});

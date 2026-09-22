@@ -930,7 +930,7 @@ function observedHoldingsHeader(text) {
 /** A security's aggregate row, printed under its per-lot rows. */
 const TOTAL_ROW = /^Total\b/;
 /** Ends a holdings table. */
-const TABLE_END = /^(TOTAL|Total Value|HOLDINGS|CASH FLOW|ACTIVITY|Page \d)/;
+const TABLE_END = /^(TOTAL\b|Total Value|HOLDINGS|CASH FLOW|ACTIVITY|Page \d)/;
 /**
  * The provider's purchases-versus-estimated-value summary. It is printed
  * immediately after the final security as one label cell and two money cells,
@@ -1467,6 +1467,39 @@ function positionCells(block, context) {
       ]),
     };
   }
+  const [onlyRow] = block;
+  const explicitUnpriced =
+    block.length === 1 &&
+    !onlyRow.conflictingCells &&
+    hasExactlyFields(onlyRow.bound, [
+      "description",
+      "tradeDate",
+      "quantity",
+      "unitCost",
+      "price",
+      "costBasis",
+      "marketValue",
+      "unrealized",
+    ]) &&
+    onlyRow.bound.get("description").text !== "" &&
+    TRADE_DATE_CELL.test(onlyRow.bound.get("tradeDate").text) &&
+    ["quantity", "unitCost", "costBasis"].every(
+      (name) =>
+        resolveStatementMoney(onlyRow.bound.get(name).text).value !== null,
+    ) &&
+    ["price", "marketValue"].every((name) => {
+      const token = onlyRow.bound.get(name).text;
+      return token !== "" && NO_VALUE.has(token);
+    });
+  if (explicitUnpriced) {
+    const merged = new Map(
+      [...onlyRow.bound].map(([name, cell]) => [
+        name,
+        { ...cell, lineStart: onlyRow.start, page: onlyRow.page },
+      ]),
+    );
+    return { row: onlyRow, merged, explicitUnpriced: true };
+  }
   const totalRow = block.find(
     ({ bound }) =>
       bound.has("description") === false &&
@@ -1661,8 +1694,8 @@ function positionFromBlock(block, columns, context) {
   const { row, merged } = resolved;
   const boundCell = (name) =>
     statesValue(merged.get(name)) ? merged.get(name) : null;
-  const span = (name, fieldLabel) => {
-    const c = boundCell(name);
+  const span = (name, fieldLabel, includeNoValue = false) => {
+    const c = includeNoValue ? (merged.get(name) ?? null) : boundCell(name);
     if (c === null) return null;
     if (c.sources) {
       return {
@@ -1699,10 +1732,13 @@ function positionFromBlock(block, columns, context) {
     );
   };
   const marketValueCell = boundCell("marketValue");
+  const printedMarketValueCell = resolved.explicitUnpriced
+    ? (merged.get("marketValue") ?? null)
+    : marketValueCell;
   const marketValue =
-    marketValueCell === null
+    printedMarketValueCell === null
       ? unstatedValue(block, "marketValue", valueColumnLabel(columns))
-      : resolveStatementMoney(marketValueCell.text);
+      : resolveStatementMoney(printedMarketValueCell.text);
   const quantityCell = boundCell("quantity");
   const quantity =
     quantityCell === null ? null : resolveStatementMoney(quantityCell.text);
@@ -1778,16 +1814,29 @@ function positionFromBlock(block, columns, context) {
       locators: {
         ...lotLocators,
         row: rowLocator,
-        marketValue:
-          marketValue.value === null
+        marketValue: resolved.explicitUnpriced
+          ? span(
+              "marketValue",
+              `${context.section} / Market Value / printed no value`,
+              true,
+            )
+          : marketValue.value === null
             ? rowLocator
             : span("marketValue", `${context.section} / Market Value`),
         ...(quantity?.value == null
           ? {}
           : { quantity: span("quantity", `${context.section} / Quantity`) }),
-        ...(price?.value == null
-          ? {}
-          : { price: span("price", `${context.section} / Price`) }),
+        ...(resolved.explicitUnpriced
+          ? {
+              price: span(
+                "price",
+                `${context.section} / Price / printed no value`,
+                true,
+              ),
+            }
+          : price?.value == null
+            ? {}
+            : { price: span("price", `${context.section} / Price`) }),
         ...(costBasis?.value == null
           ? {}
           : {
@@ -1799,8 +1848,9 @@ function positionFromBlock(block, columns, context) {
           : { account: context.accountLocator }),
       },
     },
-    gapCode: null,
+    gapCode: marketValue.value === null ? "unresolved_lots" : null,
     reason: null,
+    valuationIncomplete: marketValue.value === null,
   };
 }
 
@@ -2105,22 +2155,26 @@ function parseHoldings(
 ) {
   const positions = [];
   const skipped = [];
+  let valuationIncompleteCount = 0;
   const tables = [];
   const printedByPage = printedPages(lines);
   const populatedPages = new Set(lines.map(({ page }) => page));
   const emit = (block, columns, context, table) => {
     if (block.length === 0) return;
-    const { position, reason, gapCode } = positionFromBlock(
-      block,
-      columns,
-      context,
-    );
+    const {
+      position,
+      reason,
+      gapCode,
+      valuationIncomplete = false,
+    } = positionFromBlock(block, columns, context);
     if (position === null) {
       skipped.push(reason);
       table.gapCodes.add(gapCode);
     } else {
       positions.push(position);
       table.emittedPositionCount += 1;
+      if (gapCode !== null) table.gapCodes.add(gapCode);
+      if (valuationIncomplete) valuationIncompleteCount += 1;
     }
   };
 
@@ -2745,7 +2799,7 @@ function parseHoldings(
     populatedPages,
     explicitNone,
   });
-  return { positions, skipped, positionScopes };
+  return { positions, skipped, positionScopes, valuationIncompleteCount };
 }
 
 // --- entry point ------------------------------------------------------------
@@ -2899,16 +2953,17 @@ export function parseRealStatement(text, kind) {
     }
   }
 
-  const { positions, skipped, positionScopes } = parseHoldings(
-    lines,
-    kind,
-    period.end,
-    accountKeys,
-    markerLines,
-    textMeta,
-    namesAccounts,
-    banner?.statedNone === true ? banner.locator : null,
-  );
+  const { positions, skipped, positionScopes, valuationIncompleteCount } =
+    parseHoldings(
+      lines,
+      kind,
+      period.end,
+      accountKeys,
+      markerLines,
+      textMeta,
+      namesAccounts,
+      banner?.statedNone === true ? banner.locator : null,
+    );
   // More than one emitted section for the same account/date cannot be a
   // one-row replacement proof. Omit that selector entirely so downstream
   // correction stays fail-closed rather than picking an arbitrary section.
@@ -2946,6 +3001,12 @@ export function parseRealStatement(text, kind) {
   if (skipped.length > 0) {
     notes.push(
       `${skipped.length} holdings block(s) left unparsed: ${skipped[0]}`,
+    );
+  }
+  if (valuationIncompleteCount > 0) {
+    notes.push(
+      `${valuationIncompleteCount} retained holding(s) lack a readable market value; ` +
+        "valuation remains incomplete",
     );
   }
 
