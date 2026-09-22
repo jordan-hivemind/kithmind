@@ -364,6 +364,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "kith.fin_accounts.archive_coverage_through: the overlap boundary import-archive last applied for this account",
     url: new URL("../migrations/049_fin_archive_coverage.sql", import.meta.url),
   },
+  {
+    version: 50,
+    name: "kith.fin_accounts.match_method and kith.fin_account_link_overrides: how an archive link was made and an owner's persisted --link/--unlink override",
+    url: new URL("../migrations/050_fin_account_matching.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
