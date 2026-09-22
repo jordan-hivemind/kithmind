@@ -1411,33 +1411,18 @@ test("successor summary uses the latest header of a table carried across several
   assert.deepEqual(scope.gapCodes, []);
 });
 
-test("a successor summary accepts proved section labels and its TOTAL boundary", () => {
-  const parsed = parseStatementLines(
-    adjacentSummaryText({
-      afterSummaryHeader: [
-        "        COMMON STOCKS",
-        sectionSummaryLines()[2],
-        "        TOTAL COMMON STOCKS",
-        "        TOTAL HOLDINGS",
-      ],
-    }),
-    kind,
-  );
-  assert.equal(parsed.holdings.positions.length, 1);
-  const [scope] = parsed.holdings.positionScopes;
-  assert.equal(scope.status, "complete");
-  assert.deepEqual(scope.gapCodes, []);
-});
-
-test("a summary-only class is bounded by percentage rows on both sides", () => {
+test("the first percentage row proves closure without consuming later summaries", () => {
   const percentage = sectionSummaryLines()[2];
   const parsed = parseStatementLines(
     adjacentSummaryText({
       afterSummaryHeader: [
         percentage,
         "        SYNTHETIC SUMMARY CLASS",
+        "        Summary class detail",
+        ...sectionSummaryLines().slice(0, 2),
         percentage,
         "        TOTAL HOLDINGS",
+        "        Subsequent summary prose is outside the proved boundary",
       ],
     }),
     kind,

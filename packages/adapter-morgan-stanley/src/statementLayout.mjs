@@ -2051,99 +2051,37 @@ function parseHoldings(
       return null;
     }
 
-    const knownSections = new Set(
-      tables
-        .filter((table) => table.accountKey === pending.context.accountKey)
-        .map((table) => explicitHoldingsSection(table.section ?? ""))
-        .filter((section) => section !== null),
-    );
-    const pendingSection = explicitHoldingsSection(pending.context.section);
-    if (pendingSection !== null) knownSections.add(pendingSection);
-
-    const summaryPercentage = (line) => {
-      const { bound } = bindRow(line.text, pending.columns);
-      const percentage = bound.get("tradeDate")?.text;
-      return {
-        bound,
-        isPercentage:
-          percentage !== undefined &&
-          /^\d+(?:\.\d+)?%$/.test(percentage) &&
-          !TRADE_DATE_CELL.test(percentage),
-      };
-    };
-
-    // Inspect the summary rows through their next positive boundary. The
-    // provider may interleave a standalone asset-class label already proved
-    // by one of this account's parsed tables. A summary-only class is also
-    // admitted when it is one value-free all-caps cell strictly between two
-    // percentage rows. That local grammar cannot skip an isolated new
-    // heading. Dated rows remain source content, and TOTAL is the parser's
-    // established positive table boundary.
-    let previousWasPercentage = false;
-    for (let index = summaryIndex + 2; index < lines.length; index += 1) {
-      const line = lines[index];
-      if (line.page !== pending.footerPage) return null;
-      if (accountKeys[index] !== pending.context.accountKey) return null;
-      const trimmed = line.text.trim();
-      if (ACTIVITY_SECTION.test(trimmed)) {
-        return {
-          lineIndex: summaryIndex,
-          locator: lineSpanLocator(
-            lines[summaryIndex],
-            kind,
-            "holdings section summary boundary",
-            textMeta,
-          ),
-        };
-      }
-      if (PAGE_FOOTER.test(trimmed)) {
-        return {
-          lineIndex: summaryIndex,
-          locator: lineSpanLocator(
-            lines[summaryIndex],
-            kind,
-            "holdings section summary boundary",
-            textMeta,
-          ),
-        };
-      }
-      const { bound, isPercentage } = summaryPercentage(line);
-      if (
-        /^TOTAL\b/.test(trimmed) &&
-        !TRADE_DATE_CELL.test(bound.get("tradeDate")?.text ?? "")
-      ) {
-        return {
-          lineIndex: summaryIndex,
-          locator: lineSpanLocator(
-            lines[summaryIndex],
-            kind,
-            "holdings section summary boundary",
-            textMeta,
-          ),
-        };
-      }
-      if (knownSections.has(explicitHoldingsSection(trimmed))) {
-        previousWasPercentage = false;
-        continue;
-      }
-      if (isPercentage) {
-        previousWasPercentage = true;
-        continue;
-      }
-      const next = lines[index + 1];
-      const summaryOnlyClass =
-        previousWasPercentage &&
-        explicitHoldingsSection(trimmed) !== null &&
-        splitCells(line.text).length === 1 &&
-        !/\d|%/.test(trimmed) &&
-        next !== undefined &&
-        next.page === pending.footerPage &&
-        accountKeys[index + 1] === pending.context.accountKey &&
-        summaryPercentage(next).isPercentage;
-      if (!summaryOnlyClass) return null;
-      previousWasPercentage = false;
+    // The header alone could precede a malformed or unrecognized security.
+    // Its first percentage row is the positive source evidence that this is
+    // the provider's summary and therefore that the independently complete
+    // carried table ended. Later summaries, totals and prose belong to the
+    // following document sections and are outside this boundary proof.
+    const firstSummaryRow = lines[summaryIndex + 2];
+    if (
+      firstSummaryRow === undefined ||
+      firstSummaryRow.page !== pending.footerPage ||
+      accountKeys[summaryIndex + 2] !== pending.context.accountKey
+    ) {
+      return null;
     }
-    return null;
+    const { bound } = bindRow(firstSummaryRow.text, pending.columns);
+    const percentage = bound.get("tradeDate")?.text;
+    if (
+      percentage === undefined ||
+      !/^\d+(?:\.\d+)?%$/.test(percentage) ||
+      TRADE_DATE_CELL.test(percentage)
+    ) {
+      return null;
+    }
+    return {
+      lineIndex: summaryIndex,
+      locator: lineSpanLocator(
+        lines[summaryIndex],
+        kind,
+        "holdings section summary boundary",
+        textMeta,
+      ),
+    };
   };
   const flushCarried = (
     nextAccountKey = null,
@@ -2296,7 +2234,6 @@ function parseHoldings(
       table = {
         accountKey,
         accountLocator,
-        section,
         headers: [
           lineSpanLocator(lines[i], kind, "holdings table header", textMeta),
         ],
