@@ -1190,6 +1190,120 @@ test(
 );
 
 test(
+  "a scoped projection review blocks only its exact account and date while generic reviews stay broad",
+  { skip },
+  async (t) => {
+    const { owner, reader: r } = await fixture(t);
+    const source = await institution(owner, "scoped-review-source", {
+      accounts: 2,
+    });
+    const [unaffectedAccount, affectedAccount] = source.accountIds;
+    const sourceDoc = await document(
+      owner,
+      source.id,
+      unaffectedAccount,
+      "2026-03-31",
+    );
+    await owner.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, quantity, market_value, cost_basis, currency,
+          valuation_basis, source_document_id)
+       VALUES
+         ('scoped-review-unaffected', $1, DATE '2026-03-31', 1, 100, 90,
+          'USD', 'market_price', $3),
+         ('scoped-review-affected', $2, DATE '2026-02-28', 1, 200, 180,
+          'USD', 'market_price', $3)`,
+      [unaffectedAccount, affectedAccount, sourceDoc],
+    );
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status,
+          projection_scope_kind, projection_scope_as_of)
+       VALUES ('scoped-review', 'reparse_projection_mismatch', $1, $2,
+               'positions', 'synthetic system mismatch', 'open',
+               'positions', DATE '2026-02-28')`,
+      [affectedAccount, sourceDoc],
+    );
+
+    const inventory = async () =>
+      (await serve(r, { operation: "list_account_inventory", limit: 100 }))
+        .items;
+    let items = await inventory();
+    const unaffected = items.find(
+      (item) => item.account.accountId === unaffectedAccount,
+    );
+    const affected = items.find(
+      (item) => item.account.accountId === affectedAccount,
+    );
+    assert.equal(unaffected.latestSnapshotAsOf, "2026-03-31");
+    assert.equal(unaffected.currentValue.value.decimal, "100");
+    assert.equal(unaffected.openReviewCount, 0);
+    assert.equal(affected.latestSnapshotAsOf, undefined);
+    assert.equal(affected.currentValue, undefined);
+    assert.equal(affected.openReviewCount, 1);
+
+    const unaffectedAggregate = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      accountId: unaffectedAccount,
+    });
+    assert.equal(unaffectedAggregate.items[0].total.decimal, "100");
+    assert.equal(
+      unaffectedAggregate.coverage.reasons.includes("failed_import"),
+      false,
+    );
+    const affectedAggregate = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      accountId: affectedAccount,
+    });
+    assert.deepEqual(affectedAggregate.items, []);
+    assert.ok(affectedAggregate.coverage.reasons.includes("failed_import"));
+
+    // Activity process dates are retained in their typed review identity for
+    // audit, but they are not holdings valuation dates. The activity review
+    // still blocks the source document conservatively at its real holdings
+    // date instead of manufacturing a later empty snapshot.
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status,
+          projection_scope_kind, projection_scope_as_of)
+       VALUES ('activity-scope', 'reparse_activity_projection_mismatch', $1,
+               $2, 'activity', 'synthetic activity mismatch', 'open',
+               'activity', DATE '2026-04-30')`,
+      [unaffectedAccount, sourceDoc],
+    );
+    const activityBlockedSnapshot = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId: unaffectedAccount,
+      snapshot: { mode: "latest" },
+    });
+    assert.equal(activityBlockedSnapshot.selectedSnapshot.asOf, "2026-03-31");
+    assert.equal(activityBlockedSnapshot.summary.reason, "incomplete_source");
+    await owner.query("DELETE FROM review_items WHERE id = 'activity-scope'");
+
+    // A legacy or human-authored generic row has no typed scope and therefore
+    // retains the old source-document attribution behavior.
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, raw_value, reason, status)
+       VALUES ('generic-review', 'reparse_projection_mismatch', $1, $2,
+               'legacy', 'human-authored broad review', 'open')`,
+      [unaffectedAccount, sourceDoc],
+    );
+    items = await inventory();
+    const newlyBlocked = items.find(
+      (item) => item.account.accountId === unaffectedAccount,
+    );
+    assert.equal(newlyBlocked.latestSnapshotAsOf, undefined);
+    assert.equal(newlyBlocked.currentValue, undefined);
+    assert.equal(newlyBlocked.openReviewCount, 1);
+  },
+);
+
+test(
   "exact account scopes admit only their full semantic snapshot and preserve ordinary review gates",
   { skip },
   async (t) => {
@@ -1998,7 +2112,7 @@ test(
       ]);
       assert.deepEqual(client.getServerVersion(), {
         name: "kith-finance-archive",
-        version: "2.0.4",
+        version: "2.0.5",
       });
       const tools = await client.listTools();
       const financeRead = tools.tools.find(

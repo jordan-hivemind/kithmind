@@ -429,11 +429,11 @@ Operators do not loop ordinary reparses to try to mutate an active proof.
 ### Account/date attribution for reparse mismatches
 
 Migration 17 records the actual account, date and projection kind affected by
-a system-generated holding or activity projection mismatch. A scoped mismatch
-blocks only that account/date in finance reads. It does not assert that an
-activity date is a holdings valuation date, and projection kind remains visible
-for audit even where an existing conservative read gate treats every review at
-the same account/date as blocking.
+a system-generated holding or activity projection mismatch. A scoped holding
+mismatch blocks only that account/date in finance reads. An activity mismatch
+is account scoped and retains its process date for audit, but holdings readers
+continue to attribute it through the source document's actual holdings dates.
+They do not treat the activity process date as a holdings valuation date.
 
 Attribution is fail closed. A mismatch stays document-wide when any contributing
 stored row, candidate row or conflicting foreign row lacks a valid account/date,

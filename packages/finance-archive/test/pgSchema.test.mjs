@@ -1364,3 +1364,99 @@ test(
     });
   },
 );
+
+test(
+  "projection mismatch scopes are closed, paired and independently deduplicated",
+  { skip },
+  async () => {
+    await withArchive(async (client) => {
+      const accountId = await seedAccount(client);
+      await client.query(
+        `INSERT INTO documents
+           (id, institution_id, account_id, doc_type, doc_date, file_path, sha256)
+         VALUES ('scope-doc', 'inst-1', $1, 'statement', DATE '2026-03-31',
+                 '/raw/scope-doc', $2)`,
+        [accountId, "7".repeat(64)],
+      );
+
+      await assert.rejects(
+        client.query(
+          `INSERT INTO review_items
+             (id, kind, account_id, source_document_id, raw_value, reason,
+              projection_scope_kind)
+           VALUES ('missing-date', 'reparse_projection_mismatch', $1,
+                   'scope-doc', 'positions', 'system', 'positions')`,
+          [accountId],
+        ),
+        /review_items_projection_scope_shape/,
+      );
+      await assert.rejects(
+        client.query(
+          `INSERT INTO review_items
+             (id, kind, account_id, source_document_id, raw_value, reason,
+              projection_scope_kind, projection_scope_as_of)
+           VALUES ('wrong-kind', 'document_unparsed', $1, 'scope-doc',
+                   'parser', 'system', 'positions', DATE '2026-03-31')`,
+          [accountId],
+        ),
+        /review_items_projection_scope_shape/,
+      );
+      await assert.rejects(
+        client.query(
+          `INSERT INTO review_items
+             (id, kind, account_id, source_document_id, raw_value, reason,
+              projection_scope_kind, projection_scope_as_of)
+           VALUES ('wrong-projection-kind', 'reparse_activity_projection_mismatch',
+                   $1, 'scope-doc', 'activity', 'system', 'positions',
+                   DATE '2026-03-31')`,
+          [accountId],
+        ),
+        /review_items_projection_scope_shape/,
+      );
+
+      await client.query(
+        `INSERT INTO review_items
+           (id, kind, account_id, source_document_id, raw_value, reason,
+            projection_scope_kind, projection_scope_as_of)
+         VALUES
+           ('scope-position', 'reparse_projection_mismatch', $1, 'scope-doc',
+            'positions', 'system', 'positions', DATE '2026-03-31'),
+           ('scope-balance', 'reparse_projection_mismatch', $1, 'scope-doc',
+            'positions', 'system', 'balances', DATE '2026-03-31'),
+           ('scope-other-date', 'reparse_projection_mismatch', $1, 'scope-doc',
+            'positions', 'system', 'positions', DATE '2026-02-28')`,
+        [accountId],
+      );
+      await assert.rejects(
+        client.query(
+          `INSERT INTO review_items
+             (id, kind, account_id, source_document_id, raw_value, reason,
+              projection_scope_kind, projection_scope_as_of)
+           VALUES ('scope-duplicate', 'reparse_projection_mismatch', $1,
+                   'scope-doc', 'positions', 'system again', 'positions',
+                   DATE '2026-03-31')`,
+          [accountId],
+        ),
+        /review_items_projection_scope_key/,
+      );
+
+      await client.query(
+        `INSERT INTO review_items
+           (id, kind, account_id, source_document_id, raw_value, reason)
+         VALUES ('legacy-generic', 'reparse_projection_mismatch', $1,
+                 'scope-doc', 'positions', 'legacy broad finding')`,
+        [accountId],
+      );
+      await assert.rejects(
+        client.query(
+          `INSERT INTO review_items
+             (id, kind, account_id, source_document_id, raw_value, reason)
+           VALUES ('legacy-generic-duplicate', 'reparse_projection_mismatch',
+                   $1, 'scope-doc', 'positions', 'duplicate broad finding')`,
+          [accountId],
+        ),
+        /review_items_dedupe_key/,
+      );
+    });
+  },
+);

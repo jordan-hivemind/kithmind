@@ -231,7 +231,9 @@ async function seed(client) {
        (id, kind, source_document_id, raw_value, reason, status)
      VALUES
        ('review-unparsed', 'document_unparsed', $1, 'synthetic gap', 'synthetic gap', 'open'),
-       ('review-holdings', 'reparse_projection_mismatch', $1, 'holdings', 'synthetic mismatch', 'open'),
+       ('review-holdings', 'reparse_projection_mismatch', $1, 'holdings',
+        'authoritative replay did not exactly restate this document''s active reviewed holding projection; current holdings and history were preserved and the document remains partial',
+        'open'),
        ('review-human', 'reparse_projection_mismatch', $1, 'human-holdings', 'human decision', 'dismissed')`,
     [DOCUMENT],
   );

@@ -1324,6 +1324,56 @@ ALTER TABLE holding_projection_generations
   );
 `;
 
+// System projection mismatches can be narrower than their source document.
+// These nullable fields preserve the old document-wide meaning for legacy,
+// manually created and un-attributable reviews while giving importer-owned
+// findings an exact account/date identity. Projection kind is retained for
+// audit; existing conservative readers still treat every open review at the
+// matching account/date as blocking.
+const PROJECTION_MISMATCH_REVIEW_SCOPES = `
+ALTER TABLE review_items
+  ADD COLUMN projection_scope_kind TEXT,
+  ADD COLUMN projection_scope_as_of DATE,
+  ADD CONSTRAINT review_items_projection_scope_shape CHECK (
+    (
+      projection_scope_kind IS NULL
+      AND projection_scope_as_of IS NULL
+    )
+    OR
+    (
+      (
+        (
+          kind = 'reparse_projection_mismatch'
+          AND projection_scope_kind IN (
+            'positions', 'balances', 'liabilities'
+          )
+        )
+        OR (
+          kind = 'reparse_activity_projection_mismatch'
+          AND projection_scope_kind = 'activity'
+        )
+      )
+      AND account_id IS NOT NULL
+      AND projection_scope_as_of IS NOT NULL
+    )
+  );
+
+DROP INDEX review_items_dedupe_key;
+
+CREATE UNIQUE INDEX review_items_dedupe_key
+  ON review_items
+    (kind, source_document_id, COALESCE(source_locator, ''), raw_value)
+  WHERE source_document_id IS NOT NULL
+    AND projection_scope_kind IS NULL;
+
+CREATE UNIQUE INDEX review_items_projection_scope_key
+  ON review_items
+    (kind, source_document_id, projection_scope_kind, account_id,
+     projection_scope_as_of, COALESCE(source_locator, ''), raw_value)
+  WHERE source_document_id IS NOT NULL
+    AND projection_scope_kind IS NOT NULL;
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -1405,6 +1455,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     version: 16,
     name: "scoped holding correction generation audit",
     sql: SCOPED_HOLDING_PROJECTION_GENERATIONS,
+  },
+  {
+    version: 17,
+    name: "account and date attribution for system projection mismatch reviews",
+    sql: PROJECTION_MISMATCH_REVIEW_SCOPES,
   },
 ]);
 
