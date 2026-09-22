@@ -3907,7 +3907,7 @@ test("a dead activation is never reused for an original the server re-admitted",
       "archived",
       "the document is treated as needing work, not as published",
     );
-    assert.equal(f.journal.checkpoint.step, "intent");
+    assert.equal(f.journal.checkpoint.step, "preview");
   } finally {
     await f.journal.close();
     await rm(f.setup.base, { recursive: true, force: true });
@@ -4035,7 +4035,7 @@ test("a parked document lets the next file publish in the same pass, with no req
     // The pass walks straight on to the second file.
     assert.equal(journal.checkpoint.phase, "archived");
     assert.equal(journal.checkpoint.pdfIndex, 1);
-    assert.equal(journal.checkpoint.step, "intent");
+    assert.equal(journal.checkpoint.step, "preview");
     // PR 277's lesson: the answered page is settled, not left owing.
     assert.equal(journal.pending, undefined);
     // Nothing was sent, so no discovery attempt was spent on the parked file.
