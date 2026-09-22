@@ -174,6 +174,23 @@ function transport(requests) {
   };
 }
 
+function emptyCatalog() {
+  return {
+    findOriginalExact() {
+      return undefined;
+    },
+    findProcessingExact() {
+      return undefined;
+    },
+    listOriginals() {
+      return [];
+    },
+    listProcessings() {
+      return [];
+    },
+  };
+}
+
 function runner(config, journal, worker, executePreview) {
   return new PipelineRunner(
     config,
@@ -424,6 +441,7 @@ test("selected preview enters deep intent while FIFO routing precedes background
       return previewFor(item, "Form 1040 U.S. Individual Income Tax Return");
     },
   );
+  worker.archiveCatalog = emptyCatalog();
   try {
     await worker.driveArchived();
     assert.deepEqual(windows, [{ startPage: 1, pageCount: 2 }]);
@@ -669,6 +687,143 @@ test("a queued selected PDF is consumed after publication and cleanup across res
   }
 });
 
+test("metadata triage skips cleaned activations and resumes prior-scan cleanup before preview", async () => {
+  const selected = {
+    ...plan("selected-complete", "1"),
+    discoveryState: "unchanged",
+  };
+  const settled = { ...plan("settled", "2"), discoveryState: "unchanged" };
+  const cleanup = { ...plan("cleanup", "3"), discoveryState: "unchanged" };
+  const deferred = plan("deferred", "4");
+  const routing = {
+    version: 1,
+    triageStartIndex: 0,
+    refreshReady: false,
+    selected: [metadataFirstIdentity(selected)],
+    previewed: [],
+    previewGaps: [],
+    selectionReceipts: [],
+  };
+  const initial = checkpoint([selected, settled, cleanup, deferred], 0, {
+    metadataFirst: routing,
+  });
+  const state = await fixture(initial);
+  const captureDirectory = join(state.directory, "captures");
+  const parserOutputRoot = join(state.directory, "outputs");
+  const spoolDirectory = join(state.directory, "spool");
+  await Promise.all(
+    [captureDirectory, parserOutputRoot, spoolDirectory].map((path) =>
+      mkdir(path, { mode: 0o700 }),
+    ),
+  );
+  const worker = runner(
+    {
+      spaceId: "space",
+      sourceAccountId: "source",
+      pdfDocQa: { captureDirectory, parserOutputRoot, spoolDirectory },
+    },
+    state.journal,
+    {
+      async call() {
+        assert.fail("settled prior-scan work must not call the server");
+      },
+    },
+    async () => assert.fail("settled prior-scan work must not run preview"),
+  );
+  const originals = new Map();
+  const processings = [];
+  for (const [index, item] of [selected, settled, cleanup].entries()) {
+    const originalCatalogId = randomUUID();
+    const captureId = randomUUID();
+    originals.set(item.externalId, {
+      originalCatalogId,
+      rowRevision: 1,
+      origin: {
+        scanId: "scan-prior",
+        observationEpoch: item.observationEpoch,
+        sha256: item.sha256,
+        byteLength: item.byteLength,
+        mediaType: "application/pdf",
+      },
+    });
+    processings.push({
+      processingCatalogId: randomUUID(),
+      originalCatalogId,
+      rowRevision: 1,
+      currentObservation: {
+        scanId: "scan-prior",
+        observationEpoch: item.observationEpoch,
+        processingEpoch: item.processingEpoch,
+      },
+      fingerprints: worker.processingFingerprints(item),
+      captureIntent: { captureId },
+      capture: {},
+      parserIntent: { outputId: randomUUID() },
+      parserOutput: {},
+      spool: { opaqueName: `${randomUUID()}.json` },
+      activation: { state: "ready" },
+    });
+    if (index === 2) {
+      await writeFile(join(captureDirectory, `${captureId}.pdf`), "synthetic");
+    }
+  }
+  worker.archiveCatalog = {
+    findOriginalExact(probe) {
+      const original = originals.get(probe.sourceExternalId);
+      return original?.origin.sha256 === probe.sha256 &&
+        original.origin.byteLength === probe.byteLength
+        ? original
+        : undefined;
+    },
+    listOriginals() {
+      return [...originals.values()];
+    },
+    listProcessings() {
+      return processings;
+    },
+    findProcessingExact(probe) {
+      return processings.find(
+        (row) =>
+          row.originalCatalogId === probe.originalCatalogId &&
+          JSON.stringify(row.currentObservation) ===
+            JSON.stringify(probe.currentObservation) &&
+          JSON.stringify(row.fingerprints) ===
+            JSON.stringify(probe.fingerprints),
+      );
+    },
+  };
+  try {
+    const cleanupCheckpoint = await worker.nextMetadataCheckpoint(
+      initial,
+      routing,
+      0,
+    );
+    assert.equal(cleanupCheckpoint.phase, "archived");
+    assert.equal(cleanupCheckpoint.pdfIndex, 2);
+    assert.equal(cleanupCheckpoint.step, "intent");
+
+    const resumed = await worker.createArchivedIntents(cleanupCheckpoint);
+    assert.equal(resumed.step, "cleanup");
+    assert.equal(resumed.countPublication, false);
+
+    const cleanupRow = processings[2];
+    await rm(
+      join(captureDirectory, `${cleanupRow.captureIntent.captureId}.pdf`),
+    );
+    const previewCheckpoint = await worker.nextMetadataCheckpoint(
+      initial,
+      routing,
+      0,
+    );
+    assert.equal(previewCheckpoint.phase, "archived");
+    assert.equal(previewCheckpoint.pdfIndex, 3);
+    assert.equal(previewCheckpoint.step, "preview");
+  } finally {
+    await state.journal.close();
+    await rm(state.directory, { recursive: true, force: true });
+  }
+});
+
 test("a positive tax heading durably auto-selects its exact revision", async () => {
   const item = plan("automatic-tax", "6");
   const state = await fixture(checkpoint([item], 0));
@@ -756,6 +911,7 @@ test("a document-specific preview refusal is surfaced and the next item advances
       return previewFor(item);
     },
   );
+  worker.archiveCatalog = emptyCatalog();
   worker.preparePdfProfile = async () => {};
   worker.sourceStatus = async () => ({ sourceAccountId: "source" });
   worker.driveDiscoveryReserve = async () => {
@@ -947,6 +1103,7 @@ test("refresh reuses unchanged previews, previews changed/new identities, and pr
     },
     async (item) => previewFor(item),
   );
+  worker.archiveCatalog = emptyCatalog();
   worker.pdfNeedsArchivedWork = async () => true;
   try {
     await worker.driveReconcile();

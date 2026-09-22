@@ -117,6 +117,9 @@ changed in the base and rerunning checks affected by it. Required final-head
 CI and branch protection must still pass. Never relabel earlier evidence as
 having run against a later commit.
 
+Copy a full commit hash for a handoff only from `git rev-parse HEAD` or
+structured GitHub output. Never expand a short hash manually.
+
 Use one accountable release owner. For code requiring independent review, use
 one reviewer per risk area; prose-only edits do not need a new review lane.
 Authors own focused verification; reviewers inspect behavior and test adequacy;
