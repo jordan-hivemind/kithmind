@@ -71,10 +71,13 @@ export function BalancesTable({ initial }: { initial: BalancesPageData }) {
       },
       {
         id: "type",
-        accessorFn: (row) => row.subtype ?? row.type,
+        accessorFn: (row) => row.subtype ?? row.type ?? "",
         header: "Type",
         size: 110,
-        cell: ({ row }) => label(row.original.subtype ?? row.original.type),
+        cell: ({ row }) => {
+          const value = row.original.subtype ?? row.original.type;
+          return value === null ? "" : label(value);
+        },
       },
       {
         id: "currentBalance",

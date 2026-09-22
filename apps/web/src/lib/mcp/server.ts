@@ -595,7 +595,9 @@ export function createMcpServer(
   const server = new McpServer(
     {
       name: "open-brain",
-      version: "1.3.2",
+      // FIN-1: additive tools (list_ledger, list_holdings) over the unified
+      // ledger, so a minor bump.
+      version: "1.4.0",
     },
     { instructions: SERVER_INSTRUCTIONS },
   );
@@ -2501,6 +2503,47 @@ export function createMcpServer(
     }),
   );
 
+  const listLedgerTool = registerTool(
+    MCP_TOOL_NAMES.listLedger,
+    "List the one unified transaction ledger over the finance archive's statement history and the daily Plaid feed, newest first. Each row's source is 'archive' or 'plaid'; an account with Plaid history gets archive rows only for dates the Plaid feed does not yet cover, so nothing is double counted. accountId is kith.fin_accounts' id (see the Institutions screen), not an archive or Plaid account id.",
+    {
+      spaceId: spaceIdSchema,
+      accountId: z.string().trim().min(1).max(200).optional(),
+      from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      limit: z.number().int().min(1).max(500).optional(),
+      cursor: z.string().min(1).max(4096).optional(),
+    },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listLedger],
+    async ({ spaceId, ...args }) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(await reads.listLedger({ spaceId, ...args })),
+        },
+      ],
+    }),
+  );
+
+  const listHoldingsTool = registerTool(
+    MCP_TOOL_NAMES.listHoldings,
+    "List the latest holdings snapshot per security, archive and Plaid together, optionally as of a given date. accountId is kith.fin_accounts' id, not an archive or Plaid account id.",
+    {
+      spaceId: spaceIdSchema,
+      accountId: z.string().trim().min(1).max(200).optional(),
+      asOf: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listHoldings],
+    async ({ spaceId, ...args }) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(await reads.listHoldings({ spaceId, ...args })),
+        },
+      ],
+    }),
+  );
+
   const registeredTools = {
     [MCP_TOOL_NAMES.ingestUrl]: ingestUrlTool,
     [MCP_TOOL_NAMES.queryRecords]: queryRecordsTool,
@@ -2549,6 +2592,8 @@ export function createMcpServer(
     [MCP_TOOL_NAMES.listFinanceReviews]: listFinanceReviewsTool,
     [MCP_TOOL_NAMES.getFinanceReview]: getFinanceReviewTool,
     [MCP_TOOL_NAMES.manageFinanceReview]: manageFinanceReviewTool,
+    [MCP_TOOL_NAMES.listLedger]: listLedgerTool,
+    [MCP_TOOL_NAMES.listHoldings]: listHoldingsTool,
   } satisfies Record<McpToolName, { disable: () => void }>;
   const enabledToolNames = new Set(resolveEnabledMcpToolNames());
   for (const name of MCP_TOOL_NAME_LIST) {

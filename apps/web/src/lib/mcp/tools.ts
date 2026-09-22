@@ -42,6 +42,11 @@ export const MCP_TOOL_NAMES = {
   listFinanceReviews: "list_finance_reviews",
   getFinanceReview: "get_finance_review",
   manageFinanceReview: "manage_finance_review",
+  // FIN-1: the one unified ledger over the archive and the Plaid feed
+  // (kith.fin_transactions/fin_holding_snapshots, migration
+  // 048_finance_unify.sql).
+  listLedger: "list_ledger",
+  listHoldings: "list_holdings",
 } as const;
 
 export const MCP_TOOL_NAME_LIST = Object.values(MCP_TOOL_NAMES);

@@ -186,6 +186,35 @@ export function InstitutionsTable({
         },
       },
       {
+        // FIN-1: the account's latest Plaid balance or holdings snapshot
+        // (`kith.fin_accounts`, migration 048_finance_unify.sql), separate
+        // from the archive's own "Current value" column above -- one comes
+        // from a statement, the other from this morning's feed, and neither
+        // should read as the other.
+        id: "liveValue",
+        accessorKey: "liveValue",
+        header: "Live value",
+        size: 132,
+        meta: { nowrap: true, align: "right" },
+        cell: ({ row }) =>
+          row.original.liveValue === null ||
+          row.original.liveValueCurrency === null ? (
+            ""
+          ) : (
+            <span className="tabular-nums">
+              {tableMoney(row.original.liveValue, row.original.liveValueCurrency)}
+            </span>
+          ),
+      },
+      {
+        id: "liveAsOf",
+        accessorKey: "liveAsOf",
+        header: "Live as of",
+        size: 110,
+        meta: { nowrap: true, align: "right" },
+        cell: ({ row }) => date(row.original.liveAsOf),
+      },
+      {
         id: "activityFrom",
         accessorKey: "activityFrom",
         size: 110,

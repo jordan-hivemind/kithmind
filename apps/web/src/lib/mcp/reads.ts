@@ -44,6 +44,7 @@ import {
 import type { FinanceAccountOverride } from "@/lib/kith/finance-account-overrides";
 
 import { resolveMcpEmbedder } from "./embedder";
+import { resolveFinanceArchive } from "./finance";
 import type { WithMcpPrincipal } from "./principal";
 
 /** The snippet bound `models/thoughts/mcpActions.ts` applies to index rows. */
@@ -364,6 +365,28 @@ export type McpReads = {
     authorizedSpaceIds: string[];
     accountOverrides: FinanceAccountOverride[];
   }>;
+  /**
+   * FIN-1's unified ledger (`kith.fin_transactions`), archive and Plaid rows
+   * together. `spaceId` must be the finance archive's own pinned space and
+   * the caller a member of it -- the same gate `financeContext` gives the
+   * web Institutions screen -- or this answers empty rather than throwing,
+   * matching every other space-gated read here.
+   */
+  listLedger(
+    args: {
+      spaceId: string;
+      accountId?: string;
+      from?: string;
+      to?: string;
+      limit?: number;
+      cursor?: string;
+    },
+  ): Promise<{ rows: admin.LedgerRow[]; nextCursor: string | null }>;
+  /** The latest holdings snapshot per (account, security), archive and
+   * Plaid together (`kith.fin_holding_snapshots`). Same gate as `listLedger`. */
+  listHoldings(
+    args: { spaceId: string; accountId?: string; asOf?: string },
+  ): Promise<{ holdings: admin.HoldingRow[] }>;
 };
 
 // ---------------------------------------------------------------------------
@@ -1035,5 +1058,40 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
         };
       });
     },
+    async listLedger({ spaceId, ...args }) {
+      const empty = { rows: [], nextCursor: null };
+      return await read(async ({ ctx, principal }) => {
+        if (!(await authorizedForArchiveSpace(ctx, principal, spaceId)))
+          return empty;
+        return await admin.listLedger(ctx, args);
+      });
+    },
+    async listHoldings({ spaceId, ...args }) {
+      return await read(async ({ ctx, principal }) => {
+        if (!(await authorizedForArchiveSpace(ctx, principal, spaceId)))
+          return { holdings: [] };
+        return { holdings: await admin.listHoldings(ctx, args) };
+      });
+    },
   };
+}
+
+/**
+ * `kith.fin_*` carries no `space_id` -- it is owner-global, like the Plaid
+ * feed tables it unifies -- so "authorized for this read" is not a row
+ * filter the way `getAuthorizedReadSpaceIds` gives every other tool one. It
+ * is instead: the caller is a member of *the* space the finance archive is
+ * configured against (the same pin `admin-data.ts`'s `archiveInventory`
+ * checks for the web Institutions screen), which is the one space this data
+ * is meaningful under at all.
+ */
+async function authorizedForArchiveSpace(
+  ctx: IdentityCtx,
+  principal: Principal,
+  spaceId: string,
+): Promise<boolean> {
+  const archive = resolveFinanceArchive();
+  if (archive === null || spaceId !== archive.spaceId) return false;
+  const spaces = await listIdentitySpaces(ctx, { principal });
+  return spaces.some((space) => space.spaceId === spaceId);
 }
