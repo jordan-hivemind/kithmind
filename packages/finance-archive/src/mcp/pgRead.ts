@@ -1206,6 +1206,13 @@ type AccountInventoryRow = AccountDescriptorRow & {
   activity_from: string | null;
   activity_to: string | null;
   latest_snapshot_as_of: string | null;
+  latest_observed_as_of: string | null;
+  observed_source_complete: boolean | null;
+  observed_fully_valued: boolean | null;
+  observed_supported_basis: boolean | null;
+  observed_open_review: boolean | null;
+  observed_reconciliation_failed: boolean | null;
+  observed_reconciliation_pending: boolean | null;
   open_review_count: string;
   balance_as_of: string | null;
   balance_value: string | null;
@@ -1767,6 +1774,47 @@ async function listAccountInventory(
           )
         GROUP BY exact_scope.account_id, exact_scope.as_of
      ),
+     inventory_diagnostic_position_dates AS (
+       SELECT account_id, as_of, missing, unsupported_snapshot_basis
+         FROM inventory_observed_position_dates
+       UNION ALL
+       -- A partial current-generation scope can describe a statement date
+       -- without having emitted any usable row. Unknown valuation is NULL,
+       -- never a fabricated zero position or a financial observation.
+       SELECT s.account_id, s.as_of, NULL::bigint, NULL::bigint
+         FROM inventory_scope_verdicts s
+         JOIN position_scope_observations observation ON observation.id = s.id
+         JOIN documents current_document ON current_document.id = s.source_document_id
+        WHERE observation.retained_sha256 = current_document.retained_sha256
+          AND observation.holding_projection_generation_id
+                IS NOT DISTINCT FROM current_document.active_holding_projection_generation_id
+          AND NOT EXISTS (
+          SELECT 1 FROM inventory_observed_position_dates p
+           WHERE p.account_id = s.account_id AND p.as_of = s.as_of
+        )
+        GROUP BY s.account_id, s.as_of
+     ),
+     -- Diagnostic metadata includes the latest actual observation even when
+     -- it fails financial eligibility. The eligible date and value below
+     -- retain every existing gate independently.
+     inventory_latest_observation AS (
+       SELECT DISTINCT ON (p.account_id)
+              p.account_id, p.as_of,
+              partial.account_id IS NULL AS source_complete,
+              p.missing = 0 AS fully_valued,
+              p.unsupported_snapshot_basis = 0 AS supported_basis,
+              open_review.account_id IS NOT NULL AS open_review,
+              coalesce(reconciliation.failed, FALSE) AS reconciliation_failed,
+              coalesce(reconciliation.pending, FALSE) AS reconciliation_pending
+         FROM inventory_diagnostic_position_dates p
+         LEFT JOIN inventory_partial_source_dates partial
+           ON partial.account_id = p.account_id AND partial.as_of = p.as_of
+         LEFT JOIN inventory_open_review_dates open_review
+           ON open_review.account_id = p.account_id AND open_review.as_of = p.as_of
+         LEFT JOIN inventory_reconciliation_dates reconciliation
+           ON reconciliation.account_id = p.account_id AND reconciliation.as_of = p.as_of
+        ORDER BY p.account_id, p.as_of DESC
+     ),
      inventory_latest_holdings AS (
        SELECT DISTINCT ON (p.account_id)
               p.account_id, p.as_of, p.value, p.missing,
@@ -1823,6 +1871,13 @@ async function listAccountInventory(
               (SELECT max(b.as_of) FROM balances b WHERE b.account_id = d.account_id)
             )::text AS activity_to,
             hs.as_of::text AS latest_snapshot_as_of,
+            observed.as_of::text AS latest_observed_as_of,
+            observed.source_complete AS observed_source_complete,
+            observed.fully_valued AS observed_fully_valued,
+            observed.supported_basis AS observed_supported_basis,
+            observed.open_review AS observed_open_review,
+            observed.reconciliation_failed AS observed_reconciliation_failed,
+            observed.reconciliation_pending AS observed_reconciliation_pending,
             coalesce(review_counts.open_review_count, '0') AS open_review_count,
             lb.as_of::text AS balance_as_of,
             lb.total_value::text AS balance_value,
@@ -1869,6 +1924,7 @@ async function listAccountInventory(
        -- above. This join selects the latest eligible summary without running
        -- source-attribution subqueries once per historical position date.
        LEFT JOIN inventory_latest_holdings hs ON hs.account_id = d.account_id
+       LEFT JOIN inventory_latest_observation observed ON observed.account_id = d.account_id
       ORDER BY d.account_id
       `,
     [cursorKey?.[0] ?? null, request.limit + 1],
@@ -1890,6 +1946,23 @@ async function listAccountInventory(
         : {}),
       ...(row.latest_snapshot_as_of !== null
         ? { latestSnapshotAsOf: row.latest_snapshot_as_of }
+        : {}),
+      ...(row.latest_observed_as_of != null
+        ? {
+            latestHoldingsObservation: {
+              asOf: row.latest_observed_as_of,
+              sourceComplete: row.observed_source_complete === true,
+              fullyValued: row.observed_fully_valued === true,
+              supportedValuationBasis: row.observed_supported_basis === true,
+              hasBlockingReview: row.observed_open_review !== false,
+              reconciliation:
+                row.observed_reconciliation_failed === true
+                  ? ("failed" as const)
+                  : row.observed_reconciliation_pending === true
+                    ? ("pending" as const)
+                    : ("no_issue_recorded" as const),
+            },
+          }
         : {}),
       // FIN-FRESHNESS-1: the dates of balance rows that exist, never a
       // cadence or an expected date. The consumer infers cadence from them.

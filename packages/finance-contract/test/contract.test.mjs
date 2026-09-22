@@ -682,6 +682,40 @@ describe("structured field evidence", () => {
 describe("list_account_inventory (ADM-2)", () => {
   const inventory = () => clone(syntheticFinanceReadExchanges[8]);
 
+  it("carries diagnostic observation quality without claiming eligible financial data", () => {
+    const exchange = inventory();
+    const observation = {
+      asOf: "2026-08-31",
+      sourceComplete: false,
+      fullyValued: false,
+      supportedValuationBasis: true,
+      hasBlockingReview: true,
+      reconciliation: "failed",
+    };
+    exchange.response.items[0].latestHoldingsObservation = observation;
+    assert.deepEqual(
+      parseExchange(exchange).response.items[0].latestHoldingsObservation,
+      observation,
+    );
+    for (const field of [
+      "sourceComplete",
+      "fullyValued",
+      "supportedValuationBasis",
+      "hasBlockingReview",
+    ]) {
+      const invalid = clone(exchange);
+      invalid.response.items[0].latestHoldingsObservation[field] = "false";
+      rejects("invalid_response", () => parseExchange(invalid));
+    }
+    const unknown = clone(exchange);
+    unknown.response.items[0].latestHoldingsObservation.reconciliation =
+      "verified";
+    rejects("invalid_response", () => parseExchange(unknown));
+    const backwards = clone(exchange);
+    backwards.response.items[0].latestSnapshotAsOf = "2026-09-30";
+    rejects("invalid_response", () => parseExchange(backwards));
+  });
+
   it("takes no filters", () => {
     rejects("invalid_request", () =>
       parseFinanceReadRequest({
