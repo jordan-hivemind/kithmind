@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -447,6 +447,224 @@ test("selected preview enters deep intent while FIFO routing precedes background
     assert.equal(next.step, "preview");
   } finally {
     await state.journal.close();
+    await rm(state.directory, { recursive: true, force: true });
+  }
+});
+
+test("a queued selected PDF is consumed after publication and cleanup across restart", async () => {
+  const selected = plan("selected-queued", "2");
+  const deferred = plan("deferred-after-selected", "3");
+  const routing = {
+    version: 1,
+    triageStartIndex: 0,
+    refreshReady: false,
+    selected: [metadataFirstIdentity(selected)],
+    previewed: [],
+    selectionReceipts: [],
+  };
+  const state = await fixture(
+    checkpoint([selected, deferred], 0, { metadataFirst: routing }),
+  );
+  const captureDirectory = join(state.directory, "captures");
+  const parserOutputRoot = join(state.directory, "outputs");
+  const spoolDirectory = join(state.directory, "spool");
+  await Promise.all(
+    [captureDirectory, parserOutputRoot, spoolDirectory].map((path) =>
+      mkdir(path, { mode: 0o700 }),
+    ),
+  );
+  const config = {
+    spaceId: "space",
+    sourceAccountId: "source",
+    pdfDocQa: { captureDirectory, parserOutputRoot, spoolDirectory },
+  };
+  const requests = [];
+  const call = async (request) => {
+    requests.push(structuredClone(request));
+    if (request.operation === "discovery.recordPreview") {
+      return {
+        operation: "discovery.recordPreview",
+        previewId: randomUUID(),
+        sourceItemId: request.identity.sourceItemId,
+        observedContentHash: request.identity.contentHash,
+        previewFingerprint: request.preview.previewFingerprint,
+        state: "provisional",
+        reused: false,
+      };
+    }
+    assert.equal(request.operation, "jobs.activateParsed");
+    return {
+      operation: "jobs.activateParsed",
+      jobId: request.jobId,
+      state: "ready",
+      activatedAt: 10,
+      reused: false,
+    };
+  };
+  let original;
+  let processing;
+  const catalog = {
+    findOriginalExact(probe) {
+      return probe.sourceExternalId === selected.externalId &&
+        probe.sha256 === selected.sha256 &&
+        probe.byteLength === selected.byteLength
+        ? original
+        : undefined;
+    },
+    listOriginals() {
+      return original ? [original] : [];
+    },
+    listProcessings() {
+      return processing ? [processing] : [];
+    },
+    async recordActivation(args) {
+      assert.equal(args.catalogId, processing.processingCatalogId);
+      assert.equal(args.expectedRevision, processing.rowRevision);
+      processing = {
+        ...processing,
+        rowRevision: processing.rowRevision + 1,
+        activation: args.activation,
+      };
+      return processing;
+    },
+  };
+  const configure = (journal) => {
+    const worker = runner(
+      config,
+      journal,
+      { call },
+      async (item) => previewFor(item),
+    );
+    worker.archiveCatalog = catalog;
+    return worker;
+  };
+  let worker = configure(state.journal);
+  try {
+    // The selected item is a real queued discovery result. Preview promotes it
+    // into the existing full archived lane before publication.
+    await worker.driveArchived();
+    assert.equal(state.journal.checkpoint.step, "intent");
+    assert.equal(state.journal.checkpoint.pdfIndex, 0);
+    assert.equal(await worker.pdfNeedsArchivedWork(selected), true);
+
+    const originalCatalogId = randomUUID();
+    const processingCatalogId = randomUUID();
+    const jobId = "job-selected-queued";
+    const generationId = "generation-selected-queued";
+    const captureId = randomUUID();
+    original = {
+      originalCatalogId,
+      rowRevision: 1,
+      origin: {
+        sha256: selected.sha256,
+        byteLength: selected.byteLength,
+      },
+    };
+    processing = {
+      processingCatalogId,
+      originalCatalogId,
+      rowRevision: 1,
+      currentObservation: {
+        scanId: "scan-1",
+        observationEpoch: selected.observationEpoch,
+        processingEpoch: selected.processingEpoch,
+      },
+      fingerprints: worker.processingFingerprints(selected),
+      captureIntent: { captureId },
+      capture: {},
+      parserIntent: { outputId: randomUUID() },
+      parserOutput: {},
+      spool: { opaqueName: `${randomUUID()}.json` },
+      cloud: {
+        sourceItemId: selected.sourceItemId,
+        ingestJobId: jobId,
+        processingGenerationId: generationId,
+      },
+    };
+    await state.journal.transitionCheckpoint({
+      checkpoint: parseRunnerCheckpoint({
+        ...state.journal.checkpoint,
+        step: "parsed_activate",
+        originalCatalogId,
+        expectedOriginalRevision: 1,
+        processingCatalogId,
+        expectedProcessingRevision: 1,
+        jobLease: {
+          jobId,
+          workId: "work-selected-queued",
+          sourceItemId: selected.sourceItemId,
+          observationEpoch: selected.observationEpoch,
+          processingEpoch: selected.processingEpoch,
+          state: "staged",
+          leaseEpoch: 1,
+          leaseToken: "a".repeat(64),
+          leaseExpiresAt: Date.now() + 60_000,
+        },
+        stageId: "stage-selected-queued",
+        stagePhase: "staged",
+        stageOrdinal: 0,
+      }),
+      credentialSessionActive: true,
+    });
+    await worker.driveParsedActivate();
+    assert.equal(state.journal.checkpoint.step, "cleanup");
+    assert.equal(processing.activation.state, "ready");
+    await writeFile(join(captureDirectory, `${captureId}.pdf`), "synthetic");
+    assert.equal(
+      await worker.pdfNeedsArchivedWork(selected),
+      true,
+      "an activated queued item with retained artifacts must resume cleanup",
+    );
+    await rm(join(captureDirectory, `${captureId}.pdf`));
+
+    // This is the scheduler boundary reached after exact local cleanup. The
+    // local artifact paths intentionally do not exist, which is the durable
+    // evidence that cleanup completed. A static `queued` discovery state must
+    // not send this activated identity through publication again.
+    await state.journal.transitionCheckpoint({
+      checkpoint: await worker.afterArchivedItem(
+        state.journal.checkpoint,
+        1,
+      ),
+      credentialSessionActive: true,
+    });
+    assert.equal(state.journal.checkpoint.pdfIndex, 1);
+    assert.equal(state.journal.checkpoint.step, "preview");
+    assert.equal(state.journal.checkpoint.archivedPublished, 5);
+    assert.equal(
+      requests.filter((request) => request.operation === "jobs.activateParsed")
+        .length,
+      1,
+    );
+
+    // Restart from the next-item checkpoint. The selected identity remains
+    // queued in the immutable scan plan, but exact catalog activation plus
+    // absent cleanup artifacts keeps it consumed.
+    await state.journal.close();
+    state.journal = await Journal.open({
+      directory: state.directory,
+      binding: binding(),
+      credential: "credential",
+      initialCheckpoint: { version: 1, phase: "idle" },
+      codec: journalCodec,
+    });
+    worker = configure(state.journal);
+    await worker.driveArchived();
+    assert.equal(state.journal.checkpoint.phase, "discovery_reserve");
+    assert.equal(state.journal.checkpoint.archivedPublished, 5);
+    assert.equal(
+      requests.filter((request) => request.operation === "jobs.activateParsed")
+        .length,
+      1,
+    );
+    assert.deepEqual(
+      requests
+        .filter((request) => request.operation === "discovery.recordPreview")
+        .map((request) => request.identity.sourceItemId),
+      [selected.sourceItemId, deferred.sourceItemId],
+    );
+  } finally {
+    await state.journal.close().catch(() => undefined);
     await rm(state.directory, { recursive: true, force: true });
   }
 });

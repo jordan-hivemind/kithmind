@@ -2113,9 +2113,25 @@ export class PipelineRunner {
     // A `queued` entry is the server saying it has not settled this failure
     // yet, and the only thing that settles it is one more report carrying
     // `exhausted`, so going quiet here would strand the work row as retryable
-    // forever. One more parse settles it; every pass after that arrives here
-    // as `unchanged` and is skipped by the bound below.
-    if (plan.discoveryState === "queued") return true;
+    // forever. One more parse settles it. The exception is an exact processing
+    // identity that this runner has already activated: retained local
+    // artifacts mean cleanup must resume, while no artifacts means activation
+    // and cleanup already completed even if this scan's discovery disposition
+    // remains the original `queued` value. The processing match below binds
+    // the source bytes, processing epoch and full parser fingerprint tuple, so
+    // it cannot consume a changed or newly requested revision.
+    if (plan.discoveryState === "queued") {
+      const matches = this.matchingProcessingRows(plan);
+      const original = this.matchingOriginal(plan);
+      const reusable = this.reusableProcessingRow(matches, original);
+      if (reusable?.activation) {
+        return await this.processingArtifactsPresent(
+          reusable,
+          planMediaType(plan),
+        );
+      }
+      return true;
+    }
     if (plan.discoveryState !== "unchanged") return false;
     const matches = this.matchingProcessingRows(plan);
     // A document that has already exhausted its bounded local parser attempts
