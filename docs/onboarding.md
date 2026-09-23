@@ -170,6 +170,11 @@ Register a patient-facing app at [fhir.epic.com](https://fhir.epic.com):
 | Redirect URI | Your deployment's callback URL. |
 | Refresh tokens | Enabled. |
 
+The production redirect URI is `https://<your host>/api/epic/callback`; the
+page there only displays the returned code and state for pasting into the
+mini's terminal -- it does not authenticate, store anything or talk to a
+database.
+
 A production client ID can take up to a day to activate after registration.
 Each family member needs their own authorization, done through the account
 holder's own proxy access in MyChart -- one authorization per person, not one
