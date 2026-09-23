@@ -166,14 +166,30 @@ async function runLedgerAssertions({ kithClient, archiveClient, pool }) {
     mapTransaction(plaidTransaction("plaid-txn-2", "2024-03-01", -75), "item-1"),
   );
 
-  // Now import-archive: matches the archive account onto the Plaid
-  // account's existing kith.fin_accounts row by institution+mask, then
-  // applies the boundary rule against that row's earliest Plaid date.
+  // Now import-archive: FIN-5, the "linking" phase (mask matching here)
+  // runs after rows, so the archive account first gets its own archive-only
+  // row with both transactions (nothing to bound against yet), then mask
+  // matching merges it into the Plaid account's existing row and
+  // immediately applies the boundary rule against that row's earliest
+  // Plaid date, deleting the one archive row now past it.
   const result = await importArchive(archiveReader(archiveClient), pool);
   assert.equal(result.accountsMatched, 1, "the archive account matched the Plaid account's existing row");
-  assert.equal(result.accountsCreated, 0);
-  assert.equal(result.transactionsImported, 1, "only the pre-boundary archive transaction was imported");
-  assert.equal(result.transactionsSkippedPastBoundary, 1);
+  assert.equal(
+    result.accountsCreated,
+    1,
+    "the archive account is first written to its own archive-only row, then merged within the same run",
+  );
+  assert.equal(
+    result.transactionsImported,
+    2,
+    "both archive transactions land in the archive-only row before mask matching merges it into the Plaid row",
+  );
+  assert.equal(result.transactionsSkippedPastBoundary, 0);
+  assert.equal(
+    result.rowsDeletedAsOverlap,
+    1,
+    "the merge immediately applies the overlap boundary, deleting the now-past-boundary archive row",
+  );
 
   // One account row for this real account, not two.
   const { rows: finAccounts } = await kithClient.query(
@@ -416,8 +432,12 @@ test(
 
       const result = await importArchive(archiveReader(archiveClient), pool);
       assert.equal(result.accountsMatched, 2);
-      assert.equal(result.accountsCreated, 0);
-      assert.equal(result.accountsMerged, 0);
+      // FIN-5: mask matching now runs in the post-rows "linking" phase, so
+      // each brand-new archive account is first written to its own
+      // archive-only row (nothing else to match it against yet) and then
+      // merged into its correct Plaid account within the same run.
+      assert.equal(result.accountsCreated, 2);
+      assert.equal(result.accountsMerged, 2);
 
       const { rows: finAccounts } = await kithClient.query(
         `SELECT id, mask, archive_account_id, plaid_account_id
@@ -631,6 +651,227 @@ test(
       assert.equal(byId[finId1].match_method, "holdings");
       assert.equal(byId[finId2].archive_account_id, "arch-hold-1", "fin-2 holds arch-hold-1's securities, not arch-hold-2's");
       assert.equal(byId[finId2].match_method, "holdings");
+    } finally {
+      await pool.end();
+      await archiveClient.end();
+      await kithClient.end();
+    }
+  },
+);
+
+// FIN-5 (this PR): the linking phase now runs after rows, comparing
+// security_id sets from kith.fin_holding_snapshots directly, rather than
+// raw CUSIP/ISIN/ticker strings computed before any row was ever written.
+// The two tests below reproduce the owner's live-database shape most
+// directly: most archive-referenced securities carry no CUSIP or ISIN at
+// all, and two archive accounts can hold the identical set of securities,
+// distinguishable only by their quantities.
+test(
+  "FIN-5: two archive accounts with an identical security set link to their correct Plaid pair by quantity agreement, and a second run is idempotent",
+  { skip },
+  async (t) => {
+    const dbUrl = await throwawayDatabase(t);
+    const kithClient = new pg.Client({ connectionString: dbUrl });
+    const archiveClient = createArchiveClient(dbUrl, "finance");
+    const pool = openPool(dbUrl);
+    try {
+      await kithClient.connect();
+      await applyKithSchema(kithClient);
+      await archiveClient.connect();
+      await applyPgSchema(archiveClient, "finance");
+
+      await archiveClient.query(
+        `INSERT INTO institutions (id, name, slug) VALUES ('arch-inst-twin', 'Fidelity', 'fidelity-twin')`,
+      );
+      await archiveClient.query(
+        `INSERT INTO accounts (id, institution_id, acct_last4, display_name, account_type, base_currency)
+         VALUES
+           ('arch-twin-x', 'arch-inst-twin', '4001', NULL, 'brokerage', 'USD'),
+           ('arch-twin-y', 'arch-inst-twin', '4002', NULL, 'brokerage', 'USD')`,
+      );
+      await archiveClient.query(
+        `INSERT INTO instruments (id, symbol, cusip, isin, name, instrument_kind)
+         VALUES
+           ('instr-twin-aaa', 'TWA', 'CUSIPTWA000', NULL, 'Fund TWA', 'fund'),
+           ('instr-twin-bbb', 'TWB', 'CUSIPTWB000', NULL, 'Fund TWB', 'fund'),
+           ('instr-twin-ccc', 'TWC', 'CUSIPTWC000', NULL, 'Fund TWC', 'fund')`,
+      );
+      // Both archive accounts hold the identical three securities -- only
+      // their quantities differ, matching x to plaid-twin-p's own
+      // quantities and y to plaid-twin-q's.
+      await archiveClient.query(
+        `INSERT INTO positions (id, account_id, as_of, instrument_id, quantity, price, market_value, currency)
+         VALUES
+           ('pos-x-aaa', 'arch-twin-x', '2024-06-01', 'instr-twin-aaa', 10, 100, 1000, 'USD'),
+           ('pos-x-bbb', 'arch-twin-x', '2024-06-01', 'instr-twin-bbb', 20, 50, 1000, 'USD'),
+           ('pos-x-ccc', 'arch-twin-x', '2024-06-01', 'instr-twin-ccc', 30, 40, 1200, 'USD'),
+           ('pos-y-aaa', 'arch-twin-y', '2024-06-01', 'instr-twin-aaa', 11, 100, 1100, 'USD'),
+           ('pos-y-bbb', 'arch-twin-y', '2024-06-01', 'instr-twin-bbb', 22, 50, 1100, 'USD'),
+           ('pos-y-ccc', 'arch-twin-y', '2024-06-01', 'instr-twin-ccc', 33, 40, 1320, 'USD')`,
+      );
+
+      const finP = newKithId();
+      const finQ = newKithId();
+      await kithClient.query(
+        `INSERT INTO kith.fin_accounts (id, institution_name, name, mask, type, plaid_account_id)
+         VALUES ($1, 'Fidelity', 'Brokerage P', '5001', 'brokerage', 'plaid-twin-p'),
+                ($2, 'Fidelity', 'Brokerage Q', '5002', 'brokerage', 'plaid-twin-q')`,
+        [finP, finQ],
+      );
+      const secAaa = newKithId();
+      const secBbb = newKithId();
+      const secCcc = newKithId();
+      await kithClient.query(
+        `INSERT INTO kith.fin_securities (id, name, ticker, cusip, isin, type, plaid_security_id)
+         VALUES ($1, 'Fund TWA', 'TWA', 'CUSIPTWA000', NULL, 'fund', 'plaid-sec-twa'),
+                ($2, 'Fund TWB', 'TWB', 'CUSIPTWB000', NULL, 'fund', 'plaid-sec-twb'),
+                ($3, 'Fund TWC', 'TWC', 'CUSIPTWC000', NULL, 'fund', 'plaid-sec-twc')`,
+        [secAaa, secBbb, secCcc],
+      );
+      // plaid-twin-p's quantities exactly match arch-twin-x's; plaid-twin-q's
+      // exactly match arch-twin-y's -- Jaccard is 1.0 for all four possible
+      // pairings (every side holds the identical three securities), so only
+      // the quantity-agreement tie-break can tell the correct pair apart.
+      await insertFinHolding(kithClient, { accountId: finP, asOf: "2024-06-05", securityId: secAaa, quantity: 10, price: 100, value: 1000 });
+      await insertFinHolding(kithClient, { accountId: finP, asOf: "2024-06-05", securityId: secBbb, quantity: 20, price: 50, value: 1000 });
+      await insertFinHolding(kithClient, { accountId: finP, asOf: "2024-06-05", securityId: secCcc, quantity: 30, price: 40, value: 1200 });
+      await insertFinHolding(kithClient, { accountId: finQ, asOf: "2024-06-05", securityId: secAaa, quantity: 11, price: 100, value: 1100 });
+      await insertFinHolding(kithClient, { accountId: finQ, asOf: "2024-06-05", securityId: secBbb, quantity: 22, price: 50, value: 1100 });
+      await insertFinHolding(kithClient, { accountId: finQ, asOf: "2024-06-05", securityId: secCcc, quantity: 33, price: 40, value: 1320 });
+
+      const result = await importArchive(archiveReader(archiveClient), pool);
+      assert.equal(
+        result.linksByMethod.holdings,
+        2,
+        "both archive accounts link by holdings overlap despite an identical security set",
+      );
+
+      const { rows } = await kithClient.query(
+        `SELECT id, archive_account_id, match_method FROM kith.fin_accounts WHERE id = ANY($1)`,
+        [[finP, finQ]],
+      );
+      const byId = Object.fromEntries(rows.map((r) => [r.id, r]));
+      assert.equal(
+        byId[finP].archive_account_id,
+        "arch-twin-x",
+        "plaid-twin-p's quantities agree with arch-twin-x's, not arch-twin-y's",
+      );
+      assert.equal(byId[finP].match_method, "holdings");
+      assert.equal(
+        byId[finQ].archive_account_id,
+        "arch-twin-y",
+        "plaid-twin-q's quantities agree with arch-twin-y's, not arch-twin-x's",
+      );
+      assert.equal(byId[finQ].match_method, "holdings");
+
+      // Idempotent: a second run links nothing further and keeps the same
+      // pairing.
+      const second = await importArchive(archiveReader(archiveClient), pool);
+      assert.equal(second.linksByMethod.holdings, 0);
+      assert.equal(second.accountsMerged, 0);
+      const { rows: again } = await kithClient.query(
+        `SELECT id, archive_account_id FROM kith.fin_accounts WHERE id = ANY($1)`,
+        [[finP, finQ]],
+      );
+      const byIdAgain = Object.fromEntries(again.map((r) => [r.id, r.archive_account_id]));
+      assert.equal(byIdAgain[finP], "arch-twin-x");
+      assert.equal(byIdAgain[finQ], "arch-twin-y");
+    } finally {
+      await pool.end();
+      await archiveClient.end();
+      await kithClient.end();
+    }
+  },
+);
+
+test(
+  "FIN-5: an archive account with holdings but no CUSIP or ISIN links by security_id overlap, and a second run is idempotent",
+  { skip },
+  async (t) => {
+    const dbUrl = await throwawayDatabase(t);
+    const kithClient = new pg.Client({ connectionString: dbUrl });
+    const archiveClient = createArchiveClient(dbUrl, "finance");
+    const pool = openPool(dbUrl);
+    try {
+      await kithClient.connect();
+      await applyKithSchema(kithClient);
+      await archiveClient.connect();
+      await applyPgSchema(archiveClient, "finance");
+
+      await archiveClient.query(
+        `INSERT INTO institutions (id, name, slug) VALUES ('arch-inst-noid', 'Schwab', 'schwab-noid')`,
+      );
+      await archiveClient.query(
+        `INSERT INTO accounts (id, institution_id, acct_last4, display_name, account_type, base_currency)
+         VALUES ('arch-noid-1', 'arch-inst-noid', '3001', NULL, 'brokerage', 'USD')`,
+      );
+      // Neither instrument carries a CUSIP or an ISIN -- only a ticker, the
+      // shape most of the owner's live archive instruments have (516 of
+      // 7,461 archive-referenced securities carry a CUSIP, none an ISIN).
+      await archiveClient.query(
+        `INSERT INTO instruments (id, symbol, cusip, isin, name, instrument_kind)
+         VALUES
+           ('instr-noid-eee', 'EEE', NULL, NULL, 'Fund EEE', 'fund'),
+           ('instr-noid-fff', 'FFF', NULL, NULL, 'Fund FFF', 'fund')`,
+      );
+      await archiveClient.query(
+        `INSERT INTO positions (id, account_id, as_of, instrument_id, quantity, price, market_value, currency)
+         VALUES
+           ('pos-noid-eee', 'arch-noid-1', '2024-06-01', 'instr-noid-eee', 10, 100, 1000, 'USD'),
+           ('pos-noid-fff', 'arch-noid-1', '2024-06-01', 'instr-noid-fff', 20, 50, 1000, 'USD')`,
+      );
+
+      // The Plaid-linked feed account and its own securities, matched to
+      // the archive instruments by ticker only: resolveArchiveInstrument's
+      // CUSIP/ISIN/ticker match, in the instruments phase, gives both
+      // sides the same security_id before the linking phase ever runs, so
+      // the holdings-overlap comparison below finds the overlap even
+      // though neither instrument ever carried a CUSIP or an ISIN.
+      const finNoId = newKithId();
+      await kithClient.query(
+        `INSERT INTO kith.fin_accounts (id, institution_name, name, mask, type, plaid_account_id)
+         VALUES ($1, 'Schwab', 'Brokerage', '9911', 'brokerage', 'plaid-noid-1')`,
+        [finNoId],
+      );
+      const secEee = newKithId();
+      const secFff = newKithId();
+      await kithClient.query(
+        `INSERT INTO kith.fin_securities (id, name, ticker, cusip, isin, type, plaid_security_id)
+         VALUES ($1, 'Fund EEE', 'EEE', NULL, NULL, 'fund', 'plaid-sec-eee'),
+                ($2, 'Fund FFF', 'FFF', NULL, NULL, 'fund', 'plaid-sec-fff')`,
+        [secEee, secFff],
+      );
+      await insertFinHolding(kithClient, { accountId: finNoId, asOf: "2024-06-05", securityId: secEee, quantity: 10, price: 100, value: 1000 });
+      await insertFinHolding(kithClient, { accountId: finNoId, asOf: "2024-06-05", securityId: secFff, quantity: 20, price: 50, value: 1000 });
+
+      const result = await importArchive(archiveReader(archiveClient), pool);
+      assert.equal(
+        result.instrumentsMatched,
+        2,
+        "both archive instruments resolve onto the existing Plaid securities by ticker",
+      );
+      assert.equal(
+        result.linksByMethod.holdings,
+        1,
+        "security_id overlap links the account even with no CUSIP or ISIN on either instrument",
+      );
+
+      const { rows } = await kithClient.query(
+        `SELECT archive_account_id, match_method FROM kith.fin_accounts WHERE id = $1`,
+        [finNoId],
+      );
+      assert.equal(rows[0].archive_account_id, "arch-noid-1");
+      assert.equal(rows[0].match_method, "holdings");
+
+      // Idempotent: a second run makes no further changes.
+      const second = await importArchive(archiveReader(archiveClient), pool);
+      assert.equal(second.linksByMethod.holdings, 0);
+      assert.equal(second.accountsMerged, 0);
+      const { rows: again } = await kithClient.query(
+        `SELECT archive_account_id FROM kith.fin_accounts WHERE id = $1`,
+        [finNoId],
+      );
+      assert.equal(again[0].archive_account_id, "arch-noid-1");
     } finally {
       await pool.end();
       await archiveClient.end();

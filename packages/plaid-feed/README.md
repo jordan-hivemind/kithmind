@@ -262,16 +262,21 @@ An archive account is identified only by its own archive id
 order:
 
 1. **A manual override** (`--link`/`--unlink`, below) -- authoritative,
-   checked first, and never overwritten by anything automatic.
+   applied first, before the rows phase even runs, and never overwritten by
+   anything automatic.
 2. **Holdings overlap** (`match_method = 'holdings'`), the primary method
-   for an investment account: the latest position identifiers (CUSIP, else
-   ISIN, else ticker, plus quantity) an archive account and a Plaid-linked
-   account each report, compared by Jaccard similarity over the *set* of
-   identifiers. A pair needs at least 2 identifiers in common and a Jaccard
-   of at least 0.6; among qualifying pairs the highest Jaccard wins, ties
-   broken by quantity agreement on the shared identifiers, and the
+   for an investment account: each side's latest `kith.fin_holding_
+   snapshots` row (`source = 'archive'` for the archive-only candidate,
+   `source = 'plaid'` for the feed candidate), compared by Jaccard
+   similarity over the *set* of `security_id`s each side reports. A pair
+   needs at least 2 securities in common and a Jaccard of at least 0.6;
+   among qualifying pairs the highest Jaccard wins, ties broken by the
+   number of shared securities whose quantities agree within 0.5% (so two
+   archive accounts holding the identical set of securities are still told
+   apart by which one's quantities actually match a candidate's), and the
    assignment is one to one (a feed account already claimed by a
-   better-scoring pair is never offered to a second archive account).
+   better-scoring pair is never offered to a second archive account, which
+   instead falls through to its own next-best candidate).
 3. **Balance equality** (`match_method = 'balance'`), the primary method
    for an account with no holdings to compare -- a loan, a credit line,
    cash: the archive account's and the feed account's latest reported
@@ -288,6 +293,33 @@ order:
 Every method that sets `archive_account_id` also records `match_method`
 (migration `050_fin_account_matching.sql`) so a reader can see how a link
 was made.
+
+**Linking runs after rows (FIN-5).** Holdings, balance, mask and name
+matching all run in a dedicated phase *after* this run's own archive
+transactions, holdings and balances have already been written -- not
+before, and not from an in-memory recomputation of CUSIP/ISIN/ticker
+strings. Two reasons: first, only 516 of roughly 7,500 archive-referenced
+securities on the owner's own database carry a CUSIP at all, and none an
+ISIN, so comparing raw identifier strings between an archive instrument and
+a Plaid security found almost nothing; `kith.fin_holding_snapshots.
+security_id` is the identifier space both sides already share once
+`resolveArchiveInstrument` (FIN-4) has resolved an archive instrument onto
+an existing `fin_securities` row (by CUSIP, ISIN or ticker, whichever
+matched), so comparing the *set* of `security_id`s each side's latest
+snapshot reports finds the real overlap directly. Second, an earlier
+version of this matching excluded any archive account that already had an
+archive-only `fin_accounts` row -- even one still waiting for a feed match
+-- from ever being offered to automatic matching again, so once an account
+became archive-only after its first run it silently stayed that way
+forever (`links_set=0` on every later run, no matter how obvious the
+overlap). The linking phase below now runs against every archive account
+still without a `plaid_account_id`, regardless of whether that archive-only
+row was created in this run's own "accounts" phase moments earlier or by a
+previous run entirely. A brand-new archive account is therefore always
+written to its own archive-only row first (nothing to compare it against
+yet) and, if a match is found once its rows exist, merged into the correct
+feed row within that same run -- so `accounts_created` and `accounts_merged`
+can both count the same archive account on a single run.
 
 **`--link`/`--unlink`.** `--link ARCHIVE_ACCOUNT_ID=PLAID_ACCOUNT_ID`
 (repeatable) pins an archive account to a specific feed account regardless
@@ -363,12 +395,16 @@ plaid import-archive accounts_matched=3 links_set=1 links_holdings=2 links_balan
 ### Phased, so a failure never discards what already ran (FIN-4)
 
 `import-archive` runs in phases -- setup, instruments, accounts, self-repair,
-boundary, rows -- each wrapped so a failure partway through still returns the
-counts every completed phase produced, rather than throwing the whole run's
-counts away the way PR 435's first real run did. A failed phase's name is
-printed as `phase_failed=<phase>` on the summary line above (the phase name
-only; the underlying error goes to stderr, since it may not be counts-only),
-and the CLI exits non-zero.
+boundary, rows, linking -- each wrapped so a failure partway through still
+returns the counts every completed phase produced, rather than throwing the
+whole run's counts away the way PR 435's first real run did. A failed
+phase's name is printed as `phase_failed=<phase>` on the summary line above
+(the phase name only; the underlying error goes to stderr, since it may not
+be counts-only), and the CLI exits non-zero. `linking` (FIN-5) is the last
+phase, after `rows`: holdings, balance, mask and name matching, in that
+order, against the archive- and Plaid-source rows the earlier phases just
+wrote -- see "Account matching (FIN-3)" above for why it runs there instead
+of before rows.
 
 ## Tables (migrations `043_plaid_feed.sql`, `044_plaid_currency.sql`, `045_plaid_history.sql`, `047_plaid_strings.sql`, `048_finance_unify.sql`, `049_fin_archive_coverage.sql`, `050_fin_account_matching.sql`, `051_fin_security_links.sql`)
 
@@ -481,25 +517,34 @@ node --test packages/plaid-feed/test/*.test.mjs
 linking, boundary rule and FIN-3 self-repair reconciling archive-style
 accounts against Plaid-style ones, end to end against a real throwaway
 Postgres (its own database on whatever server `KITH_STORE_DATABASE_URL`
-points at, created and dropped by the test). Ten scenarios: a straight
-mask match with the boundary rule and a second, idempotent run; an
-archive-only account merging into a feed account that shows up later, with
-self-repair deleting the now-past-boundary archive row that an earlier,
-feed-less run had no boundary to skip it against; two archive accounts at
-the same institution linking to their own distinct feed accounts rather
-than collapsing onto one; the FIN-3 collapse repro (three same-institution,
-same-type archive accounts with a null display name each getting their own
-row); holdings-overlap linking two investment accounts to their correct
-Plaid accounts when masks disagree; balance matching a credit-line/loan
-account with no holdings; a persisted `--link` override taking precedence
-over mask matching; self-repair moving a misattributed transaction from
-a wrong bucket account to the correct one, with a second, idempotent run;
-the FIN-4 instrument repro (two archive instruments sharing one CUSIP plus a
-third already resolved by an earlier run's `fin_security_links` row,
-resolving without a unique violation across two runs, with transactions
-attributed to the right security); and a synthetic rows-phase failure
-proving the instruments and accounts phases' counts survive on the returned
-result. Skips cleanly without `KITH_STORE_DATABASE_URL` set, and runs as part of the
+points at, created and dropped by the test). Twelve scenarios: a straight
+mask match with the boundary rule and a second, idempotent run (FIN-5: the
+mask match now happens after the archive-only row's rows are written, so
+this run also exercises `accounts_created` and `accounts_merged` both
+counting the same archive account); an archive-only account merging into a
+feed account that shows up later, with self-repair deleting the
+now-past-boundary archive row that an earlier, feed-less run had no
+boundary to skip it against; two archive accounts at the same institution
+linking to their own distinct feed accounts rather than collapsing onto
+one; the FIN-3 collapse repro (three same-institution, same-type archive
+accounts with a null display name each getting their own row);
+holdings-overlap linking two investment accounts to their correct Plaid
+accounts when masks disagree; two FIN-5 scenarios reproducing the owner's
+live-database shape directly -- two archive accounts holding the identical
+set of securities, linked to their correct Plaid pair only by which one's
+quantities agree, and an archive account whose instruments carry no CUSIP
+or ISIN at all, linked by `security_id` overlap once ticker matching gives
+both sides the same security -- each with a second, idempotent run; balance
+matching a credit-line/loan account with no holdings; a persisted `--link`
+override taking precedence over mask matching; self-repair moving a
+misattributed transaction from a wrong bucket account to the correct one,
+with a second, idempotent run; the FIN-4 instrument repro (two archive
+instruments sharing one CUSIP plus a third already resolved by an earlier
+run's `fin_security_links` row, resolving without a unique violation across
+two runs, with transactions attributed to the right security); and a
+synthetic rows-phase failure proving the instruments and accounts phases'
+counts survive on the returned result. Skips cleanly without
+`KITH_STORE_DATABASE_URL` set, and runs as part of the
 same `node --test packages/plaid-feed/test/*.test.mjs` command above.
 `test/importArchive.test.mjs` additionally covers the pure matching
 functions with no database at all, including the placeholder-name and

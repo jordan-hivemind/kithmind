@@ -37,17 +37,34 @@
 //    *different* archive account, by name or by mask -- and never matches on
 //    a null or placeholder name on either side (`isUsableName`).
 // 2. Holdings-overlap matching (`matchByHoldingsOverlap`) is the new primary
-//    automatic method for an investment account: the latest position
-//    identifiers (CUSIP, then ISIN, then ticker) an archive account and a
-//    Plaid-linked account each report, compared by Jaccard overlap.
-//    Balance-equality matching (`matchByBalance`) is primary for an account
-//    with no holdings to compare (a loan, a credit line, cash). Mask and
-//    name matching remain as secondary, fallback methods. Every method that
-//    sets `archive_account_id` also records `match_method` (migration 050)
-//    so a reader can see how a link was made, and an owner's `--link`/
+//    automatic method for an investment account, and balance-equality
+//    matching (`matchByBalance`) is primary for an account with no holdings
+//    to compare (a loan, a credit line, cash). Mask and name matching
+//    remain as secondary, fallback methods. FIN-5: all four automatic
+//    methods now run in a dedicated "linking" phase *after* the rows phase
+//    has inserted this run's archive-source transactions, holdings and
+//    balances -- not before, and not from an in-memory recomputation of
+//    identifiers. The archive's own instruments carry a CUSIP or ISIN on
+//    only a small fraction of the owner's positions, and comparing raw
+//    ticker/CUSIP/ISIN strings between an archive instrument and a Plaid
+//    security found nothing for the rest; `kith.fin_holding_snapshots.
+//    security_id` is the identifier space both sides already share once
+//    `resolveArchiveInstrument` (FIN-4) has resolved an archive instrument
+//    onto an existing `fin_securities` row, so comparing the *set* of
+//    `security_id`s each side's latest snapshot reports finds the overlap
+//    directly. This also fixes a second bug the owner's live database hit:
+//    an earlier run's own "accounts" phase excluded any archive account
+//    that already had an archive-only `fin_accounts` row (even one still
+//    waiting for a feed match) from ever being offered to automatic
+//    matching again, so once an account became archive-only it stayed that
+//    way forever. The new linking phase runs against every archive account
+//    still without a `plaid_account_id`, regardless of whether that
+//    archive-only row was created this run or a previous one. Every method
+//    that sets `archive_account_id` also records `match_method` (migration
+//    050) so a reader can see how a link was made, and an owner's `--link`/
 //    `--unlink` (`kith.fin_account_link_overrides`, migration 050) is
-//    authoritative over every automatic method, checked first and persisted
-//    past the run that set it.
+//    authoritative over every automatic method -- applied first, before the
+//    rows phase even runs, and never overwritten by anything automatic.
 // 3. Self-repair for rows an earlier, collapsed-matching run already wrote
 //    to the wrong `fin_accounts` row: `reattributeArchiveRows` moves every
 //    misattributed row onto the correct one, `deleteEmptyArchiveOnlyAccounts`
@@ -63,20 +80,22 @@
 // before any new archive data lands is a no-op past the first run.
 //
 // Linking: an archive account already linked to a `kith.fin_accounts` row
-// (by `archive_account_id`) reuses that row -- it is never re-matched by any
-// automatic method once linked, so a later run can never move an archive
-// account's history onto a different row. When that existing row has no
-// `plaid_account_id` yet (an "archive-only" row a previous run created
-// because no feed account existed at the time) and a feed account now
-// exists matching by holdings, balance, mask or name, the archive-only
-// row's transactions and snapshots move onto the feed row, the feed row
-// gets `archive_account_id` set, and the now-empty archive-only row is
-// deleted -- see `mergeArchiveOnlyAccount`. An archive account with no
-// existing link is matched onto an *unclaimed* candidate (no
-// `archive_account_id` yet) so two different archive accounts sharing a
-// generic display name can never both claim the same feed row -- the first
-// one to match claims it in-memory for the rest of this run, not only in
-// the database.
+// that also has a `plaid_account_id` reuses that row untouched -- it is
+// never re-matched by any automatic method once fully linked, so a later
+// run can never move an archive account's history onto a different row.
+// Every other archive account -- one with no existing link at all (this
+// run's own "accounts" phase gives it a fresh archive-only row so its rows
+// have somewhere to land) just as much as one already sitting on an
+// archive-only row from a previous run -- goes through the same "linking"
+// phase, after rows: when a feed account now exists matching by holdings,
+// balance, mask or name, the archive-only row's transactions and snapshots
+// move onto the feed row, the feed row gets `archive_account_id` set, and
+// the now-empty archive-only row is deleted -- see `mergeArchiveOnlyAccount`.
+// A candidate already claimed by a different archive account this run is
+// never offered to a second one, so two different archive accounts sharing
+// a generic display name (or a coincidental holdings/balance overlap) can
+// never both claim the same feed row -- the first one to match claims it
+// in-memory for the rest of this run, not only in the database.
 //
 // Boundary rule: an account that already has Plaid transactions in the
 // ledger only gets archive transactions strictly before the earliest Plaid
@@ -611,19 +630,25 @@ export type OverlapMatch = { archiveAccountId: string; finAccountId: string; met
  * proportions are still the same account). A pair needs at least
  * `minShared` identifiers in common and a Jaccard of at least `minJaccard`
  * to be considered at all; among qualifying pairs, the highest Jaccard wins,
- * ties broken by quantity agreement on the shared identifiers (closer
- * average relative difference wins), then by shared-identifier count, then
- * by id order for a fully deterministic result. One to one: greedy
- * best-first assignment, so a candidate already claimed by a better-scoring
- * pair is never offered to a second one.
+ * ties broken by the number of shared identifiers whose quantities agree
+ * within `quantityAgreementTolerance` (0.5% by default -- two archive
+ * accounts that report the identical set of securities, distinguishable
+ * only by how closely their quantities match a candidate's own), then by
+ * shared-identifier count, then by id order for a fully deterministic
+ * result. One to one: greedy best-first assignment over every pair (not
+ * just the top choice per archive account), so a losing account in a tie
+ * still gets offered its own next-best candidate rather than being left
+ * unmatched, and a candidate already claimed by a better-scoring pair is
+ * never offered to a second one.
  */
 export function matchByHoldingsOverlap(
   archiveProfiles: readonly AccountIdentifierProfile[],
   candidateProfiles: readonly AccountIdentifierProfile[],
-  options: { minJaccard?: number; minShared?: number } = {},
+  options: { minJaccard?: number; minShared?: number; quantityAgreementTolerance?: number } = {},
 ): OverlapMatch[] {
   const minJaccard = options.minJaccard ?? 0.6;
   const minShared = options.minShared ?? 2;
+  const quantityAgreementTolerance = options.quantityAgreementTolerance ?? 0.005;
 
   type Scored = OverlapMatch & { jaccard: number; sharedCount: number; quantityScore: number };
   const pairs: Scored[] = [];
@@ -631,13 +656,14 @@ export function matchByHoldingsOverlap(
   for (const archiveProfile of archiveProfiles) {
     for (const candidateProfile of candidateProfiles) {
       let shared = 0;
-      let relativeDiffTotal = 0;
+      let quantityAgreeCount = 0;
       for (const [identifier, archiveQuantity] of archiveProfile.identifiers) {
         const candidateQuantity = candidateProfile.identifiers.get(identifier);
         if (candidateQuantity === undefined) continue;
         shared += 1;
         const denominator = Math.max(Math.abs(archiveQuantity), Math.abs(candidateQuantity), 1e-9);
-        relativeDiffTotal += Math.abs(archiveQuantity - candidateQuantity) / denominator;
+        const relativeDiff = Math.abs(archiveQuantity - candidateQuantity) / denominator;
+        if (relativeDiff <= quantityAgreementTolerance) quantityAgreeCount += 1;
       }
       if (shared < minShared) continue;
       const union = new Set([...archiveProfile.identifiers.keys(), ...candidateProfile.identifiers.keys()]).size;
@@ -649,7 +675,7 @@ export function matchByHoldingsOverlap(
         method: "holdings",
         jaccard,
         sharedCount: shared,
-        quantityScore: -(relativeDiffTotal / shared),
+        quantityScore: quantityAgreeCount,
       });
     }
   }
@@ -1211,6 +1237,93 @@ async function mergeArchiveOnlyAccount(
   );
 }
 
+/** What one call to `applyOverlapBoundary` (below) found and did for one
+ * `fin_accounts` row. */
+export type BoundaryApplication = {
+  /** The earliest `source = 'plaid'` transaction date on this account, or
+   * `null` if it has none yet -- the boundary the rows phase uses when
+   * inserting this run's archive transactions. */
+  transactionCutoff: string | null;
+  /** The earliest `source = 'plaid'` balance-or-holding snapshot date on
+   * this account, or `null` if it has none yet -- the boundary the rows
+   * phase uses when inserting this run's archive holdings and balances. */
+  snapshotCutoff: string | null;
+  /** Archive-source rows (transactions, holdings, balances combined)
+   * deleted because they are on or after the boundary just derived. */
+  deleted: number;
+  /** The more conservative (earlier) of the two cutoffs, `null` when
+   * neither exists -- what `archive_coverage_through` records. */
+  coverageThrough: string | null;
+};
+
+/**
+ * The overlap boundary rule, whole, for one `kith.fin_accounts` row: derive
+ * its two cutoffs (transaction, snapshot) from the ledger's own current
+ * `source = 'plaid'` rows, delete any `source = 'archive'` row already on
+ * this account on or after its own cutoff, and record the more conservative
+ * cutoff on `archive_coverage_through`. Called twice: once per linked
+ * account in the pre-rows "boundary" phase (general maintenance -- also the
+ * source of the cutoffs the rows phase inserts new archive rows against),
+ * and once more, immediately, for a single account right after the
+ * "linking" phase (after rows) merges an archive-only row into it -- the
+ * newly merged account's archive rows were inserted with no boundary at all
+ * (it had no `plaid_account_id` yet at rows-insertion time), so this second
+ * call is what actually trims them down to the correct overlap-free set.
+ */
+async function applyOverlapBoundary(pool: Pool, finAccountId: string): Promise<BoundaryApplication> {
+  const { rows: txRows } = await pool.query<{ earliest: string | null }>(
+    `SELECT min(date)::text AS earliest
+       FROM kith.fin_transactions
+      WHERE account_id = $1 AND source = 'plaid'`,
+    [finAccountId],
+  );
+  const transactionCutoff = txRows[0]?.earliest ?? null;
+
+  const { rows: snapshotRows } = await pool.query<{ earliest: string | null }>(
+    `SELECT min(as_of)::text AS earliest FROM (
+       SELECT as_of FROM kith.fin_balance_snapshots
+        WHERE account_id = $1 AND source = 'plaid'
+       UNION ALL
+       SELECT as_of FROM kith.fin_holding_snapshots
+        WHERE account_id = $1 AND source = 'plaid'
+     ) AS plaid_snapshots`,
+    [finAccountId],
+  );
+  const snapshotCutoff = snapshotRows[0]?.earliest ?? null;
+
+  let deleted = 0;
+  if (transactionCutoff !== null) {
+    const result = await pool.query(
+      `DELETE FROM kith.fin_transactions
+        WHERE account_id = $1 AND source = 'archive' AND date >= $2`,
+      [finAccountId, transactionCutoff],
+    );
+    deleted += result.rowCount ?? 0;
+  }
+  if (snapshotCutoff !== null) {
+    const deletedHoldings = await pool.query(
+      `DELETE FROM kith.fin_holding_snapshots
+        WHERE account_id = $1 AND source = 'archive' AND as_of >= $2`,
+      [finAccountId, snapshotCutoff],
+    );
+    deleted += deletedHoldings.rowCount ?? 0;
+    const deletedBalances = await pool.query(
+      `DELETE FROM kith.fin_balance_snapshots
+        WHERE account_id = $1 AND source = 'archive' AND as_of >= $2`,
+      [finAccountId, snapshotCutoff],
+    );
+    deleted += deletedBalances.rowCount ?? 0;
+  }
+
+  const coverageThrough = earlierDate(transactionCutoff, snapshotCutoff);
+  await pool.query(`UPDATE kith.fin_accounts SET archive_coverage_through = $2 WHERE id = $1`, [
+    finAccountId,
+    coverageThrough,
+  ]);
+
+  return { transactionCutoff, snapshotCutoff, deleted, coverageThrough };
+}
+
 // -- Self-repair: reattributing rows an earlier, collapsed-matching run
 
 /**
@@ -1432,12 +1545,19 @@ async function deleteEmptyArchiveOnlyAccounts(
  * "instruments" (resolve or create every archive instrument's security, a
  * single instrument's own failure counted under `instrumentConflicts` rather
  * than aborting the phase -- see `resolveArchiveInstrument`); "accounts"
- * (holdings/balance batch matching, then per-account linking: manual, then
- * that batch match, then mask/name, then create); "self-repair" (reattribute
- * existing rows onto the now-correct `fin_accounts` rows, then sweep
- * whatever archive-only row that leaves empty); "boundary" (re-derive and
- * apply the overlap boundary); "rows" (insert every transaction, position
- * and balance before its account's boundary).
+ * (manual overrides only -- authoritative, applied first -- and a fresh
+ * archive-only row for any archive account with no existing link at all;
+ * every other not-yet-plaid-linked account is left alone here); "self-repair"
+ * (reattribute existing rows onto the now-correct `fin_accounts` rows, then
+ * sweep whatever archive-only row that leaves empty); "boundary" (re-derive
+ * and apply the overlap boundary for every account already linked to a feed
+ * row, so the cutoffs below are ready before insertion); "rows" (insert
+ * every transaction, position and balance before its account's boundary);
+ * "linking" (FIN-5, after rows: holdings-overlap by `security_id`, then
+ * balance equality, then mask, then name, against every still-unlinked
+ * archive account -- see this module's top comment. Each new match moves the
+ * archive-only row's rows onto the feed row, deletes the archive-only row,
+ * and immediately applies the overlap boundary to the merged result).
  */
 export async function importArchive(
   archive: ArchiveReader,
@@ -1519,7 +1639,6 @@ export async function importArchive(
   // every instrument after it, which is what PR 435's first real run did on
   // a now-dropped unique-constraint violation (migration 051).
   const finSecurityIdByInstrumentId = new Map<string, string>();
-  const instrumentsById = new Map(archiveInstruments.map((instrument) => [instrument.id, instrument]));
   try {
     for (const instrument of archiveInstruments) {
       try {
@@ -1541,144 +1660,123 @@ export async function importArchive(
   }
 
   // -- Phase: accounts ------------------------------------------------------
+  //
+  // Manual overrides only (authoritative, and never dependent on holdings or
+  // balance data, so applied now rather than deferred), plus a fresh
+  // archive-only row for any archive account with no fin_accounts row at all
+  // yet -- so the rows phase below has somewhere to write its transactions,
+  // positions and balances. Every other not-yet-plaid-linked archive account
+  // (an existing archive-only row from a previous run, or one just created
+  // above) is left alone here: holdings, balance, mask and name matching all
+  // move to the "linking" phase after rows, against `kith.fin_holding_
+  // snapshots`/`fin_balance_snapshots` -- see this module's top comment.
   const finAccountIdByArchiveId = new Map<string, string>();
+  // Every archive account this run inserted a brand-new archive-only row
+  // for -- tracked so the final `accountsMatched` tally (after the linking
+  // phase) can still count one that goes on to merge into a feed row later
+  // in this same run without double-counting one that was already linked
+  // here (see the tally at the very end of this function).
+  const createdThisRunArchiveIds = new Set<string>();
   try {
-    // Batch holdings-overlap and balance-equality matching: only over archive
-    // accounts with no existing fin_accounts link at all and no manual
-    // override, and feed candidates unclaimed by any archive account and not
-    // reserved as some other archive account's manual target.
-    const manualTargets = new Set(
-      [...manualOverrides.values()].filter((target): target is string => target !== null),
-    );
-    const unlinkedArchiveAccounts = archiveAccounts.filter(
-      (account) =>
-        !finAccounts.some((c) => c.archiveAccountId === account.id) && !manualOverrides.has(account.id),
-    );
-    const unclaimedCandidates = finAccounts.filter(
-      (c) => c.plaidAccountId !== null && c.archiveAccountId === null && !manualTargets.has(c.plaidAccountId),
-    );
-
-    const archiveHoldingRows: IdentifiedHoldingRow[] = [];
-    for (const position of archivePositions) {
-      if (position.instrumentId === null || position.quantity === null) continue;
-      const instrument = instrumentsById.get(position.instrumentId);
-      if (instrument === undefined) continue;
-      const identifier = bestIdentifier(instrument.cusip, instrument.isin, instrument.symbol);
-      if (identifier === null) continue;
-      archiveHoldingRows.push({
-        accountId: position.accountId,
-        asOf: position.asOf,
-        identifier,
-        quantity: position.quantity,
-      });
-    }
-    const unlinkedArchiveIds = new Set(unlinkedArchiveAccounts.map((a) => a.id));
-    const archiveHoldingProfiles = buildHoldingsProfiles(
-      archiveHoldingRows.filter((row) => unlinkedArchiveIds.has(row.accountId)),
-    );
-    const candidateHoldingRows = await loadCandidateHoldingRows(
-      pool,
-      unclaimedCandidates.map((c) => c.id),
-    );
-    const candidateHoldingProfiles = buildHoldingsProfiles(candidateHoldingRows);
-
-    const holdingsMatches = matchByHoldingsOverlap(archiveHoldingProfiles, candidateHoldingProfiles);
-    const matchedArchiveIds = new Set(holdingsMatches.map((m) => m.archiveAccountId));
-    const matchedFinIds = new Set(holdingsMatches.map((m) => m.finAccountId));
-
-    const archiveBalanceProfiles = latestPerAccount(
-      archiveBalances
-        .filter((b) => b.total !== null && unlinkedArchiveIds.has(b.accountId) && !matchedArchiveIds.has(b.accountId))
-        .map((b) => ({ accountId: b.accountId, asOf: b.asOf, value: b.total as number })),
-    );
-    const candidateBalanceRows = await loadCandidateBalanceRows(
-      pool,
-      unclaimedCandidates.filter((c) => !matchedFinIds.has(c.id)).map((c) => c.id),
-    );
-    const candidateBalanceProfiles = latestPerAccount(candidateBalanceRows);
-
-    const balanceMatches = matchByBalance(archiveBalanceProfiles, candidateBalanceProfiles);
-
-    const precomputedByArchiveId = new Map<string, PrecomputedMatch>();
-    for (const match of [...holdingsMatches, ...balanceMatches]) {
-      precomputedByArchiveId.set(match.archiveAccountId, { finAccountId: match.finAccountId, method: match.method });
-    }
-
-    // Per-account linking.
     for (const account of archiveAccounts) {
-      const plan = planArchiveAccountLink(account, finAccounts, {
-        manualTarget: manualOverrides.get(account.id),
-        precomputed: precomputedByArchiveId.get(account.id),
-      });
-      switch (plan.kind) {
-        case "already-linked": {
-          result.accountsMatched += 1;
-          finAccountIdByArchiveId.set(account.id, plan.finAccountId);
-          break;
+      const manualTarget = manualOverrides.get(account.id);
+      if (manualTarget !== undefined) {
+        const plan = planArchiveAccountLink(account, finAccounts, { manualTarget });
+        switch (plan.kind) {
+          case "already-linked": {
+            result.accountsMatched += 1;
+            finAccountIdByArchiveId.set(account.id, plan.finAccountId);
+            break;
+          }
+          case "match": {
+            result.accountsMatched += 1;
+            result.linksSet += 1;
+            result.linksByMethod[plan.method] += 1;
+            await pool.query(
+              `UPDATE kith.fin_accounts
+                  SET archive_account_id = $2, match_method = $3, updated_at = transaction_timestamp()
+                WHERE id = $1 AND archive_account_id IS NULL`,
+              [plan.finAccountId, account.id, plan.method],
+            );
+            const candidate = finAccounts.find((c) => c.id === plan.finAccountId);
+            if (candidate !== undefined) candidate.archiveAccountId = account.id;
+            finAccountIdByArchiveId.set(account.id, plan.finAccountId);
+            break;
+          }
+          case "merge": {
+            result.accountsMatched += 1;
+            result.linksSet += 1;
+            result.accountsMerged += 1;
+            result.linksByMethod[plan.method] += 1;
+            await mergeArchiveOnlyAccount(
+              pool,
+              plan.archiveOnlyFinAccountId,
+              plan.feedFinAccountId,
+              account.id,
+              plan.method,
+            );
+            const feedCandidate = finAccounts.find((c) => c.id === plan.feedFinAccountId);
+            if (feedCandidate !== undefined) feedCandidate.archiveAccountId = account.id;
+            const archiveOnlyIndex = finAccounts.findIndex((c) => c.id === plan.archiveOnlyFinAccountId);
+            if (archiveOnlyIndex !== -1) finAccounts.splice(archiveOnlyIndex, 1);
+            finAccountIdByArchiveId.set(account.id, plan.feedFinAccountId);
+            break;
+          }
+          case "create": {
+            const id = newKithId();
+            await pool.query(
+              `INSERT INTO kith.fin_accounts
+                 (id, institution_name, name, mask, type, archive_account_id)
+               VALUES ($1, $2, $3, $4, $5, $6)`,
+              [id, account.institutionName, account.name, account.mask, account.accountType, account.id],
+            );
+            result.accountsCreated += 1;
+            createdThisRunArchiveIds.add(account.id);
+            finAccountIdByArchiveId.set(account.id, id);
+            finAccounts.push({
+              id,
+              institutionName: account.institutionName,
+              mask: account.mask,
+              name: account.name,
+              plaidAccountId: null,
+              archiveAccountId: account.id,
+            });
+            break;
+          }
         }
-        case "match": {
-          result.accountsMatched += 1;
-          result.linksSet += 1;
-          result.linksByMethod[plan.method] += 1;
-          await pool.query(
-            `UPDATE kith.fin_accounts
-                SET archive_account_id = $2, match_method = $3, updated_at = transaction_timestamp()
-              WHERE id = $1 AND archive_account_id IS NULL`,
-            [plan.finAccountId, account.id, plan.method],
-          );
-          const candidate = finAccounts.find((c) => c.id === plan.finAccountId);
-          if (candidate !== undefined) candidate.archiveAccountId = account.id;
-          finAccountIdByArchiveId.set(account.id, plan.finAccountId);
-          break;
-        }
-        case "merge": {
-          result.accountsMatched += 1;
-          result.linksSet += 1;
-          result.accountsMerged += 1;
-          result.linksByMethod[plan.method] += 1;
-          await mergeArchiveOnlyAccount(
-            pool,
-            plan.archiveOnlyFinAccountId,
-            plan.feedFinAccountId,
-            account.id,
-            plan.method,
-          );
-          const feedCandidate = finAccounts.find((c) => c.id === plan.feedFinAccountId);
-          if (feedCandidate !== undefined) feedCandidate.archiveAccountId = account.id;
-          const archiveOnlyIndex = finAccounts.findIndex(
-            (c) => c.id === plan.archiveOnlyFinAccountId,
-          );
-          if (archiveOnlyIndex !== -1) finAccounts.splice(archiveOnlyIndex, 1);
-          finAccountIdByArchiveId.set(account.id, plan.feedFinAccountId);
-          break;
-        }
-        case "create": {
-          const id = newKithId();
-          await pool.query(
-            `INSERT INTO kith.fin_accounts
-               (id, institution_name, name, mask, type, archive_account_id)
-             VALUES ($1, $2, $3, $4, $5, $6)`,
-            [id, account.institutionName, account.name, account.mask, account.accountType, account.id],
-          );
-          result.accountsCreated += 1;
-          finAccountIdByArchiveId.set(account.id, id);
-          finAccounts.push({
-            id,
-            institutionName: account.institutionName,
-            mask: account.mask,
-            name: account.name,
-            plaidAccountId: null,
-            archiveAccountId: account.id,
-          });
-          break;
-        }
+        continue;
       }
-    }
 
-    result.archiveOnlyAccounts = [...new Set(finAccountIdByArchiveId.values())].filter((id) => {
-      const candidate = finAccounts.find((c) => c.id === id);
-      return candidate !== undefined && candidate.plaidAccountId === null;
-    }).length;
+      // No manual override: an existing link (fully merged, or still
+      // archive-only from a previous run) is reused untouched -- automatic
+      // matching for it, if any is still owed, happens in the "linking"
+      // phase below, not here. No existing link at all gets a fresh
+      // archive-only row so the rows phase has somewhere to write to.
+      const existing = finAccounts.find((c) => c.archiveAccountId === account.id);
+      if (existing !== undefined) {
+        result.accountsMatched += 1;
+        finAccountIdByArchiveId.set(account.id, existing.id);
+        continue;
+      }
+      const id = newKithId();
+      await pool.query(
+        `INSERT INTO kith.fin_accounts
+           (id, institution_name, name, mask, type, archive_account_id)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [id, account.institutionName, account.name, account.mask, account.accountType, account.id],
+      );
+      result.accountsCreated += 1;
+      createdThisRunArchiveIds.add(account.id);
+      finAccountIdByArchiveId.set(account.id, id);
+      finAccounts.push({
+        id,
+        institutionName: account.institutionName,
+        mask: account.mask,
+        name: account.name,
+        plaidAccountId: null,
+        archiveAccountId: account.id,
+      });
+    }
   } catch (error) {
     result.phaseFailure = { phase: "accounts", message: errorMessage(error) };
     return result;
@@ -1707,68 +1805,24 @@ export async function importArchive(
   }
 
   // -- Phase: boundary --------------------------------------------------
+  //
+  // General maintenance, for every archive account this run's "accounts"
+  // phase resolved so far (a manual match/merge just now, or an account
+  // already linked -- fully or archive-only -- from a previous run):
+  // re-derive its two cutoffs and delete any archive-source row already on
+  // or after them. An archive-only row with no `plaid_account_id` yet gets
+  // `null` cutoffs here (nothing to bound against yet) -- its rows import in
+  // full below, and if the "linking" phase merges it into a feed row later
+  // in this same run, that merge applies its own boundary immediately.
   const transactionCutoffByFinAccountId = new Map<string, string | null>();
   const snapshotCutoffByFinAccountId = new Map<string, string | null>();
   try {
-    // Re-derive every linked account's two boundaries (one for transactions,
-    // one -- against the earliest Plaid holding-or-balance snapshot date --
-    // for snapshots) from the ledger's current Plaid rows, delete any
-    // archive-source row this account already has on or after its boundary,
-    // and record `archive_coverage_through` as the more conservative
-    // (earlier) of the two, so a reader never overstates archive coverage.
     for (const finAccountId of new Set(finAccountIdByArchiveId.values())) {
-      const { rows: txRows } = await pool.query<{ earliest: string | null }>(
-        `SELECT min(date)::text AS earliest
-           FROM kith.fin_transactions
-          WHERE account_id = $1 AND source = 'plaid'`,
-        [finAccountId],
-      );
-      const transactionCutoff = txRows[0]?.earliest ?? null;
-
-      const { rows: snapshotRows } = await pool.query<{ earliest: string | null }>(
-        `SELECT min(as_of)::text AS earliest FROM (
-           SELECT as_of FROM kith.fin_balance_snapshots
-            WHERE account_id = $1 AND source = 'plaid'
-           UNION ALL
-           SELECT as_of FROM kith.fin_holding_snapshots
-            WHERE account_id = $1 AND source = 'plaid'
-         ) AS plaid_snapshots`,
-        [finAccountId],
-      );
-      const snapshotCutoff = snapshotRows[0]?.earliest ?? null;
-
-      transactionCutoffByFinAccountId.set(finAccountId, transactionCutoff);
-      snapshotCutoffByFinAccountId.set(finAccountId, snapshotCutoff);
-
-      if (transactionCutoff !== null) {
-        const deleted = await pool.query(
-          `DELETE FROM kith.fin_transactions
-            WHERE account_id = $1 AND source = 'archive' AND date >= $2`,
-          [finAccountId, transactionCutoff],
-        );
-        result.rowsDeletedAsOverlap += deleted.rowCount ?? 0;
-      }
-      if (snapshotCutoff !== null) {
-        const deletedHoldings = await pool.query(
-          `DELETE FROM kith.fin_holding_snapshots
-            WHERE account_id = $1 AND source = 'archive' AND as_of >= $2`,
-          [finAccountId, snapshotCutoff],
-        );
-        result.rowsDeletedAsOverlap += deletedHoldings.rowCount ?? 0;
-        const deletedBalances = await pool.query(
-          `DELETE FROM kith.fin_balance_snapshots
-            WHERE account_id = $1 AND source = 'archive' AND as_of >= $2`,
-          [finAccountId, snapshotCutoff],
-        );
-        result.rowsDeletedAsOverlap += deletedBalances.rowCount ?? 0;
-      }
-
-      const coverageThrough = earlierDate(transactionCutoff, snapshotCutoff);
-      if (coverageThrough !== null) result.boundaryDateCount += 1;
-      await pool.query(
-        `UPDATE kith.fin_accounts SET archive_coverage_through = $2 WHERE id = $1`,
-        [finAccountId, coverageThrough],
-      );
+      const boundary = await applyOverlapBoundary(pool, finAccountId);
+      transactionCutoffByFinAccountId.set(finAccountId, boundary.transactionCutoff);
+      snapshotCutoffByFinAccountId.set(finAccountId, boundary.snapshotCutoff);
+      result.rowsDeletedAsOverlap += boundary.deleted;
+      if (boundary.coverageThrough !== null) result.boundaryDateCount += 1;
     }
   } catch (error) {
     result.phaseFailure = { phase: "boundary", message: errorMessage(error) };
@@ -1894,6 +1948,138 @@ export async function importArchive(
     return result;
   }
 
+  // -- Phase: linking (FIN-5) -------------------------------------------
+  //
+  // After rows: every archive account still without a `plaid_account_id`
+  // (an archive-only row, whether created earlier in this run or a
+  // previous one) against every Plaid-linked candidate not already claimed
+  // by an archive account and not reserved as a *different* archive
+  // account's manual target. Holdings overlap first, by the `security_id`
+  // sets each side's latest `kith.fin_holding_snapshots` row now reports
+  // (both sides' rows are final at this point: the archive side just
+  // finished the rows phase above, and `resolveArchiveInstrument`, in the
+  // instruments phase, already resolved each archive instrument onto the
+  // same `fin_securities` row a matching Plaid security uses wherever a
+  // CUSIP, ISIN or ticker matched); then balance equality for accounts
+  // holdings did not match; then mask; then real name -- see this module's
+  // top comment for why this no longer runs before rows, and why it now
+  // considers a pre-existing archive-only row instead of excluding it.
+  try {
+    const manualTargets = new Set(
+      [...manualOverrides.values()].filter((target): target is string => target !== null),
+    );
+    // Reverse of finAccountIdByArchiveId, valid because that map is
+    // injective (archive_account_id is UNIQUE on kith.fin_accounts, so no
+    // two archive accounts ever resolve to the same row).
+    const archiveAccountIdByFinAccountId = new Map(
+      [...finAccountIdByArchiveId.entries()].map(([archiveAccountId, finAccountId]) => [
+        finAccountId,
+        archiveAccountId,
+      ]),
+    );
+
+    /** Every archive account still on an archive-only row, excluding any
+     * blocked by an explicit `--unlink` -- eligible for automatic matching
+     * this phase. Recomputed on each call since a claim earlier in this
+     * same phase (holdings, then balance, then mask) removes a row from
+     * further consideration. */
+    const pendingAutoMatchFinIds = (): string[] =>
+      [...new Set(finAccountIdByArchiveId.values())].filter((finAccountId) => {
+        const archiveAccountId = archiveAccountIdByFinAccountId.get(finAccountId);
+        if (archiveAccountId === undefined || manualOverrides.get(archiveAccountId) === null) return false;
+        const candidate = finAccounts.find((c) => c.id === finAccountId);
+        return candidate !== undefined && candidate.plaidAccountId === null;
+      });
+    const unclaimedFeedCandidates = (): LinkableFinAccountCandidate[] =>
+      finAccounts.filter(
+        (c) => c.plaidAccountId !== null && c.archiveAccountId === null && !manualTargets.has(c.plaidAccountId),
+      );
+
+    async function link(archiveOnlyFinAccountId: string, feedFinAccountId: string, method: MatchMethod): Promise<void> {
+      const archiveAccountId = archiveAccountIdByFinAccountId.get(archiveOnlyFinAccountId);
+      if (archiveAccountId === undefined) return;
+      await mergeArchiveOnlyAccount(pool, archiveOnlyFinAccountId, feedFinAccountId, archiveAccountId, method);
+      const feedCandidate = finAccounts.find((c) => c.id === feedFinAccountId);
+      if (feedCandidate !== undefined) feedCandidate.archiveAccountId = archiveAccountId;
+      const archiveOnlyIndex = finAccounts.findIndex((c) => c.id === archiveOnlyFinAccountId);
+      if (archiveOnlyIndex !== -1) finAccounts.splice(archiveOnlyIndex, 1);
+      finAccountIdByArchiveId.set(archiveAccountId, feedFinAccountId);
+      archiveAccountIdByFinAccountId.set(feedFinAccountId, archiveAccountId);
+      // An account not created this run was already counted in the
+      // "accounts" phase above (every branch there except "create"
+      // increments `accountsMatched`); one created fresh this run was not,
+      // since it had nothing to match yet at that point -- count it now.
+      if (createdThisRunArchiveIds.has(archiveAccountId)) result.accountsMatched += 1;
+      result.linksSet += 1;
+      result.accountsMerged += 1;
+      result.linksByMethod[method] += 1;
+
+      const boundary = await applyOverlapBoundary(pool, feedFinAccountId);
+      result.rowsDeletedAsOverlap += boundary.deleted;
+      if (boundary.coverageThrough !== null) result.boundaryDateCount += 1;
+    }
+
+    // 1. Holdings overlap, by security_id sets.
+    {
+      const archiveProfiles = buildHoldingsProfiles(
+        await loadFinHoldingSecurityRows(pool, pendingAutoMatchFinIds(), "archive"),
+      );
+      const candidateProfiles = buildHoldingsProfiles(
+        await loadFinHoldingSecurityRows(
+          pool,
+          unclaimedFeedCandidates().map((c) => c.id),
+          "plaid",
+        ),
+      );
+      for (const match of matchByHoldingsOverlap(archiveProfiles, candidateProfiles)) {
+        await link(match.archiveAccountId, match.finAccountId, "holdings");
+      }
+    }
+
+    // 2. Balance equality, for accounts holdings did not match.
+    {
+      const archiveProfiles = latestPerAccount(
+        await loadFinBalanceRows(pool, pendingAutoMatchFinIds(), "archive"),
+      );
+      const candidateProfiles = latestPerAccount(
+        await loadFinBalanceRows(
+          pool,
+          unclaimedFeedCandidates().map((c) => c.id),
+          "plaid",
+        ),
+      );
+      for (const match of matchByBalance(archiveProfiles, candidateProfiles)) {
+        await link(match.archiveAccountId, match.finAccountId, "balance");
+      }
+    }
+
+    // 3. Mask, then 4. real name -- one archive account at a time, in the
+    // same fallback order `matchArchiveAccount` already implements, against
+    // whatever candidates holdings and balance left unclaimed.
+    for (const archiveOnlyFinAccountId of pendingAutoMatchFinIds()) {
+      const archiveAccountId = archiveAccountIdByFinAccountId.get(archiveOnlyFinAccountId);
+      if (archiveAccountId === undefined) continue;
+      const account = archiveAccounts.find((a) => a.id === archiveAccountId);
+      if (account === undefined) continue;
+      const candidates = unclaimedFeedCandidates().filter((c) => c.id !== archiveOnlyFinAccountId);
+      const match = matchArchiveAccount(account, candidates);
+      if (match !== null) {
+        await link(archiveOnlyFinAccountId, match.id, match.method);
+      }
+    }
+
+    // `archiveOnlyAccounts` counts every account still without a
+    // `plaid_account_id`, whatever the reason (no candidate qualified, or
+    // an explicit `--unlink` blocked automatic matching for it).
+    result.archiveOnlyAccounts = [...new Set(finAccountIdByArchiveId.values())].filter((finAccountId) => {
+      const candidate = finAccounts.find((c) => c.id === finAccountId);
+      return candidate !== undefined && candidate.plaidAccountId === null;
+    }).length;
+  } catch (error) {
+    result.phaseFailure = { phase: "linking", message: errorMessage(error) };
+    return result;
+  }
+
   return result;
 }
 
@@ -2015,49 +2201,61 @@ async function resolveArchiveInstrument(
   return id;
 }
 
-/** Every unclaimed Plaid-linked candidate's latest reported holdings,
- * identifier-and-quantity, for the holdings-overlap batch match. */
-async function loadCandidateHoldingRows(
+/**
+ * FIN-5: every one of the given accounts' holdings, identified by
+ * `security_id` directly rather than a recomputed CUSIP/ISIN/ticker
+ * string -- the shared identifier space `resolveArchiveInstrument` (FIN-4)
+ * already resolved an archive instrument into, so an archive-only account
+ * and a Plaid account holding the same real security carry the exact same
+ * `security_id` on their `kith.fin_holding_snapshots` rows regardless of
+ * whether either side's raw CUSIP or ISIN was ever populated. `source`
+ * selects which side of the ledger to read (`'archive'` for an archive-only
+ * candidate, `'plaid'` for a feed candidate) -- both calls read the same
+ * table, just filtered to their own source, so the two profiles this feeds
+ * into `matchByHoldingsOverlap` are directly comparable.
+ */
+async function loadFinHoldingSecurityRows(
   pool: Pool,
   accountIds: readonly string[],
+  source: "archive" | "plaid",
 ): Promise<IdentifiedHoldingRow[]> {
   if (accountIds.length === 0) return [];
   const { rows } = await pool.query<{
     account_id: string;
     as_of: string;
+    security_id: string;
     quantity: string | null;
-    cusip: string | null;
-    isin: string | null;
-    ticker: string | null;
   }>(
-    `SELECT h.account_id, h.as_of::text AS as_of, h.quantity, s.cusip, s.isin, s.ticker
-       FROM kith.fin_holding_snapshots h
-       JOIN kith.fin_securities s ON s.id = h.security_id
-      WHERE h.source = 'plaid' AND h.account_id = ANY($1)`,
-    [accountIds],
+    `SELECT account_id, as_of::text AS as_of, security_id, quantity
+       FROM kith.fin_holding_snapshots
+      WHERE source = $2 AND account_id = ANY($1)`,
+    [accountIds, source],
   );
   const result: IdentifiedHoldingRow[] = [];
   for (const row of rows) {
     if (row.quantity === null) continue;
-    const identifier = bestIdentifier(row.cusip, row.isin, row.ticker);
-    if (identifier === null) continue;
-    result.push({ accountId: row.account_id, asOf: row.as_of, identifier, quantity: Number(row.quantity) });
+    result.push({ accountId: row.account_id, asOf: row.as_of, identifier: row.security_id, quantity: Number(row.quantity) });
   }
   return result;
 }
 
-/** Every unclaimed Plaid-linked candidate's latest reported balance, for
- * the balance-equality batch match. */
-async function loadCandidateBalanceRows(
+/** FIN-5: every one of the given accounts' balance-snapshot rows on the
+ * given `source` side, for the balance-equality batch match -- see
+ * `loadFinHoldingSecurityRows` above for why this reads `kith.fin_balance_
+ * snapshots` directly rather than an in-memory recomputation. Not yet
+ * reduced to each account's own latest row -- callers pass this through
+ * `latestPerAccount`. */
+async function loadFinBalanceRows(
   pool: Pool,
   accountIds: readonly string[],
+  source: "archive" | "plaid",
 ): Promise<AccountBalanceProfile[]> {
   if (accountIds.length === 0) return [];
   const { rows } = await pool.query<{ account_id: string; as_of: string; current: string | null }>(
     `SELECT account_id, as_of::text AS as_of, current
        FROM kith.fin_balance_snapshots
-      WHERE source = 'plaid' AND account_id = ANY($1)`,
-    [accountIds],
+      WHERE source = $2 AND account_id = ANY($1)`,
+    [accountIds, source],
   );
   const result: AccountBalanceProfile[] = [];
   for (const row of rows) {
