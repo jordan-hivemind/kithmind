@@ -1,5 +1,14 @@
 # @repo/finance-archive
 
+> **DEPRECATED.** This package is the optional statement-history path: the
+> original Morgan Stanley onboarding, including downloading and parsing every
+> statement. New setups should not start here. Current account values come
+> from `@repo/plaid-feed` instead (`kith-plaid-feed link` / `pull`). Use this
+> package only to bring in history older than Plaid's own window, through
+> `kith-plaid-feed import-archive`. See
+> [`docs/onboarding.md`](../../docs/onboarding.md), "Optional: statement
+> history beyond two years."
+
 The store, schema, migrations and money policy for the financial archive
 described in
 [`docs/plans/2026-09-07-financial-transaction-database.md`](../../docs/plans/2026-09-07-financial-transaction-database.md).

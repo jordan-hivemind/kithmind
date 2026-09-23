@@ -1,5 +1,9 @@
 # Worker diagnostics
 
+> **Legacy.** This describes the legacy statement and worker path, kept only
+> for the optional history import. Current setup instructions are in
+> [`docs/onboarding.md`](onboarding.md).
+
 The doctor checks a filesystem worker's local configuration, scoped access,
 folders, protected journal, and hosted source status. It reports operational
 readiness separately from data completeness. Start with a synthetic folder;

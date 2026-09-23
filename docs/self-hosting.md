@@ -1,5 +1,11 @@
 # Self-hosting Kith Mind
 
+This runbook covers deploying the web application and its database: Vercel,
+PostgreSQL, environment variables, and the first account. For the full
+adopter runbook -- Plaid, documents, Epic MyChart, backups, and daily
+operation -- see [`docs/onboarding.md`](onboarding.md), which points back
+here for the deployment steps rather than repeating them.
+
 This runbook describes the currently implemented account-isolated application.
 Family spaces, bounded inline capture, source records, and durable processing
 primitives are implemented. A bounded filesystem text worker supports foreground

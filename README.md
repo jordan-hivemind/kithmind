@@ -16,6 +16,23 @@ You host it yourself. The data sits in your own PostgreSQL database, not in a
 shared service. Assistants reach it over MCP, so no browser extension or
 copy-paste is involved.
 
+Current account values come from a daily Plaid feed
+(`@repo/plaid-feed`), not from parsing PDF statements; statements remain
+monthly history and a cross-check, importable once as optional history older
+than the feed. Documents come from a stateless, idempotent ingester
+(`@repo/ingest-simple`) that walks a folder, hashes each file, and upserts by
+hash -- no journal or durable worker to operate. Health records are planned
+from Epic's patient-facing FHIR API, one authorization per family member; see
+[the simplification and feeds plan](docs/plans/2026-09-22-simplification-and-feeds.md)
+for the full design.
+
+## Getting started
+
+Setting up your own deployment, including the daily finance feed, the
+document folder, and health records? [`docs/onboarding.md`](docs/onboarding.md)
+is the full runbook. The steps below cover the core web app and MCP
+connection only.
+
 ## Use it with Claude or ChatGPT
 
 Steps 1 through 3 happen once. Step 4 is the daily part.
@@ -116,13 +133,14 @@ The default is the full set, which is currently the same set.
 Working today: typed facts with supersession and retraction, narrative thoughts
 with hybrid retrieval and citations, authenticated text capture, document
 search with semantic and keyword modes, family spaces with invitations and
-roles, capability-scoped API keys, and an OAuth MCP gateway. A bounded
-filesystem worker can admit local text files.
+roles, capability-scoped API keys, an OAuth MCP gateway, a daily Plaid finance
+feed, and a stateless document ingester for a local or provider-synced folder.
+See [`docs/onboarding.md`](docs/onboarding.md) to set these up.
 
-Not yet: automated connectors, typed extraction from real documents, cloud
-monitoring, and bulk backfill of your own archives. The
-[architecture document](./docs/plans/2026-09-06-architecture.md) holds the phase
-table, and it is the source of truth for what is planned.
+Not yet: Epic FHIR health records and cloud monitoring. The
+[architecture document](./docs/plans/2026-09-06-architecture.md) and the
+[simplification and feeds plan](docs/plans/2026-09-22-simplification-and-feeds.md)
+are the source of truth for what is planned.
 
 Mobile is deliberately thin. Desktop is the primary workflow, and hosted MCP
 covers mobile clients that support it. There is no native app planned.

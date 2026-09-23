@@ -1,5 +1,9 @@
 # Filesystem text worker
 
+> **Legacy.** This describes the legacy statement and worker path, kept only
+> for the optional history import. Current setup instructions are in
+> [`docs/onboarding.md`](onboarding.md).
+
 The filesystem worker sends small UTF-8 text files to a configured Kith Mind
 source. The hosted Brain retains searchable text and evidence, so reads do not
 depend on the worker or original folder being online. PDF conversion, typed

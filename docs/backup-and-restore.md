@@ -1,5 +1,11 @@
 # Backup and restore
 
+> **Legacy.** This describes the legacy statement and worker path's backup
+> approach, kept only for the optional history import. The supported
+> deployment relies on the database provider's (Neon) and the folder
+> provider's (for example Dropbox) own backups. Current setup instructions
+> are in [`docs/onboarding.md`](onboarding.md).
+
 Status, 2026-09-18: P2-39m2 removed `packages/convex` from the repository
 (plan step 11.3), so the native-Convex recovery drill this document describes
 below can no longer be run from this repository -- there is no installed

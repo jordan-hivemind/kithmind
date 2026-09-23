@@ -1,5 +1,9 @@
 # Synthetic parser evaluation
 
+> **Legacy.** This describes the legacy statement and worker path, kept only
+> for the optional history import. Current setup instructions are in
+> [`docs/onboarding.md`](onboarding.md).
+
 Date: 2026-09-07. Task: P2-3. Status: feasibility evaluation complete.
 
 Docling passed all 19 labeled value, page, table-row and UTF-16 evidence checks
