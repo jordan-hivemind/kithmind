@@ -91,6 +91,9 @@ const KITH_TABLES = [
   // FIN-3 (migration 050): an owner's persisted --link/--unlink override,
   // read before any automatic (holdings/balance/mask/name) matching runs.
   "fin_account_link_overrides",
+  // FIN-4 (migration 051): the many-archive-instruments-to-one-security map,
+  // resolved before any CUSIP/ISIN/ticker match is retried.
+  "fin_security_links",
 ];
 
 // P2-39d: retired by migration 005, so this build must never re-create them.
@@ -177,6 +180,28 @@ test(
     assert.ok(matchMethodColumn, "kith.fin_accounts.match_method should exist");
     assert.equal(matchMethodColumn.data_type, "text");
     assert.equal(matchMethodColumn.is_nullable, "YES");
+
+    // Migration 051: fin_securities.archive_instrument_id is no longer
+    // UNIQUE (many archive instruments can resolve to one security) but is
+    // still indexed for lookup.
+    const [archiveInstrumentIdConstraint] = await all(
+      client,
+      `SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'kith.fin_securities'::regclass
+          AND conname = 'fin_securities_archive_instrument_id_key'`,
+    );
+    assert.equal(
+      archiveInstrumentIdConstraint,
+      undefined,
+      "the UNIQUE constraint on fin_securities.archive_instrument_id should be dropped",
+    );
+    const [archiveInstrumentIdIndex] = await all(
+      client,
+      `SELECT 1 FROM pg_indexes
+        WHERE schemaname = 'kith' AND tablename = 'fin_securities'
+          AND indexname = 'fin_securities_archive_instrument_id_idx'`,
+    );
+    assert.ok(archiveInstrumentIdIndex, "fin_securities.archive_instrument_id should still be indexed");
 
     for (const table of RETIRED_PROOF_TABLES) {
       const [row] = await all(
