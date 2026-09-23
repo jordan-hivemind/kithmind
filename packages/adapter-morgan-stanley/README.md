@@ -1,5 +1,12 @@
 # Morgan Stanley adapter
 
+> **DEPRECATED.** This adapter belongs to the optional statement-history
+> path (see [`@repo/finance-archive`](../finance-archive)'s deprecation
+> notice). It is kept only so `docs/onboarding.md`'s "Optional: statement
+> history beyond two years" path keeps working; it is not maintained for new
+> institutions. A new adopter should set up `@repo/plaid-feed` instead. See
+> [`docs/onboarding.md`](../../docs/onboarding.md).
+
 An `InstitutionAdapter` for Morgan Stanley, implementing the public contract in
 [`@repo/finance-archive`](../finance-archive) (`src/adapter.ts`). It knows one
 institution and nothing about the store: it returns data, never opens the

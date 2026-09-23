@@ -1,5 +1,11 @@
 # Database backups
 
+> **Legacy.** This describes the legacy statement and worker path's backup
+> approach, kept only for the optional history import. The supported
+> deployment relies on the database provider's (Neon) and the folder
+> provider's (for example Dropbox) own backups. Current setup instructions
+> are in [`docs/onboarding.md`](onboarding.md).
+
 **Status, 2026-09-21:** Historical operating guide. The owner selected Neon as
 the sufficient Postgres persistence boundary and does not require a separate
 database backup. The dump, encryption, restic, schedule, retention and restore

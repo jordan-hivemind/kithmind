@@ -1,5 +1,9 @@
 # PDF document-Q&A pipeline
 
+> **Legacy.** This describes the legacy statement and worker path, kept only
+> for the optional history import. Current setup instructions are in
+> [`docs/onboarding.md`](onboarding.md).
+
 ## Status
 
 The optional PDF path connects the filesystem runner to protected capture,
