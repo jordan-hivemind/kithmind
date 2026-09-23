@@ -15,13 +15,17 @@
 // is TanStack Query's default and is the right cadence for an archive that a
 // monthly statement import changes.
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Info } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import { InstitutionAccountDrawer } from "@/components/admin/institution-account-drawer";
 import { valueInformationDetail } from "@/components/admin/institutions-value-info";
+import {
+  RenameAccountDialog,
+  type RenameTarget,
+} from "@/components/admin/rename-account-dialog";
 import { DataTable, Detail, Tag } from "@/components/ui/data-table";
 import {
   Tooltip,
@@ -61,6 +65,7 @@ export function InstitutionsTable({
 }: {
   initial: InstitutionsPageData;
 }) {
+  const queryClient = useQueryClient();
   const { data } = useQuery({
     queryKey: ["institutions"],
     queryFn: async (): Promise<InstitutionsPageData> => {
@@ -76,6 +81,54 @@ export function InstitutionsTable({
 
   const [hideEmpty, setHideEmpty] = useState(true);
   const [editing, setEditing] = useState<InstitutionRow | null>(null);
+  const [renaming, setRenaming] = useState<InstitutionRow | null>(null);
+  const renameTarget: RenameTarget | null =
+    renaming === null
+      ? null
+      : renaming.archive !== null
+        ? {
+            id: renaming.id,
+            label: renaming.name,
+            initialValue: renaming.override?.displayName ?? "",
+            placeholder: renaming.archive.name,
+          }
+        : {
+            id: renaming.id,
+            label: renaming.name,
+            // `renaming.name` already is the owner's name when `feedName`
+            // is set (`plaidOnlyChild`'s `accountName` is `displayName ??
+            // feedName`), so an active override's own text is recovered
+            // from it rather than needing a second raw field on the row.
+            initialValue: renaming.feedName === null ? "" : renaming.name,
+            placeholder: renaming.feedName ?? renaming.name,
+          };
+  const saveRename = async (row: InstitutionRow, value: string | null) => {
+    const response =
+      row.archive !== null
+        ? await fetch(
+            `/api/kith/finance-accounts/${encodeURIComponent(row.id)}`,
+            {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                displayName: value,
+                accountLast4: row.override?.accountLast4 ?? null,
+                accountType: row.override?.accountType ?? null,
+                closed: row.override?.closed ?? false,
+              }),
+            },
+          )
+        : await fetch(
+            `/api/kith/fin-accounts/${encodeURIComponent(row.finAccountId!)}`,
+            {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ displayName: value }),
+            },
+          );
+    if (!response.ok) throw new Error("rename failed");
+    await queryClient.invalidateQueries({ queryKey: ["institutions"] });
+  };
   const institutions = useMemo(
     () =>
       hideEmpty
@@ -94,6 +147,15 @@ export function InstitutionsTable({
         accessorKey: "name",
         header: "Account",
         size: 180,
+        cell: ({ row }) =>
+          row.original.feedName === null ? (
+            row.original.name
+          ) : (
+            <Detail
+              label={row.original.name}
+              detail={`Originally ${row.original.feedName}`}
+            />
+          ),
       },
       {
         id: "accountLast4",
@@ -252,12 +314,24 @@ export function InstitutionsTable({
         data={institutions}
         columns={columns}
         getSubRows={(row) => row.children}
-        onRowClick={setEditing}
+        // A Plaid-only leaf row has no archive record for the Edit drawer to
+        // show (`row.archive === null`); it opens the compact Rename dialog
+        // instead, the only edit affordance that kind of row has.
+        onRowClick={(row) =>
+          row.archive === null ? setRenaming(row) : setEditing(row)
+        }
         actions={[
           {
             label: "Edit",
             onSelect: setEditing,
             hidden: (row) => row.archive === null,
+          },
+          {
+            label: "Rename",
+            onSelect: setRenaming,
+            // A group row (an institution header) has no name of its own to
+            // rename; every leaf row -- archive-linked or Plaid-only -- does.
+            hidden: (row) => row.accounts !== null,
           },
         ]}
         parentLabel={(row) => (
@@ -293,6 +367,11 @@ export function InstitutionsTable({
       <InstitutionAccountDrawer
         row={editing}
         onClose={() => setEditing(null)}
+      />
+      <RenameAccountDialog
+        target={renameTarget}
+        onClose={() => setRenaming(null)}
+        onSave={(value) => saveRename(renaming!, value)}
       />
     </div>
   );

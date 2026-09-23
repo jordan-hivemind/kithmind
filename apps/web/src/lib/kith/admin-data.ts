@@ -381,14 +381,40 @@ function financeContribution(
 // layout above this screen already gates on owner-or-editor; this loader
 // repeats only the sign-in check every page loader here repeats.
 
-export type BalancesPageData = { balances: admin.FinAccountRow[] };
+export type BalancesPageData = {
+  balances: admin.FinAccountRow[];
+  /**
+   * FIN-5: the owner's overrides for the archive-linked accounts among
+   * `balances`, keyed by the archive's own account id
+   * (`FinAccountRow.archiveAccountId`). Read the same way `loadInstitutions`
+   * reads them, so the Rename action can write to the SAME override an
+   * archive-linked account already has -- preserving its last four, type
+   * and closed flag -- rather than a second, competing name field. Empty
+   * when the caller cannot see the archive's own space.
+   */
+  overrides: Record<string, admin.AccountOverride>;
+};
 
 export async function loadBalances(
   cookieHeader: string | null,
 ): Promise<BalancesPageData | null> {
-  const loaded = await loadAuthenticatedPage(cookieHeader, async ({ ctx }) => ({
-    balances: await admin.listFinAccounts(ctx),
-  }));
+  const loaded = await loadAuthenticatedPage(
+    cookieHeader,
+    async ({ ctx, principal }) => {
+      const spaces = await administeredSpaces(ctx, principal);
+      const archiveSpace = resolveFinanceArchive()?.spaceId;
+      const overrides =
+        archiveSpace !== undefined && spaces.includes(archiveSpace)
+          ? await admin.listAccountOverrides(ctx, { spaceId: archiveSpace })
+          : [];
+      return { balances: await admin.listFinAccounts(ctx), overrides };
+    },
+  );
   if (loaded === null) return null;
-  return { balances: loaded.balances };
+  return {
+    balances: loaded.balances,
+    overrides: Object.fromEntries(
+      loaded.overrides.map((item) => [item.accountId, item]),
+    ),
+  };
 }

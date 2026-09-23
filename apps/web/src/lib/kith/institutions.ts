@@ -57,6 +57,24 @@ export type InstitutionRow = {
   institutionName: string;
   /** A human-friendly account label. Null for an institution parent row. */
   accountName: string | null;
+  /**
+   * FIN-5: the account's name before any owner rename, when it differs from
+   * `name` -- the archive's own name for an archive-linked account, or
+   * `kith.fin_accounts.name` (the feed's own name) for a Plaid-only one.
+   * Null when there is nothing to show beside `name` at all: a group row, or
+   * an account with no owner rename in effect. A reader shows it as a
+   * tooltip or muted secondary text, never as the row's own label.
+   */
+  feedName: string | null;
+  /**
+   * FIN-5: `kith.fin_accounts.id`, set only on a Plaid-only child (`id` on
+   * that row is `plaid:<accountId>`, prefixed for uniqueness against an
+   * archive account id in the same table). This is what a Rename action
+   * writes `display_name` to; an archive-linked row's Rename writes
+   * `kith.finance_account_overrides` instead, keyed by `id` itself. Null on
+   * every other row.
+   */
+  finAccountId: string | null;
   /** Only the archive-disclosed last four digits. Null when undisclosed. */
   accountLast4: string | null;
   /** Null on a group row: an institution has no single type. */
@@ -261,6 +279,11 @@ export function groupInstitutions(
       name: shownName,
       institutionName: record.account.institutionName,
       accountName: shownName,
+      // Only when the owner's rename actually replaced the archive's own
+      // name on screen -- an unrenamed account has nothing to show beside
+      // its one name.
+      feedName: shownName === archiveName ? null : archiveName,
+      finAccountId: null,
       accountLast4,
       archive: {
         name: archiveName,
@@ -312,6 +335,8 @@ export function groupInstitutions(
       name,
       institutionName: name,
       accountName: null,
+      feedName: null,
+      finAccountId: null,
       accountLast4: null,
       archive: null,
       override: null,
@@ -598,6 +623,11 @@ function plaidOnlyChild(row: admin.FinAccountRow, now: number): InstitutionRow {
     name: row.accountName,
     institutionName: row.institutionName,
     accountName: row.accountName,
+    // FIN-5: `row.accountName` is already `displayName ?? feedName`
+    // (`admin.listFinAccounts`); show the feed's own name beside it only
+    // when an owner rename actually replaced it on screen.
+    feedName: row.accountName === row.feedName ? null : row.feedName,
+    finAccountId: row.accountId,
     accountLast4: row.mask,
     accountType: row.subtype ?? row.type,
     accounts: null,
@@ -637,6 +667,8 @@ function emptyPlaidOnlyGroup(institutionName: string): InstitutionRow {
     name: institutionName,
     institutionName,
     accountName: null,
+    feedName: null,
+    finAccountId: null,
     accountLast4: null,
     archive: null,
     override: null,
