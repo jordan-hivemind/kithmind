@@ -2635,6 +2635,12 @@ function printDocumentKindPreview(
 }
 
 async function main(): Promise<void> {
+  // Statement import is the optional, deprecated history path (see
+  // docs/onboarding.md, "Optional: statement history beyond two years").
+  // This line is informational only and never changes behavior or exit code.
+  console.error(
+    "DEPRECATED: statement import is the optional history path; see docs/onboarding.md",
+  );
   const argv = process.argv.slice(2);
   if (argv[0] === "holding-correction-publish") {
     return runHoldingCorrectionPublish(argv.slice(1));
