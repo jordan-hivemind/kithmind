@@ -49,6 +49,8 @@ function finAccount(
     plaidAccountId: "plaid-account-1",
     institutionName: "Example Broker",
     accountName: "Brokerage",
+    displayName: null,
+    feedName: "Brokerage",
     mask: "1234",
     type: "investment",
     subtype: "brokerage",
@@ -196,6 +198,17 @@ describe("the owner's overrides", () => {
       accountLast4: null,
       accountType: null,
     });
+    // The renamed account still carries the archive's own name, for a
+    // tooltip or muted secondary text -- never as the row's own label.
+    expect(child.feedName).toBe("Investments");
+  });
+
+  test("an account with no owner rename shows no feed name beside it", () => {
+    const [group] = groupInstitutions(
+      [record({ account: account({ displayLabel: "Investments" }) })],
+      NOW,
+    );
+    expect(group!.children![0]!.feedName).toBeNull();
   });
 
   test("closed makes an account inactive whatever its dates, or its own emptiness, say", () => {
@@ -976,6 +989,44 @@ describe("feed values and status (mergeLiveAccounts)", () => {
     expect(child.valueSource).toBe("feed");
     expect(child.status).toBe("fresh");
     expect(child.empty).toBe(false);
+  });
+
+  test("a Plaid-only account with no owner rename shows no feed name beside it", () => {
+    const merged = mergeLiveAccounts(
+      [],
+      [finAccount({ accountId: "fin-1", accountName: "Mortgage Loan", feedName: "Mortgage Loan" })],
+      NOW,
+    );
+    expect(merged[0]!.children![0]!.feedName).toBeNull();
+  });
+
+  test("a Plaid-only account renamed by the owner still carries the feed's own name", () => {
+    const merged = mergeLiveAccounts(
+      [],
+      [
+        finAccount({
+          accountId: "fin-1",
+          institutionName: "Example Bank",
+          accountName: "Rental property mortgage",
+          displayName: "Rental property mortgage",
+          feedName: "Mortgage Loan",
+        }),
+        finAccount({
+          accountId: "fin-2",
+          institutionName: "Example Bank",
+          accountName: "Mortgage Loan",
+          displayName: null,
+          feedName: "Mortgage Loan",
+        }),
+      ],
+      NOW,
+    );
+    const children = merged[0]!.children!;
+    const renamed = children.find((child) => child.id === "plaid:fin-1")!;
+    const untouched = children.find((child) => child.id === "plaid:fin-2")!;
+    expect(renamed.name).toBe("Rental property mortgage");
+    expect(renamed.feedName).toBe("Mortgage Loan");
+    expect(untouched.feedName).toBeNull();
   });
 
   test("the institution header sums the feed-updated value and takes the worst child status", () => {

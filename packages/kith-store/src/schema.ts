@@ -374,6 +374,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "drop the UNIQUE constraint on fin_securities.archive_instrument_id (kept as a plain index) and add kith.fin_security_links so many archive instruments can resolve to one security",
     url: new URL("../migrations/051_fin_security_links.sql", import.meta.url),
   },
+  {
+    version: 52,
+    name: "kith.fin_accounts.display_name: the owner's own name for a feed-only account, the same correction an archive account already gets through kith.finance_account_overrides",
+    url: new URL("../migrations/052_fin_account_display_name.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

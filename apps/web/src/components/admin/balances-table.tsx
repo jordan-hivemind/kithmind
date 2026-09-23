@@ -1,6 +1,7 @@
 "use client";
 
-// PLAID-1's screen, read-only: one row per linked Plaid account.
+// PLAID-1's screen, read-only apart from FIN-5's Rename action: one row per
+// linked Plaid account.
 //
 // Not on the change feed, the same reason `institutions-table.tsx` is not:
 // the Plaid feed's tables carry no `kith.changes` triggers (the simplification
@@ -8,16 +9,35 @@
 // subscribe to. It refetches on mount and when the window is refocused,
 // TanStack Query's default, which is the right cadence for a feed that a
 // daily `pull` changes at most once a day.
+//
+// FIN-5: `admin.listFinAccounts`' own `accountName` never reflects an
+// archive-linked account's `kith.finance_account_overrides` row -- that
+// override lives beside the archive, keyed by the archive's own account id,
+// and `fin_accounts.display_name` is never set for that kind of row (see
+// `packages/kith-store/src/admin/finAccounts.ts`). `rows` below applies
+// it on the client from `data.overrides` (`loadBalances`), the same name a
+// linked account's Rename writes to, so this table's own Account column
+// agrees with what Rename just saved rather than showing the feed's raw name
+// underneath it.
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ColumnDef } from "@tanstack/react-table";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 
-import { DataTable, Tag } from "@/components/ui/data-table";
+import { RenameAccountDialog, type RenameTarget } from "@/components/admin/rename-account-dialog";
+import { DataTable, Detail, Tag } from "@/components/ui/data-table";
 import type { BalancesPageData } from "@/lib/kith/admin-data";
 import { archiveDate, label, tableMoney } from "@/lib/kith/format";
 
-type BalanceRow = BalancesPageData["balances"][number];
+type FinAccountRow = BalancesPageData["balances"][number];
+type BalanceRow = Omit<FinAccountRow, "feedName"> & {
+  /** `finance_account_overrides.display_name` when this is an archive-linked
+   * account with one, otherwise `FinAccountRow.accountName` unchanged. */
+  shownName: string;
+  /** The underlying name beside `shownName`, for a tooltip -- null when an
+   * owner rename has not replaced it on screen. */
+  feedName: string | null;
+};
 
 function money(amount: number | null, currency: string | null) {
   if (amount === null || currency === null) return "";
@@ -31,6 +51,7 @@ function date(value: string | null) {
 }
 
 export function BalancesTable({ initial }: { initial: BalancesPageData }) {
+  const queryClient = useQueryClient();
   const { data } = useQuery({
     queryKey: ["balances"],
     queryFn: async (): Promise<BalancesPageData> => {
@@ -44,6 +65,64 @@ export function BalancesTable({ initial }: { initial: BalancesPageData }) {
     initialData: initial,
   });
 
+  const rows = useMemo<BalanceRow[]>(
+    () =>
+      data.balances.map((row) => {
+        const override =
+          row.archiveAccountId === null
+            ? undefined
+            : data.overrides[row.archiveAccountId];
+        const shownName = override?.displayName ?? row.accountName;
+        return {
+          ...row,
+          shownName,
+          feedName: shownName === row.feedName ? null : row.feedName,
+        };
+      }),
+    [data.balances, data.overrides],
+  );
+
+  const [renaming, setRenaming] = useState<BalanceRow | null>(null);
+  const renameTarget: RenameTarget | null =
+    renaming === null
+      ? null
+      : {
+          id: renaming.accountId,
+          label: renaming.shownName,
+          initialValue:
+            renaming.archiveAccountId !== null
+              ? (data.overrides[renaming.archiveAccountId]?.displayName ?? "")
+              : (renaming.displayName ?? ""),
+          placeholder: renaming.feedName ?? renaming.shownName,
+        };
+  const saveRename = async (row: BalanceRow, value: string | null) => {
+    const response =
+      row.archiveAccountId !== null
+        ? await fetch(
+            `/api/kith/finance-accounts/${encodeURIComponent(row.archiveAccountId)}`,
+            {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                displayName: value,
+                accountLast4: data.overrides[row.archiveAccountId]?.accountLast4 ?? null,
+                accountType: data.overrides[row.archiveAccountId]?.accountType ?? null,
+                closed: data.overrides[row.archiveAccountId]?.closed ?? false,
+              }),
+            },
+          )
+        : await fetch(
+            `/api/kith/fin-accounts/${encodeURIComponent(row.accountId)}`,
+            {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ displayName: value }),
+            },
+          );
+    if (!response.ok) throw new Error("rename failed");
+    await queryClient.invalidateQueries({ queryKey: ["balances"] });
+  };
+
   const columns = useMemo<ColumnDef<BalanceRow, unknown>[]>(
     () => [
       {
@@ -54,9 +133,18 @@ export function BalancesTable({ initial }: { initial: BalancesPageData }) {
       },
       {
         id: "accountName",
-        accessorKey: "accountName",
+        accessorKey: "shownName",
         header: "Account",
         size: 180,
+        cell: ({ row }) =>
+          row.original.feedName === null ? (
+            row.original.shownName
+          ) : (
+            <Detail
+              label={row.original.shownName}
+              detail={`Originally ${row.original.feedName}`}
+            />
+          ),
       },
       {
         id: "mask",
@@ -120,13 +208,22 @@ export function BalancesTable({ initial }: { initial: BalancesPageData }) {
   );
 
   return (
-    <DataTable
-      id="admin-balances"
-      data={data.balances}
-      columns={columns}
-      initialSorting={[{ id: "institutionName", desc: false }]}
-      searchPlaceholder="Search accounts"
-      empty="No linked accounts"
-    />
+    <>
+      <DataTable
+        id="admin-balances"
+        data={rows}
+        columns={columns}
+        initialSorting={[{ id: "institutionName", desc: false }]}
+        onRowClick={setRenaming}
+        actions={[{ label: "Rename", onSelect: setRenaming }]}
+        searchPlaceholder="Search accounts"
+        empty="No linked accounts"
+      />
+      <RenameAccountDialog
+        target={renameTarget}
+        onClose={() => setRenaming(null)}
+        onSave={(value) => saveRename(renaming!, value)}
+      />
+    </>
   );
 }

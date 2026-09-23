@@ -203,6 +203,19 @@ test(
     );
     assert.ok(archiveInstrumentIdIndex, "fin_securities.archive_instrument_id should still be indexed");
 
+    // Migration 052: the owner's own name for a feed-only account, nullable
+    // so an unnamed account reads as "use the feed's own name" rather than a
+    // sentinel.
+    const [displayNameColumn] = await all(
+      client,
+      `SELECT data_type, is_nullable FROM information_schema.columns
+        WHERE table_schema = 'kith' AND table_name = 'fin_accounts'
+          AND column_name = 'display_name'`,
+    );
+    assert.ok(displayNameColumn, "kith.fin_accounts.display_name should exist");
+    assert.equal(displayNameColumn.data_type, "text");
+    assert.equal(displayNameColumn.is_nullable, "YES");
+
     for (const table of RETIRED_PROOF_TABLES) {
       const [row] = await all(
         client,
