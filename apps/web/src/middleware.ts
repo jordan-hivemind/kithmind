@@ -58,6 +58,10 @@ export const isPublicRoute = createRouteMatcher([
   // gate in front of them would make sign-in unreachable.
   "/api/auth(.*)",
   "/mcp/authorize",
+  // Epic's OAuth redirect target. It reads nothing and shows the code for the
+  // person to paste into the terminal; the browser arriving here is not
+  // signed in to Kith Mind.
+  "/api/epic/callback",
 ]);
 
 /**

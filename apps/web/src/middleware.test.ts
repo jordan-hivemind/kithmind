@@ -85,6 +85,8 @@ describe("web authentication middleware", () => {
   test("allows the exact invite landing page without authorizing membership", async () => {
     const invite = request("/invite");
     expect(isPublicRoute(invite)).toBe(true);
+    const epicCallback = request("/api/epic/callback");
+    expect(isPublicRoute(epicCallback)).toBe(true);
     expect(await handleMiddlewareRequest(invite, {})).toBeUndefined();
   });
 
