@@ -263,3 +263,107 @@ test("pullOneSource fails without reauth when the Keychain item is missing", asy
   assert.equal(result.status, "failed");
   assert.match(result.error, /not found/);
 });
+
+function fetchImplForRefresh(tokenCalls) {
+  return async (url, init) => {
+    if (url.includes("smart-configuration")) {
+      return jsonResponse(200, {
+        authorization_endpoint: "https://fhir.synthetic.example/oauth2/authorize",
+        token_endpoint: "https://fhir.synthetic.example/oauth2/token",
+      });
+    }
+    if (url.includes("/oauth2/token")) {
+      tokenCalls.push(init);
+      return jsonResponse(200, {
+        access_token: "fresh-access",
+        refresh_token: "fresh-refresh",
+        expires_in: 3600,
+      });
+    }
+    if (url.includes("/Patient/")) return jsonResponse(200, patientResource());
+    return jsonResponse(200, { entry: [] });
+  };
+}
+
+test("pullOneSource refreshes with HTTP Basic when the stored token's clientAuth is secret", async () => {
+  const pool = fakePool();
+  const tokenCalls = [];
+  const originalToken = JSON.stringify({
+    refreshToken: "old-refresh",
+    accessToken: "stale-access",
+    expiresAt: "2020-01-01T00:00:00Z",
+    patientFhirId: "patient-1",
+    fhirBase: SOURCE.fhirBase,
+    orgName: SOURCE.orgName,
+    clientAuth: "secret",
+  });
+  const tokenStore = inMemoryTokenStore({ [SOURCE.keychainService]: originalToken });
+  const result = await pullOneSource(pool, SOURCE, fetchImplForRefresh(tokenCalls), tokenStore, {
+    clientId: "client-1",
+    clientSecret: "secret-1",
+  });
+  assert.equal(result.status, "ok");
+  assert.equal(tokenCalls.length, 1);
+  assert.equal(
+    tokenCalls[0].headers.authorization,
+    `Basic ${Buffer.from("client-1:secret-1").toString("base64")}`,
+  );
+  const body = new URLSearchParams(tokenCalls[0].body);
+  assert.equal(body.get("client_id"), null);
+  const updated = JSON.parse(tokenStore.items.get(SOURCE.keychainService));
+  assert.equal(updated.clientAuth, "secret");
+  assert.equal(updated.accessToken, "fresh-access");
+});
+
+test("pullOneSource treats a stored token with no clientAuth field as secret (Basic)", async () => {
+  const pool = fakePool();
+  const tokenCalls = [];
+  const originalToken = JSON.stringify({
+    refreshToken: "old-refresh",
+    accessToken: "stale-access",
+    expiresAt: "2020-01-01T00:00:00Z",
+    patientFhirId: "patient-1",
+    fhirBase: SOURCE.fhirBase,
+    orgName: SOURCE.orgName,
+    // No clientAuth field -- a token written before this field existed.
+  });
+  const tokenStore = inMemoryTokenStore({ [SOURCE.keychainService]: originalToken });
+  const result = await pullOneSource(pool, SOURCE, fetchImplForRefresh(tokenCalls), tokenStore, {
+    clientId: "client-1",
+    clientSecret: "secret-1",
+  });
+  assert.equal(result.status, "ok");
+  assert.equal(
+    tokenCalls[0].headers.authorization,
+    `Basic ${Buffer.from("client-1:secret-1").toString("base64")}`,
+  );
+  const updated = JSON.parse(tokenStore.items.get(SOURCE.keychainService));
+  assert.equal(updated.clientAuth, "secret");
+});
+
+test("pullOneSource refreshes with client_id in the body, no Authorization header, when the stored token's clientAuth is public", async () => {
+  const pool = fakePool();
+  const tokenCalls = [];
+  const originalToken = JSON.stringify({
+    refreshToken: "old-refresh",
+    accessToken: "stale-access",
+    expiresAt: "2020-01-01T00:00:00Z",
+    patientFhirId: "patient-1",
+    fhirBase: SOURCE.fhirBase,
+    orgName: SOURCE.orgName,
+    clientAuth: "public",
+  });
+  const tokenStore = inMemoryTokenStore({ [SOURCE.keychainService]: originalToken });
+  const result = await pullOneSource(pool, SOURCE, fetchImplForRefresh(tokenCalls), tokenStore, {
+    clientId: "client-1",
+    clientSecret: null,
+  });
+  assert.equal(result.status, "ok");
+  assert.equal(tokenCalls.length, 1);
+  assert.equal(tokenCalls[0].headers.authorization, undefined);
+  const body = new URLSearchParams(tokenCalls[0].body);
+  assert.equal(body.get("client_id"), "client-1");
+  const updated = JSON.parse(tokenStore.items.get(SOURCE.keychainService));
+  assert.equal(updated.clientAuth, "public");
+  assert.equal(updated.accessToken, "fresh-access");
+});

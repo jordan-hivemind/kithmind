@@ -20,7 +20,7 @@ import type { Pool } from "pg";
 import {
   healthDataDir,
   loadClientId,
-  loadClientSecret,
+  loadClientSecretOrNull,
   loadDatabaseUrl,
   personSlug,
   SANDBOX_FHIR_BASE,
@@ -43,6 +43,7 @@ import {
   discoverSmartConfiguration,
   InvalidGrantError,
   refreshAccessToken,
+  type ClientAuthMethod,
   type Fetch,
 } from "./oauth.js";
 import { keychainTokenStore, type TokenStore } from "./keychain.js";
@@ -54,6 +55,11 @@ export type StoredToken = {
   patientFhirId: string;
   fhirBase: string;
   orgName: string;
+  /** How this token was obtained (`"secret"` HTTP Basic, `"public"`
+   * `client_id` in the body). Absent on a token written before this field
+   * existed -- treated as `"secret"`, matching the exchange's previous,
+   * only, behavior. */
+  clientAuth?: ClientAuthMethod;
 };
 
 export type SourcePullResult = {
@@ -274,7 +280,7 @@ async function pullDocumentAttachment(
   return false;
 }
 
-export type EpicCredentials = { clientId: string; clientSecret: string };
+export type EpicCredentials = { clientId: string; clientSecret: string | null };
 
 async function refreshedAccessToken(
   source: HealthSourceRow,
@@ -286,6 +292,9 @@ async function refreshedAccessToken(
   if (token.refreshToken === null) {
     throw new InvalidGrantError("No refresh token stored; authorize again");
   }
+  // A token stored before `clientAuth` existed was always obtained with
+  // HTTP Basic (the exchange's only method at the time).
+  const clientAuth: ClientAuthMethod = token.clientAuth ?? "secret";
   const discovery = await discoverSmartConfiguration(source.fhirBase, fetchImpl);
   const refreshed = await refreshAccessToken(
     {
@@ -293,6 +302,7 @@ async function refreshedAccessToken(
       clientId: credentials.clientId,
       clientSecret: credentials.clientSecret,
       refreshToken: token.refreshToken,
+      clientAuth,
     },
     fetchImpl,
   );
@@ -303,6 +313,7 @@ async function refreshedAccessToken(
     patientFhirId: token.patientFhirId,
     fhirBase: token.fhirBase,
     orgName: token.orgName,
+    clientAuth,
   };
   await tokenStore.set(source.keychainService, JSON.stringify(updated));
   return refreshed.accessToken;
@@ -333,7 +344,7 @@ export async function pullAll(deps: PullDeps = {}): Promise<{
       if (credentials === undefined) {
         const [clientId, clientSecret] = await Promise.all([
           loadClientId(env),
-          loadClientSecret(),
+          loadClientSecretOrNull(),
         ]);
         credentials = { clientId, clientSecret };
         credentialsByEnv.set(env, credentials);

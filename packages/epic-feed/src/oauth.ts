@@ -1,6 +1,15 @@
 // SMART on FHIR standalone launch: PKCE, endpoint discovery, and the token
-// exchange/refresh calls with HTTP Basic client authentication (a
-// confidential client with a client secret, per the task).
+// exchange/refresh calls.
+//
+// The app is registered as a confidential client (a client secret), but
+// Epic's sandbox has been observed to answer a Basic-authenticated request
+// with 401 invalid_client while accepting the same request with no
+// Authorization header and `client_id` in the body -- i.e. it treats this
+// registration as a public client regardless of the configured secret. The
+// code exchange therefore tries HTTP Basic first (when a secret is
+// configured) and falls back to a public-client request on invalid_client,
+// recording which method actually worked so `refreshAccessToken` can reuse
+// it without probing again.
 //
 // Nothing here prints or logs a code, a verifier, a token or a secret --
 // only the shapes callers need to store or compare.
@@ -163,43 +172,78 @@ export class InvalidGrantError extends Error {
   }
 }
 
+/** Which way the token endpoint accepted this client: `"secret"` for HTTP
+ * Basic with the configured client secret, `"public"` for no Authorization
+ * header and `client_id` in the form body (RFC 6749 2.3.1's "public
+ * client" case, which is what Epic's sandbox has been observed to require
+ * for this app's registration). Stored alongside a person's token so a
+ * later refresh uses the same method without re-probing. */
+export type ClientAuthMethod = "secret" | "public";
+
 function basicAuthHeader(clientId: string, clientSecret: string): string {
   return `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`;
 }
 
-async function postToken(
+type RawTokenBody = {
+  access_token?: string;
+  refresh_token?: string;
+  expires_in?: number;
+  patient?: string;
+  scope?: string;
+  error?: string;
+  error_description?: string;
+};
+
+type TokenRequestResult = {
+  ok: boolean;
+  status: number;
+  parsed: RawTokenBody;
+};
+
+/** POSTs one token request, either with an `authorization` header (Basic,
+ * client-secret auth) or without one (public-client auth, `client_id`
+ * already set on `body` by the caller). Never throws on a non-2xx response
+ * -- the caller decides whether to retry, so this only reports the shape. */
+async function requestToken(
   tokenEndpoint: string,
-  clientId: string,
-  clientSecret: string,
   body: URLSearchParams,
   fetchImpl: Fetch,
-): Promise<TokenResponse> {
+  authorizationHeader: string | null,
+): Promise<TokenRequestResult> {
+  const headers: Record<string, string> = {
+    "content-type": "application/x-www-form-urlencoded",
+    accept: "application/json",
+  };
+  if (authorizationHeader !== null) headers.authorization = authorizationHeader;
   const response = await fetchImpl(tokenEndpoint, {
     method: "POST",
-    headers: {
-      "content-type": "application/x-www-form-urlencoded",
-      accept: "application/json",
-      authorization: basicAuthHeader(clientId, clientSecret),
-    },
+    headers,
     body: body.toString(),
   });
-  const parsed = (await response.json().catch(() => ({}))) as {
-    access_token?: string;
-    refresh_token?: string;
-    expires_in?: number;
-    patient?: string;
-    scope?: string;
-    error?: string;
-    error_description?: string;
-  };
-  if (!response.ok) {
-    if (parsed.error === "invalid_grant") {
-      throw new InvalidGrantError(parsed.error_description ?? null);
-    }
-    throw new Error(
-      `Epic token request failed (${response.status}): ${parsed.error ?? "unknown_error"} ${parsed.error_description ?? ""}`.trim(),
-    );
+  const parsed = (await response.json().catch(() => ({}))) as RawTokenBody;
+  return { ok: response.ok, status: response.status, parsed };
+}
+
+/** A 400 or 401 with `error=invalid_client` -- Epic's sandbox answers this
+ * way to a Basic-authenticated request for a registration it treats as a
+ * public client, regardless of the configured secret. */
+function isInvalidClient(result: TokenRequestResult): boolean {
+  return (
+    (result.status === 400 || result.status === 401) &&
+    result.parsed.error === "invalid_client"
+  );
+}
+
+function throwTokenError(result: TokenRequestResult): never {
+  if (result.parsed.error === "invalid_grant") {
+    throw new InvalidGrantError(result.parsed.error_description ?? null);
   }
+  throw new Error(
+    `Epic token request failed (${result.status}): ${result.parsed.error ?? "unknown_error"} ${result.parsed.error_description ?? ""}`.trim(),
+  );
+}
+
+function toTokenResponse(parsed: RawTokenBody): TokenResponse {
   if (!parsed.access_token) {
     throw new Error("Epic token response had no access_token");
   }
@@ -216,43 +260,78 @@ async function postToken(
 export type ExchangeCodeArgs = {
   tokenEndpoint: string;
   clientId: string;
-  clientSecret: string;
+  /** `null` when no client secret is configured at all (no env, no
+   * Keychain) -- the exchange then goes straight to the public-client
+   * request instead of failing. */
+  clientSecret: string | null;
   code: string;
   redirectUri: string;
   codeVerifier: string;
 };
 
-/** Authorization-code exchange, HTTP Basic client authentication. */
+export type ExchangeCodeResult = TokenResponse & { clientAuth: ClientAuthMethod };
+
+/**
+ * Authorization-code exchange. Tries HTTP Basic client authentication
+ * first when a client secret is configured; on a 400/401 `invalid_client`
+ * response (or when no secret is configured at all), retries once as a
+ * public client -- no Authorization header, `client_id` in the form body,
+ * the same code, redirect_uri and code_verifier. The result records which
+ * method actually succeeded.
+ */
 export async function exchangeCode(
   args: ExchangeCodeArgs,
   fetchImpl: Fetch = fetch,
-): Promise<TokenResponse> {
-  const body = new URLSearchParams({
-    grant_type: "authorization_code",
-    code: args.code,
-    redirect_uri: args.redirectUri,
-    code_verifier: args.codeVerifier,
-  });
-  return await postToken(
-    args.tokenEndpoint,
-    args.clientId,
-    args.clientSecret,
-    body,
-    fetchImpl,
-  );
+): Promise<ExchangeCodeResult> {
+  const baseBody = (): URLSearchParams =>
+    new URLSearchParams({
+      grant_type: "authorization_code",
+      code: args.code,
+      redirect_uri: args.redirectUri,
+      code_verifier: args.codeVerifier,
+    });
+
+  if (args.clientSecret !== null) {
+    const basicResult = await requestToken(
+      args.tokenEndpoint,
+      baseBody(),
+      fetchImpl,
+      basicAuthHeader(args.clientId, args.clientSecret),
+    );
+    if (basicResult.ok) {
+      return { ...toTokenResponse(basicResult.parsed), clientAuth: "secret" };
+    }
+    if (!isInvalidClient(basicResult)) {
+      throwTokenError(basicResult);
+    }
+    // Falls through to the public-client retry below.
+  }
+
+  const publicBody = baseBody();
+  publicBody.set("client_id", args.clientId);
+  const publicResult = await requestToken(args.tokenEndpoint, publicBody, fetchImpl, null);
+  if (!publicResult.ok) throwTokenError(publicResult);
+  return { ...toTokenResponse(publicResult.parsed), clientAuth: "public" };
 }
 
 export type RefreshTokenArgs = {
   tokenEndpoint: string;
   clientId: string;
-  clientSecret: string;
+  /** `null` when no client secret is configured; only valid together with
+   * `clientAuth: "public"` (a `"secret"` refresh with no secret throws). */
+  clientSecret: string | null;
   refreshToken: string;
+  /** The method the token being refreshed was originally obtained with --
+   * refresh always reuses it rather than probing again. */
+  clientAuth: ClientAuthMethod;
 };
 
 /**
- * Refreshes an access token. Throws `InvalidGrantError` when Epic reports
- * `invalid_grant` (the refresh token is dead -- the caller marks
- * `needs_reauth_at` and reports, never loops on this).
+ * Refreshes an access token, using the same client authentication method
+ * the token was originally exchanged with (Basic for `"secret"`,
+ * `client_id` in the body for `"public"`). Throws `InvalidGrantError` when
+ * Epic reports `invalid_grant` (the refresh token is dead -- the caller
+ * marks `needs_reauth_at` and reports, never loops on this).
  */
 export async function refreshAccessToken(
   args: RefreshTokenArgs,
@@ -262,13 +341,21 @@ export async function refreshAccessToken(
     grant_type: "refresh_token",
     refresh_token: args.refreshToken,
   });
-  return await postToken(
-    args.tokenEndpoint,
-    args.clientId,
-    args.clientSecret,
-    body,
-    fetchImpl,
-  );
+  let authorizationHeader: string | null = null;
+  if (args.clientAuth === "secret") {
+    if (args.clientSecret === null) {
+      throw new Error(
+        "Epic refresh needs a client secret (this token was obtained as a " +
+          "confidential client) but none is configured",
+      );
+    }
+    authorizationHeader = basicAuthHeader(args.clientId, args.clientSecret);
+  } else {
+    body.set("client_id", args.clientId);
+  }
+  const result = await requestToken(args.tokenEndpoint, body, fetchImpl, authorizationHeader);
+  if (!result.ok) throwTokenError(result);
+  return toTokenResponse(result.parsed);
 }
 
 /** Parses either a bare authorization code or a full pasted callback URL

@@ -61,7 +61,7 @@ Two commands:
 | `com.kithmind.epic.client-id` | Production client id (optional; falls back to the public default above). |
 | `com.kithmind.epic.client-id-nonprod` | Sandbox client id (optional; falls back to the public default above). |
 | `com.kithmind.epic.client-secret` | The client secret. Required (no built-in default -- a secret is never public). |
-| `com.kithmind.epic.token.<person-slug>` | One person's refresh token, access token, expiry, patient FHIR id, FHIR base and org name, as JSON. Written by `authorize`, read and rewritten by `pull`. |
+| `com.kithmind.epic.token.<person-slug>` | One person's refresh token, access token, expiry, patient FHIR id, FHIR base, org name, and `clientAuth` (`"secret"` or `"public"` -- see `authorize` step 6), as JSON. Written by `authorize`, read and rewritten by `pull`. A token stored before `clientAuth` existed is treated as `"secret"`. |
 | `com.kithmind.deferred-work.database-url` | The Postgres connection string (shared with `@repo/plaid-feed`). |
 
 ## `authorize`
@@ -91,12 +91,24 @@ kith-epic-feed authorize --person <kith_id-or-name> [--org "<health system name>
    -- accepts either the bare code or the full pasted callback URL (the
    production callback page shows both the code and the state to copy).
 6. Exchanges the code at the token endpoint with HTTP Basic client
-   authentication and the PKCE code verifier, then writes the result to
-   `com.kithmind.epic.token.<person-slug>` and upserts
-   `kith.health_sources`.
+   authentication and the PKCE code verifier. Epic's sandbox has been
+   observed to answer that Basic request with `invalid_client` for this
+   app's registration regardless of the configured secret, treating it as a
+   public client instead; on a 400/401 `invalid_client` response (or when
+   no client secret is configured at all) the exchange retries once with no
+   Authorization header and `client_id` in the form body. Whichever method
+   succeeds is stored as `clientAuth: "secret" | "public"` alongside the
+   token, and the same method is reused on every later refresh -- it is
+   never re-probed. The result is written to
+   `com.kithmind.epic.token.<person-slug>` and `kith.health_sources` is
+   upserted.
+7. Prints `Authorized as <public|confidential> client; refresh token:
+   <present|absent>`. If Epic did not grant a refresh token, a second line
+   says the daily pull will need a new authorization once the access token
+   expires; what was received is still stored either way.
 
 Nothing here ever prints a secret, a token, or patient data -- only the
-authorization URL (a public value) and a confirmation line.
+authorization URL (a public value) and confirmation lines.
 
 ## `pull`
 
@@ -104,9 +116,12 @@ authorization URL (a public value) and a confirmation line.
 kith-epic-feed pull
 ```
 
-For each linked source: refreshes the access token (an `invalid_grant`
-response sets `needs_reauth_at` and reports -- it is never retried in this
-process; run `authorize` again for that person), fetches `Patient` by id,
+For each linked source: refreshes the access token, using whichever client
+authentication method (`clientAuth`) that source's stored token was
+obtained with -- it is never re-probed here, only at `authorize` time (an
+`invalid_grant` response sets `needs_reauth_at` and reports -- it is never
+retried in this process; run `authorize` again for that person), fetches
+`Patient` by id,
 then pages through every other incoming resource type's search by patient
 with `_count=200`, following `link[rel=next]`, retrying 429 and 5xx with
 backoff. `DocumentReference`'s `Binary` attachment is fetched when its

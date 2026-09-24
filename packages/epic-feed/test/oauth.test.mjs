@@ -158,9 +158,103 @@ test("exchangeCode sends HTTP Basic client auth and the code verifier", async ()
   assert.equal(result.accessToken, "access-1");
   assert.equal(result.refreshToken, "refresh-1");
   assert.equal(result.patientFhirId, "patient-1");
+  assert.equal(result.clientAuth, "secret");
 });
 
-test("refreshAccessToken sends the refresh grant with Basic auth", async () => {
+test("exchangeCode falls back to a public-client request after Basic gets invalid_client", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push(init);
+    if (init.headers.authorization !== undefined) {
+      // Basic attempt: Epic's sandbox rejects this registration as
+      // confidential regardless of the configured secret.
+      return jsonResponse(401, {
+        error: "invalid_client",
+        error_description: "invalid client credentials",
+      });
+    }
+    return jsonResponse(200, {
+      access_token: "access-1",
+      refresh_token: "refresh-1",
+      expires_in: 3600,
+      patient: "patient-1",
+      scope: "openid patient/Patient.read",
+    });
+  };
+  const result = await exchangeCode(
+    {
+      tokenEndpoint: "https://fhir.epic.com/oauth2/token",
+      clientId: "client-1",
+      clientSecret: "secret-1",
+      code: "code-1",
+      redirectUri: "https://brain.hive-mind.com/api/epic/callback",
+      codeVerifier: "verifier-1",
+    },
+    fetchImpl,
+  );
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].headers.authorization, `Basic ${Buffer.from("client-1:secret-1").toString("base64")}`);
+  assert.equal(calls[1].headers.authorization, undefined);
+  const publicBody = new URLSearchParams(calls[1].body);
+  assert.equal(publicBody.get("client_id"), "client-1");
+  assert.equal(publicBody.get("code"), "code-1");
+  assert.equal(publicBody.get("code_verifier"), "verifier-1");
+  assert.equal(result.accessToken, "access-1");
+  assert.equal(result.clientAuth, "public");
+});
+
+test("exchangeCode rejects on a Basic failure that is not invalid_client, without retrying", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push(init);
+    return jsonResponse(500, { error: "server_error", error_description: "boom" });
+  };
+  await assert.rejects(() =>
+    exchangeCode(
+      {
+        tokenEndpoint: "https://fhir.epic.com/oauth2/token",
+        clientId: "client-1",
+        clientSecret: "secret-1",
+        code: "code-1",
+        redirectUri: "https://brain.hive-mind.com/api/epic/callback",
+        codeVerifier: "verifier-1",
+      },
+      fetchImpl,
+    ),
+  );
+  assert.equal(calls.length, 1);
+});
+
+test("exchangeCode goes straight to the public-client request when no secret is configured", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push(init);
+    return jsonResponse(200, {
+      access_token: "access-1",
+      refresh_token: "refresh-1",
+      expires_in: 3600,
+      patient: "patient-1",
+    });
+  };
+  const result = await exchangeCode(
+    {
+      tokenEndpoint: "https://fhir.epic.com/oauth2/token",
+      clientId: "client-1",
+      clientSecret: null,
+      code: "code-1",
+      redirectUri: "https://brain.hive-mind.com/api/epic/callback",
+      codeVerifier: "verifier-1",
+    },
+    fetchImpl,
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].headers.authorization, undefined);
+  const body = new URLSearchParams(calls[0].body);
+  assert.equal(body.get("client_id"), "client-1");
+  assert.equal(result.clientAuth, "public");
+});
+
+test("refreshAccessToken sends the refresh grant with Basic auth for clientAuth: secret", async () => {
   let captured;
   const fetchImpl = async (url, init) => {
     captured = init;
@@ -176,13 +270,64 @@ test("refreshAccessToken sends the refresh grant with Basic auth", async () => {
       clientId: "client-1",
       clientSecret: "secret-1",
       refreshToken: "refresh-1",
+      clientAuth: "secret",
     },
     fetchImpl,
+  );
+  assert.equal(
+    captured.headers.authorization,
+    `Basic ${Buffer.from("client-1:secret-1").toString("base64")}`,
   );
   const body = new URLSearchParams(captured.body);
   assert.equal(body.get("grant_type"), "refresh_token");
   assert.equal(body.get("refresh_token"), "refresh-1");
+  assert.equal(body.get("client_id"), null);
   assert.equal(result.accessToken, "access-2");
+});
+
+test("refreshAccessToken sends client_id in the body, no Authorization header, for clientAuth: public", async () => {
+  let captured;
+  const fetchImpl = async (url, init) => {
+    captured = init;
+    return jsonResponse(200, {
+      access_token: "access-2",
+      refresh_token: "refresh-2",
+      expires_in: 3600,
+    });
+  };
+  const result = await refreshAccessToken(
+    {
+      tokenEndpoint: "https://fhir.epic.com/oauth2/token",
+      clientId: "client-1",
+      clientSecret: null,
+      refreshToken: "refresh-1",
+      clientAuth: "public",
+    },
+    fetchImpl,
+  );
+  assert.equal(captured.headers.authorization, undefined);
+  const body = new URLSearchParams(captured.body);
+  assert.equal(body.get("grant_type"), "refresh_token");
+  assert.equal(body.get("refresh_token"), "refresh-1");
+  assert.equal(body.get("client_id"), "client-1");
+  assert.equal(result.accessToken, "access-2");
+});
+
+test("refreshAccessToken throws when clientAuth is secret but no client secret is configured", async () => {
+  await assert.rejects(
+    () =>
+      refreshAccessToken(
+        {
+          tokenEndpoint: "https://fhir.epic.com/oauth2/token",
+          clientId: "client-1",
+          clientSecret: null,
+          refreshToken: "refresh-1",
+          clientAuth: "secret",
+        },
+        async () => jsonResponse(200, {}),
+      ),
+    /client secret/,
+  );
 });
 
 test("refreshAccessToken throws InvalidGrantError on an invalid_grant response", async () => {
@@ -196,6 +341,7 @@ test("refreshAccessToken throws InvalidGrantError on an invalid_grant response",
           clientId: "client-1",
           clientSecret: "secret-1",
           refreshToken: "dead-refresh-token",
+          clientAuth: "secret",
         },
         fetchImpl,
       ),
@@ -218,6 +364,7 @@ test("refreshAccessToken throws a plain error for a non-invalid_grant failure", 
           clientId: "client-1",
           clientSecret: "secret-1",
           refreshToken: "refresh-1",
+          clientAuth: "secret",
         },
         fetchImpl,
       ),

@@ -80,6 +80,7 @@ test("runAuthorize completes a sandbox flow and stores the token and the source 
   const stored = JSON.parse(secret);
   assert.equal(stored.refreshToken, "refresh-1");
   assert.equal(stored.patientFhirId, "patient-1");
+  assert.equal(stored.clientAuth, "secret");
   const insert = pool.calls.find((call) =>
     call.text.includes("INSERT INTO kith.health_sources"),
   );
@@ -87,6 +88,115 @@ test("runAuthorize completes a sandbox flow and stores the token and the source 
   assert.equal(insert.params[1], "person-kith-id-1");
   assert.equal(insert.params[2], "space-kith-id-1");
   assert.ok(reports.some((line) => line.includes("Linked Epic Sandbox")));
+  assert.ok(
+    reports.some(
+      (line) => line === "Authorized as confidential client; refresh token: present",
+    ),
+  );
+});
+
+test("runAuthorize falls back to a public client on Basic invalid_client and stores clientAuth: public", async () => {
+  const pool = personPool();
+  const tokenCalls = [];
+  const fetchImpl = async (url, init) => {
+    if (url.includes("well-known/smart-configuration")) {
+      return jsonResponse(200, {
+        authorization_endpoint: "https://fhir.epic.com/oauth2/authorize",
+        token_endpoint: "https://fhir.epic.com/oauth2/token",
+      });
+    }
+    if (url.includes("/oauth2/token")) {
+      tokenCalls.push(init);
+      if (init.headers.authorization !== undefined) {
+        return jsonResponse(401, {
+          error: "invalid_client",
+          error_description: "invalid client credentials",
+        });
+      }
+      return jsonResponse(200, {
+        access_token: "access-1",
+        refresh_token: "refresh-1",
+        expires_in: 3600,
+        patient: "patient-1",
+        scope: "openid patient/Patient.read",
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const tokenStore = inMemoryTokenStore();
+  const reports = [];
+  const outcome = await runAuthorize(
+    { personSelector: "person-kith-id-1", sandbox: true },
+    {
+      pool,
+      fetchImpl,
+      prompt: async () => "the-pasted-code",
+      tokenStore,
+      report: (line) => reports.push(line),
+      generateVerifier: () => "verifier-1",
+      generateStateValue: () => "state-1",
+    },
+  );
+
+  assert.equal(outcome.status, "linked");
+  assert.equal(tokenCalls.length, 2);
+  const [[, secret]] = tokenStore.items;
+  const stored = JSON.parse(secret);
+  assert.equal(stored.clientAuth, "public");
+  assert.equal(stored.refreshToken, "refresh-1");
+  assert.ok(
+    reports.some((line) => line === "Authorized as public client; refresh token: present"),
+  );
+});
+
+test("runAuthorize reports and stores an absent refresh token", async () => {
+  const pool = personPool();
+  const fetchImpl = async (url) => {
+    if (url.includes("well-known/smart-configuration")) {
+      return jsonResponse(200, {
+        authorization_endpoint: "https://fhir.epic.com/oauth2/authorize",
+        token_endpoint: "https://fhir.epic.com/oauth2/token",
+      });
+    }
+    if (url.includes("/oauth2/token")) {
+      return jsonResponse(200, {
+        access_token: "access-1",
+        expires_in: 3600,
+        patient: "patient-1",
+        scope: "openid patient/Patient.read",
+        // No refresh_token: Epic did not grant one.
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const tokenStore = inMemoryTokenStore();
+  const reports = [];
+  const outcome = await runAuthorize(
+    { personSelector: "person-kith-id-1", sandbox: true },
+    {
+      pool,
+      fetchImpl,
+      prompt: async () => "the-pasted-code",
+      tokenStore,
+      report: (line) => reports.push(line),
+      generateVerifier: () => "verifier-1",
+      generateStateValue: () => "state-1",
+    },
+  );
+
+  assert.equal(outcome.status, "linked");
+  const [[, secret]] = tokenStore.items;
+  const stored = JSON.parse(secret);
+  assert.equal(stored.refreshToken, null);
+  assert.equal(stored.accessToken, "access-1");
+  assert.ok(
+    reports.some(
+      (line) => line === "Authorized as confidential client; refresh token: absent",
+    ),
+  );
+  assert.ok(
+    reports.some((line) => line.includes("will need a new authorization")),
+  );
 });
 
 test("runAuthorize throws when no person matches the selector", async () => {
