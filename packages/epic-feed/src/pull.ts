@@ -39,6 +39,7 @@ import {
   loadClientSecretForOrg,
   loadDatabaseUrl,
   OBSERVATION_SEARCH_CATEGORIES,
+  orgSlug,
   personSlug,
   SANDBOX_FHIR_BASE,
   SEARCHABLE_RESOURCES,
@@ -439,6 +440,7 @@ const MIN_ACCESS_TOKEN_LIFETIME_MS = 60_000;
 
 async function refreshAndStore(
   source: HealthSourceRow,
+  keychainService: string,
   token: StoredToken,
   refreshToken: string,
   fetchImpl: Fetch,
@@ -468,7 +470,9 @@ async function refreshAndStore(
     orgName: token.orgName,
     clientAuth,
   };
-  await tokenStore.set(source.keychainService, JSON.stringify(updated));
+  // Written back under whichever name it was read from -- see
+  // `resolveKeychainService`'s migration path below.
+  await tokenStore.set(keychainService, JSON.stringify(updated));
   return refreshed.accessToken;
 }
 
@@ -496,6 +500,7 @@ export type AccessTokenOutcome = {
  */
 async function resolveAccessToken(
   source: HealthSourceRow,
+  keychainService: string,
   token: StoredToken,
   fetchImpl: Fetch,
   tokenStore: TokenStore,
@@ -504,6 +509,7 @@ async function resolveAccessToken(
   if (token.refreshToken !== null) {
     const accessToken = await refreshAndStore(
       source,
+      keychainService,
       token,
       token.refreshToken,
       fetchImpl,
@@ -587,6 +593,30 @@ export async function pullAll(deps: PullDeps = {}): Promise<{
   }
 }
 
+/**
+ * One-time migration path for a `health_sources` row written before
+ * `tokenKeychainService` (see `config.ts`) suffixed its Keychain item name
+ * with the organization slug. When `source.keychainService` already ends
+ * in `.<org-slug>` it is used as-is -- the common case once every source
+ * has been authorized (or re-authorized) under the current naming. When it
+ * does not, this checks whether an item under the newly suffixed name
+ * exists and prefers it when so; otherwise the original, unsuffixed name is
+ * kept unchanged -- no rename, since that is the name the actual Keychain
+ * item was written under and `pull` must keep reading it until that
+ * person/org pair is authorized again (which rewrites both the Keychain
+ * item and the `keychain_service` column together).
+ */
+async function resolveKeychainService(
+  source: HealthSourceRow,
+  tokenStore: TokenStore,
+): Promise<string> {
+  const suffix = `.${orgSlug(source.orgName)}`;
+  if (source.keychainService.endsWith(suffix)) return source.keychainService;
+  const suffixed = `${source.keychainService}${suffix}`;
+  const migratedItem = await tokenStore.get(suffixed);
+  return migratedItem !== null ? suffixed : source.keychainService;
+}
+
 /** One source's pull end to end, starting from its stored token JSON:
  * refreshes the access token (handling `invalid_grant`), then delegates to
  * `pullSource`. Exported so a test can drive the refresh/reauth decision
@@ -599,18 +629,26 @@ export async function pullOneSource(
   credentials: EpicCredentials,
   dataDirRoot?: (personSlugValue: string) => string,
 ): Promise<SourcePullResult> {
-  const raw = await tokenStore.get(source.keychainService);
+  const keychainService = await resolveKeychainService(source, tokenStore);
+  const raw = await tokenStore.get(keychainService);
   if (raw === null) {
     const result = emptyResult(source.orgName);
     result.status = "failed";
-    result.error = `Keychain item "${source.keychainService}" not found`;
+    result.error = `Keychain item "${keychainService}" not found`;
     await recordPullFailure(pool, source.id, result.error, false);
     return result;
   }
   const token = JSON.parse(raw) as StoredToken;
   let outcome: AccessTokenOutcome;
   try {
-    outcome = await resolveAccessToken(source, token, fetchImpl, tokenStore, credentials);
+    outcome = await resolveAccessToken(
+      source,
+      keychainService,
+      token,
+      fetchImpl,
+      tokenStore,
+      credentials,
+    );
   } catch (error) {
     const result = emptyResult(source.orgName);
     const invalidGrant = error instanceof InvalidGrantError;

@@ -9,6 +9,7 @@ import {
   clientSecretKeychainService,
   loadClientSecretForOrg,
   orgSlug,
+  tokenKeychainService,
 } from "../dist/index.js";
 
 test("orgSlug lowercases, hyphenates, and trims a health system name", () => {
@@ -30,6 +31,27 @@ test("clientSecretKeychainService namespaces the shared item by org slug", () =>
     clientSecretKeychainService("Virginia Mason Franciscan Health"),
     "com.kithmind.epic.client-secret.virginia-mason-franciscan-health",
   );
+});
+
+test("tokenKeychainService namespaces the token item by person slug and org slug", () => {
+  assert.equal(
+    tokenKeychainService("jamie-synthetic", "Virginia Mason Franciscan Health"),
+    "com.kithmind.epic.token.jamie-synthetic.virginia-mason-franciscan-health",
+  );
+  assert.equal(
+    tokenKeychainService("jamie-synthetic", "Optum Care Washington"),
+    "com.kithmind.epic.token.jamie-synthetic.optum-care-washington",
+  );
+  assert.equal(
+    tokenKeychainService("jamie-synthetic", "Epic Sandbox"),
+    "com.kithmind.epic.token.jamie-synthetic.epic-sandbox",
+  );
+});
+
+test("tokenKeychainService gives the same person two distinct items at two organizations", () => {
+  const vmfh = tokenKeychainService("jamie-synthetic", "Virginia Mason Franciscan Health");
+  const optum = tokenKeychainService("jamie-synthetic", "Optum Care Washington");
+  assert.notEqual(vmfh, optum);
 });
 
 test("loadClientSecretForOrg prefers the org's own Keychain item", async () => {

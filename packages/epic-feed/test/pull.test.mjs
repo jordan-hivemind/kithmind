@@ -464,6 +464,72 @@ test("pullOneSource fails without reauth when the Keychain item is missing", asy
   assert.match(result.error, /not found/);
 });
 
+// Migration coverage for a `health_sources` row written before
+// `tokenKeychainService` suffixed its Keychain item name with the org slug
+// (see `config.ts`/`pull.ts`'s `resolveKeychainService`). `SOURCE.keychainService`
+// ("com.kithmind.epic.token.synthetic") is itself such a pre-migration,
+// unsuffixed name for `SOURCE.orgName` ("Synthetic Health System" ->
+// org slug "synthetic-health-system").
+test("pullOneSource keeps reading a pre-migration Keychain item when no suffixed item exists (no rename)", async () => {
+  const pool = fakePool();
+  const fetchImpl = async (url) => {
+    if (url.includes("smart-configuration") || url.includes("/oauth2/token")) {
+      throw new Error(`unexpected token-refresh fetch in this test: ${url}`);
+    }
+    if (url.includes("/Patient/")) return jsonResponse(200, patientResource());
+    return jsonResponse(200, { entry: [] });
+  };
+  const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+  const originalToken = JSON.stringify({
+    refreshToken: null,
+    accessToken: "pre-migration-access",
+    expiresAt,
+    patientFhirId: "patient-1",
+    fhirBase: SOURCE.fhirBase,
+    orgName: SOURCE.orgName,
+  });
+  // Only the pre-migration, unsuffixed item exists -- the suffixed name
+  // ("...synthetic.synthetic-health-system") was never written.
+  const tokenStore = inMemoryTokenStore({ [SOURCE.keychainService]: originalToken });
+  const result = await pullOneSource(pool, SOURCE, fetchImpl, tokenStore, {
+    clientId: "client-1",
+    clientSecret: "secret-1",
+  });
+  assert.equal(result.status, "ok");
+  // No rename: still exactly one item, at the original, unsuffixed name.
+  assert.equal(tokenStore.items.size, 1);
+  assert.ok(tokenStore.items.has(SOURCE.keychainService));
+});
+
+test("pullOneSource prefers an already-migrated suffixed Keychain item over the stored unsuffixed name", async () => {
+  const pool = fakePool();
+  const fetchImpl = async (url) => {
+    if (url.includes("smart-configuration") || url.includes("/oauth2/token")) {
+      throw new Error(`unexpected token-refresh fetch in this test: ${url}`);
+    }
+    if (url.includes("/Patient/")) return jsonResponse(200, patientResource());
+    return jsonResponse(200, { entry: [] });
+  };
+  const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+  const migratedToken = JSON.stringify({
+    refreshToken: null,
+    accessToken: "migrated-access",
+    expiresAt,
+    patientFhirId: "patient-1",
+    fhirBase: SOURCE.fhirBase,
+    orgName: SOURCE.orgName,
+  });
+  const suffixedService = `${SOURCE.keychainService}.synthetic-health-system`;
+  const tokenStore = inMemoryTokenStore({ [suffixedService]: migratedToken });
+  const result = await pullOneSource(pool, SOURCE, fetchImpl, tokenStore, {
+    clientId: "client-1",
+    clientSecret: "secret-1",
+  });
+  assert.equal(result.status, "ok");
+  assert.equal(tokenStore.items.size, 1);
+  assert.ok(tokenStore.items.has(suffixedService));
+});
+
 test("pullOneSource pulls with an unexpired access token when no refresh token is stored", async () => {
   const pool = fakePool();
   // No `smart-configuration`/`/oauth2/token` call is expected -- there is no

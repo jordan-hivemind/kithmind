@@ -185,7 +185,7 @@ export async function runAuthorize(
     );
   }
 
-  const keychainService = tokenKeychainService(personSlug(person.canonicalName));
+  const keychainService = tokenKeychainService(personSlug(person.canonicalName), orgName);
   await tokenStore.set(
     keychainService,
     JSON.stringify({
