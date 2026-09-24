@@ -260,6 +260,47 @@ test("pullSource searches Observation once per registered category and merges th
   assert.deepEqual(storedCategories, new Set(["laboratory", "vital-signs", "social-history"]));
 });
 
+test("pullSource treats a 400 on one Observation category as unsupported without losing the others", async () => {
+  const pool = fakePool();
+  const observationUrls = [];
+  const fetchImpl = async (url) => {
+    if (url.includes("/Patient/")) return jsonResponse(200, patientResource());
+    if (url.includes("Observation")) {
+      observationUrls.push(url);
+      const category = new URL(url).searchParams.get("category");
+      if (category === "social-history") return jsonResponse(400, { issue: "unsupported" });
+      return jsonResponse(200, {
+        entry: [
+          {
+            resource: {
+              resourceType: "Observation",
+              id: `obs-${category}`,
+              status: "final",
+              category: [{ coding: [{ code: category }] }],
+              code: { text: `Observation (${category})` },
+            },
+          },
+        ],
+      });
+    }
+    return jsonResponse(200, { entry: [] });
+  };
+
+  const result = await pullSource(pool, SOURCE, "access-token-1", fetchImpl);
+
+  assert.equal(result.status, "ok");
+  // laboratory and vital-signs still ran and are counted, even though
+  // social-history 400'd.
+  assert.equal(result.counts.Observation, 2);
+  assert.equal(observationUrls.length, 3);
+  const categories = observationUrls.map((url) => new URL(url).searchParams.get("category"));
+  assert.deepEqual(new Set(categories), new Set(["laboratory", "vital-signs", "social-history"]));
+  assert.deepEqual(result.unsupported, ["Observation:social-history"]);
+  // A 400 on one category is not a resource error for Observation.
+  assert.equal(result.resourceErrors.Observation, undefined);
+  assert.deepEqual(result.resourceErrors, {});
+});
+
 test("pullSource resolves a relative Binary url against the source's FHIR base", async () => {
   const pool = fakePool();
   const binaryUrls = [];
