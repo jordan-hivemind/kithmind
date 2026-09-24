@@ -13,7 +13,7 @@ path; each one now links back here.
 | Web app | A personal knowledge base you and connected AI assistants can read and write, over MCP. See the root [`README.md`](../README.md). |
 | Finance | Daily account balances and holdings from a Plaid feed, shown on the Balances and Institutions pages and readable by MCP tools. |
 | Documents | A folder (local or provider-synced) walked on a schedule, with returns and K-1s kept in full and everything else kept as metadata plus a first page. |
-| Health | Planned: structured records from Epic's patient-facing FHIR API. Not yet implemented; see "Health records with Epic MyChart" below for the honest current state. |
+| Health | Structured records (labs, conditions, medications, immunizations, encounters and more) from Epic's patient-facing FHIR API, one authorization per person, shown on the Health Records admin page and readable by MCP tools. See "Health records with Epic MyChart" below. |
 
 ## Prerequisites
 
@@ -165,8 +165,8 @@ Register a patient-facing app at [fhir.epic.com](https://fhir.epic.com):
 | Setting | Value |
 | --- | --- |
 | Audience | Patients |
-| Resources | The R4 resource list your use case needs (for example Patient, Observation, DocumentReference, DiagnosticReport). |
-| Client type | Confidential client with a public certificate. |
+| Resources | Patient, Observation, DiagnosticReport, Condition, MedicationRequest, AllergyIntolerance, Immunization, Encounter, Procedure, DocumentReference, Binary, Specimen, Goal (R4 Read and Search). |
+| Client type | Confidential client with a client secret (not a certificate). SMART on FHIR R4, SMART v1 scopes. |
 | Redirect URI | Your deployment's callback URL. |
 | Refresh tokens | Enabled. |
 
@@ -180,14 +180,15 @@ Each family member needs their own authorization, done through the account
 holder's own proxy access in MyChart -- one authorization per person, not one
 for the household.
 
-**Honest current state:** the MyChart pull is in progress, not shipped. The
-[simplification and feeds plan](plans/2026-09-22-simplification-and-feeds.md)
-names it as order-of-work items 4 and 5 (Epic FHIR pull for the owner, then
-each family member; MyChart message export and visit transcripts after
-that). The planned package is `@repo/epic-feed` (alongside `@repo/plaid-feed`
-and `@repo/ingest-simple`); it does not exist in this repository yet. Register
-the app now so the production client ID is ready when the package lands --
-that is the only step this section can honestly ask for today.
+**Current state:** Epic FHIR pull for the owner and each family member (order
+of work item 4 of the
+[simplification and feeds plan](plans/2026-09-22-simplification-and-feeds.md))
+is shipped as `@repo/epic-feed` (alongside `@repo/plaid-feed` and
+`@repo/ingest-simple`) -- see
+[`packages/epic-feed/README.md`](../packages/epic-feed/README.md) for setup,
+the `authorize`/`pull` commands and the sandbox test procedure. MyChart
+message export and visit transcripts (order of work item 5) remain
+unshipped.
 
 ## Optional: statement history beyond two years
 
