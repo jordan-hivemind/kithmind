@@ -214,6 +214,165 @@ test("pullSource stores a PDF DocumentReference attachment to the injected data 
   }
 });
 
+test("pullSource searches Observation once per registered category and merges the results", async () => {
+  const pool = fakePool();
+  const observationUrls = [];
+  const fetchImpl = async (url) => {
+    if (url.includes("/Patient/")) return jsonResponse(200, patientResource());
+    if (url.includes("Observation")) {
+      observationUrls.push(url);
+      const category = new URL(url).searchParams.get("category");
+      return jsonResponse(200, {
+        entry: [
+          {
+            resource: {
+              resourceType: "Observation",
+              id: `obs-${category}`,
+              status: "final",
+              category: [{ coding: [{ code: category }] }],
+              code: { text: `Observation (${category})` },
+            },
+          },
+        ],
+      });
+    }
+    return jsonResponse(200, { entry: [] });
+  };
+
+  const result = await pullSource(pool, SOURCE, "access-token-1", fetchImpl);
+
+  assert.equal(result.status, "ok");
+  assert.equal(result.counts.Observation, 3);
+  assert.deepEqual(result.resourceErrors, {});
+  assert.equal(observationUrls.length, 3);
+  const categories = observationUrls.map((url) => new URL(url).searchParams.get("category"));
+  assert.deepEqual(new Set(categories), new Set(["laboratory", "vital-signs", "social-history"]));
+  // Every category call also carried the patient id.
+  assert.ok(observationUrls.every((url) => url.includes("patient=patient-1")));
+  // Each stored record keeps its own category, read off the resource rather
+  // than the search parameter.
+  const inserts = pool.calls.filter(
+    (call) =>
+      call.text.includes("INSERT INTO kith.health_records") && call.params[3] === "Observation",
+  );
+  assert.equal(inserts.length, 3);
+  const storedCategories = new Set(inserts.map((call) => call.params[11]));
+  assert.deepEqual(storedCategories, new Set(["laboratory", "vital-signs", "social-history"]));
+});
+
+test("pullSource resolves a relative Binary url against the source's FHIR base", async () => {
+  const pool = fakePool();
+  const binaryUrls = [];
+  const fetchImpl = async (url) => {
+    if (url.includes("/Patient/")) return jsonResponse(200, patientResource());
+    if (url.includes("DocumentReference")) {
+      return jsonResponse(200, {
+        entry: [
+          {
+            resource: {
+              resourceType: "DocumentReference",
+              id: "docref-3",
+              status: "current",
+              type: { text: "Clinical note" },
+              content: [
+                {
+                  attachment: {
+                    contentType: "text/plain",
+                    url: "Binary/ew0p-relative",
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      });
+    }
+    if (url.includes("Binary")) {
+      binaryUrls.push(url);
+      return jsonResponse(
+        200,
+        {
+          resourceType: "Binary",
+          contentType: "text/plain",
+          data: Buffer.from("Note from the Binary resource.").toString("base64"),
+        },
+        { "content-type": "application/fhir+json" },
+      );
+    }
+    return jsonResponse(200, { entry: [] });
+  };
+
+  const result = await pullSource(pool, SOURCE, "access-token-1", fetchImpl);
+
+  assert.equal(result.documents, 1);
+  assert.equal(binaryUrls.length, 1);
+  assert.equal(binaryUrls[0], "https://fhir.synthetic.example/api/FHIR/R4/Binary/ew0p-relative");
+  const documentInsert = pool.calls.find((call) =>
+    call.text.includes("INSERT INTO kith.health_documents"),
+  );
+  // The Binary resource's own `data` (base64) was read and decoded --
+  // text/plain is extracted, so no filesystem write happens.
+  assert.equal(documentInsert.params[5], "Note from the Binary resource.");
+  assert.equal(documentInsert.params[6], null);
+});
+
+test("pullSource leaves an absolute Binary url untouched", async () => {
+  const pool = fakePool();
+  const binaryUrls = [];
+  const absoluteUrl = "https://other.example/FHIR/R4/Binary/abs-1";
+  const fetchImpl = async (url) => {
+    if (url.includes("/Patient/")) return jsonResponse(200, patientResource());
+    if (url.includes("DocumentReference")) {
+      return jsonResponse(200, {
+        entry: [
+          {
+            resource: {
+              resourceType: "DocumentReference",
+              id: "docref-4",
+              status: "current",
+              type: { text: "Clinical note" },
+              content: [{ attachment: { contentType: "text/plain", url: absoluteUrl } }],
+            },
+          },
+        ],
+      });
+    }
+    if (url === absoluteUrl) {
+      binaryUrls.push(url);
+      return jsonResponse(
+        200,
+        {
+          resourceType: "Binary",
+          contentType: "text/plain",
+          data: Buffer.from("Note from the Binary resource.").toString("base64"),
+        },
+        { "content-type": "application/fhir+json" },
+      );
+    }
+    return jsonResponse(200, { entry: [] });
+  };
+
+  const result = await pullSource(pool, SOURCE, "access-token-1", fetchImpl);
+
+  assert.equal(result.documents, 1);
+  assert.deepEqual(binaryUrls, [absoluteUrl]);
+});
+
+test("pullSource treats a Specimen 400 as unsupported, not a resource error", async () => {
+  const pool = fakePool();
+  const fetchImpl = async (url) => {
+    if (url.includes("/Patient/")) return jsonResponse(200, patientResource());
+    if (url.includes("Specimen")) return jsonResponse(400, { issue: "unsupported" });
+    return jsonResponse(200, { entry: [] });
+  };
+
+  const result = await pullSource(pool, SOURCE, "access-token-1", fetchImpl);
+
+  assert.equal(result.status, "ok");
+  assert.deepEqual(result.unsupported, ["Specimen"]);
+  assert.equal(result.resourceErrors.Specimen, undefined);
+});
+
 test("pullOneSource sets needs_reauth on invalid_grant and does not call pullSource", async () => {
   const pool = fakePool();
   const fetchImpl = async (url) => {

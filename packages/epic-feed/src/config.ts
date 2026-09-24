@@ -69,6 +69,24 @@ export const SEARCHABLE_RESOURCES = FHIR_RESOURCES.filter(
   (resource) => resource !== "Patient" && resource !== "Binary",
 );
 
+/** Epic rejects an `Observation` search with no `category` parameter (400).
+ * These are the three categories this app registered scopes for; `pull`
+ * searches once per category and merges the pages under one `Observation`
+ * count, keeping each stored record's own `category` (from the resource
+ * itself, not the search parameter). */
+export const OBSERVATION_SEARCH_CATEGORIES = [
+  "laboratory",
+  "vital-signs",
+  "social-history",
+] as const;
+
+/** Resource types where Epic's sandbox has been observed to reject the
+ * search outright (400) for a source that simply doesn't support that
+ * resource type. `pull` treats this as "unsupported for that source" rather
+ * than a resource error: skipped, counted under `unsupported`, source status
+ * unaffected, not retried within the same run. */
+export const UNSUPPORTED_ON_400_RESOURCES = new Set<string>(["Specimen", "Goal"]);
+
 /** `EPIC_ENV`, defaulting to production per the task. */
 export function epicEnv(): EpicEnv {
   const raw = process.env.EPIC_ENV?.trim().toLowerCase();
