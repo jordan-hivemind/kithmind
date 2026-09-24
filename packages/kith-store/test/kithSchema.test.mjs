@@ -94,6 +94,11 @@ const KITH_TABLES = [
   // FIN-4 (migration 051): the many-archive-instruments-to-one-security map,
   // resolved before any CUSIP/ISIN/ticker match is retried.
   "fin_security_links",
+  // Epic MyChart feed (migration 053): one FHIR authorization per person and
+  // the structured records and Clinical Note documents pulled from it.
+  "health_sources",
+  "health_records",
+  "health_documents",
 ];
 
 // P2-39d: retired by migration 005, so this build must never re-create them.

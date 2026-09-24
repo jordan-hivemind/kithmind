@@ -595,9 +595,9 @@ export function createMcpServer(
   const server = new McpServer(
     {
       name: "open-brain",
-      // FIN-1: additive tools (list_ledger, list_holdings) over the unified
-      // ledger, so a minor bump.
-      version: "1.4.0",
+      // Epic MyChart feed: additive tools (list_health_records,
+      // get_health_document) over the new health_* tables, so a minor bump.
+      version: "1.5.0",
     },
     { instructions: SERVER_INSTRUCTIONS },
   );
@@ -2544,6 +2544,43 @@ export function createMcpServer(
     }),
   );
 
+  const listHealthRecordsTool = registerTool(
+    MCP_TOOL_NAMES.listHealthRecords,
+    "List one household member's Epic MyChart records (labs, conditions, medications, immunizations, encounters, procedures, documents and more), newest first. personId is the person's kith_id from get_profile/list_entities. Optionally narrow to one resourceType (for example 'Observation' or 'Condition') and/or a since date (effective_at lower bound, YYYY-MM-DD).",
+    {
+      personId: z.string().trim().min(1).max(200),
+      resourceType: z.string().trim().min(1).max(50).optional(),
+      since: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      limit: z.number().int().min(1).max(500).optional(),
+    },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listHealthRecords],
+    async (args) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(await reads.listHealthRecords(args)),
+        },
+      ],
+    }),
+  );
+
+  const getHealthDocumentTool = registerTool(
+    MCP_TOOL_NAMES.getHealthDocument,
+    "Fetch one Epic MyChart Clinical Note document by id (kith.health_documents.id, from a DocumentReference record's own id is not enough -- use the document id a prior list_health_records call returned). Returns its content type, byte length, extracted text when available (text/HTML), and a storage note (a local file path) instead of text for a PDF or RTF attachment, which is not yet extracted.",
+    {
+      documentId: z.string().trim().min(1).max(200),
+    },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.getHealthDocument],
+    async ({ documentId }) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(await reads.getHealthDocument({ documentId })),
+        },
+      ],
+    }),
+  );
+
   const registeredTools = {
     [MCP_TOOL_NAMES.ingestUrl]: ingestUrlTool,
     [MCP_TOOL_NAMES.queryRecords]: queryRecordsTool,
@@ -2594,6 +2631,8 @@ export function createMcpServer(
     [MCP_TOOL_NAMES.manageFinanceReview]: manageFinanceReviewTool,
     [MCP_TOOL_NAMES.listLedger]: listLedgerTool,
     [MCP_TOOL_NAMES.listHoldings]: listHoldingsTool,
+    [MCP_TOOL_NAMES.listHealthRecords]: listHealthRecordsTool,
+    [MCP_TOOL_NAMES.getHealthDocument]: getHealthDocumentTool,
   } satisfies Record<McpToolName, { disable: () => void }>;
   const enabledToolNames = new Set(resolveEnabledMcpToolNames());
   for (const name of MCP_TOOL_NAME_LIST) {

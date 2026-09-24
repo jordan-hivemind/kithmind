@@ -387,6 +387,26 @@ export type McpReads = {
   listHoldings(
     args: { spaceId: string; accountId?: string; asOf?: string },
   ): Promise<{ holdings: admin.HoldingRow[] }>;
+  /**
+   * Epic MyChart feed (migration 053_health_feed.sql): one person's records,
+   * newest first. Gated on the caller's membership in that person's own
+   * `kith.health_sources.space_id` (`admin.healthPersonSpaceId`) -- the same
+   * "resolve the real space, then check membership" shape `listLedger` uses
+   * for the finance archive's fixed space, just resolved per person here
+   * instead of pinned to one archive.
+   */
+  listHealthRecords(args: {
+    personId: string;
+    resourceType?: string;
+    since?: string;
+    limit?: number;
+  }): Promise<{ records: admin.HealthRecordRow[]; nextCursor: string | null }>;
+  /** One health document by id, gated on the same person-space membership
+   * check as `listHealthRecords`. Null for a document that does not exist or
+   * whose person the caller cannot see. */
+  getHealthDocument(args: {
+    documentId: string;
+  }): Promise<admin.HealthDocumentRow | null>;
 };
 
 // ---------------------------------------------------------------------------
@@ -1071,6 +1091,25 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
         if (!(await authorizedForArchiveSpace(ctx, principal, spaceId)))
           return { holdings: [] };
         return { holdings: await admin.listHoldings(ctx, args) };
+      });
+    },
+    async listHealthRecords({ personId, ...args }) {
+      const empty = { records: [], nextCursor: null };
+      return await read(async ({ ctx, spaces }) => {
+        const spaceId = await admin.healthPersonSpaceId(ctx, personId);
+        if (spaceId === null) return empty;
+        const authorized = await spaces([spaceId]);
+        if (!authorized.includes(spaceId)) return empty;
+        return await admin.listHealthRecords(ctx, { personId, ...args });
+      });
+    },
+    async getHealthDocument({ documentId }) {
+      return await read(async ({ ctx, spaces }) => {
+        const spaceId = await admin.healthDocumentSpaceId(ctx, documentId);
+        if (spaceId === null) return null;
+        const authorized = await spaces([spaceId]);
+        if (!authorized.includes(spaceId)) return null;
+        return await admin.getHealthDocument(ctx, documentId);
       });
     },
   };

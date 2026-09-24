@@ -35,6 +35,7 @@ const SCREENS = [
   { href: "/admin/investments", label: "Private Investments", ready: true },
   { href: "/admin/sources", label: "Data Sources", ready: true },
   { href: "/admin/health", label: "System Health", ready: true },
+  { href: "/admin/medical", label: "Health Records", ready: true },
   // ADM-8a: the corrections table widened into the single attention queue
   // (section 5 of docs/plans/2026-09-19-investment-document-matching.md),
   // so this screen replaces the earlier "Corrections" placeholder rather

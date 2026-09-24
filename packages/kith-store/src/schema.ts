@@ -379,6 +379,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "kith.fin_accounts.display_name: the owner's own name for a feed-only account, the same correction an archive account already gets through kith.finance_account_overrides",
     url: new URL("../migrations/052_fin_account_display_name.sql", import.meta.url),
   },
+  {
+    version: 53,
+    name: "Epic MyChart feed: kith.health_sources, kith.health_records and kith.health_documents, one FHIR authorization per person",
+    url: new URL("../migrations/053_health_feed.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

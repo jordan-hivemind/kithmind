@@ -20,6 +20,7 @@ import {
   loadCoverage,
   loadHealth,
   loadInstitutions,
+  loadMedical,
 } from "@/lib/kith/admin-data";
 import { guardedRequest, mutationFailure, noStoreJson, problem } from "@/lib/kith/api-route";
 
@@ -31,6 +32,7 @@ const LOADERS = {
   institutions: loadInstitutions,
   coverage: loadCoverage,
   balances: loadBalances,
+  medical: loadMedical,
 } as const;
 
 export async function GET(
