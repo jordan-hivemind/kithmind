@@ -17,6 +17,7 @@ export * from "./investmentLinks.js";
 export * from "./investmentLinkWork.js";
 export * from "./investments.js";
 export * from "./linkScoring.js";
+export * from "./medicalRecords.js";
 export * from "./model.js";
 export * from "./status.js";
 export * from "./taxPayments.js";
