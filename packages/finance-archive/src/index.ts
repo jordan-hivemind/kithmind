@@ -155,6 +155,18 @@ export {
   type HoldingProjectionPublication,
 } from "./holdingProjectionPublisher.js";
 export {
+  approveInstrumentIdentitySplit,
+  instrumentDescriptorSha256,
+  instrumentIdentitySplitApprovalDigest,
+  normalizeInstrumentDescriptor,
+  prepareInstrumentIdentitySplit,
+  type InstrumentIdentitySplitApproval,
+  type InstrumentIdentitySplitEndpoint,
+  type InstrumentIdentitySplitManifest,
+  type InstrumentIdentitySplitPublication,
+  type InstrumentIdentitySplitSelection,
+} from "./instrumentIdentitySplit.js";
+export {
   ARCHIVE_TYPES,
   ARCHIVE_WRITE_LOCK_KEY,
   archiveDatabaseUrl,

@@ -1544,6 +1544,49 @@ ALTER TABLE holding_projection_generations
   );
 `;
 
+// FIN-IDENTITY-SPLIT-1. Exact spelling and arithmetic can identify a
+// candidate split, but only an operator approval creates this mapping. The
+// descriptor remains in retained evidence; the table stores its digest and
+// the two immutable endpoint generations that grounded the decision.
+const INSTRUMENT_DESCRIPTOR_BINDINGS = `
+CREATE TABLE instrument_descriptor_bindings (
+  id TEXT PRIMARY KEY,
+  institution_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  descriptor_sha256 TEXT NOT NULL CHECK (descriptor_sha256 ~ '^[0-9a-f]{64}$'),
+  source_instrument_id TEXT NOT NULL REFERENCES instruments(id),
+  matched_instrument_id TEXT NOT NULL REFERENCES instruments(id),
+  period_start DATE NOT NULL,
+  period_end DATE NOT NULL CHECK (period_end > period_start),
+  start_document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  end_document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  start_generation_id TEXT NOT NULL,
+  end_generation_id TEXT NOT NULL,
+  candidate_digest TEXT NOT NULL CHECK (candidate_digest ~ '^[0-9a-f]{64}$'),
+  approval_digest TEXT NOT NULL CHECK (approval_digest ~ '^[0-9a-f]{64}$'),
+  approved_by TEXT NOT NULL CHECK (approved_by <> '' AND char_length(approved_by) <= 200),
+  approved_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT instrument_descriptor_binding_account_fkey
+    FOREIGN KEY (account_id, institution_id)
+    REFERENCES accounts (id, institution_id),
+  CONSTRAINT instrument_descriptor_binding_start_generation_fkey
+    FOREIGN KEY (start_document_id, start_generation_id)
+    REFERENCES holding_projection_generations(document_id, id) ON DELETE CASCADE,
+  CONSTRAINT instrument_descriptor_binding_end_generation_fkey
+    FOREIGN KEY (end_document_id, end_generation_id)
+    REFERENCES holding_projection_generations(document_id, id) ON DELETE CASCADE,
+  CONSTRAINT instrument_descriptor_binding_distinct_instruments
+    CHECK (source_instrument_id <> matched_instrument_id),
+  CONSTRAINT instrument_descriptor_binding_exact_key
+    UNIQUE (institution_id, account_id, descriptor_sha256)
+);
+
+CREATE TRIGGER instrument_descriptor_bindings_immutable
+  BEFORE UPDATE ON instrument_descriptor_bindings
+  FOR EACH ROW EXECUTE FUNCTION reject_holding_projection_history_update();
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -1636,6 +1679,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     name: "additions-only partial holding projection generation audit",
     sql: ADDITIVE_PARTIAL_HOLDING_PROJECTION_GENERATIONS,
   },
+  {
+    version: 19,
+    name: "approved account-scoped exact instrument descriptor bindings",
+    sql: INSTRUMENT_DESCRIPTOR_BINDINGS,
+  },
 ]);
 
 /** The version an archive reaches once every migration has been applied. */
@@ -1659,6 +1707,7 @@ export const PG_TABLES: readonly string[] = Object.freeze([
   "review_items",
   "account_aliases",
   "instrument_identifier_sources",
+  "instrument_descriptor_bindings",
   "retained_texts",
   "finance_read_revision",
   "holding_projection_generations",

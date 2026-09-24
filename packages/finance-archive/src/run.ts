@@ -128,6 +128,12 @@ import {
   type InstrumentMatchSummary,
 } from "./instrumentMatch.js";
 import {
+  approveInstrumentIdentitySplit,
+  prepareInstrumentIdentitySplit,
+  type InstrumentIdentitySplitApproval,
+  type InstrumentIdentitySplitSelection,
+} from "./instrumentIdentitySplit.js";
+import {
   publishImport,
   REVIEW_COLUMNS,
   type ImportBatch,
@@ -1602,6 +1608,82 @@ async function runHoldingCorrectionPublish(
   }
 }
 
+function readPrivateJson<T>(path: string, code: string): T {
+  try {
+    return JSON.parse(readFileSync(resolve(path), "utf8")) as T;
+  } catch {
+    throw new Error(`instrument identity split failed: ${code}`);
+  }
+}
+
+/**
+ * Verifies the exact retained endpoint spans, current failed window, unique
+ * identifier-backed target and counterfactual quantity replay. It writes
+ * nothing and emits only an approval-bound manifest, never the quoted source
+ * descriptor from the private selection file.
+ */
+async function runInstrumentIdentitySplitCandidate(
+  args: readonly string[],
+): Promise<void> {
+  const { values } = parseArgs({
+    args: [...args],
+    options: { selection: { type: "string" } },
+  });
+  if (!values.selection) throw new Error("--selection <private-json-path> is required");
+  const selection = readPrivateJson<InstrumentIdentitySplitSelection>(
+    values.selection,
+    "selection_open",
+  );
+  const client = createArchiveClient();
+  await client.connect();
+  try {
+    const manifest = await withArchiveTransaction(client, async (tx) => {
+      await lockArchiveForWrite(tx);
+      return prepareInstrumentIdentitySplit(tx, selection);
+    });
+    console.log(JSON.stringify(manifest));
+  } finally {
+    await closeArchiveClient(client);
+  }
+}
+
+/**
+ * Persists the exact descriptor binding after an operator signs the candidate
+ * digest. This does not rewrite a holding. The ordinary scoped holding
+ * correction candidate/publish commands perform that separately, preserving
+ * immutable prior generations and requiring their own approval.
+ */
+async function runInstrumentIdentitySplitApprove(args: readonly string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: [...args],
+    options: {
+      selection: { type: "string" },
+      approval: { type: "string" },
+    },
+  });
+  if (!values.selection) throw new Error("--selection <private-json-path> is required");
+  if (!values.approval) throw new Error("--approval <private-json-path> is required");
+  const selection = readPrivateJson<InstrumentIdentitySplitSelection>(
+    values.selection,
+    "selection_open",
+  );
+  const approval = readPrivateJson<InstrumentIdentitySplitApproval>(
+    values.approval,
+    "approval_open",
+  );
+  const client = createArchiveClient();
+  await client.connect();
+  try {
+    const publication = await withArchiveTransaction(client, async (tx) => {
+      await lockArchiveForWrite(tx);
+      return approveInstrumentIdentitySplit(tx, selection, approval);
+    });
+    console.log(JSON.stringify(publication));
+  } finally {
+    await closeArchiveClient(client);
+  }
+}
+
 type OpenedDocument = {
   readonly manifest: CaptureManifest;
   readonly capturePath: string;
@@ -2642,6 +2724,12 @@ async function main(): Promise<void> {
     "DEPRECATED: statement import is the optional history path; see docs/onboarding.md",
   );
   const argv = process.argv.slice(2);
+  if (argv[0] === "instrument-identity-split-candidate") {
+    return runInstrumentIdentitySplitCandidate(argv.slice(1));
+  }
+  if (argv[0] === "instrument-identity-split-approve") {
+    return runInstrumentIdentitySplitApprove(argv.slice(1));
+  }
   if (argv[0] === "holding-correction-publish") {
     return runHoldingCorrectionPublish(argv.slice(1));
   }
