@@ -3,6 +3,7 @@
 // lets `test/*.test.mjs` import the OAuth, mapping, and db layers directly.
 
 export * from "./authorize.js";
+export * from "./check.js";
 export * from "./config.js";
 export * from "./db.js";
 export * from "./documents.js";

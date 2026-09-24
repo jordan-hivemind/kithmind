@@ -13,6 +13,7 @@ import {
   generateState,
   InvalidGrantError,
   parsePastedCode,
+  probeTokenRequest,
   refreshAccessToken,
 } from "../dist/index.js";
 
@@ -400,4 +401,56 @@ test("parsePastedCode rejects a callback URL whose state does not match", () => 
 
 test("parsePastedCode rejects empty input", () => {
   assert.throws(() => parsePastedCode("   ", "state-1"));
+});
+
+test("probeTokenRequest sends HTTP Basic auth when given a client secret, and never throws on an error response", async () => {
+  let captured;
+  const fetchImpl = async (url, init) => {
+    captured = { url, init };
+    return jsonResponse(400, { error: "invalid_grant", error_description: "bogus code" });
+  };
+  const result = await probeTokenRequest(
+    {
+      tokenEndpoint: "https://fhir.epic.com/oauth2/token",
+      clientId: "client-1",
+      clientSecret: "secret-1",
+      code: "bogus-code",
+      redirectUri: "https://brain.hive-mind.com/api/epic/callback",
+    },
+    fetchImpl,
+  );
+  assert.equal(result.status, 400);
+  assert.equal(result.error, "invalid_grant");
+  assert.equal(result.errorDescription, "bogus code");
+  assert.equal(
+    captured.init.headers.authorization,
+    `Basic ${Buffer.from("client-1:secret-1").toString("base64")}`,
+  );
+  const body = new URLSearchParams(captured.init.body);
+  assert.equal(body.get("grant_type"), "authorization_code");
+  assert.equal(body.get("code"), "bogus-code");
+  assert.equal(body.get("client_id"), null);
+});
+
+test("probeTokenRequest sends no Authorization header and client_id in the body when clientSecret is null", async () => {
+  let captured;
+  const fetchImpl = async (url, init) => {
+    captured = { url, init };
+    return jsonResponse(400, { error: "invalid_client" });
+  };
+  const result = await probeTokenRequest(
+    {
+      tokenEndpoint: "https://fhir.epic.com/oauth2/token",
+      clientId: "client-1",
+      clientSecret: null,
+      code: "bogus-code",
+      redirectUri: "https://brain.hive-mind.com/api/epic/callback",
+    },
+    fetchImpl,
+  );
+  assert.equal(result.error, "invalid_client");
+  assert.equal(result.errorDescription, null);
+  assert.equal(captured.init.headers.authorization, undefined);
+  const body = new URLSearchParams(captured.init.body);
+  assert.equal(body.get("client_id"), "client-1");
 });
