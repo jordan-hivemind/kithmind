@@ -37,13 +37,30 @@ Two commands:
    These are the built-in defaults; override with `EPIC_CLIENT_ID` or a
    Keychain item when a different registration is used.
 
-2. **Client secret.** Add a Keychain item (never commit this):
+2. **Client secret.** Epic issues a refresh token for an organization only
+   when a client secret is configured for it (fhir.epic.com's app page:
+   "select the key icon next to the organization... if you forgo adding
+   client secrets, refresh tokens will be unavailable for that
+   organization"), and recommends a distinct secret per organization and per
+   environment. Add one Keychain item per organization, named after a slug
+   of its `--org` name (lowercase, non-alphanumeric runs collapsed to a
+   single hyphen, trimmed) -- e.g. for `--org "Virginia Mason Franciscan
+   Health"`:
 
    ```sh
-   security add-generic-password -a "$USER" -s com.kithmind.epic.client-secret -w <secret>
+   security add-generic-password -a "$USER" \
+     -s com.kithmind.epic.client-secret.virginia-mason-franciscan-health \
+     -w <secret>
    ```
 
-   `EPIC_CLIENT_SECRET` overrides the Keychain if set.
+   `authorize --org N` and `pull` both look up a secret in this order: the
+   organization's own item (`com.kithmind.epic.client-secret.<org-slug>`),
+   then the shared item (`com.kithmind.epic.client-secret`, for a
+   registration that uses one secret everywhere, or the sandbox), then
+   `EPIC_CLIENT_SECRET`. `authorize` prints which one it used (never the
+   value) as `Client secret: <item or env var name>`. No secret configured
+   at all is not an error -- see `authorize` step 7 below, "falls back to a
+   public-client request".
 
 3. **Database.** `DATABASE_URL` overrides; otherwise this reads the same
    `com.kithmind.deferred-work.database-url` Keychain item
@@ -60,8 +77,9 @@ Two commands:
 | --- | --- |
 | `com.kithmind.epic.client-id` | Production client id (optional; falls back to the public default above). |
 | `com.kithmind.epic.client-id-nonprod` | Sandbox client id (optional; falls back to the public default above). |
-| `com.kithmind.epic.client-secret` | The client secret. Required (no built-in default -- a secret is never public). |
-| `com.kithmind.epic.token.<person-slug>` | One person's refresh token, access token, expiry, patient FHIR id, FHIR base, org name, and `clientAuth` (`"secret"` or `"public"` -- see `authorize` step 6), as JSON. Written by `authorize`, read and rewritten by `pull`. A token stored before `clientAuth` existed is treated as `"secret"`. |
+| `com.kithmind.epic.client-secret.<org-slug>` | That organization's own client secret, e.g. `com.kithmind.epic.client-secret.virginia-mason-franciscan-health` for `--org "Virginia Mason Franciscan Health"`. Checked first; see "Client secret" above. |
+| `com.kithmind.epic.client-secret` | The shared client secret, used when no per-org item exists. No secret configured at all is not an error -- see `authorize` step 7 below, "falls back to a public-client request". |
+| `com.kithmind.epic.token.<person-slug>` | One person's refresh token (`null` if Epic did not grant one), access token, expiry, patient FHIR id, FHIR base, org name, and `clientAuth` (`"secret"` or `"public"` -- see `authorize` step 7), as JSON. Written by `authorize`, read and rewritten by `pull`. A token stored before `clientAuth` existed is treated as `"secret"`. |
 | `com.kithmind.deferred-work.database-url` | The Postgres connection string (shared with `@repo/plaid-feed`). |
 
 ## `authorize`
@@ -78,19 +96,21 @@ kith-epic-feed authorize --person <kith_id-or-name> [--org "<health system name>
    fresh at authorize time -- this repository never vendors that list. In
    sandbox, `--org` is optional and defaults to Epic's own public sandbox
    FHIR base.
-3. Discovers the authorize/token endpoints from
+3. Looks up the client secret for that org name (see "Client secret" above)
+   and prints `Client secret: <item or env var name>` -- never the value.
+4. Discovers the authorize/token endpoints from
    `<fhir-base>/.well-known/smart-configuration`, falling back to
    `/metadata`'s `oauth-uris` extension.
-4. Builds a standalone SMART launch URL with PKCE (S256) and an anti-CSRF
+5. Builds a standalone SMART launch URL with PKCE (S256) and an anti-CSRF
    `state`, requesting `openid fhirUser offline_access launch/patient` plus
    `patient/<Resource>.read` for every incoming resource (Patient,
    Observation, DiagnosticReport, Condition, MedicationRequest,
    AllergyIntolerance, Immunization, Encounter, Procedure, DocumentReference,
    Binary, Specimen, Goal), `aud` pinned to the FHIR base.
-5. Prints the URL, then prompts `Paste the code shown by the callback page:`
+6. Prints the URL, then prompts `Paste the code shown by the callback page:`
    -- accepts either the bare code or the full pasted callback URL (the
    production callback page shows both the code and the state to copy).
-6. Exchanges the code at the token endpoint with HTTP Basic client
+7. Exchanges the code at the token endpoint with HTTP Basic client
    authentication and the PKCE code verifier. Epic's sandbox has been
    observed to answer that Basic request with `invalid_client` for this
    app's registration regardless of the configured secret, treating it as a
@@ -102,7 +122,7 @@ kith-epic-feed authorize --person <kith_id-or-name> [--org "<health system name>
    never re-probed. The result is written to
    `com.kithmind.epic.token.<person-slug>` and `kith.health_sources` is
    upserted.
-7. Prints `Authorized as <public|confidential> client; refresh token:
+8. Prints `Authorized as <public|confidential> client; refresh token:
    <present|absent>`. If Epic did not grant a refresh token, a second line
    says the daily pull will need a new authorization once the access token
    expires; what was received is still stored either way.
@@ -116,25 +136,34 @@ authorization URL (a public value) and confirmation lines.
 kith-epic-feed pull
 ```
 
-For each linked source: refreshes the access token, using whichever client
-authentication method (`clientAuth`) that source's stored token was
-obtained with -- it is never re-probed here, only at `authorize` time (an
-`invalid_grant` response sets `needs_reauth_at` and reports -- it is never
-retried in this process; run `authorize` again for that person), fetches
-`Patient` by id,
-then pages through every other incoming resource type's search by patient
-with `_count=200`, following `link[rel=next]`, retrying 429 and 5xx with
-backoff. `DocumentReference`'s `Binary` attachment is fetched when its
-content type is text, HTML, RTF or PDF; text and HTML get their text
-extracted, RTF and PDF are stored as bytes under
-`~/.local/share/kithmind/health/<person-slug>/` with no text extraction yet.
+For each linked source: when a refresh token is on file, refreshes the
+access token, using whichever client authentication method (`clientAuth`)
+that source's stored token was obtained with -- it is never re-probed here,
+only at `authorize` time (an `invalid_grant` response sets `needs_reauth_at`
+and reports -- it is never retried in this process; run `authorize` again
+for that person). When no refresh token is on file (Epic's sandbox has been
+observed to issue an access token with no refresh token at all, and any
+organization with no client secret configured never grants one at all --
+see "Client secret" above), the stored access token is used directly as
+long as it still has more than 60 seconds of life left, and the summary line
+carries `note="access token only; expires in <n> minutes"`; otherwise the
+source is marked `needs_reauth`, same as an `invalid_grant` refresh. Either
+way, fetches `Patient` by id, then pages through every other incoming
+resource type's search by patient with `_count=200`, following
+`link[rel=next]`, retrying 429 and 5xx with backoff. `DocumentReference`'s
+`Binary` attachment is fetched when its content type is text, HTML, RTF or
+PDF; text and HTML get their text extracted, RTF and PDF are stored as
+bytes under `~/.local/share/kithmind/health/<person-slug>/` with no text
+extraction yet.
 
 ```
 epic pull source=... org="Synthetic Health System" status=ok documents=1 Patient=1 Observation=42 DiagnosticReport=6 Condition=3 MedicationRequest=5 AllergyIntolerance=2 Immunization=8 Encounter=11 Procedure=4 Goal=0 Specimen=6 DocumentReference=3
+epic pull source=... org="Epic Sandbox" status=ok documents=0 Patient=1 Observation=12 ... note="access token only; expires in 47 minutes"
 ```
 
-Only counts are ever printed -- never a value, a diagnosis, a medication
-name or a note's text. Exits non-zero when any source needed reauth, failed
+Only counts (and, for an access-token-only source, the expiry note above)
+are ever printed -- never a value, a diagnosis, a medication name or a
+note's text. Exits non-zero when any source needed reauth, failed
 outright, or had a resource-type fetch error.
 
 ## Tables (migration `053_health_feed.sql`)
@@ -178,8 +207,11 @@ pnpm --filter @repo/epic-feed test:once
 
 Unit tests (mocked `fetch`, no network, no Keychain, no database) cover
 PKCE, endpoint discovery, the token exchange/refresh, `invalid_grant`
-handling, the endpoint directory lookup, paging with `next` links, and every
-resource mapper. One test (`test/sandboxDiscovery.test.mjs`) calls Epic's
+handling, the per-organization client secret lookup order and `orgSlug`
+(`test/config.test.mjs`), pulling with an access token only (no refresh
+token, both the still-valid and the expired case), the endpoint directory
+lookup, paging with `next` links, and every resource mapper. One test
+(`test/sandboxDiscovery.test.mjs`) calls Epic's
 real public sandbox `.well-known/smart-configuration`/`/metadata` once, to
 prove discovery works against the live sandbox rather than only a mocked
 fixture of it -- it skips cleanly with no network path to `fhir.epic.com`

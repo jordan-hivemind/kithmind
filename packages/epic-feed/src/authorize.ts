@@ -13,7 +13,7 @@ import {
   epicEnv,
   FHIR_RESOURCES,
   loadClientId,
-  loadClientSecretOrNull,
+  loadClientSecretForOrg,
   personSlug,
   redirectUri,
   SANDBOX_FHIR_BASE,
@@ -32,7 +32,11 @@ import {
   parsePastedCode,
   type Fetch,
 } from "./oauth.js";
-import { keychainTokenStore, type TokenStore } from "./keychain.js";
+import {
+  keychainTokenStore,
+  readKeychainSecretByService,
+  type TokenStore,
+} from "./keychain.js";
 
 export type AuthorizeArgs = {
   personSelector: string;
@@ -51,6 +55,10 @@ export type AuthorizeDeps = {
   report?: (line: string) => void;
   generateVerifier?: () => string;
   generateStateValue?: () => string;
+  /** Reads one Keychain item by service name, for `loadClientSecretForOrg`.
+   * Defaults to the real Keychain; a test passes an in-memory reader instead
+   * (`security` does not exist on a Linux CI runner). */
+  readClientSecret?: (service: string) => Promise<string | null>;
 };
 
 export type AuthorizeOutcome = {
@@ -115,6 +123,7 @@ export async function runAuthorize(
     report = (line) => process.stdout.write(`${line}\n`),
     generateVerifier = generateCodeVerifier,
     generateStateValue = generateState,
+    readClientSecret = readKeychainSecretByService,
   } = deps;
 
   const person = await resolvePerson(pool, args.personSelector);
@@ -124,10 +133,10 @@ export async function runAuthorize(
 
   const env: EpicEnv = args.sandbox ? "sandbox" : epicEnv();
   const { orgName, fhirBase } = await resolveOrg(env, args.org, fetchImpl);
-  const [clientId, clientSecret] = await Promise.all([
-    loadClientId(env),
-    loadClientSecretOrNull(),
-  ]);
+  const clientId = await loadClientId(env);
+  const secretLookup = await loadClientSecretForOrg(orgName, readClientSecret);
+  const clientSecret = secretLookup.secret;
+  report(`Client secret: ${secretLookup.source}`);
   const discovery = await discoverSmartConfiguration(fhirBase, fetchImpl);
 
   const codeVerifier = generateVerifier();
