@@ -47,6 +47,10 @@ export const MCP_TOOL_NAMES = {
   // 048_finance_unify.sql).
   listLedger: "list_ledger",
   listHoldings: "list_holdings",
+  // Epic MyChart feed (migration 053_health_feed.sql): one household
+  // member's structured health records and Clinical Note documents.
+  listHealthRecords: "list_health_records",
+  getHealthDocument: "get_health_document",
 } as const;
 
 export const MCP_TOOL_NAME_LIST = Object.values(MCP_TOOL_NAMES);

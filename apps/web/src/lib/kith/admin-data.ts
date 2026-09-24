@@ -418,3 +418,30 @@ export async function loadBalances(
     ),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Screen: Health Records (Epic MyChart feed, migration 053_health_feed.sql)
+// ---------------------------------------------------------------------------
+//
+// Named `MedicalPageData`/`loadMedical` and served at `/admin/medical`
+// rather than `/admin/health` -- that path and `HealthPageData`/`loadHealth`
+// above already belong to ADM-2's "System Health" screen (watcher and
+// processing state, not patient data). Two unrelated meanings of "health"
+// collided on the obvious name; this screen keeps the medical one.
+//
+// Owner-global, like the Balances screen above: `kith.health_sources` and
+// `kith.health_records` carry no single space to narrow to, so this loader
+// repeats only the admin layout's own sign-in check, exactly like
+// `loadBalances`.
+
+export type MedicalPageData = { overview: admin.HealthOverview };
+
+export async function loadMedical(
+  cookieHeader: string | null,
+): Promise<MedicalPageData | null> {
+  const loaded = await loadAuthenticatedPage(cookieHeader, async ({ ctx }) => ({
+    overview: await admin.listHealthOverview(ctx, {}),
+  }));
+  if (loaded === null) return null;
+  return loaded;
+}

@@ -101,6 +101,8 @@ export const MCP_TOOL_ANNOTATIONS = {
   [MCP_TOOL_NAMES.manageFinanceReview]: managedWrite,
   [MCP_TOOL_NAMES.listLedger]: readOnly,
   [MCP_TOOL_NAMES.listHoldings]: readOnly,
+  [MCP_TOOL_NAMES.listHealthRecords]: readOnly,
+  [MCP_TOOL_NAMES.getHealthDocument]: readOnly,
 } as const satisfies Record<McpToolName, McpToolAnnotations>;
 
 export const MCP_MEMORY_TOOL_NAMES = [
