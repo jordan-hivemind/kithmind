@@ -358,6 +358,64 @@ export async function refreshAccessToken(
   return toTokenResponse(result.parsed);
 }
 
+export type ProbeTokenArgs = {
+  tokenEndpoint: string;
+  clientId: string;
+  /** `null` sends the request as a public client (no Authorization header,
+   * `client_id` in the form body); any other value sends it with HTTP
+   * Basic client-secret authentication. This is the one deliberate
+   * difference from `exchangeCode`: that function tries Basic first and
+   * automatically falls back to public on `invalid_client`, collapsing the
+   * two shapes into one outcome. `probeTokenRequest` sends exactly the one
+   * shape the caller asked for and never falls back, so `check` can run
+   * both shapes itself and compare their two outcomes. */
+  clientSecret: string | null;
+  /** A deliberately bogus authorization code -- this call is never expected
+   * to succeed; `check` only reads which error Epic returns. */
+  code: string;
+  redirectUri: string;
+};
+
+export type TokenErrorProbe = {
+  status: number;
+  error: string | null;
+  errorDescription: string | null;
+};
+
+/**
+ * Sends one `authorization_code` token request with a bogus code and
+ * reports Epic's error back verbatim -- never throws, since `check`'s whole
+ * job is to look at the error Epic returns rather than treat it as a
+ * failure. Used only by `check`; `authorize`'s real code exchange is
+ * `exchangeCode` above.
+ */
+export async function probeTokenRequest(
+  args: ProbeTokenArgs,
+  fetchImpl: Fetch = fetch,
+): Promise<TokenErrorProbe> {
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    code: args.code,
+    redirect_uri: args.redirectUri,
+    // No real PKCE flow produced this code, so no real verifier exists;
+    // this call is never expected to reach PKCE validation since the code
+    // itself is bogus.
+    code_verifier: "check-command-has-no-real-pkce-verifier",
+  });
+  let authorizationHeader: string | null = null;
+  if (args.clientSecret !== null) {
+    authorizationHeader = basicAuthHeader(args.clientId, args.clientSecret);
+  } else {
+    body.set("client_id", args.clientId);
+  }
+  const result = await requestToken(args.tokenEndpoint, body, fetchImpl, authorizationHeader);
+  return {
+    status: result.status,
+    error: result.parsed.error ?? null,
+    errorDescription: result.parsed.error_description ?? null,
+  };
+}
+
 /** Parses either a bare authorization code or a full pasted callback URL
  * (`...?code=...&state=...`), and validates `state` when the URL carries
  * one. */

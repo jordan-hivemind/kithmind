@@ -97,20 +97,50 @@ export function epicEnv(): EpicEnv {
   throw new Error(`EPIC_ENV must be "sandbox" or "production", got "${raw}"`);
 }
 
+export type ClientIdLookup = {
+  clientId: string;
+  /** The env var name, the Keychain item name, or the Keychain item name
+   * plus a note that it was unset and the built-in public default was used
+   * instead -- what `check` reports (never the client id itself needs
+   * hiding, since client ids are public, but this is the name of *where it
+   * came from*, for a person comparing it against fhir.epic.com). */
+  source: string;
+};
+
+/**
+ * The client id and where it came from: `EPIC_CLIENT_ID` first, then the
+ * environment's own Keychain item, then the well-known public default id
+ * for that environment. `readClientId` defaults to the real Keychain and is
+ * overridden by a test with an in-memory reader.
+ */
+export async function loadClientIdWithSource(
+  env: EpicEnv,
+  readClientId: (service: string) => Promise<string | null> = readKeychainSecretByService,
+): Promise<ClientIdLookup> {
+  const fromEnv = process.env.EPIC_CLIENT_ID;
+  if (fromEnv !== undefined && fromEnv !== "") {
+    return { clientId: fromEnv, source: "EPIC_CLIENT_ID" };
+  }
+  const service =
+    env === "sandbox"
+      ? EPIC_CLIENT_ID_NONPROD_SERVICE
+      : EPIC_CLIENT_ID_SERVICE;
+  const fromKeychain = await readClientId(service);
+  if (fromKeychain !== null && fromKeychain !== "") {
+    return { clientId: fromKeychain, source: service };
+  }
+  return {
+    clientId: env === "sandbox" ? SANDBOX_CLIENT_ID : PRODUCTION_CLIENT_ID,
+    source: `${service} (not set; using the built-in public default)`,
+  };
+}
+
 /**
  * The client id: `EPIC_CLIENT_ID` first, then the environment's own Keychain
  * item, then the well-known public default id for that environment.
  */
 export async function loadClientId(env: EpicEnv): Promise<string> {
-  const fromEnv = process.env.EPIC_CLIENT_ID;
-  if (fromEnv !== undefined && fromEnv !== "") return fromEnv;
-  const service =
-    env === "sandbox"
-      ? EPIC_CLIENT_ID_NONPROD_SERVICE
-      : EPIC_CLIENT_ID_SERVICE;
-  const fromKeychain = await readKeychainSecretByService(service);
-  if (fromKeychain !== null && fromKeychain !== "") return fromKeychain;
-  return env === "sandbox" ? SANDBOX_CLIENT_ID : PRODUCTION_CLIENT_ID;
+  return (await loadClientIdWithSource(env)).clientId;
 }
 
 /**

@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 // `kith-epic-feed authorize --person <id-or-name> [--org "<health system>"]
-// [--sandbox] | pull`. See README.md for setup and the commands; see
+// [--sandbox] | pull | check [--org "<health system>"] [--sandbox]`. See
+// README.md for setup and the commands; see
 // docs/plans/2026-09-22-simplification-and-feeds.md for why this package
 // exists (order of work items 4 and 5).
 
 import process from "node:process";
 
 import { runAuthorize, type AuthorizeArgs } from "./authorize.js";
+import { runCheck, type CheckArgs } from "./check.js";
 import { loadDatabaseUrl } from "./config.js";
 import { openPool } from "./db.js";
 import { pullAll } from "./pull.js";
@@ -14,7 +16,8 @@ import { pullAll } from "./pull.js";
 function usage(): never {
   process.stderr.write(
     "Usage: kith-epic-feed authorize --person <id-or-name> " +
-      '[--org "<health system name>"] [--sandbox] | pull\n',
+      '[--org "<health system name>"] [--sandbox] | pull | ' +
+      'check [--org "<health system name>"] [--sandbox]\n',
   );
   process.exit(2);
 }
@@ -52,6 +55,23 @@ async function authorizeCommand(rest: string[]): Promise<void> {
   }
 }
 
+function parseCheckArgs(rest: string[]): CheckArgs {
+  let org: string | undefined;
+  let sandbox = false;
+  for (let index = 0; index < rest.length; index += 1) {
+    const arg = rest[index];
+    if (arg === "--org") {
+      org = rest[index + 1];
+      index += 1;
+    } else if (arg === "--sandbox") {
+      sandbox = true;
+    } else {
+      usage();
+    }
+  }
+  return { org, sandbox };
+}
+
 async function main(argv: string[]): Promise<void> {
   const [command, ...rest] = argv;
   if (command === "authorize") {
@@ -62,6 +82,10 @@ async function main(argv: string[]): Promise<void> {
     if (rest.length > 0) usage();
     const { anyFailed } = await pullAll();
     if (anyFailed) process.exitCode = 1;
+    return;
+  }
+  if (command === "check") {
+    await runCheck(parseCheckArgs(rest));
     return;
   }
   usage();

@@ -16,12 +16,11 @@ import {
   loadClientSecretForOrg,
   personSlug,
   redirectUri,
-  SANDBOX_FHIR_BASE,
   tokenKeychainService,
   type EpicEnv,
 } from "./config.js";
 import { resolvePerson, upsertHealthSource } from "./db.js";
-import { findEndpointsByName } from "./endpoints.js";
+import { resolveOrgForEnv } from "./endpoints.js";
 import {
   buildAuthorizationUrl,
   codeChallengeS256,
@@ -81,33 +80,6 @@ export function requiredScopes(): string[] {
   ];
 }
 
-async function resolveOrg(
-  env: EpicEnv,
-  org: string | undefined,
-  fetchImpl: Fetch,
-): Promise<{ orgName: string; fhirBase: string }> {
-  if (env === "sandbox") {
-    return { orgName: org ?? "Epic Sandbox", fhirBase: SANDBOX_FHIR_BASE };
-  }
-  if (org === undefined || org.trim() === "") {
-    throw new Error("--org \"<health system name>\" is required in production");
-  }
-  const matches = await findEndpointsByName(org, fetchImpl);
-  if (matches.length === 0) {
-    throw new Error(`No health system in Epic's endpoint directory matches "${org}"`);
-  }
-  if (matches.length > 1) {
-    const names = matches
-      .slice(0, 20)
-      .map((match) => `  - ${match.orgName}`)
-      .join("\n");
-    throw new Error(
-      `"${org}" matches more than one health system; use a more specific name:\n${names}`,
-    );
-  }
-  return matches[0]!;
-}
-
 /** One standalone SMART launch: builds the authorization URL, exchanges the
  * pasted code, and stores the result. Every dependency is injectable so a
  * test drives this with no network, no Keychain and no real stdin. */
@@ -132,7 +104,7 @@ export async function runAuthorize(
   }
 
   const env: EpicEnv = args.sandbox ? "sandbox" : epicEnv();
-  const { orgName, fhirBase } = await resolveOrg(env, args.org, fetchImpl);
+  const { orgName, fhirBase } = await resolveOrgForEnv(env, args.org, fetchImpl);
   const clientId = await loadClientId(env);
   const secretLookup = await loadClientSecretForOrg(orgName, readClientSecret);
   const clientSecret = secretLookup.secret;

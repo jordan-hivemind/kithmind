@@ -4,6 +4,7 @@
 // is not to be copied into the repository, since Epic adds and retires
 // health systems on its own schedule.
 
+import { SANDBOX_FHIR_BASE, type EpicEnv } from "./config.js";
 import type { Fetch } from "./oauth.js";
 
 export type EndpointMatch = {
@@ -57,4 +58,40 @@ export async function findEndpointsByName(
     }
   }
   return matches;
+}
+
+/**
+ * Resolves an `--org` selector to one organization's FHIR base, the same
+ * way for `authorize` and `check`: in sandbox, `org` is optional and
+ * defaults to Epic's own public sandbox FHIR base (`SANDBOX_FHIR_BASE`); in
+ * production, `org` is required and looked up by name against Epic's public
+ * R4 endpoint directory, throwing when it matches zero or more than one
+ * health system (in which case the matches are listed so the caller can be
+ * more specific).
+ */
+export async function resolveOrgForEnv(
+  env: EpicEnv,
+  org: string | undefined,
+  fetchImpl: Fetch = fetch,
+): Promise<EndpointMatch> {
+  if (env === "sandbox") {
+    return { orgName: org ?? "Epic Sandbox", fhirBase: SANDBOX_FHIR_BASE };
+  }
+  if (org === undefined || org.trim() === "") {
+    throw new Error('--org "<health system name>" is required in production');
+  }
+  const matches = await findEndpointsByName(org, fetchImpl);
+  if (matches.length === 0) {
+    throw new Error(`No health system in Epic's endpoint directory matches "${org}"`);
+  }
+  if (matches.length > 1) {
+    const names = matches
+      .slice(0, 20)
+      .map((match) => `  - ${match.orgName}`)
+      .join("\n");
+    throw new Error(
+      `"${org}" matches more than one health system; use a more specific name:\n${names}`,
+    );
+  }
+  return matches[0]!;
 }
