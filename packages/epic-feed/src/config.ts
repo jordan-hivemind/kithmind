@@ -95,15 +95,31 @@ export async function loadClientId(env: EpicEnv): Promise<string> {
   return env === "sandbox" ? SANDBOX_CLIENT_ID : PRODUCTION_CLIENT_ID;
 }
 
-/** The client secret: `EPIC_CLIENT_SECRET` first, then Keychain. Never a
- * built-in default -- the secret is never a public value. */
-export async function loadClientSecret(): Promise<string> {
+/**
+ * The client secret: `EPIC_CLIENT_SECRET` first, then Keychain, `null` when
+ * neither is configured. A missing secret is not an error here -- Epic's
+ * sandbox has been observed to treat this app's registration as a public
+ * client regardless of the secret, so `oauth.ts`'s token exchange and
+ * refresh fall back to the public-client method instead of failing.
+ */
+export async function loadClientSecretOrNull(): Promise<string | null> {
   const fromEnv = process.env.EPIC_CLIENT_SECRET;
   if (fromEnv !== undefined && fromEnv !== "") return fromEnv;
   const fromKeychain = await readKeychainSecretByService(
     EPIC_CLIENT_SECRET_SERVICE,
   );
   if (fromKeychain !== null && fromKeychain !== "") return fromKeychain;
+  return null;
+}
+
+/** Same as `loadClientSecretOrNull`, but throws when neither `EPIC_CLIENT_SECRET`
+ * nor the Keychain item is configured. Kept for callers that genuinely
+ * require a confidential-client secret; `authorize`/`pull`'s token calls use
+ * `loadClientSecretOrNull` instead so a public-client registration works
+ * with no secret configured at all. */
+export async function loadClientSecret(): Promise<string> {
+  const secret = await loadClientSecretOrNull();
+  if (secret !== null) return secret;
   throw new Error(
     `EPIC_CLIENT_SECRET is not set and Keychain item "${EPIC_CLIENT_SECRET_SERVICE}" ` +
       "was not found. Set EPIC_CLIENT_SECRET or add the item with: " +

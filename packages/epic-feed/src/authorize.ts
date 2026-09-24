@@ -13,7 +13,7 @@ import {
   epicEnv,
   FHIR_RESOURCES,
   loadClientId,
-  loadClientSecret,
+  loadClientSecretOrNull,
   personSlug,
   redirectUri,
   SANDBOX_FHIR_BASE,
@@ -126,7 +126,7 @@ export async function runAuthorize(
   const { orgName, fhirBase } = await resolveOrg(env, args.org, fetchImpl);
   const [clientId, clientSecret] = await Promise.all([
     loadClientId(env),
-    loadClientSecret(),
+    loadClientSecretOrNull(),
   ]);
   const discovery = await discoverSmartConfiguration(fhirBase, fetchImpl);
 
@@ -165,6 +165,17 @@ export async function runAuthorize(
     throw new Error("Epic's token response had no patient id (launch/patient scope)");
   }
 
+  report(
+    `Authorized as ${token.clientAuth === "public" ? "public" : "confidential"} ` +
+      `client; refresh token: ${token.refreshToken !== null ? "present" : "absent"}`,
+  );
+  if (token.refreshToken === null) {
+    report(
+      "No refresh token was returned; the daily pull will need a new " +
+        "authorization once this access token expires.",
+    );
+  }
+
   const keychainService = tokenKeychainService(personSlug(person.canonicalName));
   await tokenStore.set(
     keychainService,
@@ -175,6 +186,7 @@ export async function runAuthorize(
       patientFhirId: token.patientFhirId,
       fhirBase,
       orgName,
+      clientAuth: token.clientAuth,
     }),
   );
 
