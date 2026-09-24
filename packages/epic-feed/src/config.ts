@@ -112,6 +112,56 @@ export async function loadClientSecretOrNull(): Promise<string | null> {
   return null;
 }
 
+/** `com.kithmind.epic.client-secret.<org-slug>`, one organization's own
+ * client secret item -- see `loadClientSecretForOrg`. */
+export function clientSecretKeychainService(orgName: string): string {
+  return `${EPIC_CLIENT_SECRET_SERVICE}.${orgSlug(orgName)}`;
+}
+
+export type ClientSecretLookup = {
+  secret: string | null;
+  /** The Keychain item name or env var name the secret came from, or
+   * `"none"` when nothing is configured. Never the secret value -- this is
+   * what `authorize` reports. */
+  source: string;
+};
+
+/**
+ * The client secret for one organization: Epic issues a refresh token only
+ * when a client secret is configured for that organization ("select the key
+ * icon next to the organization... if you forgo adding client secrets,
+ * refresh tokens will be unavailable for that organization"), and Epic
+ * recommends a distinct secret per organization and per environment. So the
+ * lookup is per-org first: that organization's own Keychain item
+ * (`clientSecretKeychainService`), then the shared Keychain item
+ * (`EPIC_CLIENT_SECRET_SERVICE`), then `EPIC_CLIENT_SECRET`. `secret: null`
+ * when none of the three is configured -- not an error, since a missing
+ * secret falls back to the public-client method (see
+ * `loadClientSecretOrNull`) rather than failing.
+ *
+ * `readSecret` defaults to the real Keychain and is overridden by a test
+ * with an in-memory reader.
+ */
+export async function loadClientSecretForOrg(
+  orgName: string,
+  readSecret: (service: string) => Promise<string | null> = readKeychainSecretByService,
+): Promise<ClientSecretLookup> {
+  const perOrgService = clientSecretKeychainService(orgName);
+  const fromPerOrg = await readSecret(perOrgService);
+  if (fromPerOrg !== null && fromPerOrg !== "") {
+    return { secret: fromPerOrg, source: perOrgService };
+  }
+  const fromShared = await readSecret(EPIC_CLIENT_SECRET_SERVICE);
+  if (fromShared !== null && fromShared !== "") {
+    return { secret: fromShared, source: EPIC_CLIENT_SECRET_SERVICE };
+  }
+  const fromEnv = process.env.EPIC_CLIENT_SECRET;
+  if (fromEnv !== undefined && fromEnv !== "") {
+    return { secret: fromEnv, source: "EPIC_CLIENT_SECRET" };
+  }
+  return { secret: null, source: "none" };
+}
+
 /** Same as `loadClientSecretOrNull`, but throws when neither `EPIC_CLIENT_SECRET`
  * nor the Keychain item is configured. Kept for callers that genuinely
  * require a confidential-client secret; `authorize`/`pull`'s token calls use
@@ -150,14 +200,27 @@ export function tokenKeychainService(personSlug: string): string {
   return `com.kithmind.epic.token.${personSlug}`;
 }
 
-/** Lowercase, hyphenated, alphanumeric-only slug of a person's name, the
- * same shape `@repo/plaid-feed`'s `institutionSlug` produces. */
-export function personSlug(name: string): string {
-  const slug = name
+/** Lowercase, hyphenated, alphanumeric-only slug, the same shape
+ * `@repo/plaid-feed`'s `institutionSlug` produces; falls back to `fallback`
+ * when nothing alphanumeric remains. */
+function slugify(value: string, fallback: string): string {
+  const slug = value
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return slug === "" ? "person" : slug;
+  return slug === "" ? fallback : slug;
+}
+
+/** Lowercase, hyphenated, alphanumeric-only slug of a person's name. */
+export function personSlug(name: string): string {
+  return slugify(name, "person");
+}
+
+/** Lowercase, hyphenated, alphanumeric-only slug of a health system's name,
+ * e.g. `"Virginia Mason Franciscan Health"` -> `"virginia-mason-franciscan-health"`.
+ * Used only for `clientSecretKeychainService`. */
+export function orgSlug(orgName: string): string {
+  return slugify(orgName, "org");
 }
 
 /** The redirect URI this environment's app registration uses. */

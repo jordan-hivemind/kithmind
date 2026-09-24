@@ -1,13 +1,16 @@
 // `kith-epic-feed pull`: one round over every linked `kith.health_sources`
 // row.
 //
-// For each source: refresh the access token (an `invalid_grant` sets
-// `needs_reauth_at` and reports -- never retried in this process), fetch
-// `Patient` by id, then page through every `SEARCHABLE_RESOURCES` type's
-// search by patient with `_count=200`, following `link[rel=next]`, retrying
-// 429 and 5xx with backoff (`fetchRetry.ts`). `DocumentReference` also
-// fetches its `Binary` attachment when the content type qualifies
-// (`documents.ts`).
+// For each source: refresh the access token when a refresh token is on
+// file (an `invalid_grant` sets `needs_reauth_at` and reports -- never
+// retried in this process); when none is on file, use the stored access
+// token directly as long as it still has more than 60 seconds of life left
+// (Epic's sandbox has been observed to issue a token with no refresh grant
+// at all), otherwise mark `needs_reauth` as above. Then fetch `Patient` by
+// id, then page through every `SEARCHABLE_RESOURCES` type's search by
+// patient with `_count=200`, following `link[rel=next]`, retrying 429 and
+// 5xx with backoff (`fetchRetry.ts`). `DocumentReference` also fetches its
+// `Binary` attachment when the content type qualifies (`documents.ts`).
 //
 // Nothing here prints a value, a note's text or a diagnosis -- only counts --
 // and the process exits non-zero when any source needed reauth, failed
@@ -20,7 +23,7 @@ import type { Pool } from "pg";
 import {
   healthDataDir,
   loadClientId,
-  loadClientSecretOrNull,
+  loadClientSecretForOrg,
   loadDatabaseUrl,
   personSlug,
   SANDBOX_FHIR_BASE,
@@ -69,6 +72,13 @@ export type SourcePullResult = {
   documents: number;
   error: string | null;
   resourceErrors: Record<string, string>;
+  /** Set when this pull used the stored access token directly because no
+   * refresh token is on file (e.g. Epic's sandbox issuing a token with no
+   * refresh grant) -- `"access token only; expires in <n> minutes"`.
+   * Printed in the summary line so an operator watching the daily log knows
+   * this source will need `authorize` again once the access token expires.
+   * `null` otherwise. */
+  tokenNote: string | null;
 };
 
 export type PullDeps = {
@@ -90,6 +100,7 @@ function emptyResult(orgName: string): SourcePullResult {
     documents: 0,
     error: null,
     resourceErrors: {},
+    tokenNote: null,
   };
 }
 
@@ -282,16 +293,19 @@ async function pullDocumentAttachment(
 
 export type EpicCredentials = { clientId: string; clientSecret: string | null };
 
-async function refreshedAccessToken(
+/** A stored access token is only used directly (no refresh) when it still
+ * has more than this much life left -- matching the task's "expires more
+ * than 60 seconds from now". */
+const MIN_ACCESS_TOKEN_LIFETIME_MS = 60_000;
+
+async function refreshAndStore(
   source: HealthSourceRow,
   token: StoredToken,
+  refreshToken: string,
   fetchImpl: Fetch,
   tokenStore: TokenStore,
   credentials: EpicCredentials,
 ): Promise<string> {
-  if (token.refreshToken === null) {
-    throw new InvalidGrantError("No refresh token stored; authorize again");
-  }
   // A token stored before `clientAuth` existed was always obtained with
   // HTTP Basic (the exchange's only method at the time).
   const clientAuth: ClientAuthMethod = token.clientAuth ?? "secret";
@@ -301,13 +315,13 @@ async function refreshedAccessToken(
       tokenEndpoint: discovery.tokenEndpoint,
       clientId: credentials.clientId,
       clientSecret: credentials.clientSecret,
-      refreshToken: token.refreshToken,
+      refreshToken,
       clientAuth,
     },
     fetchImpl,
   );
   const updated: StoredToken = {
-    refreshToken: refreshed.refreshToken ?? token.refreshToken,
+    refreshToken: refreshed.refreshToken ?? refreshToken,
     accessToken: refreshed.accessToken,
     expiresAt: refreshed.expiresAt,
     patientFhirId: token.patientFhirId,
@@ -317,6 +331,61 @@ async function refreshedAccessToken(
   };
   await tokenStore.set(source.keychainService, JSON.stringify(updated));
   return refreshed.accessToken;
+}
+
+export type AccessTokenOutcome = {
+  accessToken: string;
+  /** See `SourcePullResult.tokenNote`. */
+  note: string | null;
+};
+
+/**
+ * Resolves the access token to pull with: refreshes as before when a
+ * refresh token is on file; otherwise, when the stored access token itself
+ * still has more than 60 seconds of life left, uses it directly rather than
+ * refusing the whole source (Epic's sandbox has been observed to issue an
+ * access token with no refresh token at all); otherwise throws
+ * `InvalidGrantError` so the caller marks `needs_reauth_at`, same as an
+ * `invalid_grant` refresh response.
+ *
+ * `expiresAt` is always present in `token` (computed from `expires_in` at
+ * exchange time by `oauth.ts`'s `toTokenResponse`, for both `authorize` and
+ * a prior refresh here) -- a missing or unparseable value is treated as
+ * already expired rather than thrown on, so a malformed or pre-`expiresAt`
+ * stored token safely falls through to `needs_reauth` instead of crashing
+ * the whole pull.
+ */
+async function resolveAccessToken(
+  source: HealthSourceRow,
+  token: StoredToken,
+  fetchImpl: Fetch,
+  tokenStore: TokenStore,
+  credentials: EpicCredentials,
+): Promise<AccessTokenOutcome> {
+  if (token.refreshToken !== null) {
+    const accessToken = await refreshAndStore(
+      source,
+      token,
+      token.refreshToken,
+      fetchImpl,
+      tokenStore,
+      credentials,
+    );
+    return { accessToken, note: null };
+  }
+
+  const msRemaining = Date.parse(token.expiresAt) - Date.now();
+  if (Number.isFinite(msRemaining) && msRemaining > MIN_ACCESS_TOKEN_LIFETIME_MS) {
+    const minutes = Math.floor(msRemaining / 60_000);
+    return {
+      accessToken: token.accessToken,
+      note: `access token only; expires in ${minutes} minutes`,
+    };
+  }
+  throw new InvalidGrantError(
+    "No refresh token stored and the access token has expired or is about " +
+      "to; authorize again",
+  );
 }
 
 export async function pullAll(deps: PullDeps = {}): Promise<{
@@ -337,18 +406,25 @@ export async function pullAll(deps: PullDeps = {}): Promise<{
       return { results: [], anyFailed: false };
     }
     const results: SourcePullResult[] = [];
-    const credentialsByEnv = new Map<EpicEnv, EpicCredentials>();
+    const clientIdByEnv = new Map<EpicEnv, string>();
+    // Client secret is looked up per organization, not per environment --
+    // Epic issues (and recommends) a distinct client secret, and thus a
+    // distinct refresh-token grant, per organization. See
+    // `loadClientSecretForOrg`.
+    const clientSecretByOrg = new Map<string, string | null>();
     for (const source of sources) {
       const env = fhirEnvOf(source.fhirBase);
-      let credentials = credentialsByEnv.get(env);
-      if (credentials === undefined) {
-        const [clientId, clientSecret] = await Promise.all([
-          loadClientId(env),
-          loadClientSecretOrNull(),
-        ]);
-        credentials = { clientId, clientSecret };
-        credentialsByEnv.set(env, credentials);
+      let clientId = clientIdByEnv.get(env);
+      if (clientId === undefined) {
+        clientId = await loadClientId(env);
+        clientIdByEnv.set(env, clientId);
       }
+      let clientSecret = clientSecretByOrg.get(source.orgName);
+      if (clientSecret === undefined) {
+        clientSecret = (await loadClientSecretForOrg(source.orgName)).secret;
+        clientSecretByOrg.set(source.orgName, clientSecret);
+      }
+      const credentials: EpicCredentials = { clientId, clientSecret };
       const result = await pullOneSource(
         pool,
         source,
@@ -393,15 +469,9 @@ export async function pullOneSource(
     return result;
   }
   const token = JSON.parse(raw) as StoredToken;
-  let accessToken: string;
+  let outcome: AccessTokenOutcome;
   try {
-    accessToken = await refreshedAccessToken(
-      source,
-      token,
-      fetchImpl,
-      tokenStore,
-      credentials,
-    );
+    outcome = await resolveAccessToken(source, token, fetchImpl, tokenStore, credentials);
   } catch (error) {
     const result = emptyResult(source.orgName);
     const invalidGrant = error instanceof InvalidGrantError;
@@ -410,7 +480,9 @@ export async function pullOneSource(
     await recordPullFailure(pool, source.id, result.error, invalidGrant);
     return result;
   }
-  return await pullSource(pool, source, accessToken, fetchImpl, dataDirRoot);
+  const result = await pullSource(pool, source, outcome.accessToken, fetchImpl, dataDirRoot);
+  result.tokenNote = outcome.note;
+  return result;
 }
 
 function summaryLine(source: HealthSourceRow, result: SourcePullResult): string {
@@ -427,6 +499,7 @@ function summaryLine(source: HealthSourceRow, result: SourcePullResult): string 
   if (Object.keys(result.resourceErrors).length > 0) {
     parts.push(`resource_errors=${JSON.stringify(result.resourceErrors)}`);
   }
+  if (result.tokenNote !== null) parts.push(`note=${JSON.stringify(result.tokenNote)}`);
   if (result.error !== null) parts.push(`error=${JSON.stringify(result.error)}`);
   return parts.join(" ");
 }

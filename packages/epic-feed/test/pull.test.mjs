@@ -264,6 +264,65 @@ test("pullOneSource fails without reauth when the Keychain item is missing", asy
   assert.match(result.error, /not found/);
 });
 
+test("pullOneSource pulls with an unexpired access token when no refresh token is stored", async () => {
+  const pool = fakePool();
+  // No `smart-configuration`/`/oauth2/token` call is expected -- there is no
+  // refresh token to refresh with, and this test throws if either is
+  // fetched anyway.
+  const fetchImpl = async (url) => {
+    if (url.includes("smart-configuration") || url.includes("/oauth2/token")) {
+      throw new Error(`unexpected token-refresh fetch in this test: ${url}`);
+    }
+    if (url.includes("/Patient/")) return jsonResponse(200, patientResource());
+    return jsonResponse(200, { entry: [] });
+  };
+  const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+  const originalToken = JSON.stringify({
+    refreshToken: null,
+    accessToken: "sandbox-access-only",
+    expiresAt,
+    patientFhirId: "patient-1",
+    fhirBase: SOURCE.fhirBase,
+    orgName: SOURCE.orgName,
+  });
+  const tokenStore = inMemoryTokenStore({ [SOURCE.keychainService]: originalToken });
+  const result = await pullOneSource(pool, SOURCE, fetchImpl, tokenStore, {
+    clientId: "client-1",
+    clientSecret: "secret-1",
+  });
+  assert.equal(result.status, "ok");
+  assert.equal(result.counts.Patient, 1);
+  assert.match(result.tokenNote, /^access token only; expires in \d+ minutes$/);
+  // Nothing was refreshed, so the stored token is untouched.
+  assert.equal(tokenStore.items.get(SOURCE.keychainService), originalToken);
+});
+
+test("pullOneSource marks needs_reauth when no refresh token is stored and the access token has expired", async () => {
+  const pool = fakePool();
+  const fetchImpl = async (url) => {
+    throw new Error(`unexpected fetch in this test: ${url}`);
+  };
+  const originalToken = JSON.stringify({
+    refreshToken: null,
+    accessToken: "sandbox-access-only",
+    expiresAt: new Date(Date.now() - 1000).toISOString(),
+    patientFhirId: "patient-1",
+    fhirBase: SOURCE.fhirBase,
+    orgName: SOURCE.orgName,
+  });
+  const tokenStore = inMemoryTokenStore({ [SOURCE.keychainService]: originalToken });
+  const result = await pullOneSource(pool, SOURCE, fetchImpl, tokenStore, {
+    clientId: "client-1",
+    clientSecret: "secret-1",
+  });
+  assert.equal(result.status, "needs_reauth");
+  assert.match(result.error, /No refresh token stored/);
+  assert.equal(tokenStore.items.get(SOURCE.keychainService), originalToken);
+  const failureUpdate = pool.calls.find((call) => call.text.includes("needs_reauth_at"));
+  assert.ok(failureUpdate);
+  assert.equal(failureUpdate.params[2], true);
+});
+
 function fetchImplForRefresh(tokenCalls) {
   return async (url, init) => {
     if (url.includes("smart-configuration")) {

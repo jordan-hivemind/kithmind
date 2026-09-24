@@ -9,14 +9,21 @@ import { runAuthorize } from "../dist/index.js";
 import { fakePool } from "./helpers/fakePool.mjs";
 import { inMemoryTokenStore } from "./helpers/tokenStore.mjs";
 
-// `runAuthorize` loads the client id and secret itself (env-first, then
-// Keychain, `loadClientId`/`loadClientSecret` in `config.ts`); setting both
-// here means these tests never fall through to a real Keychain lookup --
-// `security` does not exist on a Linux CI runner, and a fallback lookup that
-// found nothing there would otherwise throw `spawn ... ENOENT` before this
-// file's own `tokenStore`/`fakePool` mocks are ever reached.
+// `runAuthorize` loads the client id (env-first, then Keychain,
+// `loadClientId` in `config.ts`) and the client secret
+// (`loadClientSecretForOrg`: the org's own Keychain item, then the shared
+// Keychain item, then env -- see `config.test.mjs` for that order on its
+// own) itself; setting `EPIC_CLIENT_ID` here and passing
+// `readClientSecret: async () => null` in each test below (so both Keychain
+// items "miss" and the lookup falls through to `EPIC_CLIENT_SECRET`) means
+// these tests never fall through to a real Keychain lookup -- `security`
+// does not exist on a Linux CI runner, and a fallback lookup that found
+// nothing there would otherwise throw `spawn ... ENOENT` before this file's
+// own `tokenStore`/`fakePool` mocks are ever reached.
 process.env.EPIC_CLIENT_ID ??= "synthetic-test-client-id";
 process.env.EPIC_CLIENT_SECRET ??= "synthetic-test-secret";
+
+const noKeychainSecret = async () => null;
 
 function jsonResponse(status, body) {
   return { ok: status >= 200 && status < 300, status, json: async () => body };
@@ -68,6 +75,7 @@ test("runAuthorize completes a sandbox flow and stores the token and the source 
       report: (line) => reports.push(line),
       generateVerifier: () => "verifier-1",
       generateStateValue: () => "state-1",
+      readClientSecret: noKeychainSecret,
     },
   );
 
@@ -135,6 +143,7 @@ test("runAuthorize falls back to a public client on Basic invalid_client and sto
       report: (line) => reports.push(line),
       generateVerifier: () => "verifier-1",
       generateStateValue: () => "state-1",
+      readClientSecret: noKeychainSecret,
     },
   );
 
@@ -181,6 +190,7 @@ test("runAuthorize reports and stores an absent refresh token", async () => {
       report: (line) => reports.push(line),
       generateVerifier: () => "verifier-1",
       generateStateValue: () => "state-1",
+      readClientSecret: noKeychainSecret,
     },
   );
 
@@ -247,8 +257,71 @@ test("runAuthorize rejects a pasted code whose state does not match", async () =
           prompt: async () =>
             "https://brain.hive-mind.com/api/epic/callback?code=abc&state=wrong-state",
           generateStateValue: () => "expected-state",
+          readClientSecret: noKeychainSecret,
         },
       ),
     /state/,
+  );
+});
+
+test("runAuthorize prefers the org's own client secret and reports the item name, never the value", async () => {
+  const pool = personPool();
+  const tokenCalls = [];
+  const fetchImpl = async (url, init) => {
+    if (url.includes("well-known/smart-configuration")) {
+      return jsonResponse(200, {
+        authorization_endpoint: "https://fhir.epic.com/oauth2/authorize",
+        token_endpoint: "https://fhir.epic.com/oauth2/token",
+      });
+    }
+    if (url.includes("/oauth2/token")) {
+      tokenCalls.push(init);
+      return jsonResponse(200, {
+        access_token: "access-1",
+        refresh_token: "refresh-1",
+        expires_in: 3600,
+        patient: "patient-1",
+        scope: "openid patient/Patient.read",
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const secretReads = [];
+  const readClientSecret = async (service) => {
+    secretReads.push(service);
+    if (service === "com.kithmind.epic.client-secret.epic-sandbox") {
+      return "org-specific-secret";
+    }
+    return null;
+  };
+  const tokenStore = inMemoryTokenStore();
+  const reports = [];
+  const outcome = await runAuthorize(
+    { personSelector: "person-kith-id-1", sandbox: true },
+    {
+      pool,
+      fetchImpl,
+      prompt: async () => "the-pasted-code",
+      tokenStore,
+      report: (line) => reports.push(line),
+      generateVerifier: () => "verifier-1",
+      generateStateValue: () => "state-1",
+      readClientSecret,
+    },
+  );
+
+  assert.equal(outcome.status, "linked");
+  // The org's own item answered, so the shared item was never consulted.
+  assert.deepEqual(secretReads, ["com.kithmind.epic.client-secret.epic-sandbox"]);
+  assert.ok(
+    reports.includes("Client secret: com.kithmind.epic.client-secret.epic-sandbox"),
+  );
+  // The secret value itself is never printed.
+  assert.ok(reports.every((line) => !line.includes("org-specific-secret")));
+  // The exchange actually used it.
+  assert.equal(tokenCalls.length, 1);
+  assert.equal(
+    tokenCalls[0].headers.authorization,
+    `Basic ${Buffer.from("synthetic-test-client-id:org-specific-secret").toString("base64")}`,
   );
 });
