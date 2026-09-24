@@ -33,7 +33,10 @@ export const PRODUCTION_ENDPOINT_DIRECTORY_URL =
 
 export const REDIRECT_URI_PRODUCTION =
   "https://brain.hive-mind.com/api/epic/callback";
-export const REDIRECT_URI_SANDBOX = "http://localhost:8766/callback";
+// Epic's sandbox rejected the http://localhost redirect in practice
+// (OAuth/Start error=4) while accepting the https callback page, so both
+// environments use the hosted page. EPIC_REDIRECT_URI overrides either.
+export const REDIRECT_URI_SANDBOX = REDIRECT_URI_PRODUCTION;
 
 export type EpicEnv = "sandbox" | "production";
 
@@ -143,6 +146,8 @@ export function personSlug(name: string): string {
 
 /** The redirect URI this environment's app registration uses. */
 export function redirectUri(env: EpicEnv): string {
+  const override = process.env.EPIC_REDIRECT_URI?.trim();
+  if (override) return override;
   return env === "sandbox" ? REDIRECT_URI_SANDBOX : REDIRECT_URI_PRODUCTION;
 }
 

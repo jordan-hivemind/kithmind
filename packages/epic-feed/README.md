@@ -24,7 +24,7 @@ Two commands:
    `https://brain.hive-mind.com/api/epic/callback` (production -- the page
    there only displays the returned code and state for pasting into the
    terminal; it does not authenticate or store anything) and
-   `http://localhost:8766/callback` (sandbox, unused by this CLI's own flow
+   `https://brain.hive-mind.com/api/epic/callback` for both environments (the sandbox rejected the localhost redirect; `EPIC_REDIRECT_URI` overrides it
    since `authorize` prompts for a pasted code rather than running a local
    server, but registered to match the app's configuration). Client IDs are
    public values, not secrets:
