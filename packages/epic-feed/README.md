@@ -79,7 +79,7 @@ Two commands:
 | `com.kithmind.epic.client-id-nonprod` | Sandbox client id (optional; falls back to the public default above). |
 | `com.kithmind.epic.client-secret.<org-slug>` | That organization's own client secret, e.g. `com.kithmind.epic.client-secret.virginia-mason-franciscan-health` for `--org "Virginia Mason Franciscan Health"`. Checked first; see "Client secret" above. |
 | `com.kithmind.epic.client-secret` | The shared client secret, used when no per-org item exists. No secret configured at all is not an error -- see `authorize` step 7 below, "falls back to a public-client request". |
-| `com.kithmind.epic.token.<person-slug>` | One person's refresh token (`null` if Epic did not grant one), access token, expiry, patient FHIR id, FHIR base, org name, and `clientAuth` (`"secret"` or `"public"` -- see `authorize` step 7), as JSON. Written by `authorize`, read and rewritten by `pull`. A token stored before `clientAuth` existed is treated as `"secret"`. |
+| `com.kithmind.epic.token.<person-slug>.<org-slug>` | One person's refresh token (`null` if Epic did not grant one), access token, expiry, patient FHIR id, FHIR base, org name, and `clientAuth` (`"secret"` or `"public"` -- see `authorize` step 7), as JSON. Written by `authorize`, read and rewritten by `pull`. Suffixed by both person and organization -- e.g. `com.kithmind.epic.token.jamie-synthetic.virginia-mason-franciscan-health` -- so authorizing the same person at a second organization (say, Virginia Mason Franciscan Health and then Optum Care Washington through the owner's own MyChart proxy access) gets its own item instead of overwriting the first, matching `kith.health_sources`'s one row per (`person_id`, `fhir_base`). A token stored before `clientAuth` existed is treated as `"secret"`. A `keychain_service` column written before this org suffix existed is read as-is by `pull` (see "Keychain item migration" below) rather than renamed. |
 | `com.kithmind.deferred-work.database-url` | The Postgres connection string (shared with `@repo/plaid-feed`). |
 
 ## `authorize`
@@ -120,8 +120,8 @@ kith-epic-feed authorize --person <kith_id-or-name> [--org "<health system name>
    succeeds is stored as `clientAuth: "secret" | "public"` alongside the
    token, and the same method is reused on every later refresh -- it is
    never re-probed. The result is written to
-   `com.kithmind.epic.token.<person-slug>` and `kith.health_sources` is
-   upserted.
+   `com.kithmind.epic.token.<person-slug>.<org-slug>` and
+   `kith.health_sources` is upserted.
 8. Prints `Authorized as <public|confidential> client; refresh token:
    <present|absent>`. If Epic did not grant a refresh token, a second line
    says the daily pull will need a new authorization once the access token
@@ -166,6 +166,21 @@ are ever printed -- never a value, a diagnosis, a medication name or a
 note's text. Exits non-zero when any source needed reauth, failed
 outright, or had a resource-type fetch error.
 
+### Keychain item migration
+
+`pull` always reads and writes whatever name is stored in that source row's
+`keychain_service` column -- it never recomputes a name from the person and
+org and assumes the Keychain item lives there. A row written before
+`tokenKeychainService` suffixed its item with the org slug still has the
+older, person-only name (`com.kithmind.epic.token.<person-slug>`, with no
+trailing `.<org-slug>`); `pull` detects that and checks whether an item
+already exists under the newly suffixed name. If it does, `pull` uses that
+one; if it does not (the common case until that person/org pair is
+authorized again), `pull` keeps reading and writing the original, unsuffixed
+name -- no rename. Running `authorize` again for that person and
+organization is what moves a source onto the current, org-suffixed name (it
+writes the new Keychain item and updates `keychain_service` together).
+
 ## Tables (migration `053_health_feed.sql`)
 
 | Table | Holds |
@@ -207,10 +222,14 @@ pnpm --filter @repo/epic-feed test:once
 
 Unit tests (mocked `fetch`, no network, no Keychain, no database) cover
 PKCE, endpoint discovery, the token exchange/refresh, `invalid_grant`
-handling, the per-organization client secret lookup order and `orgSlug`
-(`test/config.test.mjs`), pulling with an access token only (no refresh
-token, both the still-valid and the expired case), the endpoint directory
-lookup, paging with `next` links, and every resource mapper. One test
+handling, the per-organization client secret lookup order, `orgSlug` and
+`tokenKeychainService` (`test/config.test.mjs`), authorizing the same
+person at two organizations into two distinct Keychain items and source
+rows, the Keychain item migration path (a pre-org-suffix `keychain_service`
+with and without an already-migrated item present), pulling with an access
+token only (no refresh token, both the still-valid and the expired case),
+the endpoint directory lookup, paging with `next` links, and every resource
+mapper. One test
 (`test/sandboxDiscovery.test.mjs`) calls Epic's
 real public sandbox `.well-known/smart-configuration`/`/metadata` once, to
 prove discovery works against the live sandbox rather than only a mocked

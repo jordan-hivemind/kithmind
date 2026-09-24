@@ -212,12 +212,6 @@ export async function loadDatabaseUrl(): Promise<string> {
   );
 }
 
-/** `com.kithmind.epic.token.<person-slug>`, the Keychain item `authorize`
- * writes and `pull` reads for one person's tokens. */
-export function tokenKeychainService(personSlug: string): string {
-  return `com.kithmind.epic.token.${personSlug}`;
-}
-
 /** Lowercase, hyphenated, alphanumeric-only slug, the same shape
  * `@repo/plaid-feed`'s `institutionSlug` produces; falls back to `fallback`
  * when nothing alphanumeric remains. */
@@ -236,9 +230,22 @@ export function personSlug(name: string): string {
 
 /** Lowercase, hyphenated, alphanumeric-only slug of a health system's name,
  * e.g. `"Virginia Mason Franciscan Health"` -> `"virginia-mason-franciscan-health"`.
- * Used only for `clientSecretKeychainService`. */
+ * Used by `clientSecretKeychainService` and `tokenKeychainService`. */
 export function orgSlug(orgName: string): string {
   return slugify(orgName, "org");
+}
+
+/** `com.kithmind.epic.token.<person-slug>.<org-slug>`, the Keychain item
+ * `authorize` writes and `pull` reads for one person's tokens at one
+ * organization. Suffixed with the organization (not just the person) so
+ * that authorizing the same person at a second organization -- e.g.
+ * Virginia Mason Franciscan Health and then Optum Care Washington -- gets
+ * its own item instead of overwriting the first organization's token,
+ * matching `kith.health_sources`'s one-row-per-(person_id, fhir_base)
+ * shape. See `pull.ts`'s migration path for a source row whose
+ * `keychain_service` was written before this suffix existed. */
+export function tokenKeychainService(personSlugValue: string, orgName: string): string {
+  return `com.kithmind.epic.token.${personSlugValue}.${orgSlug(orgName)}`;
 }
 
 /** The redirect URI this environment's app registration uses. */

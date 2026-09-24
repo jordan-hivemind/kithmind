@@ -84,7 +84,7 @@ test("runAuthorize completes a sandbox flow and stores the token and the source 
   assert.equal(outcome.orgName, "Epic Sandbox");
   assert.equal(tokenStore.items.size, 1);
   const [[service, secret]] = tokenStore.items;
-  assert.equal(service, "com.kithmind.epic.token.jamie-synthetic");
+  assert.equal(service, "com.kithmind.epic.token.jamie-synthetic.epic-sandbox");
   const stored = JSON.parse(secret);
   assert.equal(stored.refreshToken, "refresh-1");
   assert.equal(stored.patientFhirId, "patient-1");
@@ -324,4 +324,110 @@ test("runAuthorize prefers the org's own client secret and reports the item name
     tokenCalls[0].headers.authorization,
     `Basic ${Buffer.from("synthetic-test-client-id:org-specific-secret").toString("base64")}`,
   );
+});
+
+// Regression coverage for the defect this task fixes: authorizing the same
+// person at two organizations (e.g. Virginia Mason Franciscan Health, then
+// Optum Care Washington -- a real scenario Epic's own proxy access enables)
+// must not have the second authorization's Keychain item overwrite the
+// first's, since `kith.health_sources` allows one row per
+// (person_id, fhir_base) and both organizations get their own row.
+test("runAuthorize stores a distinct Keychain item and source row per organization for the same person", async () => {
+  const pool = personPool();
+  const DIRECTORY_BUNDLE = {
+    entry: [
+      {
+        resource: {
+          resourceType: "Endpoint",
+          name: "Virginia Mason Franciscan Health",
+          address: "https://fhir.vmfh.example/api/FHIR/R4/",
+        },
+      },
+      {
+        resource: {
+          resourceType: "Endpoint",
+          name: "Optum Care Washington",
+          address: "https://fhir.optum-wa.example/api/FHIR/R4/",
+        },
+      },
+    ],
+  };
+  const fetchImpl = async (url) => {
+    if (url.includes("Endpoints/R4")) {
+      return jsonResponse(200, DIRECTORY_BUNDLE);
+    }
+    if (url.includes("well-known/smart-configuration")) {
+      return jsonResponse(200, {
+        authorization_endpoint: "https://example.org/oauth2/authorize",
+        token_endpoint: "https://example.org/oauth2/token",
+      });
+    }
+    if (url.includes("/oauth2/token")) {
+      return jsonResponse(200, {
+        access_token: "access-1",
+        refresh_token: "refresh-1",
+        expires_in: 3600,
+        patient: "patient-1",
+        scope: "openid patient/Patient.read",
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const tokenStore = inMemoryTokenStore();
+
+  const first = await runAuthorize(
+    {
+      personSelector: "person-kith-id-1",
+      org: "Virginia Mason Franciscan Health",
+      sandbox: false,
+    },
+    {
+      pool,
+      fetchImpl,
+      prompt: async () => "code-1",
+      tokenStore,
+      report: () => {},
+      generateVerifier: () => "verifier-1",
+      generateStateValue: () => "state-1",
+      readClientSecret: noKeychainSecret,
+    },
+  );
+  const second = await runAuthorize(
+    { personSelector: "person-kith-id-1", org: "Optum Care Washington", sandbox: false },
+    {
+      pool,
+      fetchImpl,
+      prompt: async () => "code-2",
+      tokenStore,
+      report: () => {},
+      generateVerifier: () => "verifier-2",
+      generateStateValue: () => "state-2",
+      readClientSecret: noKeychainSecret,
+    },
+  );
+
+  assert.equal(first.status, "linked");
+  assert.equal(second.status, "linked");
+
+  // Two distinct Keychain items -- the second authorization did not
+  // overwrite the first.
+  assert.equal(tokenStore.items.size, 2);
+  const itemNames = [...tokenStore.items.keys()].sort();
+  assert.deepEqual(itemNames, [
+    "com.kithmind.epic.token.jamie-synthetic.optum-care-washington",
+    "com.kithmind.epic.token.jamie-synthetic.virginia-mason-franciscan-health",
+  ]);
+
+  // Two distinct `health_sources` upserts, one per (person, fhir_base).
+  const upserts = pool.calls.filter((call) =>
+    call.text.includes("INSERT INTO kith.health_sources"),
+  );
+  assert.equal(upserts.length, 2);
+  const fhirBases = upserts.map((call) => call.params[4]).sort();
+  assert.deepEqual(fhirBases, [
+    "https://fhir.optum-wa.example/api/FHIR/R4/",
+    "https://fhir.vmfh.example/api/FHIR/R4/",
+  ]);
+  const keychainParams = upserts.map((call) => call.params[6]).sort();
+  assert.deepEqual(keychainParams, itemNames);
 });
