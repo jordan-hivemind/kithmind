@@ -45,7 +45,7 @@ import {
   refreshAccessToken,
   type Fetch,
 } from "./oauth.js";
-import { readKeychainSecret, writeKeychainSecret } from "./keychain.js";
+import { keychainTokenStore, type TokenStore } from "./keychain.js";
 
 export type StoredToken = {
   refreshToken: string | null;
@@ -67,8 +67,9 @@ export type SourcePullResult = {
 
 export type PullDeps = {
   fetchImpl?: Fetch;
-  readSecret?: (service: string) => Promise<string | null>;
-  writeSecret?: (service: string, secret: string) => Promise<void>;
+  /** Where a person's tokens are read and rewritten after a refresh.
+   * Defaults to the real Keychain; a test passes an in-memory store. */
+  tokenStore?: TokenStore;
   /** Overrides where a PDF/RTF attachment is written; see `pullSource`. */
   dataDirRoot?: (personSlugValue: string) => string;
 };
@@ -279,7 +280,7 @@ async function refreshedAccessToken(
   source: HealthSourceRow,
   token: StoredToken,
   fetchImpl: Fetch,
-  writeSecret: (service: string, secret: string) => Promise<void>,
+  tokenStore: TokenStore,
   credentials: EpicCredentials,
 ): Promise<string> {
   if (token.refreshToken === null) {
@@ -303,7 +304,7 @@ async function refreshedAccessToken(
     fhirBase: token.fhirBase,
     orgName: token.orgName,
   };
-  await writeSecret(source.keychainService, JSON.stringify(updated));
+  await tokenStore.set(source.keychainService, JSON.stringify(updated));
   return refreshed.accessToken;
 }
 
@@ -313,8 +314,7 @@ export async function pullAll(deps: PullDeps = {}): Promise<{
 }> {
   const {
     fetchImpl = fetch,
-    readSecret = readKeychainSecret,
-    writeSecret = writeKeychainSecret,
+    tokenStore = keychainTokenStore,
     dataDirRoot,
   } = deps;
   const databaseUrl = await loadDatabaseUrl();
@@ -342,8 +342,7 @@ export async function pullAll(deps: PullDeps = {}): Promise<{
         pool,
         source,
         fetchImpl,
-        readSecret,
-        writeSecret,
+        tokenStore,
         credentials,
         dataDirRoot,
       );
@@ -370,12 +369,11 @@ export async function pullOneSource(
   pool: Pool,
   source: HealthSourceRow,
   fetchImpl: Fetch,
-  readSecret: (service: string) => Promise<string | null>,
-  writeSecret: (service: string, secret: string) => Promise<void>,
+  tokenStore: TokenStore,
   credentials: EpicCredentials,
   dataDirRoot?: (personSlugValue: string) => string,
 ): Promise<SourcePullResult> {
-  const raw = await readSecret(source.keychainService);
+  const raw = await tokenStore.get(source.keychainService);
   if (raw === null) {
     const result = emptyResult(source.orgName);
     result.status = "failed";
@@ -390,7 +388,7 @@ export async function pullOneSource(
       source,
       token,
       fetchImpl,
-      writeSecret,
+      tokenStore,
       credentials,
     );
   } catch (error) {

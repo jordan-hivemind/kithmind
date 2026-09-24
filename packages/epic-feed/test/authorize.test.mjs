@@ -7,10 +7,15 @@ import test from "node:test";
 import { runAuthorize } from "../dist/index.js";
 
 import { fakePool } from "./helpers/fakePool.mjs";
+import { inMemoryTokenStore } from "./helpers/tokenStore.mjs";
 
-// `runAuthorize` loads the client secret itself (env-first, then Keychain);
-// setting it here means these tests never depend on a real Keychain item
-// existing on the machine that runs them.
+// `runAuthorize` loads the client id and secret itself (env-first, then
+// Keychain, `loadClientId`/`loadClientSecret` in `config.ts`); setting both
+// here means these tests never fall through to a real Keychain lookup --
+// `security` does not exist on a Linux CI runner, and a fallback lookup that
+// found nothing there would otherwise throw `spawn ... ENOENT` before this
+// file's own `tokenStore`/`fakePool` mocks are ever reached.
+process.env.EPIC_CLIENT_ID ??= "synthetic-test-client-id";
 process.env.EPIC_CLIENT_SECRET ??= "synthetic-test-secret";
 
 function jsonResponse(status, body) {
@@ -51,7 +56,7 @@ test("runAuthorize completes a sandbox flow and stores the token and the source 
     }
     throw new Error(`unexpected fetch: ${url}`);
   };
-  const written = [];
+  const tokenStore = inMemoryTokenStore();
   const reports = [];
   const outcome = await runAuthorize(
     { personSelector: "person-kith-id-1", sandbox: true },
@@ -59,7 +64,7 @@ test("runAuthorize completes a sandbox flow and stores the token and the source 
       pool,
       fetchImpl,
       prompt: async () => "the-pasted-code",
-      writeSecret: async (service, secret) => written.push({ service, secret }),
+      tokenStore,
       report: (line) => reports.push(line),
       generateVerifier: () => "verifier-1",
       generateStateValue: () => "state-1",
@@ -69,9 +74,10 @@ test("runAuthorize completes a sandbox flow and stores the token and the source 
   assert.equal(outcome.status, "linked");
   assert.equal(outcome.personName, "Jamie Synthetic");
   assert.equal(outcome.orgName, "Epic Sandbox");
-  assert.equal(written.length, 1);
-  assert.equal(written[0].service, "com.kithmind.epic.token.jamie-synthetic");
-  const stored = JSON.parse(written[0].secret);
+  assert.equal(tokenStore.items.size, 1);
+  const [[service, secret]] = tokenStore.items;
+  assert.equal(service, "com.kithmind.epic.token.jamie-synthetic");
+  const stored = JSON.parse(secret);
   assert.equal(stored.refreshToken, "refresh-1");
   assert.equal(stored.patientFhirId, "patient-1");
   const insert = pool.calls.find((call) =>

@@ -64,6 +64,20 @@ export async function readKeychainSecret(
 }
 
 /**
+ * The exact `security add-generic-password` argv `writeKeychainSecret`
+ * passes, as a pure function so a test can assert on it without ever
+ * executing `/usr/bin/security` (which does not exist on a Linux CI
+ * runner).
+ */
+export function addGenericPasswordArgs(
+  account: string,
+  service: string,
+  secret: string,
+): string[] {
+  return ["add-generic-password", "-U", "-a", account, "-s", service, "-w", secret];
+}
+
+/**
  * Writes (or replaces, `-U`) one generic-password Keychain item.
  *
  * The secret is passed as an argv element, not through the shell, and is
@@ -74,19 +88,39 @@ export async function writeKeychainSecret(
   secret: string,
 ): Promise<void> {
   try {
-    await run("/usr/bin/security", [
-      "add-generic-password",
-      "-U",
-      "-a",
-      keychainAccount(),
-      "-s",
-      service,
-      "-w",
-      secret,
-    ]);
+    await run(
+      "/usr/bin/security",
+      addGenericPasswordArgs(keychainAccount(), service, secret),
+    );
   } catch {
     throw new Error(
       `Failed to write Keychain item "${service}" (security add-generic-password)`,
+    );
+  }
+}
+
+/**
+ * The exact `security delete-generic-password` argv `deleteKeychainSecret`
+ * passes, as a pure function for the same reason `addGenericPasswordArgs`
+ * is one.
+ */
+export function deleteGenericPasswordArgs(account: string, service: string): string[] {
+  return ["delete-generic-password", "-a", account, "-s", service];
+}
+
+/** Deletes one generic-password Keychain item this package wrote. A missing
+ * item is not an error -- deleting something already gone is the state the
+ * caller wanted. */
+export async function deleteKeychainSecret(service: string): Promise<void> {
+  try {
+    await run(
+      "/usr/bin/security",
+      deleteGenericPasswordArgs(keychainAccount(), service),
+    );
+  } catch (error) {
+    if (isNotFound(error)) return;
+    throw new Error(
+      `Failed to delete Keychain item "${service}" (security delete-generic-password)`,
     );
   }
 }
@@ -97,3 +131,24 @@ function isNotFound(error: unknown): boolean {
     message.includes("could not be found") || message.includes("exit code 44")
   );
 }
+
+/**
+ * The `get`/`set`/`delete` shape `authorize.ts` and `pull.ts` depend on,
+ * rather than three loose functions -- so a test can substitute one
+ * in-memory object instead of mocking three module exports individually,
+ * and a production caller never has to remember to pass all three
+ * consistently.
+ */
+export type TokenStore = {
+  get(service: string): Promise<string | null>;
+  set(service: string, secret: string): Promise<void>;
+  delete(service: string): Promise<void>;
+};
+
+/** The real Keychain-backed store, the default everywhere this package
+ * reads or writes a person's tokens. */
+export const keychainTokenStore: TokenStore = {
+  get: readKeychainSecret,
+  set: writeKeychainSecret,
+  delete: deleteKeychainSecret,
+};

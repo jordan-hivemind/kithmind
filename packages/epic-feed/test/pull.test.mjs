@@ -7,6 +7,7 @@ import test from "node:test";
 import { pullOneSource, pullSource } from "../dist/index.js";
 
 import { fakePool } from "./helpers/fakePool.mjs";
+import { inMemoryTokenStore } from "./helpers/tokenStore.mjs";
 
 const SOURCE = {
   id: "source-1",
@@ -227,26 +228,24 @@ test("pullOneSource sets needs_reauth on invalid_grant and does not call pullSou
     }
     throw new Error(`unexpected fetch in this test: ${url}`);
   };
-  const readSecret = async () =>
-    JSON.stringify({
-      refreshToken: "dead-refresh",
-      accessToken: "stale-access",
-      expiresAt: "2020-01-01T00:00:00Z",
-      patientFhirId: "patient-1",
-      fhirBase: SOURCE.fhirBase,
-      orgName: SOURCE.orgName,
-    });
-  let wroteSecret = false;
-  const writeSecret = async () => {
-    wroteSecret = true;
-  };
-  const result = await pullOneSource(pool, SOURCE, fetchImpl, readSecret, writeSecret, {
+  const originalToken = JSON.stringify({
+    refreshToken: "dead-refresh",
+    accessToken: "stale-access",
+    expiresAt: "2020-01-01T00:00:00Z",
+    patientFhirId: "patient-1",
+    fhirBase: SOURCE.fhirBase,
+    orgName: SOURCE.orgName,
+  });
+  const tokenStore = inMemoryTokenStore({ [SOURCE.keychainService]: originalToken });
+  const result = await pullOneSource(pool, SOURCE, fetchImpl, tokenStore, {
     clientId: "client-1",
     clientSecret: "secret-1",
   });
   assert.equal(result.status, "needs_reauth");
   assert.match(result.error, /dead token/);
-  assert.equal(wroteSecret, false);
+  // A dead refresh token must not be rewritten -- the stored token is
+  // exactly what it was before this failed attempt.
+  assert.equal(tokenStore.items.get(SOURCE.keychainService), originalToken);
   const failureUpdate = pool.calls.find((call) => call.text.includes("needs_reauth_at"));
   assert.ok(failureUpdate);
   assert.equal(failureUpdate.params[2], true);
@@ -258,8 +257,7 @@ test("pullOneSource fails without reauth when the Keychain item is missing", asy
     pool,
     SOURCE,
     async () => jsonResponse(200, {}),
-    async () => null,
-    async () => {},
+    inMemoryTokenStore(),
     { clientId: "client-1", clientSecret: "secret-1" },
   );
   assert.equal(result.status, "failed");

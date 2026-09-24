@@ -32,7 +32,7 @@ import {
   parsePastedCode,
   type Fetch,
 } from "./oauth.js";
-import { writeKeychainSecret } from "./keychain.js";
+import { keychainTokenStore, type TokenStore } from "./keychain.js";
 
 export type AuthorizeArgs = {
   personSelector: string;
@@ -45,7 +45,9 @@ export type AuthorizeDeps = {
   fetchImpl?: Fetch;
   /** Reads the pasted code (or full callback URL) from the operator. */
   prompt?: (question: string) => Promise<string>;
-  writeSecret?: (service: string, secret: string) => Promise<void>;
+  /** Where the person's tokens are stored. Defaults to the real Keychain; a
+   * test passes an in-memory store instead. */
+  tokenStore?: TokenStore;
   report?: (line: string) => void;
   generateVerifier?: () => string;
   generateStateValue?: () => string;
@@ -109,7 +111,7 @@ export async function runAuthorize(
     pool,
     fetchImpl = fetch,
     prompt = defaultPrompt,
-    writeSecret = writeKeychainSecret,
+    tokenStore = keychainTokenStore,
     report = (line) => process.stdout.write(`${line}\n`),
     generateVerifier = generateCodeVerifier,
     generateStateValue = generateState,
@@ -164,7 +166,7 @@ export async function runAuthorize(
   }
 
   const keychainService = tokenKeychainService(personSlug(person.canonicalName));
-  await writeSecret(
+  await tokenStore.set(
     keychainService,
     JSON.stringify({
       refreshToken: token.refreshToken,
