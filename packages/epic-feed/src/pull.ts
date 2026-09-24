@@ -9,8 +9,15 @@
 // at all), otherwise mark `needs_reauth` as above. Then fetch `Patient` by
 // id, then page through every `SEARCHABLE_RESOURCES` type's search by
 // patient with `_count=200`, following `link[rel=next]`, retrying 429 and
-// 5xx with backoff (`fetchRetry.ts`). `DocumentReference` also fetches its
-// `Binary` attachment when the content type qualifies (`documents.ts`).
+// 5xx with backoff (`fetchRetry.ts`). `Observation` is searched once per
+// `OBSERVATION_SEARCH_CATEGORIES` value (Epic 400s an Observation search
+// with no `category`), and the pages are merged under one `Observation`
+// count. A 400 on a resource type in `UNSUPPORTED_ON_400_RESOURCES`
+// (`Specimen`, `Goal`) is not a resource error -- it is counted under
+// `unsupported` and the source is not retried for that resource type in the
+// same run. `DocumentReference` also fetches its `Binary` attachment when
+// the content type qualifies (`documents.ts`); a relative attachment `url`
+// or `reference` is resolved against the source's FHIR base first.
 //
 // Nothing here prints a value, a note's text or a diagnosis -- only counts --
 // and the process exits non-zero when any source needed reauth, failed
@@ -25,9 +32,11 @@ import {
   loadClientId,
   loadClientSecretForOrg,
   loadDatabaseUrl,
+  OBSERVATION_SEARCH_CATEGORIES,
   personSlug,
   SANDBOX_FHIR_BASE,
   SEARCHABLE_RESOURCES,
+  UNSUPPORTED_ON_400_RESOURCES,
   type EpicEnv,
 } from "./config.js";
 import {
@@ -72,6 +81,11 @@ export type SourcePullResult = {
   documents: number;
   error: string | null;
   resourceErrors: Record<string, string>;
+  /** Resource types this source's search 400'd on and that this run treated
+   * as unsupported for that source rather than a resource error (see
+   * `UNSUPPORTED_ON_400_RESOURCES`) -- skipped, not retried this run, and
+   * the source's own status is unaffected. */
+  unsupported: string[];
   /** Set when this pull used the stored access token directly because no
    * refresh token is on file (e.g. Epic's sandbox issuing a token with no
    * refresh grant) -- `"access token only; expires in <n> minutes"`.
@@ -100,12 +114,25 @@ function emptyResult(orgName: string): SourcePullResult {
     documents: 0,
     error: null,
     resourceErrors: {},
+    unsupported: [],
     tokenNote: null,
   };
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Thrown by `pageThroughSearch` for a non-2xx search response, carrying the
+ * HTTP status so the caller can tell a plain resource error apart from a 400
+ * on a resource type this run treats as unsupported. */
+class ResourceSearchError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ResourceSearchError";
+    this.status = status;
+  }
 }
 
 function fhirEnvOf(fhirBase: string): EpicEnv {
@@ -176,54 +203,115 @@ export async function pullSource(
 
   for (const resourceType of SEARCHABLE_RESOURCES) {
     try {
-      let url: string | null =
-        `${source.fhirBase}${resourceType}?patient=${encodeURIComponent(source.patientFhirId)}&_count=200`;
-      while (url !== null) {
-        const response = await fetchFhir(url, accessToken, fetchImpl);
-        if (!response.ok) {
-          throw new Error(`${resourceType} search failed (${response.status})`);
-        }
-        const bundle = (await response.json()) as {
-          entry?: Array<{ resource?: Record<string, unknown> }>;
-          link?: Array<{ relation?: string; url?: string }>;
-        };
-        for (const entry of bundle.entry ?? []) {
-          const resource = entry.resource;
-          if (!resource || resource.resourceType !== resourceType) continue;
-          const mapped = mapResource(resource);
-          const recordId = await upsertHealthRecord(
+      if (resourceType === "Observation") {
+        // Epic 400s an Observation search with no `category`; search once
+        // per registered category and merge the pages -- each call below
+        // accumulates into the same `result.counts.Observation`.
+        for (const category of OBSERVATION_SEARCH_CATEGORIES) {
+          const url =
+            `${source.fhirBase}Observation?patient=${encodeURIComponent(source.patientFhirId)}` +
+            `&category=${encodeURIComponent(category)}&_count=200`;
+          await pageThroughSearch(
             pool,
-            source.id,
-            source.personId,
+            source,
             resourceType,
-            mapped,
-            resource,
+            url,
+            accessToken,
+            fetchImpl,
+            dataDirRoot,
+            result,
           );
-          result.counts[resourceType] = (result.counts[resourceType] ?? 0) + 1;
-          if (resourceType === "DocumentReference") {
-            const documentStored = await pullDocumentAttachment(
-              pool,
-              source,
-              recordId,
-              mapped.fhirId,
-              resource,
-              accessToken,
-              fetchImpl,
-              dataDirRoot,
-            );
-            if (documentStored) result.documents += 1;
-          }
         }
-        const next = (bundle.link ?? []).find((link) => link.relation === "next");
-        url = next?.url ?? null;
+      } else {
+        const url = `${source.fhirBase}${resourceType}?patient=${encodeURIComponent(source.patientFhirId)}&_count=200`;
+        await pageThroughSearch(
+          pool,
+          source,
+          resourceType,
+          url,
+          accessToken,
+          fetchImpl,
+          dataDirRoot,
+          result,
+        );
       }
     } catch (error) {
+      if (
+        error instanceof ResourceSearchError &&
+        error.status === 400 &&
+        UNSUPPORTED_ON_400_RESOURCES.has(resourceType)
+      ) {
+        result.unsupported.push(resourceType);
+        continue;
+      }
       result.resourceErrors[resourceType] = errorMessage(error);
     }
   }
 
   await recordPullSuccess(pool, source.id);
   return result;
+}
+
+/** Pages one search URL to completion (following `link[rel=next]`),
+ * upserting every matching entry and, for `DocumentReference`, pulling its
+ * `Binary` attachment. Mutates `result.counts`/`result.documents` directly
+ * so a caller that searches one resource type more than once (`Observation`,
+ * per category) accumulates a single merged count. Throws
+ * `ResourceSearchError` on a non-2xx response so the caller can tell a 400
+ * on a resource this run treats as unsupported apart from a real error. */
+async function pageThroughSearch(
+  pool: Pool,
+  source: HealthSourceRow,
+  resourceType: string,
+  initialUrl: string,
+  accessToken: string,
+  fetchImpl: Fetch,
+  dataDirRoot: ((personSlugValue: string) => string) | undefined,
+  result: SourcePullResult,
+): Promise<void> {
+  let url: string | null = initialUrl;
+  while (url !== null) {
+    const response = await fetchFhir(url, accessToken, fetchImpl);
+    if (!response.ok) {
+      throw new ResourceSearchError(
+        `${resourceType} search failed (${response.status})`,
+        response.status,
+      );
+    }
+    const bundle = (await response.json()) as {
+      entry?: Array<{ resource?: Record<string, unknown> }>;
+      link?: Array<{ relation?: string; url?: string }>;
+    };
+    for (const entry of bundle.entry ?? []) {
+      const resource = entry.resource;
+      if (!resource || resource.resourceType !== resourceType) continue;
+      const mapped = mapResource(resource);
+      const recordId = await upsertHealthRecord(
+        pool,
+        source.id,
+        source.personId,
+        resourceType,
+        mapped,
+        resource,
+      );
+      result.counts[resourceType] = (result.counts[resourceType] ?? 0) + 1;
+      if (resourceType === "DocumentReference") {
+        const documentStored = await pullDocumentAttachment(
+          pool,
+          source,
+          recordId,
+          mapped.fhirId,
+          resource,
+          accessToken,
+          fetchImpl,
+          dataDirRoot,
+        );
+        if (documentStored) result.documents += 1;
+      }
+    }
+    const next = (bundle.link ?? []).find((link) => link.relation === "next");
+    url = next?.url ?? null;
+  }
 }
 
 async function pullDocumentAttachment(
@@ -241,7 +329,7 @@ async function pullDocumentAttachment(
     : [];
   for (const entry of contentEntries) {
     const attachment = entry.attachment as Record<string, unknown> | undefined;
-    const contentType =
+    let contentType =
       typeof attachment?.contentType === "string" ? attachment.contentType : null;
     if (contentType === null || !isFetchableContentType(contentType)) continue;
 
@@ -250,20 +338,48 @@ async function pullDocumentAttachment(
     if (inlineData !== null) {
       buffer = Buffer.from(inlineData, "base64");
     } else {
-      const url = typeof attachment?.url === "string" ? attachment.url : null;
-      if (url === null) continue;
+      // A DocumentReference attachment's `url` (or, defensively, `reference`)
+      // is often relative to the source's own FHIR base rather than
+      // absolute -- resolving against the base leaves an absolute URL
+      // untouched and turns e.g. "Binary/ew0p..." into
+      // "<fhirBase>Binary/ew0p...".
+      const rawUrl =
+        typeof attachment?.url === "string"
+          ? attachment.url
+          : typeof attachment?.reference === "string"
+            ? attachment.reference
+            : null;
+      if (rawUrl === null) continue;
+      const url = new URL(rawUrl, source.fhirBase).toString();
       const response = await fetchWithRetry(
         url,
         {
           headers: {
             authorization: `Bearer ${accessToken}`,
-            accept: contentType,
+            accept: "application/fhir+json",
           },
         },
         fetchImpl,
       );
       if (!response.ok) continue;
-      buffer = Buffer.from(await response.arrayBuffer());
+      // Epic normally honors `Accept: application/fhir+json` and returns a
+      // `Binary` resource (`data` base64, with its own `contentType`); fall
+      // back to reading the response body directly when a server returns
+      // the content itself instead.
+      const responseContentType = (response.headers.get("content-type") ?? "").toLowerCase();
+      if (responseContentType.includes("json")) {
+        const binary = (await response.json()) as {
+          data?: string;
+          contentType?: string;
+        };
+        if (typeof binary.contentType === "string") contentType = binary.contentType;
+        buffer =
+          typeof binary.data === "string"
+            ? Buffer.from(binary.data, "base64")
+            : Buffer.alloc(0);
+      } else {
+        buffer = Buffer.from(await response.arrayBuffer());
+      }
     }
 
     const text = extractText(contentType, buffer);
@@ -498,6 +614,9 @@ function summaryLine(source: HealthSourceRow, result: SourcePullResult): string 
   ];
   if (Object.keys(result.resourceErrors).length > 0) {
     parts.push(`resource_errors=${JSON.stringify(result.resourceErrors)}`);
+  }
+  if (result.unsupported.length > 0) {
+    parts.push(`unsupported=${result.unsupported.join(",")}`);
   }
   if (result.tokenNote !== null) parts.push(`note=${JSON.stringify(result.tokenNote)}`);
   if (result.error !== null) parts.push(`error=${JSON.stringify(result.error)}`);
