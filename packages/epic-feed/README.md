@@ -9,12 +9,13 @@ order of work items 4 and 5, for why this exists, and
 [`docs/onboarding.md`](../../docs/onboarding.md)'s "Health records with Epic
 MyChart" section for registering the app at fhir.epic.com.
 
-Two commands:
+Three commands:
 
 | Command                                             | What it does                                                                                                                  |
 | ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | `kith-epic-feed authorize --person <id-or-name> [--org "<health system>"] [--sandbox]` | One SMART standalone launch (PKCE) for one person, ending in a Keychain item and a `kith.health_sources` row. |
 | `kith-epic-feed pull`                                | For every linked source: refreshes its token, fetches `Patient` and every incoming resource type, upserts into Postgres.      |
+| `kith-epic-feed check [--org "<health system>"] [--sandbox]` | Diagnoses whether an organization has picked up this app's client ID, with no browser, no database and no Keychain token write -- see "`check`" below. |
 
 ## One-time setup
 
@@ -181,6 +182,40 @@ name -- no rename. Running `authorize` again for that person and
 organization is what moves a source onto the current, org-suffixed name (it
 writes the new Keychain item and updates `keychain_service` together).
 
+## `check`
+
+```sh
+kith-epic-feed check [--org "<health system name>"] [--sandbox]
+```
+
+Diagnoses whether an organization has picked up this app's client ID,
+without ever opening a browser, writing to Postgres, or writing a Keychain
+token item -- run it before `authorize` to avoid an ambiguous
+`invalid_client` at the real token exchange, or any time later to check
+whether a pending production activation has landed yet.
+
+1. Resolves `--org` the same way `authorize` does (directory lookup by name
+   in production, defaulting to Epic's own public sandbox FHIR base with
+   `--sandbox`).
+2. Discovers the token endpoint the same way `authorize` does.
+3. Sends one `authorization_code` token request with a deliberately bogus
+   code and the configured client secret (HTTP Basic), and a second one with
+   no secret at all -- the same two shapes `authorize`'s real code exchange
+   tries, but run independently here instead of one falling back to the
+   other. Neither is expected to succeed; only the `error` each one returns
+   is read.
+4. Prints which Keychain item name (or env var) it used for the client ID
+   and for the client secret -- never a secret value -- then a diagnosis:
+
+   | Result | Diagnosis |
+   | --- | --- |
+   | `invalid_grant` on either attempt | The client ID is known at this organization; `authorize` should work. |
+   | `invalid_client` on both attempts | Either the client ID has not reached this organization yet (Epic says up to a day, and organizations sync on their own schedule), or the wrong client ID is stored. |
+   | `invalid_client` with the secret, `invalid_grant` without it | The client ID is known, but this organization's own client secret is not set or does not match. |
+
+Nothing here ever prints a secret or touches `kith.health_sources` --
+`check` reads and diagnoses only, it never links anything.
+
 ## Tables (migration `053_health_feed.sql`)
 
 | Table | Holds |
@@ -228,8 +263,9 @@ person at two organizations into two distinct Keychain items and source
 rows, the Keychain item migration path (a pre-org-suffix `keychain_service`
 with and without an already-migrated item present), pulling with an access
 token only (no refresh token, both the still-valid and the expired case),
-the endpoint directory lookup, paging with `next` links, and every resource
-mapper. One test
+the endpoint directory lookup, paging with `next` links, every resource
+mapper, and `check`'s three diagnoses plus the no-secret-configured and
+sandbox-default-org cases (`test/check.test.mjs`). One test
 (`test/sandboxDiscovery.test.mjs`) calls Epic's
 real public sandbox `.well-known/smart-configuration`/`/metadata` once, to
 prove discovery works against the live sandbox rather than only a mocked

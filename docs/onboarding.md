@@ -160,35 +160,203 @@ that older path is).
 
 ## Health records with Epic MyChart
 
-Register a patient-facing app at [fhir.epic.com](https://fhir.epic.com):
+[`packages/epic-feed`](../packages/epic-feed) pulls structured health records
+(labs, conditions, medications, immunizations, encounters and more) from any
+Epic health system's patient-facing FHIR API: one SMART on FHIR
+authorization per person, one authorization per health system that person
+uses. This section is an agent-drivable runbook -- every step is marked
+**person** (a browser action only a human can do) or **agent** (a command
+the agent runs), with the exact field values used. See
+[its README](../packages/epic-feed/README.md) for the `authorize`, `pull`,
+and `check` commands in full detail; this is the setup path.
 
-| Setting | Value |
+### Which health systems can I connect?
+
+Any patient portal whose sign-in page says **MyChart** is built on Epic and
+is supported -- the same one registered app works against every Epic
+organization once each organization activates it. A portal's own branding
+often differs from the legal name Epic's directory uses for that
+organization (for example, a hospital system's own MyChart login page may
+not use the name Epic lists it under). To find the right name, search
+Epic's public R4 endpoint directory
+([`https://open.epic.com/Endpoints/R4`](https://open.epic.com/Endpoints/R4))
+for the portal's own hostname or a recognizable fragment of its name, or ask
+the agent to do that search. Patient portals that are **not** MyChart use a
+different, unimplemented API and are not supported yet.
+
+### Register the app (once, not per health system)
+
+1. **person.** Sign in (or create an account) at
+   [fhir.epic.com](https://fhir.epic.com) and start a new app registration.
+2. **person.** Set **Application Audience** to `Patients`.
+3. **person.** Set **Automatic Client Distribution** to `USCDI v3`. This is
+   what lets any Epic organization activate the app on its own, without a
+   manual per-organization approval from Epic.
+4. **person.** Under **Incoming APIs**, select R4 Read and Search for
+   exactly: Patient, Observation (Labs, Vitals, Social History),
+   DiagnosticReport, Condition, MedicationRequest, AllergyIntolerance,
+   Immunization, Encounter, Procedure, DocumentReference (Clinical Notes),
+   Binary (Clinical Notes), Goal. Skip Specimen, DSTU2, STU3, Create, and
+   Premium Billing.
+5. **person.** Set **Endpoint URI** to the app's https callback only:
+   `https://<your host>/api/epic/callback`. Epic's sandbox rejected
+   `http://localhost` here; only the https form worked.
+6. **person.** Leave **Can Register Dynamic Clients** unchecked. Check **Is
+   Confidential Client**. Check **Requires Persistent Access** -- without
+   it, Epic drops the `offline_access` scope and issues no refresh token at
+   all (learned by omitting it once and having to register a new app, since
+   Epic locks an app's configuration once it reaches production). Leave
+   **Uses Rolling Refresh Tokens** unchecked -- the code handles rotation
+   itself, but a non-rolling token survives an interrupted pull. Leave
+   **JWK Set URLs** blank.
+7. **person.** Under **Sandbox Client Secret**, click **Generate Secret**,
+   copy the value immediately (it is shown once), then click **Store
+   Hash**.
+8. **person.** Set the protocol to **SMART on FHIR R4**, scopes to **SMART
+   v1 scopes**, and FHIR IDs to **Unconstrained FHIR IDs**.
+9. **person.** Set **Intended Purposes** to only "Individuals' Access to
+   their EHI" and **Intended Users** to only "Individual/Caregiver".
+10. **person.** Set the **Terms and Conditions URL** to this repository's
+    terms page (`docs/terms.md`), e.g.
+    `https://github.com/<org>/<repo>/blob/main/docs/terms.md`.
+11. **person.** Answer the **Data Use Questionnaire** truthfully: the data
+    is not sold, not shared with third parties, stays under the user's
+    control, and access is revocable at any time from within MyChart.
+12. **person.** Accept the terms and click **Save**.
+13. **person.** Click **Ready for Sandbox**. Note both client IDs the app's
+    page now shows -- one for the sandbox (non-production) environment and
+    one for production. Client IDs are public values, not secrets, but
+    record them: they are what step 14 below stores.
+
+### Store the credentials
+
+Do this on the machine that will run `authorize` and `pull` -- the Keychain
+items live there, not in the repository.
+
+| Keychain item | Holds |
 | --- | --- |
-| Audience | Patients |
-| Resources | Patient, Observation, DiagnosticReport, Condition, MedicationRequest, AllergyIntolerance, Immunization, Encounter, Procedure, DocumentReference, Binary, Specimen, Goal (R4 Read and Search). |
-| Client type | Confidential client with a client secret (not a certificate). SMART on FHIR R4, SMART v1 scopes. |
-| Redirect URI | Your deployment's callback URL. |
-| Refresh tokens | Enabled. |
+| `com.kithmind.epic.client-id` | This app's production client id. |
+| `com.kithmind.epic.client-id-nonprod` | This app's sandbox (non-production) client id. |
+| `com.kithmind.epic.client-secret` | A shared client secret, used for any organization with no secret of its own (and for the sandbox). |
+| `com.kithmind.epic.client-secret.<org-slug>` | One organization's own client secret (recommended per organization, and required for that organization's refresh tokens -- see step 26). `<org-slug>` is the organization's name, lowercased with runs of non-alphanumeric characters collapsed to one hyphen, e.g. `Virginia Mason Franciscan Health` -> `virginia-mason-franciscan-health`. |
+| `com.kithmind.epic.token.<person-slug>.<org-slug>` | Written by `authorize`, read and rewritten by `pull` -- not something to add by hand. |
 
-The production redirect URI is `https://<your host>/api/epic/callback`; the
-page there only displays the returned code and state for pasting into the
-mini's terminal -- it does not authenticate, store anything or talk to a
-database.
+14. **agent.** Store each item with `security add-generic-password`, argv
+    form (never a shell string the secret could leak through):
 
-A production client ID can take up to a day to activate after registration.
-Each family member needs their own authorization, done through the account
-holder's own proxy access in MyChart -- one authorization per person, not one
-for the household.
+    ```sh
+    security add-generic-password -U -a "$USER" -s <item-name> -w <value>
+    ```
 
-**Current state:** Epic FHIR pull for the owner and each family member (order
-of work item 4 of the
-[simplification and feeds plan](plans/2026-09-22-simplification-and-feeds.md))
-is shipped as `@repo/epic-feed` (alongside `@repo/plaid-feed` and
-`@repo/ingest-simple`) -- see
-[`packages/epic-feed/README.md`](../packages/epic-feed/README.md) for setup,
-the `authorize`/`pull` commands and the sandbox test procedure. MyChart
-message export and visit transcripts (order of work item 5) remain
-unshipped.
+    If macOS answers `SecKeychainItemCreateFromContent: User interaction is
+    not allowed`, the login keychain is locked in this session; unlock it
+    first and retry:
+
+    ```sh
+    security unlock-keychain ~/Library/Keychains/login.keychain-db
+    ```
+
+### Prove it works in the sandbox
+
+15. **agent.** Build the package once:
+
+    ```sh
+    pnpm --filter @repo/epic-feed build
+    ```
+
+16. **agent.** Run, for a synthetic or test person entity:
+
+    ```sh
+    node packages/epic-feed/dist/cli.js authorize --person <id-or-name> --sandbox
+    # or, once installed as a bin: kith-epic-feed authorize --person <id-or-name> --sandbox
+    ```
+
+    This prints an authorization URL.
+17. **person.** Open the printed URL and sign in as one of
+    [Epic's own published sandbox test patients](https://fhir.epic.com/Documentation?docId=testpatients)
+    (the username commonly used is `fhircamila`; use the password Epic's own
+    page publishes there -- never invent or guess one, only that page's
+    values work against the sandbox). Approve access.
+18. **person.** Paste the code the callback page shows back into the
+    terminal `authorize` is waiting in.
+19. **agent.** Confirm the line `Authorized as confidential client; refresh
+    token: present`. `absent` here means step 6's Requires Persistent
+    Access checkbox was missed -- see Troubleshooting below.
+20. **agent.** Run:
+
+    ```sh
+    node packages/epic-feed/dist/cli.js pull
+    ```
+
+    and confirm counts print for `Patient` and a few other resource types.
+21. **agent.** Delete the sandbox source afterward, so Epic's synthetic test
+    data does not stay attached to a real person entity. There is no CLI
+    command for this yet, so delete directly: the row's `ON DELETE CASCADE`
+    (`packages/kith-store/migrations/053_health_feed.sql`) takes its
+    `health_records` and `health_documents` rows with it.
+
+    ```sh
+    psql "$DATABASE_URL" -c "DELETE FROM kith.health_sources WHERE fhir_base = 'https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4/'"
+    security delete-generic-password -a "$USER" -s com.kithmind.epic.token.<person-slug>.epic-sandbox
+    ```
+
+### Go to production
+
+22. **person.** On the app's page at fhir.epic.com, click **Ready for
+    Production**.
+23. **person.** Open the app's Manage keys page
+    (`fhir.epic.com/Developer/Management?id=<app>`). For each health system
+    to connect, search for it by Epic's own directory name (see "Which
+    health systems can I connect?" above), then activate it twice, in this
+    order -- Epic requires Non-Production activation before Production:
+    1. **Activate for Non-Production**, with **Use app-level endpoint
+       URIs** and authentication **Other**, then **Client Secret**.
+    2. **Activate for Production**, with the same two settings.
+24. **agent.** Store that organization's production secret under its own
+    Keychain item (`com.kithmind.epic.client-secret.<org-slug>`, step 14's
+    form).
+25. **agent.** Run `check` until it reports the client is known there --
+    Epic says activation can take up to a day, and organizations sync it on
+    their own schedule:
+
+    ```sh
+    node packages/epic-feed/dist/cli.js check --org "<Epic directory name>"
+    ```
+
+26. **agent.** Once `check` reports the client known, authorize each person
+    at that organization:
+
+    ```sh
+    node packages/epic-feed/dist/cli.js authorize --person <id-or-name> --org "<Epic directory name>"
+    ```
+
+27. **person.** When authorizing a family member, choose them in MyChart's
+    own proxy picker during sign-in (see "Family members" below).
+28. **agent.** Run `pull` (same command as step 20) to confirm the new
+    source comes back with counts.
+29. **agent.** Schedule `pull` daily with a LaunchAgent. Copy
+    [`com.kithmind.epic-feed.plist.example`](../packages/epic-feed/com.kithmind.epic-feed.plist.example)
+    into a real `.plist` under `~/Library/LaunchAgents/`, replace every
+    `ABSOLUTE/PATH/...` placeholder, and `launchctl load` it -- see the
+    README's "LaunchAgent (daily pull at 06:30)" section.
+
+### Family members
+
+Each family member is a person entity in Kith Mind. Connecting them needs
+one authorization per person per health system (step 26), and requires that
+the account holder already has that family member's proxy access set up in
+MyChart -- Epic's own mechanism, not anything this package implements. There
+is no household-wide authorization.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+| --- | --- |
+| `error=4 The request is invalid` at OAuth/Start | The redirect URI Epic has on file for this app does not match the one `authorize` sent. Confirm step 5's Endpoint URI matches `EPIC_REDIRECT_URI` (or the built-in default) exactly. |
+| `genericloginfailed` on the sandbox login page | Developer credentials were used instead of a published test patient. Sign in as one of [Epic's own test patients](https://fhir.epic.com/Documentation?docId=testpatients) (step 17), not the fhir.epic.com developer account. |
+| `invalid_client` at the token exchange | Either the secret is not stored or hashed correctly, or this organization has not yet distributed the client ID (production activation can take up to a day). Run `check --org "<name>"` (step 25) for a precise diagnosis without guessing. |
+| `refresh token: absent` after `authorize` | Step 6's **Requires Persistent Access** was not checked at app registration. This cannot be fixed by re-saving the existing app -- Epic locks a production app's configuration, so register a new app with that box checked and repeat registration. |
+| An `Observation` search returns nothing, or `Specimen` always fails | Expected: Epic requires a `category` parameter for `Observation` searches (handled -- `pull` searches once per registered category), and Epic does not support `Specimen` for patient-facing access (handled -- treated as unsupported, not a resource error). |
 
 ## Optional: statement history beyond two years
 
