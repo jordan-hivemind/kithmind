@@ -12,7 +12,13 @@
 // 5xx with backoff (`fetchRetry.ts`). `Observation` is searched once per
 // `OBSERVATION_SEARCH_CATEGORIES` value (Epic 400s an Observation search
 // with no `category`), and the pages are merged under one `Observation`
-// count. A 400 on a resource type in `UNSUPPORTED_ON_400_RESOURCES`
+// count. Each category's search is independent: a 400 on one category
+// (Epic's sandbox has been observed to reject `social-history` alone) is
+// recorded as `unsupported=Observation:<category>` and does not affect the
+// other categories' results or count as a resource error, while a
+// non-400 status on a category (401, 403, 5xx after retries) still counts
+// as a resource error, naming the category in the message. A 400 on a
+// resource type in `UNSUPPORTED_ON_400_RESOURCES`
 // (`Specimen`, `Goal`) is not a resource error -- it is counted under
 // `unsupported` and the source is not retried for that resource type in the
 // same run. `DocumentReference` also fetches its `Binary` attachment when
@@ -84,7 +90,10 @@ export type SourcePullResult = {
   /** Resource types this source's search 400'd on and that this run treated
    * as unsupported for that source rather than a resource error (see
    * `UNSUPPORTED_ON_400_RESOURCES`) -- skipped, not retried this run, and
-   * the source's own status is unaffected. */
+   * the source's own status is unaffected. An `Observation` category that
+   * 400'd (see `OBSERVATION_SEARCH_CATEGORIES`) is recorded here as
+   * `"Observation:<category>"`, e.g. `"Observation:social-history"`, rather
+   * than the bare resource name. */
   unsupported: string[];
   /** Set when this pull used the stored access token directly because no
    * refresh token is on file (e.g. Epic's sandbox issuing a token with no
@@ -202,15 +211,20 @@ export async function pullSource(
   result.counts.Patient = 1;
 
   for (const resourceType of SEARCHABLE_RESOURCES) {
-    try {
-      if (resourceType === "Observation") {
-        // Epic 400s an Observation search with no `category`; search once
-        // per registered category and merge the pages -- each call below
-        // accumulates into the same `result.counts.Observation`.
-        for (const category of OBSERVATION_SEARCH_CATEGORIES) {
-          const url =
-            `${source.fhirBase}Observation?patient=${encodeURIComponent(source.patientFhirId)}` +
-            `&category=${encodeURIComponent(category)}&_count=200`;
+    if (resourceType === "Observation") {
+      // Epic 400s an Observation search with no `category`; search once per
+      // registered category and merge the pages -- each call below
+      // accumulates into the same `result.counts.Observation`. Each
+      // category is independent: a 400 on one (Epic's sandbox has been
+      // observed to reject only `social-history`) is recorded as
+      // `unsupported`, named by category, and does not stop or count
+      // against the other categories; any other status is still a resource
+      // error, naming the category so the summary says which one failed.
+      for (const category of OBSERVATION_SEARCH_CATEGORIES) {
+        const url =
+          `${source.fhirBase}Observation?patient=${encodeURIComponent(source.patientFhirId)}` +
+          `&category=${encodeURIComponent(category)}&_count=200`;
+        try {
           await pageThroughSearch(
             pool,
             source,
@@ -221,20 +235,29 @@ export async function pullSource(
             dataDirRoot,
             result,
           );
+        } catch (error) {
+          if (error instanceof ResourceSearchError && error.status === 400) {
+            result.unsupported.push(`Observation:${category}`);
+            continue;
+          }
+          result.resourceErrors.Observation = `${errorMessage(error)} (category ${category})`;
         }
-      } else {
-        const url = `${source.fhirBase}${resourceType}?patient=${encodeURIComponent(source.patientFhirId)}&_count=200`;
-        await pageThroughSearch(
-          pool,
-          source,
-          resourceType,
-          url,
-          accessToken,
-          fetchImpl,
-          dataDirRoot,
-          result,
-        );
       }
+      continue;
+    }
+
+    try {
+      const url = `${source.fhirBase}${resourceType}?patient=${encodeURIComponent(source.patientFhirId)}&_count=200`;
+      await pageThroughSearch(
+        pool,
+        source,
+        resourceType,
+        url,
+        accessToken,
+        fetchImpl,
+        dataDirRoot,
+        result,
+      );
     } catch (error) {
       if (
         error instanceof ResourceSearchError &&
