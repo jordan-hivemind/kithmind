@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template only: copy this into a real .plist file under
+  ~/Library/LaunchAgents/, replace every ABSOLUTE/PATH/... placeholder with a
+  real path, and `launchctl load` it. No owner path, account name or
+  credential value belongs in this template or its copy checked into a
+  public clone -- DATABASE_URL and the Epic client secret come from the
+  environment or Keychain (see README.md), never from an argument or an env
+  var written here.
+
+  StartCalendarInterval, not StartInterval: the owner wants one pull a day at
+  a fixed time (06:30), not "every N seconds since the agent last loaded" --
+  the same reasoning `@repo/plaid-feed`'s own daily cadence follows, just
+  pinned to a wall-clock time here instead of an hourly interval. `pull` does
+  one bounded pass and exits, so RunAtLoad is left off: the agent should run
+  at 06:30, not immediately on every login or reload.
+
+  This never runs `authorize` -- that command is interactive (it waits for a
+  pasted code) and is run by hand once per person, not scheduled.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.kithmind.epic-feed</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/node</string>
+    <string>/ABSOLUTE/PATH/TO/REPOSITORY/packages/epic-feed/dist/cli.js</string>
+    <string>pull</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/ABSOLUTE/PATH/TO/REPOSITORY</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>6</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/ABSOLUTE/PATH/TO/PRIVATE-LOG-DIRECTORY/epic-feed.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/ABSOLUTE/PATH/TO/PRIVATE-LOG-DIRECTORY/epic-feed.stderr.log</string>
+</dict>
+</plist>
