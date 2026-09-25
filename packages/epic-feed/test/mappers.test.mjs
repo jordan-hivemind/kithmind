@@ -86,6 +86,31 @@ test("mapResource maps MedicationRequest's medication display and dosage", () =>
   assert.equal(mapped.valueText, "Take 1 tablet by mouth daily");
 });
 
+test("mapResource prefers medicationReference.display over the bare reference id", () => {
+  const mapped = mapResource({
+    resourceType: "MedicationRequest",
+    id: "mr-2",
+    status: "stopped",
+    medicationReference: {
+      reference: "Medication/med-opaque-id-1",
+      display: "Atorvastatin 20 MG Oral Tablet",
+    },
+    authoredOn: "2026-03-01",
+  });
+  assert.equal(mapped.codeDisplay, "Atorvastatin 20 MG Oral Tablet");
+});
+
+test("mapResource falls back to the bare reference id when medicationReference has no display", () => {
+  const mapped = mapResource({
+    resourceType: "MedicationRequest",
+    id: "mr-3",
+    status: "completed",
+    medicationReference: { reference: "Medication/med-opaque-id-2" },
+    authoredOn: "2026-03-15",
+  });
+  assert.equal(mapped.codeDisplay, "med-opaque-id-2");
+});
+
 test("mapResource maps AllergyIntolerance's category as a plain code", () => {
   const mapped = mapResource({
     resourceType: "AllergyIntolerance",

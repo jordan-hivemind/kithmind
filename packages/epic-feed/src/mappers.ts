@@ -66,6 +66,15 @@ function referenceId(value: unknown): string | null {
   return slash === -1 ? ref : ref.slice(slash + 1);
 }
 
+/** A `Reference.display`, when present -- for `medicationReference`, which
+ * carries a human-readable medication name Epic fills in even though the
+ * reference itself points at a `Medication` resource this feed never
+ * fetches. Preferred over the bare reference id, which is opaque. */
+function referenceDisplay(value: unknown): string | null {
+  const reference = asObject(value);
+  return reference ? asString(reference.display) : null;
+}
+
 function fhirId(resource: Fhir): string {
   const id = asString(resource.id);
   if (id === null) throw new Error("FHIR resource had no id");
@@ -142,6 +151,7 @@ export function mapMedicationRequest(resource: Fhir): MappedHealthRecord {
   const record = base(resource);
   record.codeDisplay =
     codeableConceptText(resource.medicationCodeableConcept) ??
+    referenceDisplay(resource.medicationReference) ??
     referenceId(resource.medicationReference);
   record.status = asString(resource.status);
   record.effectiveAt = asString(resource.authoredOn);

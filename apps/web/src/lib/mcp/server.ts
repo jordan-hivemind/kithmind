@@ -595,9 +595,12 @@ export function createMcpServer(
   const server = new McpServer(
     {
       name: "open-brain",
-      // Epic MyChart feed: additive tools (list_health_records,
-      // get_health_document) over the new health_* tables, so a minor bump.
-      version: "1.5.0",
+      // 1.5.1: `list_health_records`' `codeDisplay` for a MedicationRequest
+      // now reads `medicationReference.display` before falling back to the
+      // opaque reference id (packages/epic-feed/src/mappers.ts), so an
+      // existing tool's results changed shape for that resource type -- a
+      // patch bump, no new or removed tool.
+      version: "1.5.1",
     },
     { instructions: SERVER_INSTRUCTIONS },
   );

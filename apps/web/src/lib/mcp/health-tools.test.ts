@@ -57,7 +57,7 @@ describe("MCP health tools", () => {
 
   test("advertises the Epic MyChart release version", async () => {
     await withClient(async (client) => {
-      expect(client.getServerVersion()?.version).toBe("1.5.0");
+      expect(client.getServerVersion()?.version).toBe("1.5.1");
     });
   });
 
