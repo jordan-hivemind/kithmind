@@ -11,6 +11,7 @@ export * from "./areas.js";
 export * from "./attention.js";
 export * from "./changes.js";
 export * from "./finAccounts.js";
+export * from "./finBanking.js";
 export * from "./finLedger.js";
 export * from "./health.js";
 export * from "./investmentLinks.js";

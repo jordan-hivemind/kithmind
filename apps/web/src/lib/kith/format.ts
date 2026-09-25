@@ -67,6 +67,14 @@ export function tableMoney(amount: number, currency: string): string {
   return `${symbol} ${numeric}`;
 }
 
+/** A ratio as a whole-number percent, e.g. `tablePercent(250, 1000)` is
+ * `"25%"` -- a credit account's utilization against its limit. Empty (never
+ * `"0%"` or `"Infinity%"`) when there is nothing to divide by. */
+export function tablePercent(numerator: number, denominator: number): string {
+  if (denominator === 0) return "";
+  return `${Math.round((numerator / denominator) * 100)}%`;
+}
+
 /** Exact-decimal accounting money for authoritative values from the store. */
 export function tableAccountingMoney(value: string, currency = "USD"): string {
   const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(value);

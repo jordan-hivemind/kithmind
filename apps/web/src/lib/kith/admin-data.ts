@@ -328,6 +328,9 @@ export async function loadCoverage(
       // narrow this to, so it is read once alongside `listAreaCoverage`
       // rather than through `archiveInventory`'s cross-database contract.
       health: await admin.healthContribution(ctx),
+      // Owner-global like `health` above: `kith.fin_accounts`/
+      // `fin_transactions` carry no space to narrow this to either.
+      banking: await admin.bankingContribution(ctx),
       principal,
       spaces: await administeredSpaces(ctx, principal),
     }),
@@ -335,29 +338,69 @@ export async function loadCoverage(
   if (loaded === null) return null;
   const inventory = await archiveInventory(loaded.principal, loaded.spaces);
   return {
-    areas: admin.mergeHealthIntoAreas(
-      admin.mergeFinanceIntoAreas(
-        loaded.areas,
-        inventory.state === "read" ? financeContribution(inventory.records) : null,
+    areas: admin.mergeBankingIntoAreas(
+      admin.mergeHealthIntoAreas(
+        admin.mergeFinanceIntoAreas(
+          loaded.areas,
+          inventory.state === "read" ? financeContribution(inventory.records) : null,
+        ),
+        loaded.health,
       ),
-      loaded.health,
+      loaded.banking,
     ),
     truncated: inventory.state === "read" && inventory.truncated,
   };
 }
 
-/** The archive's accounts, statements and records as one area's contribution. */
+/**
+ * Archive `accountType` strings that name a bank or card account rather than
+ * a brokerage, retirement or trust one. These are the owner's own override
+ * vocabulary for an archive account's type
+ * (`InstitutionAccountDrawer`'s `TYPES`: "bank" and "credit_line", alongside
+ * "mortgage"), normalized the same way `normalizeArea` normalizes an area
+ * name -- lowercased, trimmed, underscores and inner whitespace collapsed to
+ * one space -- so "credit_line" and "Credit Line" both match.
+ *
+ * Before this filter, `financeContribution` summed every archive account's
+ * `statementCount`/`recordCount` into the `brokerage` ("Investment
+ * Accounts") row regardless of what kind of account it was. A bank, mortgage
+ * or line-of-credit account the archive holds (from a legacy statement
+ * import, before that account's activity moved to `kith.fin_accounts` and
+ * this PR's `bankingContribution`) would double as an "Investment Accounts"
+ * count for an account that is not an investment account at all, and now
+ * has its own `banking and cards` row. After this filter, those accounts are
+ * excluded from `financeContribution`; `brokerage`/`retirement`/`trust`/
+ * `other` accounts are unaffected.
+ */
+const BANKING_ARCHIVE_TYPES = new Set(["bank", "mortgage", "credit line"]);
+
+function normalizeArchiveType(value: string | undefined): string {
+  return (value ?? "").trim().toLowerCase().replace(/[_\s]+/g, " ");
+}
+
+function isBankingArchiveAccount(
+  record: FinanceAccountInventoryRecord,
+): boolean {
+  return BANKING_ARCHIVE_TYPES.has(normalizeArchiveType(record.account.accountType));
+}
+
+/** The archive's accounts, statements and records as one area's contribution.
+ * Excludes bank, mortgage and line-of-credit accounts: see
+ * `BANKING_ARCHIVE_TYPES` above. */
 function financeContribution(
   records: readonly FinanceAccountInventoryRecord[],
 ): admin.AreaContribution {
+  const investmentRecords = records.filter(
+    (record) => !isBankingArchiveAccount(record),
+  );
   const contribution: admin.AreaContribution = {
-    sources: records.length,
+    sources: investmentRecords.length,
     documents: 0,
     records: 0,
     from: null,
     to: null,
   };
-  for (const record of records) {
+  for (const record of investmentRecords) {
     contribution.documents += record.statementCount;
     contribution.records += record.recordCount;
     if (
@@ -451,4 +494,123 @@ export async function loadMedical(
   }));
   if (loaded === null) return null;
   return loaded;
+}
+
+// ---------------------------------------------------------------------------
+// Screen: Banking & Cards (`kith.fin_accounts` depository, credit and loan
+// accounts -- see `admin.BANKING_ACCOUNT_TYPES`)
+// ---------------------------------------------------------------------------
+//
+// Owner-global, like the Balances screen: no space to narrow this to. The
+// transactions table defaults to the last `BANKING_DEFAULT_WINDOW_DAYS` days;
+// widening it is a second, dedicated read (`loadBankingTransactions`) rather
+// than the first paint loading everything, so the common case (today's page
+// view) never pays for years of transaction history it will not show.
+
+/** The transactions table's default window, before the owner widens it. */
+export const BANKING_DEFAULT_WINDOW_DAYS = 90;
+
+/** Rows the first paint's transactions table loads at most. Well above what
+ * 90 days of activity across these accounts holds today, and still bounded
+ * by `admin.listBankingTransactions`'s own hard cap regardless. */
+const BANKING_INITIAL_TRANSACTION_LIMIT = 1000;
+
+/** Rows a widened window loads at most -- the store's own hard cap. */
+const BANKING_WIDENED_TRANSACTION_LIMIT = 2000;
+
+const DAY_MS = 86_400_000;
+
+function isoDate(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+/**
+ * `[from, toExclusive)` for the last `days` days through today, inclusive.
+ * `toExclusive` is tomorrow's date rather than today's so a transaction dated
+ * today is not excluded by an exclusive upper bound.
+ */
+function bankingWindow(
+  now: number,
+  days: number,
+): { from: string; toExclusive: string } {
+  return {
+    from: isoDate(now - days * DAY_MS),
+    toExclusive: isoDate(now + DAY_MS),
+  };
+}
+
+export type BankingPageData = {
+  accounts: admin.BankingAccountRow[];
+  transactions: admin.BankingTransactionRow[];
+  transactionsTotal: number;
+  windowDays: number;
+};
+
+export async function loadBanking(
+  cookieHeader: string | null,
+  now: number = Date.now(),
+): Promise<BankingPageData | null> {
+  const window = bankingWindow(now, BANKING_DEFAULT_WINDOW_DAYS);
+  const loaded = await loadAuthenticatedPage(cookieHeader, async ({ ctx }) => {
+    const accounts = await admin.listBankingAccounts(ctx);
+    const { items, total } = await admin.listBankingTransactions(ctx, {
+      from: window.from,
+      toExclusive: window.toExclusive,
+      limit: BANKING_INITIAL_TRANSACTION_LIMIT,
+    });
+    return { accounts, transactions: items, transactionsTotal: total };
+  });
+  if (loaded === null) return null;
+  return { ...loaded, windowDays: BANKING_DEFAULT_WINDOW_DAYS };
+}
+
+export type BankingTransactionsPageData = {
+  transactions: admin.BankingTransactionRow[];
+  total: number;
+};
+
+/**
+ * The transactions table's "widen" control: a caller-chosen window in days,
+ * or every transaction these accounts hold when `days` is null. Gated the
+ * same admin-or-editor way every loader here is -- this is not folded into
+ * `loadBanking` above because the first paint must not pay for a window the
+ * owner has not asked to widen to yet.
+ */
+export async function loadBankingTransactions(
+  cookieHeader: string | null,
+  args: { days: number | null },
+  now: number = Date.now(),
+): Promise<BankingTransactionsPageData | null> {
+  const window = args.days === null ? null : bankingWindow(now, args.days);
+  const loaded = await loadAuthenticatedPage(cookieHeader, async ({ ctx }) =>
+    admin.listBankingTransactions(ctx, {
+      from: window?.from ?? null,
+      toExclusive: window?.toExclusive ?? null,
+      limit: BANKING_WIDENED_TRANSACTION_LIMIT,
+    }),
+  );
+  if (loaded === null) return null;
+  return { transactions: loaded.items, total: loaded.total };
+}
+
+export type BankingAccountDetailData = {
+  transactions: admin.BankingTransactionRow[];
+  balanceHistory: admin.BankingBalancePoint[];
+};
+
+/** The account drawer's own read: the account's latest 50 transactions and
+ * its last 12 month-end balances. A dedicated loader rather than folding
+ * into `loadBanking` so opening a drawer does not require reloading every
+ * account and the whole transactions window first. */
+export async function loadBankingAccountDetail(
+  cookieHeader: string | null,
+  accountId: string,
+): Promise<BankingAccountDetailData | null> {
+  return await loadAuthenticatedPage(cookieHeader, async ({ ctx }) => {
+    const [{ items }, balanceHistory] = await Promise.all([
+      admin.listBankingTransactions(ctx, { accountId, limit: 50 }),
+      admin.listAccountBalanceHistory(ctx, accountId, 12),
+    ]);
+    return { transactions: items, balanceHistory };
+  });
 }

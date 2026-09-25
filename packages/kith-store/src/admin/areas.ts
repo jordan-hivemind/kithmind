@@ -17,6 +17,7 @@
 import type { Principal } from "../identity/authorization.js";
 import { type IdentityCtx, rows } from "../identity/db.js";
 import { spacePredicate } from "../spaces.js";
+import { BANKING_ACCOUNT_TYPES } from "./finBanking.js";
 import { getAdminSpaceIds } from "./model.js";
 import { coverageStatus, type CoverageStatus } from "./status.js";
 
@@ -44,6 +45,8 @@ const MEMORY_AREA = "notes and facts";
 export const FINANCE_AREA = "brokerage";
 /** The area the Epic health feed's own inventory is added to by the caller. */
 export const MEDICAL_AREA = "medical";
+/** The area the unified ledger's banking and card accounts are added to. */
+export const BANKING_AREA = "banking and cards";
 
 /** A bound on the rows an unexpected area explosion could add. */
 const MAX_AREAS = 50;
@@ -387,6 +390,68 @@ export async function healthContribution(
   return {
     sources: Number(row?.sources ?? "0"),
     documents: Number(row?.documents ?? "0"),
+    records: Number(row?.records ?? "0"),
+    from: row?.from_date ?? null,
+    to: row?.to_date ?? null,
+  };
+}
+
+/**
+ * Folds `kith.fin_accounts`' depository, credit and loan accounts into the
+ * `banking and cards` row, the same way `mergeHealthIntoAreas` folds the
+ * Epic feed's into `medical`.
+ */
+export function mergeBankingIntoAreas(
+  areas: readonly AreaCoverageRow[],
+  contribution: AreaContribution | null,
+): AreaCoverageRow[] {
+  return mergeContributionIntoArea(areas, BANKING_AREA, contribution);
+}
+
+type BankingContributionRow = {
+  sources: string;
+  records: string;
+  from_date: string | null;
+  to_date: string | null;
+};
+
+/**
+ * The unified ledger's banking and card accounts (`BANKING_ACCOUNT_TYPES`),
+ * for `mergeBankingIntoAreas` to fold into the `banking and cards` row.
+ *
+ * Owner-global -- no space predicate -- for the same reason
+ * `healthContribution` is: `kith.fin_accounts` and `kith.fin_transactions`
+ * carry no space to narrow to (migration 048_finance_unify.sql), so the
+ * caller's own admin-layout sign-in check is the only gate.
+ *
+ * `documents` is always 0: the unified ledger has no per-account statement
+ * count of its own (Plaid's feed and the archive's own statements are two
+ * different things, and `financeContribution` already carries the archive's
+ * statement count into `brokerage`), so there is nothing genuine to put here.
+ */
+export async function bankingContribution(
+  ctx: IdentityCtx,
+): Promise<AreaContribution> {
+  const found = await rows<BankingContributionRow>(
+    ctx,
+    `SELECT
+       (SELECT count(*) FROM kith.fin_accounts fa
+         WHERE lower(fa.type) = ANY($1::text[]))::text AS sources,
+       (SELECT count(*) FROM kith.fin_transactions t
+          JOIN kith.fin_accounts fa ON fa.id = t.account_id
+         WHERE lower(fa.type) = ANY($1::text[]))::text AS records,
+       (SELECT min(t.date) FROM kith.fin_transactions t
+          JOIN kith.fin_accounts fa ON fa.id = t.account_id
+         WHERE lower(fa.type) = ANY($1::text[]))::text AS from_date,
+       (SELECT max(t.date) FROM kith.fin_transactions t
+          JOIN kith.fin_accounts fa ON fa.id = t.account_id
+         WHERE lower(fa.type) = ANY($1::text[]))::text AS to_date`,
+    [BANKING_ACCOUNT_TYPES],
+  );
+  const row = found[0];
+  return {
+    sources: Number(row?.sources ?? "0"),
+    documents: 0,
     records: Number(row?.records ?? "0"),
     from: row?.from_date ?? null,
     to: row?.to_date ?? null,
