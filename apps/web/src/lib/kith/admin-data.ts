@@ -324,6 +324,10 @@ export async function loadCoverage(
     cookieHeader,
     async ({ ctx, principal }) => ({
       areas: await admin.listAreaCoverage(ctx, { principal }),
+      // Owner-global, like `loadMedical` reads the same tables: no space to
+      // narrow this to, so it is read once alongside `listAreaCoverage`
+      // rather than through `archiveInventory`'s cross-database contract.
+      health: await admin.healthContribution(ctx),
       principal,
       spaces: await administeredSpaces(ctx, principal),
     }),
@@ -331,9 +335,12 @@ export async function loadCoverage(
   if (loaded === null) return null;
   const inventory = await archiveInventory(loaded.principal, loaded.spaces);
   return {
-    areas: admin.mergeFinanceIntoAreas(
-      loaded.areas,
-      inventory.state === "read" ? financeContribution(inventory.records) : null,
+    areas: admin.mergeHealthIntoAreas(
+      admin.mergeFinanceIntoAreas(
+        loaded.areas,
+        inventory.state === "read" ? financeContribution(inventory.records) : null,
+      ),
+      loaded.health,
     ),
     truncated: inventory.state === "read" && inventory.truncated,
   };

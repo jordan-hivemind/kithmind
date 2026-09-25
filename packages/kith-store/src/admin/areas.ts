@@ -42,6 +42,8 @@ const INVESTMENTS_AREA = "outside investments";
 const MEMORY_AREA = "notes and facts";
 /** The area the finance archive's own inventory is added to by the caller. */
 export const FINANCE_AREA = "brokerage";
+/** The area the Epic health feed's own inventory is added to by the caller. */
+export const MEDICAL_AREA = "medical";
 
 /** A bound on the rows an unexpected area explosion could add. */
 const MAX_AREAS = 50;
@@ -151,7 +153,10 @@ type ScalarDbRow = {
  *
  * The finance archive is not read here (another database, another contract);
  * `mergeFinanceIntoAreas` folds its inventory into the `brokerage` row for a
- * caller that has one.
+ * caller that has one. The Epic health feed's tables are read here (this
+ * package, this database), but not scoped by space at all -- unlike every
+ * query above -- so `healthContribution` and `mergeHealthIntoAreas` fold
+ * them into the `medical` row the same, separate way.
  */
 export async function listAreaCoverage(
   ctx: IdentityCtx,
@@ -290,20 +295,22 @@ export type AreaContribution = {
 };
 
 /**
- * Folds the finance archive's inventory into the `brokerage` row.
+ * Folds a contribution into the one row named `area`, add the counts, widen
+ * the range, leave the gaps alone because the contributor reports its own
+ * coverage (or none) through its own contract.
  *
- * Kept here rather than in the caller so the merge rule -- add the counts,
- * widen the range, leave the gaps alone because the archive reports its own
- * coverage through its own contract -- is next to the rule that built the row.
+ * Shared by `mergeFinanceIntoAreas` and `mergeHealthIntoAreas` so the one
+ * merge rule lives in one place rather than twice.
  */
-export function mergeFinanceIntoAreas(
+function mergeContributionIntoArea(
   areas: readonly AreaCoverageRow[],
+  area: string,
   contribution: AreaContribution | null,
 ): AreaCoverageRow[] {
   if (contribution === null) return [...areas];
   return tagged(
     areas.map((row) =>
-      row.area !== FINANCE_AREA
+      row.area !== area
         ? row
         : {
             ...row,
@@ -315,4 +322,73 @@ export function mergeFinanceIntoAreas(
           },
     ),
   );
+}
+
+/**
+ * Folds the finance archive's inventory into the `brokerage` row.
+ *
+ * Kept here rather than in the caller so the merge rule -- add the counts,
+ * widen the range, leave the gaps alone because the archive reports its own
+ * coverage through its own contract -- is next to the rule that built the row.
+ */
+export function mergeFinanceIntoAreas(
+  areas: readonly AreaCoverageRow[],
+  contribution: AreaContribution | null,
+): AreaCoverageRow[] {
+  return mergeContributionIntoArea(areas, FINANCE_AREA, contribution);
+}
+
+/**
+ * Folds the Epic health feed's inventory into the `medical` row, the same
+ * way `mergeFinanceIntoAreas` folds the finance archive's into `brokerage`.
+ */
+export function mergeHealthIntoAreas(
+  areas: readonly AreaCoverageRow[],
+  contribution: AreaContribution | null,
+): AreaCoverageRow[] {
+  return mergeContributionIntoArea(areas, MEDICAL_AREA, contribution);
+}
+
+type HealthContributionRow = {
+  sources: string;
+  documents: string;
+  records: string;
+  from_date: string | null;
+  to_date: string | null;
+};
+
+/**
+ * The Epic feed's own inventory (`kith.health_sources`/`health_records`/
+ * `health_documents`, migration 053), for `mergeHealthIntoAreas` to fold into
+ * the `medical` row.
+ *
+ * Read owner-global -- no space predicate -- the same way `listHealthOverview`
+ * reads these tables (see the comment above `loadMedical` in
+ * `admin-data.ts`): none of these three tables carry a single space this
+ * screen could narrow to, and the caller's own admin-layout sign-in check is
+ * the only gate, exactly as it is for `listHealthOverview`.
+ */
+export async function healthContribution(
+  ctx: IdentityCtx,
+): Promise<AreaContribution> {
+  const found = await rows<HealthContributionRow>(
+    ctx,
+    `SELECT
+       (SELECT count(*) FROM kith.health_sources)::text AS sources,
+       (SELECT count(*) FROM kith.health_documents)::text AS documents,
+       (SELECT count(*) FROM kith.health_records)::text AS records,
+       (SELECT min(effective_at) FROM kith.health_records)::date::text
+         AS from_date,
+       (SELECT max(effective_at) FROM kith.health_records)::date::text
+         AS to_date`,
+    [],
+  );
+  const row = found[0];
+  return {
+    sources: Number(row?.sources ?? "0"),
+    documents: Number(row?.documents ?? "0"),
+    records: Number(row?.records ?? "0"),
+    from: row?.from_date ?? null,
+    to: row?.to_date ?? null,
+  };
 }

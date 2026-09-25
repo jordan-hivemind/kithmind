@@ -613,4 +613,66 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
     expect(data!.state).toBe("unavailable");
     expect(data!.institutions).toEqual([]);
   });
+
+  // --- Home's medical row: the Epic feed's own inventory ------------------
+
+  test("loadCoverage folds the Epic feed's inventory into the medical row, owner-global", async () => {
+    resetLog();
+    const personId = newKithId();
+    const sourceId = newKithId();
+    const recordId = newKithId();
+    await inTransaction(async (ctx) => {
+      await ctx.client.query(
+        `INSERT INTO kith.entities
+           (id, space_id, created_at, user_id, key, kind, canonical_name,
+            normalized_name, aliases, normalized_aliases)
+         VALUES ($1,$2,transaction_timestamp(),$3,$4,'person','Alex','alex',
+                 '[]'::jsonb,'[]'::jsonb)`,
+        [
+          personId,
+          fixture.userA.spaceId,
+          fixture.userA.userId,
+          `person:alex:${personId}`,
+        ],
+      );
+      await ctx.client.query(
+        `INSERT INTO kith.health_sources
+           (id, person_id, space_id, org_name, fhir_base, patient_fhir_id,
+            keychain_service, scopes)
+         VALUES ($1,$2,$3,'Synthetic Health','https://epic.example.test/fhir',
+                 'patient-synthetic','com.kithmind.epic.token.synthetic',
+                 'patient/*.read')`,
+        [sourceId, personId, fixture.userA.spaceId],
+      );
+      await ctx.client.query(
+        `INSERT INTO kith.health_records
+           (id, source_id, person_id, resource_type, fhir_id, effective_at, raw)
+         VALUES ($1,$2,$3,'Observation','obs-synthetic-1',
+                 '2026-01-15T00:00:00Z','{}'::jsonb)`,
+        [recordId, sourceId, personId],
+      );
+      await ctx.client.query(
+        `INSERT INTO kith.health_documents
+           (id, record_id, person_id, content_type, byte_length)
+         VALUES ($1,$2,$3,'application/pdf',1024)`,
+        [newKithId(), recordId, personId],
+      );
+    });
+
+    const { loadCoverage } = await import("./admin-data");
+    const forA = await loadCoverage(fixture.userA.cookie);
+    const medicalForA = forA!.areas.find((area) => area.area === "medical")!;
+    expect(medicalForA.documents).toBe(1);
+    expect(medicalForA.records).toBe(1);
+    expect(medicalForA.status).not.toBe("empty");
+
+    // Owner-global, exactly like `listHealthOverview`: neither
+    // `health_records` nor `health_documents` carries a space to narrow
+    // this to, so a different user administering their own, unrelated space
+    // still sees the same feed inventory folded into their medical row.
+    const forB = await loadCoverage(fixture.userB.cookie);
+    const medicalForB = forB!.areas.find((area) => area.area === "medical")!;
+    expect(medicalForB.documents).toBe(1);
+    expect(medicalForB.records).toBe(1);
+  });
 });
