@@ -25,7 +25,6 @@ import type {
 import {
   archiveDate,
   label,
-  signedTableMoney,
   tableInteger,
   tableMoney,
   tablePercent,
@@ -33,11 +32,6 @@ import {
 
 type AccountRow = BankingPageData["accounts"][number];
 type TransactionRow = BankingPageData["transactions"][number];
-
-/** `kith.fin_accounts.type` values whose balance is a liability -- shown
- * negative (`signedTableMoney`) rather than as a positive asset value. The
- * fourth banking type, `depository`, is deliberately not in this set. */
-const LIABILITY_TYPES = new Set(["credit", "loan", "mortgage"]);
 
 const WINDOW_OPTIONS = [
   { value: "90", label: "Last 90 days" },
@@ -86,14 +80,16 @@ function money(amount: number | null, currency: string | null) {
   return <span className="tabular-nums">{tableMoney(amount, currency)}</span>;
 }
 
+/**
+ * The stored balance, unsigned -- the same raw figure the Balances page
+ * shows. A credit or loan account's `current` is Plaid's own "amount owed"
+ * convention (positive), not negated here: two screens reading the same
+ * account with opposite signs would read as a bug, not as two views of the
+ * same fact. The account's own type tag (credit/loan/mortgage, from the
+ * adjacent Type column) is what marks a row as a liability.
+ */
 function balanceCell(row: AccountRow) {
-  if (row.currentBalance === null || row.currency === null) return "";
-  const negate = LIABILITY_TYPES.has((row.type ?? "").toLowerCase());
-  return (
-    <span className="tabular-nums">
-      {signedTableMoney(row.currentBalance, row.currency, negate)}
-    </span>
-  );
+  return money(row.currentBalance, row.currency);
 }
 
 /** Available (depository) or limit and utilization (credit); blank for a
