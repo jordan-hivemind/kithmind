@@ -23,7 +23,7 @@ const DATA_TYPES: readonly {
   },
   { area: "banking and cards", label: "Banking & Cards" },
   { area: "taxes", label: "Taxes" },
-  { area: "medical", label: "Medical" },
+  { area: "medical", label: "Medical", href: "/admin/medical" },
   { area: "vehicles", label: "Vehicles" },
   { area: "home and projects", label: "Home & Projects" },
   { area: "notes and facts", label: "Thoughts & Facts", href: "/browse" },

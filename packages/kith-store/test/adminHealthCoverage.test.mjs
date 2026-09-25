@@ -14,9 +14,11 @@ import test from "node:test";
 import { newKithId } from "../dist/index.js";
 import {
   LIFE_AREAS,
+  healthContribution,
   listAreaCoverage,
   latestChangeId,
   listChangesSince,
+  mergeHealthIntoAreas,
   readHealthFacts,
   upsertSourceRoot,
 } from "../dist/admin/index.js";
@@ -184,6 +186,52 @@ async function makeEntity(ctx, spaceId, userId) {
      VALUES ($1,$2,to_timestamp($3/1000.0),$4,$5,'person','Alex','alex',
              '[]'::jsonb,'[]'::jsonb)`,
     [id, spaceId, NOW, userId, `person:alex:${id}`],
+  );
+  return id;
+}
+
+/** migration 053: one Epic MyChart authorization for `personId`. */
+async function makeHealthSource(ctx, personId, spaceId) {
+  const id = newKithId();
+  await ctx.client.query(
+    `INSERT INTO kith.health_sources
+       (id, person_id, space_id, org_name, fhir_base, patient_fhir_id,
+        keychain_service, scopes)
+     VALUES ($1,$2,$3,'Synthetic Health','https://epic.example.test/fhir',
+             'patient-synthetic','com.kithmind.epic.token.synthetic',
+             'patient/*.read')`,
+    [id, personId, spaceId],
+  );
+  return id;
+}
+
+/** One structured record the Epic feed's `pull` wrote from that source. */
+async function makeHealthRecord(ctx, sourceId, personId, fields = {}) {
+  const id = newKithId();
+  await ctx.client.query(
+    `INSERT INTO kith.health_records
+       (id, source_id, person_id, resource_type, fhir_id, effective_at, raw)
+     VALUES ($1,$2,$3,$4,$5,$6,'{}'::jsonb)`,
+    [
+      id,
+      sourceId,
+      personId,
+      fields.resourceType ?? "Observation",
+      fields.fhirId ?? `fhir-${id}`,
+      fields.effectiveAt ?? null,
+    ],
+  );
+  return id;
+}
+
+/** One `DocumentReference` attachment fetched for that record. */
+async function makeHealthDocument(ctx, recordId, personId) {
+  const id = newKithId();
+  await ctx.client.query(
+    `INSERT INTO kith.health_documents
+       (id, record_id, person_id, content_type, byte_length)
+     VALUES ($1,$2,$3,'application/pdf',1024)`,
+    [id, recordId, personId],
   );
   return id;
 }
@@ -482,6 +530,81 @@ test("thoughts, facts and investment entries land in their own areas", { skip },
   assert.equal(investments.from, "2025-02-01");
   assert.equal(investments.to, "2026-01-15");
 });
+
+test(
+  "the Epic feed's inventory folds into the medical row, owner-global",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const ctx = f.ctx(NOW);
+
+    const sourceId = await makeHealthSource(ctx, f.entityId, f.spaceId);
+    const recordId = await makeHealthRecord(ctx, sourceId, f.entityId, {
+      effectiveAt: "2026-01-15T00:00:00Z",
+    });
+    await makeHealthRecord(ctx, sourceId, f.entityId, {
+      resourceType: "Condition",
+      effectiveAt: "2025-11-01T00:00:00Z",
+    });
+    await makeHealthDocument(ctx, recordId, f.entityId);
+
+    // A document-area tag on the same source account, so the merge is
+    // proven to add rather than replace what `listAreaCoverage` already
+    // found for `medical`.
+    await upsertSourceRoot(ctx, {
+      principal: f.principal,
+      sourceAccountId: f.sourceAccountId,
+      kind: "folder",
+      area: "Medical",
+    });
+    await makeSourceItem(ctx, f.spaceId, f.sourceAccountId);
+
+    const contribution = await healthContribution(ctx);
+    assert.deepEqual(contribution, {
+      sources: 1,
+      documents: 1,
+      records: 2,
+      from: "2025-11-01",
+      to: "2026-01-15",
+    });
+
+    const areas = await listAreaCoverage(ctx, { principal: f.principal });
+    const merged = mergeHealthIntoAreas(areas, contribution);
+    const medical = merged.find((row) => row.area === "medical");
+    // 1 from the folder tag, plus the feed's own.
+    assert.equal(medical.sources, 2);
+    assert.equal(medical.documents, 2);
+    assert.equal(medical.records, 2);
+    assert.equal(medical.from, "2025-11-01");
+    assert.equal(medical.to, "2026-01-15");
+    assert.equal(medical.status, "covered");
+
+    // Every other row is untouched by the merge.
+    for (const row of merged) {
+      if (row.area === "medical") continue;
+      assert.deepEqual(
+        row,
+        areas.find((original) => original.area === row.area),
+      );
+    }
+
+    // Owner-global like `listHealthOverview`: a stranger administering their
+    // own, unrelated space still folds in the same feed inventory, because
+    // neither `health_records` nor `health_documents` carries a space to
+    // narrow this to.
+    const strangerAreas = await listAreaCoverage(ctx, {
+      principal: f.stranger,
+    });
+    const strangerMerged = mergeHealthIntoAreas(strangerAreas, contribution);
+    const strangerMedical = strangerMerged.find((row) => row.area === "medical");
+    assert.equal(strangerMedical.sources, 1);
+    assert.equal(strangerMedical.documents, 1);
+    assert.equal(strangerMedical.records, 2);
+
+    // `null` (no contribution) changes nothing, same as `mergeFinanceIntoAreas`.
+    assert.deepEqual(mergeHealthIntoAreas(areas, null), areas);
+  },
+);
 
 test("migration 024's triggers put every health and coverage table on the feed", { skip }, async (t) => {
   const f = await fixture(t);
