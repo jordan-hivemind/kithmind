@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { createTaxPayment } from "../dist/admin/index.js";
 import * as memory from "../dist/memory/index.js";
 import { coverage, newKithId } from "../dist/index.js";
 import { webPrincipal } from "../dist/identity/index.js";
@@ -439,6 +440,61 @@ test(
         ],
       );
 
+      const taxPayment = await createTaxPayment(ctx, {
+        principal,
+        spaceId,
+        payer: {
+          key: source.key,
+          kind: "person",
+          name: source.canonicalName,
+        },
+        authority: "us_federal",
+        paymentKind: "estimated_income",
+        taxYear: 2026,
+        amount: "500.00",
+        currency: "USD",
+        submittedOn: "2026-09-01",
+        confirmationNumber: "CONF-MERGE-SYNTHETIC-1",
+      });
+      const healthSourceId = newKithId();
+      await ctx.client.query(
+        `INSERT INTO kith.health_sources
+           (id, person_id, space_id, org_name, fhir_base, patient_fhir_id,
+            keychain_service, scopes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [
+          healthSourceId,
+          source.id,
+          spaceId,
+          "Synthetic Health System",
+          "https://fhir.example.test/synthetic",
+          "patient-synthetic",
+          "com.kithmind.epic.token.synthetic",
+          "patient/*.read",
+        ],
+      );
+      const healthRecordId = newKithId();
+      await ctx.client.query(
+        `INSERT INTO kith.health_records
+           (id, source_id, person_id, resource_type, fhir_id, raw)
+         VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
+        [
+          healthRecordId,
+          healthSourceId,
+          source.id,
+          "Observation",
+          "obs-synthetic",
+          JSON.stringify({ resourceType: "Observation" }),
+        ],
+      );
+      const healthDocumentId = newKithId();
+      await ctx.client.query(
+        `INSERT INTO kith.health_documents
+           (id, record_id, person_id, content_type, byte_length)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [healthDocumentId, healthRecordId, source.id, "text/plain", 42],
+      );
+
       const merged = await memory.mergeEntities(ctx, {
         principal,
         sourceEntityId: source.id,
@@ -457,6 +513,30 @@ test(
         31,
         "both alias sets and the losing canonical name survive",
       );
+      assert.equal(merged.repointed.taxPayments, 1);
+      assert.equal(merged.repointed.healthSources, 1);
+      assert.equal(merged.repointed.healthRecords, 1);
+      assert.equal(merged.repointed.healthDocuments, 1);
+      const movedTaxPayment = await ctx.client.query(
+        "SELECT payer_entity_id FROM kith.tax_payments WHERE id = $1",
+        [taxPayment.paymentId],
+      );
+      assert.equal(movedTaxPayment.rows[0].payer_entity_id, target.id);
+      const movedHealthSource = await ctx.client.query(
+        "SELECT person_id FROM kith.health_sources WHERE id = $1",
+        [healthSourceId],
+      );
+      assert.equal(movedHealthSource.rows[0].person_id, target.id);
+      const movedHealthRecord = await ctx.client.query(
+        "SELECT person_id FROM kith.health_records WHERE id = $1",
+        [healthRecordId],
+      );
+      assert.equal(movedHealthRecord.rows[0].person_id, target.id);
+      const movedHealthDocument = await ctx.client.query(
+        "SELECT person_id FROM kith.health_documents WHERE id = $1",
+        [healthDocumentId],
+      );
+      assert.equal(movedHealthDocument.rows[0].person_id, target.id);
       await memory.rememberFact(ctx, userId, spaceId, {
         subject: {
           key: target.key,

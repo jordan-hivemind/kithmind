@@ -1129,6 +1129,32 @@ export async function mergeEntities(
     "corrections",
     `UPDATE kith.corrections SET corrected_value = jsonb_set(corrected_value, '{entityId}', to_jsonb($1::text)) WHERE corrected_value ->> 'type' = 'entity' AND corrected_value ->> 'entityId' = $2 AND space_id = $3`,
   );
+  // A collision (e.g. the target already has a tax payment with the same
+  // confirmation number or EFT trace, or the same FHIR base as a health
+  // source) is a real conflict the merge cannot silently resolve. Let the
+  // unique-index violation propagate so the whole merge transaction rolls
+  // back rather than dropping a row.
+  await repoint(
+    "taxPayments",
+    "UPDATE kith.tax_payments SET payer_entity_id = $1 WHERE payer_entity_id = $2 AND space_id = $3",
+  );
+  await repoint(
+    "healthSources",
+    "UPDATE kith.health_sources SET person_id = $1 WHERE person_id = $2 AND space_id = $3",
+  );
+  // health_records and health_documents denormalize person_id from
+  // health_sources but carry no space_id of their own; the entity id (a
+  // globally unique kith_id) is already the correct scope.
+  await repoint(
+    "healthRecords",
+    "UPDATE kith.health_records SET person_id = $1 WHERE person_id = $2",
+    [targetId, sourceId],
+  );
+  await repoint(
+    "healthDocuments",
+    "UPDATE kith.health_documents SET person_id = $1 WHERE person_id = $2",
+    [targetId, sourceId],
+  );
   await repoint(
     "mergedEntities",
     "UPDATE kith.entities SET merged_into = $1, updated_at = $4 WHERE merged_into = $2 AND space_id = $3",
