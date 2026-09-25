@@ -16,6 +16,7 @@
 import { randomBytes } from "node:crypto";
 
 import {
+  admin,
   applyKithSchema,
   createKithPool,
   memory,
@@ -851,5 +852,190 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
     ).toBe(true);
 
     expect(await loadBanking(null)).toBeNull();
+  });
+
+  // --- Taxes (TAXES-1) -----------------------------------------------------
+
+  /** A minimal `tax_return`/`k1`/`tax_support` document, with no extraction
+   * of its own -- `loadTaxes` must still show it, its tax year read from its
+   * title (`admin.parseTitleTaxYear`'s own unit tests below cover the
+   * parser itself; this proves the loader actually calls it end to end). */
+  async function seedTaxDocument(
+    ctx: IdentityCtx,
+    spaceId: string,
+    input: { title: string; docType: string; capturedAt: string },
+  ): Promise<string> {
+    const sourceAccountId = newKithId();
+    const sourceItemId = newKithId();
+    const generationId = newKithId();
+    const documentId = newKithId();
+    await ctx.client.query(
+      `INSERT INTO kith.source_accounts (id, space_id, created_at, connector, enabled)
+         VALUES ($1, $2, transaction_timestamp(), 'synthetic', true)`,
+      [sourceAccountId, spaceId],
+    );
+    await ctx.client.query(
+      `INSERT INTO kith.source_items
+         (id, space_id, created_at, source_account_id, external_id_hash, title,
+          lifecycle, original_link_available, desired_processing_epoch)
+         VALUES ($1, $2, transaction_timestamp(), $3, $4, $5, 'available', true, 0)`,
+      [
+        sourceItemId,
+        spaceId,
+        sourceAccountId,
+        `${sourceItemId}`.padEnd(64, "a").slice(0, 64),
+        input.title,
+      ],
+    );
+    await ctx.client.query(
+      `INSERT INTO kith.processing_generations
+         (id, space_id, created_at, source_account_id, source_item_id,
+          desired_processing_epoch, card_generation, state)
+         VALUES ($1, $2, transaction_timestamp(), $3, $4, 0, false, 'ready')`,
+      [generationId, spaceId, sourceAccountId, sourceItemId],
+    );
+    await ctx.client.query(
+      `INSERT INTO kith.documents
+         (id, space_id, created_at, processing_generation_id, source_item_id,
+          document_key, title, doc_type, captured_at, evidence_span_ids,
+          publication_state)
+         VALUES ($1, $2, transaction_timestamp(), $3, $4, $5, $6, $7, $8,
+                 '[]'::jsonb, 'active')`,
+      [
+        documentId,
+        spaceId,
+        generationId,
+        sourceItemId,
+        `doc-${documentId}`,
+        input.title,
+        input.docType,
+        new Date(input.capturedAt),
+      ],
+    );
+    return documentId;
+  }
+
+  test("loadTaxes lists a tax document under its title's tax year, scoped to the caller's space", async () => {
+    resetLog();
+    await inTransaction((ctx) =>
+      seedTaxDocument(ctx, fixture.userA.spaceId, {
+        title: "2024 - 1040 - Synthetic filer.pdf",
+        docType: "tax_return",
+        capturedAt: "2025-03-01",
+      }),
+    );
+
+    const { loadTaxes } = await import("./admin-data");
+    const forA = await loadTaxes(fixture.userA.cookie);
+    expect(forA!.overview.documents).toHaveLength(1);
+    expect(forA!.overview.documents[0]!.taxYear).toBe(2024);
+    expect(forA!.overview.documents[0]!.yearSource).toBe("title");
+    const year = forA!.overview.years.find((row) => row.taxYear === 2024);
+    expect(year!.returnCount).toBe(1);
+    expect(transactionLog).toEqual([
+      "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    ]);
+
+    // Space isolation: userB administers their own space only.
+    const forB = await loadTaxes(fixture.userB.cookie);
+    expect(forB!.overview.documents).toHaveLength(0);
+    expect(forB!.overview.years).toHaveLength(0);
+  });
+
+  test("loadTaxes denies an unauthenticated request", async () => {
+    const { loadTaxes } = await import("./admin-data");
+    expect(await loadTaxes(null)).toBeNull();
+  });
+
+  test("loadCoverage folds tax_return/k1/tax_support documents and tax payments into the taxes row", async () => {
+    resetLog();
+    await inTransaction((ctx) =>
+      seedTaxDocument(ctx, fixture.userA.spaceId, {
+        title: "2025 - 1040 - Synthetic filer.pdf",
+        docType: "tax_return",
+        capturedAt: "2026-03-01",
+      }),
+    );
+    await inTransaction((ctx) =>
+      admin.createTaxPayment(ctx, {
+        principal: { userId: fixture.userA.userId, capabilities: [] },
+        spaceId: fixture.userA.spaceId,
+        payer: {
+          key: "person:synthetic-tax-payer",
+          kind: "person",
+          name: "Synthetic Tax Payer",
+        },
+        authority: "us_federal",
+        paymentKind: "estimated_income",
+        taxYear: 2025,
+        amount: "500.00",
+        currency: "USD",
+        submittedOn: "2025-09-01",
+        confirmationNumber: "CONF-I5-SYNTHETIC",
+      }),
+    );
+
+    const { loadCoverage } = await import("./admin-data");
+    const forA = await loadCoverage(fixture.userA.cookie);
+    const taxesForA = forA!.areas.find((area) => area.area === "taxes")!;
+    // Cumulative with the earlier `loadTaxes` test's own seeded document,
+    // since this suite's fixture (and its space) is shared across tests.
+    expect(taxesForA.documents).toBe(2);
+    expect(taxesForA.records).toBe(1);
+    expect(taxesForA.status).not.toBe("empty");
+
+    // Space-scoped, unlike the medical row above: userB's own coverage read
+    // never sees userA's tax documents or payments.
+    const forB = await loadCoverage(fixture.userB.cookie);
+    const taxesForB = forB!.areas.find((area) => area.area === "taxes")!;
+    expect(taxesForB.documents).toBe(0);
+    expect(taxesForB.records).toBe(0);
+  });
+});
+
+describe("tax title parsing (pure helpers, no database)", () => {
+  test("parseTitleTaxYear reads the first plausible year, or null", () => {
+    expect(
+      admin.parseTitleTaxYear(
+        "Tax return 2021 · 2021 - 1041 - ZRS Irrevocable Trust.pdf",
+      ),
+    ).toBe(2021);
+    expect(
+      admin.parseTitleTaxYear("K-1 2022 · Synthetic Partners LP.pdf"),
+    ).toBe(2022);
+    expect(
+      admin.parseTitleTaxYear("Scanned receipt, no year printed.pdf"),
+    ).toBe(null);
+    expect(admin.parseTitleTaxYear("Invoice 2021-04 for services.pdf")).toBe(
+      2021,
+    );
+  });
+
+  test("parseTitleFormType reads a known federal form family, or null", () => {
+    expect(admin.parseTitleFormType("2021 - 1040 - Synthetic filer.pdf")).toBe(
+      "1040",
+    );
+    expect(admin.parseTitleFormType("2021 - 1041 - ZRS Trust.pdf")).toBe(
+      "1041",
+    );
+    expect(admin.parseTitleFormType("Schedule K-1 (Form 1065).pdf")).toBe(
+      "1065",
+    );
+    expect(admin.parseTitleFormType("1120-S synthetic return.pdf")).toBe(
+      "1120S",
+    );
+    expect(admin.parseTitleFormType("Brokerage statement.pdf")).toBe(null);
+  });
+
+  test("parseTitleIssuer guesses the longest non-year, non-form segment", () => {
+    expect(
+      admin.parseTitleIssuer(
+        "Tax return 2021 · 2021 - 1041 - ZRS Irrevocable Trust.pdf",
+      ),
+    ).toBe("ZRS Irrevocable Trust");
+    expect(admin.parseTitleIssuer("K-1 2022 · Synthetic Partners LP.pdf")).toBe(
+      "Synthetic Partners LP",
+    );
+    expect(admin.parseTitleIssuer("2022.pdf")).toBe(null);
   });
 });

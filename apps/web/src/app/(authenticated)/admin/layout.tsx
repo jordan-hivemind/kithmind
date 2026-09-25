@@ -34,6 +34,7 @@ const SCREENS = [
   { href: "/admin/institutions", label: "Investment Accounts", ready: true },
   { href: "/admin/banking", label: "Banking & Cards", ready: true },
   { href: "/admin/investments", label: "Private Investments", ready: true },
+  { href: "/admin/taxes", label: "Taxes", ready: true },
   { href: "/admin/sources", label: "Data Sources", ready: true },
   { href: "/admin/health", label: "System Health", ready: true },
   { href: "/admin/medical", label: "Health Records", ready: true },
