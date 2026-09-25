@@ -21,7 +21,11 @@ const DATA_TYPES: readonly {
     label: "Private Investments",
     href: "/admin/investments",
   },
-  { area: "banking and cards", label: "Banking & Cards" },
+  {
+    area: "banking and cards",
+    label: "Banking & Cards",
+    href: "/admin/banking",
+  },
   { area: "taxes", label: "Taxes" },
   { area: "medical", label: "Medical", href: "/admin/medical" },
   { area: "vehicles", label: "Vehicles" },

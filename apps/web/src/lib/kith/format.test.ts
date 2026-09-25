@@ -4,10 +4,13 @@ import {
   archiveDate,
   label,
   shortDate,
+  signedTableMoney,
   tableAccountingMoney,
   tableDateTime,
   tableDecimal,
   tableInteger,
+  tableMoney,
+  tablePercent,
 } from "@/lib/kith/format";
 
 describe("table display formatting", () => {
@@ -34,5 +37,22 @@ describe("table display formatting", () => {
   test("formats exact USD values as accounting money", () => {
     expect(tableAccountingMoney("100000.22")).toBe("$ 100,000.22");
     expect(tableAccountingMoney("-12.5")).toBe("($ 12.50)");
+  });
+
+  test("signedTableMoney negates a liability balance so it reads as owed", () => {
+    expect(signedTableMoney(482.13, "USD", true)).toBe("$ -482.13");
+    // A depository account's balance is unaffected.
+    expect(signedTableMoney(482.13, "USD", false)).toBe(
+      tableMoney(482.13, "USD"),
+    );
+    // Negating twice (a liability whose stored value is already negative --
+    // Plaid reports some credit refund states this way) reads as positive.
+    expect(signedTableMoney(-50, "USD", true)).toBe(tableMoney(50, "USD"));
+  });
+
+  test("tablePercent rounds a ratio and never divides by zero", () => {
+    expect(tablePercent(250, 1000)).toBe("25%");
+    expect(tablePercent(482.13, 5000)).toBe("10%");
+    expect(tablePercent(0, 0)).toBe("");
   });
 });

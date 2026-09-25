@@ -675,4 +675,181 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
     expect(medicalForB.documents).toBe(1);
     expect(medicalForB.records).toBe(1);
   });
+
+  // --- Home's banking row, and the Banking & Cards screen -----------------
+
+  const BANKING_NOW = Date.parse("2026-09-25T12:00:00Z");
+
+  /** A `kith.fin_accounts` row. Plaid-linked unless `archiveAccountId` is
+   * given, matching the schema's "at least one id" CHECK. */
+  async function makeFinAccount(
+    ctx: IdentityCtx,
+    fields: {
+      institutionName?: string;
+      name?: string;
+      type?: string | null;
+      subtype?: string | null;
+      archiveAccountId?: string;
+    } = {},
+  ): Promise<string> {
+    const id = newKithId();
+    const archiveAccountId = fields.archiveAccountId ?? null;
+    await ctx.client.query(
+      `INSERT INTO kith.fin_accounts
+         (id, institution_name, name, type, subtype, archive_account_id,
+          plaid_account_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        id,
+        fields.institutionName ?? "Synthetic Bank",
+        fields.name ?? "Account",
+        fields.type ?? null,
+        fields.subtype ?? null,
+        archiveAccountId,
+        archiveAccountId === null ? `plaid-${id}` : null,
+      ],
+    );
+    return id;
+  }
+
+  async function makeFinTransaction(
+    ctx: IdentityCtx,
+    accountId: string,
+    fields: { date?: string; amount?: number; description?: string } = {},
+  ): Promise<void> {
+    await ctx.client.query(
+      `INSERT INTO kith.fin_transactions
+         (id, account_id, date, kind, description, amount, currency, source,
+          source_ref)
+       VALUES ($1,$2,$3,'other',$4,$5,'USD','plaid',$6)`,
+      [
+        newKithId(),
+        accountId,
+        fields.date ?? "2026-08-01",
+        fields.description ?? "Synthetic transaction",
+        fields.amount ?? -10,
+        `ref-${newKithId()}`,
+      ],
+    );
+  }
+
+  test("loadCoverage folds kith.fin_accounts' banking and card accounts into the banking and cards row", async () => {
+    resetLog();
+    const { loadCoverage } = await import("./admin-data");
+    // A delta, not an absolute count: `kith.fin_accounts` is owner-global
+    // and unscoped, so another test in this file may have already added a
+    // row to it by the time this one runs.
+    const before = await loadCoverage(fixture.userA.cookie);
+    const bankingBefore = before!.areas.find(
+      (area) => area.area === "banking and cards",
+    )!;
+
+    const checking = await inTransaction((ctx) =>
+      makeFinAccount(ctx, { type: "depository" }),
+    );
+    await inTransaction((ctx) =>
+      makeFinTransaction(ctx, checking, { date: "2026-08-01" }),
+    );
+    // An investment account, which must not be counted here.
+    const brokerage = await inTransaction((ctx) =>
+      makeFinAccount(ctx, { type: "investment" }),
+    );
+    await inTransaction((ctx) =>
+      makeFinTransaction(ctx, brokerage, { date: "2026-08-01" }),
+    );
+
+    const after = await loadCoverage(fixture.userA.cookie);
+    const bankingAfter = after!.areas.find(
+      (area) => area.area === "banking and cards",
+    )!;
+    expect(bankingAfter.sources).toBe(bankingBefore.sources + 1);
+    expect(bankingAfter.records).toBe(bankingBefore.records + 1);
+    expect(bankingAfter.documents).toBe(0);
+    expect(bankingAfter.status).not.toBe("empty");
+
+    // Owner-global, exactly like the medical row above: a different user
+    // administering their own, unrelated space still sees the same delta.
+    const forB = await loadCoverage(fixture.userB.cookie);
+    const bankingForB = forB!.areas.find(
+      (area) => area.area === "banking and cards",
+    )!;
+    expect(bankingForB.records).toBe(bankingAfter.records);
+  });
+
+  test("financeContribution no longer counts a bank or mortgage archive account as Investment Accounts", async () => {
+    financeMock.resolve.mockReturnValue({
+      spaceId: fixture.userA.sharedSpaceId,
+      read: async () =>
+        Promise.resolve({
+          ...inventoryResponse(fixture.userA.sharedSpaceId),
+          items: [
+            {
+              ...inventoryResponse(fixture.userA.sharedSpaceId).items[0]!,
+              account: {
+                ...inventoryResponse(fixture.userA.sharedSpaceId).items[0]!
+                  .account,
+                accountId: "account-synthetic-mortgage",
+                accountType: "Mortgage",
+              },
+            },
+          ],
+        }),
+    });
+    const { loadCoverage } = await import("./admin-data");
+    const data = await loadCoverage(fixture.userA.cookie);
+    const brokerage = data!.areas.find((area) => area.area === "brokerage")!;
+    // Before this change, every archive account's statementCount/recordCount
+    // landed here regardless of type; a mortgage-typed one no longer does.
+    expect(brokerage.sources).toBe(0);
+    expect(brokerage.documents).toBe(0);
+    expect(brokerage.records).toBe(0);
+  });
+
+  test("loadBanking lists depository/credit/loan accounts and the default 90-day transaction window", async () => {
+    resetLog();
+    const checking = await inTransaction((ctx) =>
+      makeFinAccount(ctx, {
+        institutionName: "Chase",
+        name: "Checking",
+        type: "depository",
+      }),
+    );
+    const brokerage = await inTransaction((ctx) =>
+      makeFinAccount(ctx, { type: "investment" }),
+    );
+    // Unique to this test run, so another test's rows in this owner-global,
+    // unscoped table can never be mistaken for these.
+    const recentDescription = `recent-${checking}`;
+    const oldDescription = `old-${checking}`;
+    await inTransaction(async (ctx) => {
+      // Inside the default 90-day window (BANKING_NOW - ~55 days).
+      await makeFinTransaction(ctx, checking, {
+        date: "2026-08-01",
+        description: recentDescription,
+      });
+      // Outside it (BANKING_NOW - ~178 days).
+      await makeFinTransaction(ctx, checking, {
+        date: "2026-03-30",
+        description: oldDescription,
+      });
+      await makeFinTransaction(ctx, brokerage, { date: "2026-08-01" });
+    });
+
+    const { loadBanking } = await import("./admin-data");
+    const data = await loadBanking(fixture.userA.cookie, BANKING_NOW);
+    expect(data).not.toBeNull();
+    expect(data!.windowDays).toBe(90);
+    expect(data!.accounts.some((row) => row.accountId === checking)).toBe(true);
+    expect(data!.accounts.every((row) => row.accountId !== brokerage)).toBe(
+      true,
+    );
+    expect(
+      data!.transactions.some((row) => row.description === recentDescription),
+    ).toBe(true);
+    expect(
+      data!.transactions.every((row) => row.description !== oldDescription),
+    ).toBe(true);
+
+    expect(await loadBanking(null)).toBeNull();
+  });
 });

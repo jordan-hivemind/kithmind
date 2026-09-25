@@ -67,6 +67,29 @@ export function tableMoney(amount: number, currency: string): string {
   return `${symbol} ${numeric}`;
 }
 
+/**
+ * `tableMoney`, with the sign flipped first when `negate` is true -- for a
+ * liability balance (a credit card or loan's `current`) that Plaid and the
+ * archive both store as a positive "amount owed": negating it before display
+ * is what makes it read as owed rather than as a positive asset value, the
+ * Banking & Cards screen's own convention for its credit and loan rows.
+ */
+export function signedTableMoney(
+  amount: number,
+  currency: string,
+  negate: boolean,
+): string {
+  return tableMoney(negate ? -amount : amount, currency);
+}
+
+/** A ratio as a whole-number percent, e.g. `tablePercent(250, 1000)` is
+ * `"25%"` -- a credit account's utilization against its limit. Empty (never
+ * `"0%"` or `"Infinity%"`) when there is nothing to divide by. */
+export function tablePercent(numerator: number, denominator: number): string {
+  if (denominator === 0) return "";
+  return `${Math.round((numerator / denominator) * 100)}%`;
+}
+
 /** Exact-decimal accounting money for authoritative values from the store. */
 export function tableAccountingMoney(value: string, currency = "USD"): string {
   const match = /^(-?)(\d+)(?:\.(\d+))?$/.exec(value);

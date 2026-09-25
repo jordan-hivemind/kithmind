@@ -17,6 +17,7 @@
 
 import {
   loadBalances,
+  loadBanking,
   loadCoverage,
   loadHealth,
   loadInstitutions,
@@ -33,6 +34,7 @@ const LOADERS = {
   coverage: loadCoverage,
   balances: loadBalances,
   medical: loadMedical,
+  banking: loadBanking,
 } as const;
 
 export async function GET(
