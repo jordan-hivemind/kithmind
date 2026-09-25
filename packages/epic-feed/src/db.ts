@@ -85,6 +85,40 @@ export type HealthSourceRow = {
   needsReauthAt: string | null;
 };
 
+export type HealthSourcePatientMatch = {
+  personId: string;
+  orgName: string;
+};
+
+/**
+ * Looks up whether some *other* person already has a `kith.health_sources`
+ * row for this exact FHIR base and patient id. `kith.health_sources` is
+ * only unique on `(person_id, fhir_base)`, not on `(fhir_base,
+ * patient_fhir_id)`, so nothing at the database level stops the same Epic
+ * patient from being linked to two different person entities -- which is
+ * exactly what happens if the operator picks the wrong family member in
+ * MyChart's proxy picker during `authorize`. `excludePersonId` is the person
+ * being authorized right now, so re-authorizing the same person for the same
+ * patient (a normal refresh/re-link) is never reported as a collision.
+ * Returns the colliding row's `person_id` and `org_name`, or `null` when no
+ * other person is linked to this patient.
+ */
+export async function findHealthSourceByPatient(
+  pool: Pool,
+  fhirBase: string,
+  patientFhirId: string,
+  excludePersonId: string,
+): Promise<HealthSourcePatientMatch | null> {
+  const { rows } = await pool.query<{ person_id: string; org_name: string }>(
+    `SELECT person_id, org_name
+       FROM kith.health_sources
+      WHERE fhir_base = $1 AND patient_fhir_id = $2 AND person_id <> $3`,
+    [fhirBase, patientFhirId, excludePersonId],
+  );
+  if (rows.length === 0) return null;
+  return { personId: rows[0]!.person_id, orgName: rows[0]!.org_name };
+}
+
 export async function listHealthSources(pool: Pool): Promise<HealthSourceRow[]> {
   const { rows } = await pool.query<{
     id: string;

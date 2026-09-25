@@ -357,6 +357,7 @@ is no household-wide authorization.
 | `invalid_client` at the token exchange | Either the secret is not stored or hashed correctly, or this organization has not yet distributed the client ID (production activation can take up to a day). Run `check --org "<name>"` (step 25) for a precise diagnosis without guessing. |
 | `refresh token: absent` after `authorize` | Step 6's **Requires Persistent Access** was not checked at app registration. This cannot be fixed by re-saving the existing app -- Epic locks a production app's configuration, so register a new app with that box checked and repeat registration. |
 | An `Observation` search returns nothing, or `Specimen` always fails | Expected: Epic requires a `category` parameter for `Observation` searches (handled -- `pull` searches once per registered category), and Epic does not support `Specimen` for patient-facing access (handled -- treated as unsupported, not a resource error). |
+| `authorize` refuses with "already linked to another person" | The proxy picker in MyChart's sign-in flow selected the wrong family member -- Epic's own picker, not something this package renders. Nothing was written (no Keychain item, no `kith.health_sources` row). Re-run `authorize --person <the intended family member>` and pick that family member in MyChart's proxy picker this time. |
 
 ## Optional: statement history beyond two years
 

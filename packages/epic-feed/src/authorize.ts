@@ -19,7 +19,7 @@ import {
   tokenKeychainService,
   type EpicEnv,
 } from "./config.js";
-import { resolvePerson, upsertHealthSource } from "./db.js";
+import { findHealthSourceByPatient, resolvePerson, upsertHealthSource } from "./db.js";
 import { resolveOrgForEnv } from "./endpoints.js";
 import {
   buildAuthorizationUrl,
@@ -144,6 +144,26 @@ export async function runAuthorize(
   );
   if (token.patientFhirId === null) {
     throw new Error("Epic's token response had no patient id (launch/patient scope)");
+  }
+
+  // Guard against the operator picking the wrong family member in MyChart's
+  // proxy picker: if some other person entity is already linked to this
+  // exact patient at this org, refuse before anything is written -- the
+  // token store and `kith.health_sources` are untouched below this point.
+  // Re-authorizing the same person for the same patient (a normal refresh
+  // or re-link) is unaffected.
+  const collision = await findHealthSourceByPatient(
+    pool,
+    fhirBase,
+    token.patientFhirId,
+    person.id,
+  );
+  if (collision !== null) {
+    throw new Error(
+      `The patient picked for "${args.personSelector}" at ${orgName} is already linked to ` +
+        `another person in Kith Mind. Re-run "authorize" and choose the intended family ` +
+        `member in MyChart's proxy picker.`,
+    );
   }
 
   report(
