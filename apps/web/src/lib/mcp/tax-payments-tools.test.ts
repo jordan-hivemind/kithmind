@@ -59,7 +59,7 @@ describe("MCP tax payment tools", () => {
 
   test("advertises the additive release and forwards exact year reads", async () => {
     await withClient(async (client) => {
-      expect(client.getServerVersion()?.version).toBe("1.5.0");
+      expect(client.getServerVersion()?.version).toBe("1.5.1");
       const result = await client.callTool({
         name: "list_tax_payments",
         arguments: { spaceIds: ["space-a"], taxYear: 2026 },
