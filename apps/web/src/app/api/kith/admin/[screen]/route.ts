@@ -22,8 +22,14 @@ import {
   loadHealth,
   loadInstitutions,
   loadMedical,
+  loadTaxes,
 } from "@/lib/kith/admin-data";
-import { guardedRequest, mutationFailure, noStoreJson, problem } from "@/lib/kith/api-route";
+import {
+  guardedRequest,
+  mutationFailure,
+  noStoreJson,
+  problem,
+} from "@/lib/kith/api-route";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -35,6 +41,7 @@ const LOADERS = {
   balances: loadBalances,
   medical: loadMedical,
   banking: loadBanking,
+  taxes: loadTaxes,
 } as const;
 
 export async function GET(
@@ -54,7 +61,8 @@ export async function GET(
     // also read the finance archive, which is a second pool and must not be
     // reached with a kith connection held open across it.
     const data = await load(request.headers.get("cookie"));
-    if (data === null) return problem(401, "Not authenticated", "not_authenticated");
+    if (data === null)
+      return problem(401, "Not authenticated", "not_authenticated");
     return noStoreJson(data);
   } catch (error) {
     return mutationFailure(error);

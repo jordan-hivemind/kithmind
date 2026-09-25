@@ -331,6 +331,13 @@ export async function loadCoverage(
       // Owner-global like `health` above: `kith.fin_accounts`/
       // `fin_transactions` carry no space to narrow this to either.
       banking: await admin.bankingContribution(ctx),
+      // Space-scoped, unlike `health` above: `kith.documents`/`tax_payments`
+      // carry `space_id`, so this needs the caller's administered spaces the
+      // same way `listAreaCoverage` resolves them for itself.
+      tax: await admin.taxContribution(
+        ctx,
+        await administeredSpaces(ctx, principal),
+      ),
       principal,
       spaces: await administeredSpaces(ctx, principal),
     }),
@@ -338,15 +345,20 @@ export async function loadCoverage(
   if (loaded === null) return null;
   const inventory = await archiveInventory(loaded.principal, loaded.spaces);
   return {
-    areas: admin.mergeBankingIntoAreas(
-      admin.mergeHealthIntoAreas(
-        admin.mergeFinanceIntoAreas(
-          loaded.areas,
-          inventory.state === "read" ? financeContribution(inventory.records) : null,
+    areas: admin.mergeTaxIntoAreas(
+      admin.mergeBankingIntoAreas(
+        admin.mergeHealthIntoAreas(
+          admin.mergeFinanceIntoAreas(
+            loaded.areas,
+            inventory.state === "read"
+              ? financeContribution(inventory.records)
+              : null,
+          ),
+          loaded.health,
         ),
-        loaded.health,
+        loaded.banking,
       ),
-      loaded.banking,
+      loaded.tax,
     ),
     truncated: inventory.state === "read" && inventory.truncated,
   };
@@ -375,13 +387,18 @@ export async function loadCoverage(
 const BANKING_ARCHIVE_TYPES = new Set(["bank", "mortgage", "credit line"]);
 
 function normalizeArchiveType(value: string | undefined): string {
-  return (value ?? "").trim().toLowerCase().replace(/[_\s]+/g, " ");
+  return (value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_\s]+/g, " ");
 }
 
 function isBankingArchiveAccount(
   record: FinanceAccountInventoryRecord,
 ): boolean {
-  return BANKING_ARCHIVE_TYPES.has(normalizeArchiveType(record.account.accountType));
+  return BANKING_ARCHIVE_TYPES.has(
+    normalizeArchiveType(record.account.accountType),
+  );
 }
 
 /** The archive's accounts, statements and records as one area's contribution.
@@ -613,4 +630,29 @@ export async function loadBankingAccountDetail(
     ]);
     return { transactions: items, balanceHistory };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Screen: Taxes (tax_return/k1/tax_support documents, tax payments)
+// ---------------------------------------------------------------------------
+//
+// Space-scoped, unlike `loadMedical` above: `kith.documents` and
+// `kith.tax_payments` both carry `space_id`, so `admin.listTaxOverview`
+// narrows to the caller's administered spaces the same way
+// `admin.listAreaCoverage` does for itself -- see that function's own
+// `getAdminSpaceIds` call.
+
+export type TaxesPageData = { overview: admin.TaxOverview };
+
+export async function loadTaxes(
+  cookieHeader: string | null,
+): Promise<TaxesPageData | null> {
+  const loaded = await loadAuthenticatedPage(
+    cookieHeader,
+    async ({ ctx, principal }) => ({
+      overview: await admin.listTaxOverview(ctx, { principal }),
+    }),
+  );
+  if (loaded === null) return null;
+  return loaded;
 }

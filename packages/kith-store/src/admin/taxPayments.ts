@@ -746,3 +746,67 @@ export async function listTaxPayments(
     })),
   };
 }
+
+const ALL_PAYMENTS_LIMIT = 5_000;
+
+/**
+ * Every tax payment in scope, across every tax year -- for the Taxes
+ * screen's payments table (TAXES-1), which is not narrowed to one year the
+ * way `listTaxPayments` is. Newest tax year first, same status history shape.
+ */
+export async function listAllTaxPayments(
+  ctx: IdentityCtx,
+  spaceIds: readonly string[],
+): Promise<TaxPayment[]> {
+  const predicate = spacePredicate(spaceIds, 1, "p.space_id");
+  const payments = await rows<PaymentDbRow>(
+    ctx,
+    `SELECT ${PAYMENT_COLUMNS}
+       FROM kith.tax_payments p
+       JOIN kith.entities e ON e.id = p.payer_entity_id AND e.space_id = p.space_id
+       LEFT JOIN kith.evidence_spans es
+         ON es.id = p.evidence_span_id AND es.space_id = p.space_id
+       LEFT JOIN kith.source_revisions sr
+         ON sr.id = es.source_revision_id AND sr.space_id = es.space_id
+      WHERE ${predicate.sql}
+      ORDER BY p.tax_year DESC, p.submitted_on, p.id
+      LIMIT $2`,
+    [predicate.value, ALL_PAYMENTS_LIMIT + 1],
+  );
+  if (payments.length > ALL_PAYMENTS_LIMIT) {
+    typedError("tax_payment_limit", "Too many tax payments to list");
+  }
+  const paymentIds = payments.map((payment) => payment.id);
+  const statusRows =
+    paymentIds.length === 0
+      ? []
+      : await rows<StatusDbRow>(
+          ctx,
+          `SELECT s.id, s.payment_id, s.status, s.effective_on,
+                  s.is_correction, s.reason, s.evidence_span_id,
+                  sr.source_item_id AS evidence_source_item_id,
+                  s.actor_user_id, s.created_at
+             FROM kith.tax_payment_status_events s
+             LEFT JOIN kith.evidence_spans es
+               ON es.id = s.evidence_span_id AND es.space_id = s.space_id
+             LEFT JOIN kith.source_revisions sr
+               ON sr.id = es.source_revision_id AND sr.space_id = es.space_id
+            WHERE s.space_id = ANY($1::text[]) AND s.payment_id = ANY($2::text[])
+            ORDER BY s.payment_id, s.created_at, s.id
+            LIMIT $3`,
+          [predicate.value, paymentIds, STATUS_EVENT_LIMIT + 1],
+        );
+  if (statusRows.length > STATUS_EVENT_LIMIT) {
+    typedError("tax_payment_history_limit", "Tax payment history is too large");
+  }
+  const history = new Map<string, TaxPaymentStatusEvent[]>();
+  for (const event of statusRows) {
+    const values = history.get(event.payment_id) ?? [];
+    values.push(statusFromRow(event));
+    history.set(event.payment_id, values);
+  }
+  return payments.map((payment) => ({
+    ...paymentFromRow(payment),
+    statusHistory: history.get(payment.id) ?? [],
+  }));
+}

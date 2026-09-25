@@ -26,7 +26,7 @@ const DATA_TYPES: readonly {
     label: "Banking & Cards",
     href: "/admin/banking",
   },
-  { area: "taxes", label: "Taxes" },
+  { area: "taxes", label: "Taxes", href: "/admin/taxes" },
   { area: "medical", label: "Medical", href: "/admin/medical" },
   { area: "vehicles", label: "Vehicles" },
   { area: "home and projects", label: "Home & Projects" },

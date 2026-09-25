@@ -271,7 +271,8 @@ export async function listAreaCoverage(
     const row = byArea.get(normalizeArea(record.area));
     if (row === undefined) continue;
     const reason = record.reason ?? "unspecified";
-    row.gapReasons[reason] = (row.gapReasons[reason] ?? 0) + Number(record.count);
+    row.gapReasons[reason] =
+      (row.gapReasons[reason] ?? 0) + Number(record.count);
   }
 
   const scalar = scalars[0];
@@ -452,6 +453,78 @@ export async function bankingContribution(
   return {
     sources: Number(row?.sources ?? "0"),
     documents: 0,
+    records: Number(row?.records ?? "0"),
+    from: row?.from_date ?? null,
+    to: row?.to_date ?? null,
+  };
+}
+
+/** The area the Taxes screen's own inventory is added to by the caller. */
+export const TAX_AREA = "taxes";
+
+/**
+ * Folds the Taxes screen's own inventory into the `taxes` row, the same way
+ * `mergeHealthIntoAreas` folds the Epic feed's into `medical`.
+ */
+export function mergeTaxIntoAreas(
+  areas: readonly AreaCoverageRow[],
+  contribution: AreaContribution | null,
+): AreaCoverageRow[] {
+  return mergeContributionIntoArea(areas, TAX_AREA, contribution);
+}
+
+type TaxContributionDbRow = {
+  documents: string;
+  records: string;
+  from_date: string | null;
+  to_date: string | null;
+};
+
+/**
+ * The Taxes screen's own inventory (`kith.documents` restricted to
+ * `tax_return`/`k1`/`tax_support`, and `kith.tax_payments`; see
+ * `taxes.ts`'s `listTaxOverview`), for `mergeTaxIntoAreas` to fold into the
+ * `taxes` row.
+ *
+ * Unlike `healthContribution`, both tables carry `space_id`, so this reads
+ * space-scoped from the caller's already-resolved space ids rather than
+ * owner-global. `documents` counts only `publication_state = 'active'`: a
+ * `historical` row is a superseded revision of a document already counted,
+ * the same reason `listAreaCoverage`'s own document counts come from
+ * `source_items` rather than every revision ever parsed.
+ */
+export async function taxContribution(
+  ctx: IdentityCtx,
+  spaceIds: readonly string[],
+): Promise<AreaContribution> {
+  if (spaceIds.length === 0) {
+    return { sources: 0, documents: 0, records: 0, from: null, to: null };
+  }
+  const inSpaces = (alias: string) => spacePredicate(spaceIds, 1, alias).sql;
+  const spaceIdsValue = spacePredicate(spaceIds, 1).value;
+  const found = await rows<TaxContributionDbRow>(
+    ctx,
+    `SELECT
+       (SELECT count(*) FROM kith.documents d
+         WHERE ${inSpaces("d.space_id")}
+           AND d.doc_type IN ('tax_return', 'k1', 'tax_support')
+           AND d.publication_state = 'active')::text AS documents,
+       (SELECT count(*) FROM kith.tax_payments p
+         WHERE ${inSpaces("p.space_id")})::text AS records,
+       (SELECT min(d.captured_at) FROM kith.documents d
+         WHERE ${inSpaces("d.space_id")}
+           AND d.doc_type IN ('tax_return', 'k1', 'tax_support')
+           AND d.publication_state = 'active')::date::text AS from_date,
+       (SELECT max(d.captured_at) FROM kith.documents d
+         WHERE ${inSpaces("d.space_id")}
+           AND d.doc_type IN ('tax_return', 'k1', 'tax_support')
+           AND d.publication_state = 'active')::date::text AS to_date`,
+    [spaceIdsValue],
+  );
+  const row = found[0];
+  return {
+    sources: 0,
+    documents: Number(row?.documents ?? "0"),
     records: Number(row?.records ?? "0"),
     from: row?.from_date ?? null,
     to: row?.to_date ?? null,

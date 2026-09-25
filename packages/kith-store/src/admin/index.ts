@@ -21,4 +21,5 @@ export * from "./linkScoring.js";
 export * from "./medicalRecords.js";
 export * from "./model.js";
 export * from "./status.js";
+export * from "./taxes.js";
 export * from "./taxPayments.js";
