@@ -131,6 +131,18 @@ kith-epic-feed authorize --person <kith_id-or-name> [--org "<health system name>
 Nothing here ever prints a secret, a token, or patient data -- only the
 authorization URL (a public value) and confirmation lines.
 
+`kith.health_sources` is only unique on `(person_id, fhir_base)`, not on
+`(fhir_base, patient_fhir_id)`, so nothing at the database level stops the
+operator from picking the wrong family member in MyChart's proxy picker and
+attaching one Epic patient's records to two different person entities.
+Between the token exchange and any write, `authorize` checks whether some
+*other* person entity already has a `kith.health_sources` row for this exact
+FHIR base and patient id; if so it throws before the Keychain token or the
+source row is written, naming the organization and the `--person` selector
+that was passed and asking the operator to re-run `authorize` and choose the
+intended family member in MyChart's proxy picker. Re-authorizing the *same*
+person for the same patient (a normal refresh or re-link) is unaffected.
+
 ## `pull`
 
 ```sh
@@ -260,8 +272,11 @@ PKCE, endpoint discovery, the token exchange/refresh, `invalid_grant`
 handling, the per-organization client secret lookup order, `orgSlug` and
 `tokenKeychainService` (`test/config.test.mjs`), authorizing the same
 person at two organizations into two distinct Keychain items and source
-rows, the Keychain item migration path (a pre-org-suffix `keychain_service`
-with and without an already-migrated item present), pulling with an access
+rows, the patient-collision guard (a different person already linked to the
+same patient at the same org is refused with neither the Keychain token nor
+the source row written; the same person re-authorizing the same patient
+still succeeds), the Keychain item migration path (a pre-org-suffix
+`keychain_service` with and without an already-migrated item present), pulling with an access
 token only (no refresh token, both the still-valid and the expired case),
 the endpoint directory lookup, paging with `next` links, every resource
 mapper, and `check`'s three diagnoses plus the no-secret-configured and

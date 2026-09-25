@@ -38,6 +38,10 @@ const PERSON_ROW = {
 function personPool() {
   return fakePool({
     "WHERE id = $1 AND kind = 'person'": { rows: [PERSON_ROW] },
+    // No other person is already linked to whatever patient this test
+    // exchanges a code for -- see the collision-guard tests near the
+    // bottom of this file for the case where this does find a row.
+    "WHERE fhir_base = $1 AND patient_fhir_id = $2 AND person_id <> $3": { rows: [] },
   });
 }
 
@@ -430,4 +434,114 @@ test("runAuthorize stores a distinct Keychain item and source row per organizati
   ]);
   const keychainParams = upserts.map((call) => call.params[6]).sort();
   assert.deepEqual(keychainParams, itemNames);
+});
+
+// Regression coverage for the collision guard: `kith.health_sources` is
+// only unique on (person_id, fhir_base), not on (fhir_base,
+// patient_fhir_id), so nothing at the database level stops the operator
+// from picking the wrong family member in MyChart's proxy picker and
+// attaching one patient's records to two different person entities. This
+// must be refused before either the Keychain token or the source row is
+// written.
+function collisionFetchImpl() {
+  return async (url) => {
+    if (url.includes("well-known/smart-configuration")) {
+      return jsonResponse(200, {
+        authorization_endpoint: "https://fhir.epic.com/oauth2/authorize",
+        token_endpoint: "https://fhir.epic.com/oauth2/token",
+      });
+    }
+    if (url.includes("/oauth2/token")) {
+      return jsonResponse(200, {
+        access_token: "access-1",
+        refresh_token: "refresh-1",
+        expires_in: 3600,
+        patient: "shared-patient-1",
+        scope: "openid patient/Patient.read",
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+}
+
+test("runAuthorize refuses to link a patient already linked to a different person", async () => {
+  const pool = fakePool({
+    "WHERE id = $1 AND kind = 'person'": { rows: [PERSON_ROW] },
+    "WHERE fhir_base = $1 AND patient_fhir_id = $2 AND person_id <> $3": {
+      rows: [{ person_id: "some-other-person-kith-id", org_name: "Epic Sandbox" }],
+    },
+  });
+  const tokenStore = inMemoryTokenStore();
+  const reports = [];
+
+  await assert.rejects(
+    () =>
+      runAuthorize(
+        { personSelector: "person-kith-id-1", sandbox: true },
+        {
+          pool,
+          fetchImpl: collisionFetchImpl(),
+          prompt: async () => "the-pasted-code",
+          tokenStore,
+          report: (line) => reports.push(line),
+          generateVerifier: () => "verifier-1",
+          generateStateValue: () => "state-1",
+          readClientSecret: noKeychainSecret,
+        },
+      ),
+    (error) => {
+      assert.match(error.message, /already linked to another person/);
+      // Names the org and the person selector the operator passed, per the
+      // task -- never a token or the raw patient id.
+      assert.match(error.message, /Epic Sandbox/);
+      assert.match(error.message, /person-kith-id-1/);
+      assert.match(error.message, /proxy picker/);
+      assert.doesNotMatch(error.message, /shared-patient-1/);
+      assert.doesNotMatch(error.message, /refresh-1/);
+      assert.doesNotMatch(error.message, /access-1/);
+      return true;
+    },
+  );
+
+  // Nothing was written: the collision check runs before the Keychain
+  // token store write and before `upsertHealthSource`.
+  assert.equal(tokenStore.items.size, 0);
+  assert.ok(
+    !pool.calls.some((call) => call.text.includes("INSERT INTO kith.health_sources")),
+  );
+});
+
+test("runAuthorize still succeeds when the same person re-authorizes the same patient", async () => {
+  const pool = fakePool({
+    "WHERE id = $1 AND kind = 'person'": { rows: [PERSON_ROW] },
+    // The only existing row for this (fhir_base, patient) pair belongs to
+    // the same person being authorized -- `person_id <> $3` excludes it, so
+    // the lookup below finds no collision and the flow proceeds as before.
+    "WHERE fhir_base = $1 AND patient_fhir_id = $2 AND person_id <> $3": { rows: [] },
+  });
+  const tokenStore = inMemoryTokenStore();
+  const reports = [];
+
+  const outcome = await runAuthorize(
+    { personSelector: "person-kith-id-1", sandbox: true },
+    {
+      pool,
+      fetchImpl: collisionFetchImpl(),
+      prompt: async () => "the-pasted-code",
+      tokenStore,
+      report: (line) => reports.push(line),
+      generateVerifier: () => "verifier-1",
+      generateStateValue: () => "state-1",
+      readClientSecret: noKeychainSecret,
+    },
+  );
+
+  assert.equal(outcome.status, "linked");
+  assert.equal(tokenStore.items.size, 1);
+  const insert = pool.calls.find((call) =>
+    call.text.includes("INSERT INTO kith.health_sources"),
+  );
+  assert.ok(insert);
+  assert.equal(insert.params[1], "person-kith-id-1");
+  assert.ok(reports.some((line) => line.includes("Linked Epic Sandbox")));
 });
