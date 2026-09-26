@@ -61,6 +61,7 @@ import {
   MATCHABLE_DOCUMENT_KINDS,
   matchableKind,
   normalizeMatchName,
+  organizationMatchKey,
   pathNamesFromUri,
 } from "./linkScoring.js";
 import type { InvestmentEntryType } from "./model.js";
@@ -639,13 +640,21 @@ function documentCouldMatch(
     | undefined,
 ): boolean {
   if (names.length > 0) {
+    // Exact names for the entry-level kinds, and `organizationMatchKey`s for
+    // the investment-level ones ("Acme Robotics, Inc." naming "Acme
+    // Robotics"). Checking both over-answers, which is the cheap direction.
+    const keys = new Set(names.map(organizationMatchKey).filter(Boolean));
     for (const name of pathNamesFromUri(document.uri)) {
       if (names.includes(name)) return true;
+      const key = organizationMatchKey(name);
+      if (key && keys.has(key)) return true;
     }
     for (const value of document.values) {
       if (value.type !== "text") continue;
       const normalized = normalizeMatchName(value.value);
       if (normalized && names.includes(normalized)) return true;
+      const key = organizationMatchKey(value.value);
+      if (key && keys.has(key)) return true;
     }
   }
   if (entry === undefined) return false;
