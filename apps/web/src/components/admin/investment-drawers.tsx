@@ -20,8 +20,14 @@
 // be typed but never saved, with the Save button simply staying dead.
 
 import type { admin } from "@repo/kith-store";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { Tag } from "@/components/ui/data-table";
+import {
+  type DocumentReference,
+  DocumentViewer,
+} from "@/components/ui/document-viewer";
 import {
   buttonClass,
   Drawer,
@@ -34,6 +40,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { commitmentEntry } from "@/lib/kith/investment-commitment";
 import {
   amountSchema,
   amountSchemaFor,
@@ -225,11 +232,17 @@ export function EntryDrawer({
               })
             }
           >
-            {Object.entries(ENTRY_TYPE_LABELS).map(([value, label]) => (
-              <option key={value} value={value}>
-                {label}
-              </option>
-            ))}
+            {Object.entries(ENTRY_TYPE_LABELS)
+              .filter(
+                // The commitment is edited on the investment itself.
+                ([value]) =>
+                  value !== "commitment" || initial.entryType === "commitment",
+              )
+              .map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
           </select>
         </Field>
 
@@ -394,6 +407,10 @@ export type InvestmentDraft = {
   signedOn: string;
   status: admin.InvestmentStatus;
   notes: string;
+  /** The base commitment's amount, in `commitmentCurrency`. Empty when none.
+   * A property of the investment on this screen; stored as its `commitment`
+   * entry (see `lib/kith/investment-commitment.ts`). */
+  commitment: string;
 };
 
 export function emptyInvestment(): InvestmentDraft {
@@ -403,10 +420,30 @@ export function emptyInvestment(): InvestmentDraft {
     signedOn: "",
     status: "active",
     notes: "",
+    commitment: "",
   };
 }
 
 const CATEGORIES = ["Investment Fund", "Direct", "AngelList"] as const;
+
+type InvestmentDocument = Omit<admin.InvestmentDocument, "uri">;
+
+/** What the drawer read when it opened, passed back on save so the commitment
+ * write is decided against the entries the owner was looking at. */
+export type InvestmentDrawerContext = {
+  entries: admin.InvestmentEntry[];
+  commitmentCurrency: string;
+};
+
+const DOCUMENT_KIND_LABELS: Record<string, string> = {
+  investment_agreement: "Agreement",
+  capital_call_notice: "Capital call",
+  distribution_notice: "Distribution",
+  schedule_k1: "K-1",
+  capital_account_statement: "Statement",
+  wire_confirmation: "Wire",
+  letter_or_notice: "Letter",
+};
 
 export function InvestmentDrawer({
   open,
@@ -419,26 +456,165 @@ export function InvestmentDrawer({
   onOpenChange: (open: boolean) => void;
   initial: InvestmentDraft;
   editingId: string | null;
-  onSave: (draft: InvestmentDraft) => Promise<void>;
+  onSave: (
+    draft: InvestmentDraft,
+    context: InvestmentDrawerContext,
+  ) => Promise<void>;
 }) {
   const [draft, setDraft] = useState<InvestmentDraft>(initial);
+  // The draft the owner started from, once the entries have said what the
+  // commitment is. `dirty` compares against this, not against `initial`,
+  // so the commitment arriving is not mistaken for an edit.
+  const [baseline, setBaseline] = useState<InvestmentDraft>(initial);
+  const [context, setContext] = useState<InvestmentDrawerContext>({
+    entries: [],
+    commitmentCurrency: "USD",
+  });
+  const [loaded, setLoaded] = useState(editingId === null);
+  const [documents, setDocuments] = useState<InvestmentDocument[] | null>(null);
+  const [uploads, setUploads] = useState<
+    { name: string; state: "uploading" | "added" | "failed"; error?: string }[]
+  >([]);
+  const [viewing, setViewing] = useState<DocumentReference | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const loadDocuments = useCallback(async () => {
+    if (editingId === null) return;
+    const response = await fetch(
+      `/api/kith/investments/${editingId}/documents`,
+      { cache: "no-store" },
+    );
+    if (!response.ok) return;
+    setDocuments(
+      ((await response.json()) as { documents: InvestmentDocument[] })
+        .documents,
+    );
+  }, [editingId]);
+
   useEffect(() => {
-    if (open) setDraft(initial);
-  }, [open, initial]);
+    if (!open) return;
+    setDraft(initial);
+    setBaseline(initial);
+    setUploads([]);
+    setDocuments(null);
+    if (editingId === null) {
+      setContext({ entries: [], commitmentCurrency: "USD" });
+      setLoaded(true);
+      return;
+    }
+    setLoaded(false);
+    const controller = new AbortController();
+    void fetch(`/api/kith/investments/${editingId}/entries`, {
+      cache: "no-store",
+      signal: controller.signal,
+    })
+      .then((response) =>
+        response.ok
+          ? (response.json() as Promise<{ entries: admin.InvestmentEntry[] }>)
+          : Promise.reject(new Error("entries fetch failed")),
+      )
+      .then(({ entries }) => {
+        const entry = commitmentEntry(entries);
+        const next = { ...initial, commitment: entry?.amount ?? "" };
+        setContext({ entries, commitmentCurrency: entry?.currency ?? "USD" });
+        setDraft(next);
+        setBaseline(next);
+        setLoaded(true);
+      })
+      .catch(() => undefined);
+    void loadDocuments();
+    return () => controller.abort();
+  }, [open, initial, editingId, loadDocuments]);
+
+  const commitmentEditable =
+    loaded &&
+    context.entries.filter((entry) => entry.entryType === "commitment")
+      .length <= 1;
+  const commitmentValid =
+    draft.commitment.trim() === "" ||
+    amountSchema.safeParse(draft.commitment.trim()).success;
+  const valid = draft.name.trim() !== "" && loaded && commitmentValid;
+
+  const act = async (linkId: string, action: "confirm" | "remove") => {
+    if (editingId === null) return;
+    setDocuments((current) =>
+      action === "remove"
+        ? (current ?? []).filter((document) => document.linkId !== linkId)
+        : (current ?? []).map((document) =>
+            document.linkId === linkId
+              ? { ...document, state: "confirmed" }
+              : document,
+          ),
+    );
+    await fetch(`/api/kith/investments/${editingId}/documents`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ linkId, action }),
+    }).catch(() => undefined);
+    await loadDocuments();
+  };
+
+  const upload = async (files: FileList | null) => {
+    if (editingId === null || files === null) return;
+    for (const file of Array.from(files)) {
+      setUploads((current) => [
+        ...current,
+        { name: file.name, state: "uploading" },
+      ]);
+      const finish = (state: "added" | "failed", error?: string) =>
+        setUploads((current) =>
+          current.map((item) =>
+            item.name === file.name && item.state === "uploading"
+              ? { name: item.name, state, ...(error ? { error } : {}) }
+              : item,
+          ),
+        );
+      try {
+        const response = await fetch(
+          `/api/kith/investments/${editingId}/documents`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ filename: file.name }),
+          },
+        );
+        const body = (await response.json().catch(() => ({}))) as {
+          uploadUrl?: string;
+          error?: string;
+        };
+        if (!response.ok || !body.uploadUrl) {
+          finish("failed", body.error ?? "Upload failed");
+          continue;
+        }
+        const sent = await fetch(body.uploadUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: file,
+        });
+        finish(
+          sent.ok ? "added" : "failed",
+          sent.ok ? undefined : "Upload failed",
+        );
+      } catch {
+        finish("failed", "Upload failed");
+      }
+    }
+    if (fileRef.current) fileRef.current.value = "";
+  };
 
   return (
     <Drawer
       open={open}
       onOpenChange={onOpenChange}
       title={editingId === null ? "Add investment" : "Edit investment"}
-      dirty={JSON.stringify(draft) !== JSON.stringify(initial)}
+      dirty={JSON.stringify(draft) !== JSON.stringify(baseline)}
     >
       <form
         className="flex flex-col gap-3"
         onSubmit={(event) => {
           event.preventDefault();
-          if (draft.name.trim() === "") return;
-          void onSave(draft).then(() => onOpenChange(false));
+          if (!valid) return;
+          void onSave(draft, context).then(() => onOpenChange(false));
         }}
       >
         <Field label="Name">
@@ -475,6 +651,21 @@ export function InvestmentDrawer({
             }
           />
         </Field>
+        <Field label={`Commitment (${context.commitmentCurrency})`}>
+          <input
+            inputMode="decimal"
+            className={inputClass}
+            disabled={!commitmentEditable}
+            aria-invalid={!commitmentValid}
+            value={draft.commitment}
+            onChange={(event) =>
+              setDraft({
+                ...draft,
+                commitment: event.target.value.replace(/[,$\s]/g, ""),
+              })
+            }
+          />
+        </Field>
         <Field label="Status">
           <select
             className={inputClass}
@@ -500,6 +691,108 @@ export function InvestmentDrawer({
             }
           />
         </Field>
+
+        {editingId === null ? null : (
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center justify-between">
+              <span className="text-meta font-medium text-gray-700">
+                Documents
+              </span>
+              <button
+                type="button"
+                className={buttonClass}
+                onClick={() => fileRef.current?.click()}
+              >
+                Add document
+              </button>
+              <input
+                ref={fileRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={(event) => void upload(event.target.files)}
+              />
+            </div>
+            <ul className="flex flex-col divide-y divide-gray-100 rounded-control border border-gray-200">
+              {documents === null ? (
+                <li className="px-2 py-1.5 text-meta text-gray-400">Loading</li>
+              ) : documents.length === 0 && uploads.length === 0 ? (
+                <li className="px-2 py-1.5 text-meta text-gray-400">None</li>
+              ) : null}
+              {(documents ?? []).map((document) => (
+                <li
+                  key={document.linkId}
+                  className="flex items-center gap-2 px-2 py-1"
+                >
+                  <button
+                    type="button"
+                    className="min-w-0 flex-1 truncate text-left text-meta text-gray-900 hover:text-accent-700 hover:underline"
+                    onClick={() =>
+                      setViewing({
+                        sourceItemId: document.sourceItemId,
+                        title: document.title,
+                      })
+                    }
+                  >
+                    {document.title ?? "Untitled"}
+                  </button>
+                  {document.kind && DOCUMENT_KIND_LABELS[document.kind] ? (
+                    <Tag>{DOCUMENT_KIND_LABELS[document.kind]}</Tag>
+                  ) : null}
+                  {document.state === "suggested" ? (
+                    <button
+                      type="button"
+                      className="rounded-tag border border-accent-200 bg-accent-50 px-1.5 py-0.5 text-xs leading-none text-accent-700 hover:border-accent-400"
+                      onClick={() => void act(document.linkId, "confirm")}
+                    >
+                      Confirm
+                    </button>
+                  ) : null}
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        aria-label="Remove"
+                        className="rounded-control p-0.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
+                        onClick={() => void act(document.linkId, "remove")}
+                      >
+                        <X className="size-3.5" aria-hidden="true" />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>Not this investment</TooltipContent>
+                  </Tooltip>
+                </li>
+              ))}
+              {uploads.map((item, index) => (
+                <li
+                  key={`${item.name}:${index}`}
+                  className="flex items-center gap-2 px-2 py-1"
+                >
+                  <span className="min-w-0 flex-1 truncate text-meta text-gray-600">
+                    {item.name}
+                  </span>
+                  {item.state === "failed" ? (
+                    <Tag tone="warn" title={item.error}>
+                      failed
+                    </Tag>
+                  ) : (
+                    <Tag
+                      tone="accent"
+                      title={
+                        item.state === "added"
+                          ? "Saved to Dropbox. Listed here after the next hourly scan."
+                          : undefined
+                      }
+                    >
+                      {item.state === "added" ? "processing" : "uploading"}
+                    </Tag>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
         <div className="flex items-center justify-end gap-2 pt-1">
           <button
             type="button"
@@ -510,13 +803,20 @@ export function InvestmentDrawer({
           </button>
           <button
             type="submit"
-            disabled={draft.name.trim() === ""}
+            disabled={!valid}
             className={primaryButtonClass}
           >
             Save
           </button>
         </div>
       </form>
+      <DocumentViewer
+        document={viewing}
+        open={viewing !== null}
+        onOpenChange={(next) => {
+          if (!next) setViewing(null);
+        }}
+      />
     </Drawer>
   );
 }
