@@ -14,7 +14,9 @@ import {
   amountMatches,
   calendarDays,
   dateInWindow,
+  decideInvestmentLevelLinks,
   decideLinks,
+  isInvestmentLevelKind,
   LINK_AUTO_POINTS,
   LINK_SIGNAL_POINTS,
   LINK_SUGGEST_POINTS,
@@ -22,11 +24,13 @@ import {
   matchableKind,
   MATCHABLE_DOCUMENT_KINDS,
   normalizeMatchName,
+  organizationMatchKey,
   pathNamesFromUri,
   rateToleranceCents,
   RATE_TOLERANCE_FLOOR_CENTS,
   RATE_TOLERANCE_FRACTION,
   scoreCandidate,
+  scoreInvestmentLevel,
 } from "../dist/admin/index.js";
 import { normalizeEntityName } from "../dist/memory/index.js";
 
@@ -564,4 +568,136 @@ test("the same inputs in a different order produce the same decision", () => {
     forward.suggestions.map((item) => item.entryId),
     backward.suggestions.map((item) => item.entryId),
   );
+});
+
+// ---------------------------------------------------------------------------
+// Investment-level links (owner decision, 2026-09-26)
+// ---------------------------------------------------------------------------
+
+test("agreements, letters, K-1s and unclassified pages are investment-level kinds", () => {
+  for (const kind of [
+    "investment_agreement",
+    "letter_or_notice",
+    "other",
+    "schedule_k1",
+    "capital_account_statement",
+  ]) {
+    assert.equal(isInvestmentLevelKind(matchableKind(kind)), true, kind);
+  }
+  for (const kind of ["capital_call_notice", "wire_confirmation", "distribution_notice"]) {
+    assert.equal(isInvestmentLevelKind(matchableKind(kind)), false, kind);
+  }
+  assert.deepEqual(AGREEMENT.entryTypes, [], "no longer scored against commitments");
+});
+
+test("the organization key drops trailing legal-form words and nothing else", () => {
+  assert.equal(organizationMatchKey("Synthetic Robotics, Inc."), "synthetic robotics");
+  assert.equal(organizationMatchKey("Synthetic Fund II, L.P."), "synthetic fund ii");
+  assert.equal(organizationMatchKey("Synthetic Holdings LLC"), "synthetic holdings");
+  assert.equal(organizationMatchKey("Synthetic Co"), "synthetic");
+  assert.equal(organizationMatchKey("Co"), "co", "the last token always stays");
+  // Fund numbering and partnership words are identity, not form.
+  assert.notEqual(
+    organizationMatchKey("Synthetic Fund II"),
+    organizationMatchKey("Synthetic Fund III"),
+  );
+  assert.notEqual(
+    organizationMatchKey("Synthetic"),
+    organizationMatchKey("Synthetic Partners"),
+  );
+  assert.equal(organizationMatchKey(""), "");
+  assert.equal(organizationMatchKey(null), "");
+});
+
+function investmentLevel(id, names, statements, pathNames = []) {
+  return scoreInvestmentLevel({
+    statements,
+    investment: { id, normalizedNames: names, signedOn: null },
+    pathNames,
+  });
+}
+
+const ROBOTICS = ["investment0000000001", ["synthetic robotics"]];
+const ORCHARDS = ["investment0000000002", ["synthetic orchards"]];
+const COMPANY = statement("company", "organization", {
+  type: "text",
+  value: "Synthetic Robotics, Inc.",
+});
+
+function decideLevel(candidates, hasConfirmedInvestmentLink = false) {
+  return decideInvestmentLevelLinks({
+    candidates,
+    hasConfirmedInvestmentLink,
+    maxSuggestions: 10,
+  });
+}
+
+test("a unique party match is an investment-level auto-link citing its statement", () => {
+  const robotics = investmentLevel(...ROBOTICS, [COMPANY]);
+  const orchards = investmentLevel(...ORCHARDS, [COMPANY]);
+  assert.equal(robotics.fired.party, true);
+  assert.equal(robotics.entryId, null);
+  assert.deepEqual(robotics.evidence, [
+    { field: "company", observationKey: "company", evidenceSpanId: COMPANY.evidenceSpanId },
+  ]);
+  const decision = decideLevel([robotics, orchards]);
+  assert.equal(decision.autoLink?.investmentId, ROBOTICS[0]);
+  assert.deepEqual(decision.suggestions, []);
+});
+
+test("a unique path match cites the segment, with no invented span", () => {
+  const robotics = investmentLevel(...ROBOTICS, [], ["synthetic robotics", "scan"]);
+  assert.equal(robotics.reason, "path");
+  assert.deepEqual(robotics.evidence, [
+    { field: "source_path", pathSegment: "synthetic robotics" },
+  ]);
+  assert.equal(decideLevel([robotics]).autoLink?.investmentId, ROBOTICS[0]);
+});
+
+test("several matches, or a party and a folder that disagree, link nothing", () => {
+  const both = [
+    investmentLevel("investment0000000001", ["synthetic robotics"], [COMPANY]),
+    investmentLevel("investment0000000003", ["synthetic robotics llc"], [COMPANY]),
+  ];
+  const several = decideLevel(both);
+  assert.equal(several.autoLink, null);
+  assert.equal(several.noAutoLinkReason, "several_investments_match");
+  assert.equal(several.suggestions.length, 2);
+
+  const disagree = decideLevel([
+    investmentLevel(...ROBOTICS, [COMPANY], ["synthetic orchards"]),
+    investmentLevel(...ORCHARDS, [COMPANY], ["synthetic orchards"]),
+  ]);
+  assert.equal(disagree.autoLink, null);
+  assert.equal(disagree.noAutoLinkReason, "party_and_path_disagree");
+  assert.equal(disagree.suggestions.length, 2);
+
+  const twoFolders = decideLevel([
+    investmentLevel(...ROBOTICS, [], ["synthetic robotics", "synthetic orchards"]),
+    investmentLevel(...ORCHARDS, [], ["synthetic robotics", "synthetic orchards"]),
+  ]);
+  assert.equal(twoFolders.autoLink, null);
+  assert.equal(twoFolders.suggestions.length, 2);
+});
+
+test("a party match in its own folder still auto-links", () => {
+  const decision = decideLevel([
+    investmentLevel(...ROBOTICS, [COMPANY], ["synthetic robotics"]),
+    investmentLevel(...ORCHARDS, [COMPANY], ["synthetic robotics"]),
+  ]);
+  assert.equal(decision.autoLink?.investmentId, ROBOTICS[0]);
+  assert.equal(decision.autoLink?.reason, "party+path");
+});
+
+test("an owner-confirmed investment link stops further auto-links", () => {
+  const decision = decideLevel([investmentLevel(...ROBOTICS, [COMPANY])], true);
+  assert.equal(decision.autoLink, null);
+  assert.equal(decision.noAutoLinkReason, "investment_already_confirmed");
+  assert.equal(decision.suggestions.length, 1);
+});
+
+test("nothing fired is nothing written", () => {
+  const decision = decideLevel([investmentLevel(...ORCHARDS, [COMPANY])]);
+  assert.equal(decision.autoLink, null);
+  assert.deepEqual(decision.suggestions, []);
 });
