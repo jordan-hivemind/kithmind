@@ -596,3 +596,19 @@ candidate, and items opened against auto-closed.
 | 4 | When is a missing K-1 a problem? | Never an alert or queue item. A pull-only checklist, shown on request (section 4, "Missing K-1s: a checklist, not a detector") |
 | 5 | Immediate alerts at night? | No alert of any class sends outside the next local 08:00 window (section 5) |
 | 6 | Fund commitments? | The existing model already tracks a total commitment that calls count against; this design references it rather than adding a second one (section 3, "Commitments") |
+
+## 10. Investment-level matching (owner decision, 2026-09-26)
+
+The commitment is a property of the investment. Storage keeps the one
+`commitment` entry per investment. Agreements therefore link to the
+investment (`entry_id` null), not to the commitment entry.
+
+| Topic | Behavior |
+| --- | --- |
+| Kinds | `investment_agreement`, `letter_or_notice`, `other`, `schedule_k1` and `capital_account_statement` link at the investment level only. The three payment kinds keep the entry-level rules above unchanged. |
+| Party | An organization statement equal to the investment's name or an entity alias, compared after `normalizeMatchName` and after dropping trailing legal-form words ("Inc", "LLC", "L.P.") on both sides. |
+| Path | Failing a party match, a URI folder or file-name segment equal to the name or an alias. The link cites `{ "field": "source_path", "pathSegment": ... }`, with no span. |
+| Decision | Exactly one investment matches: `auto_linked`, `decided_by = 'rule'`. Several match, or the party names one investment while the folder names another: a `suggested` row for each, and no link. A suggestion opens no attention item. A rejected pair is never proposed again. |
+| Signed date | An investment-level live link to an agreement with a day-precision `date_signed` fills an empty `signed_on` with the earliest such day. A set `signed_on` is never overwritten. Rejecting the link does not restore NULL yet: `kith.corrections` does not admit `investment` targets without a migration. |
+| Commitment date | An estimated commitment entry date is not moved by an investment-level link. The estimated-date rule still acts only through an entry's primary link. |
+| Counts | `documentCount` counts distinct source items with a live link to the investment, entry- or investment-level. |

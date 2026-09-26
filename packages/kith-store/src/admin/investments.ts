@@ -152,12 +152,14 @@ export type InvestmentRow = {
   notes: string | null;
   archivedAt: number | null;
   entryCount: number;
-  /** Entries carrying a document. The screen's "documents" column. */
+  /** Distinct source items with a live (`auto_linked` or `confirmed`) link to
+   * this investment, entry- or investment-level, plus any entry citation no
+   * link accounts for. The screen's "documents" column. */
   documentCount: number;
-  /** The distinct documents those entries cite. */
+  /** The distinct current documents of those links and entry citations. */
   linkedDocumentIds: string[];
   /** Section 6(c): published documents whose title names this investment and
-   * that no entry links to. The number the owner should look at. */
+   * that neither an entry nor a live investment-level link cites. */
   unlinkedDocumentCount: number;
   totals: InvestmentTotals;
 };
@@ -381,14 +383,6 @@ const TOTALS_CTE = `
   in_usd AS (
     SELECT investment_id,
            count(*) AS entry_count,
-           count(document_id) AS document_count,
-           -- The linked documents, from the entries already scanned. Read
-           -- here rather than by loading every entry: a caller that wants the
-           -- ids should not have to pull the household's whole ledger to get
-           -- them.
-           coalesce(jsonb_agg(DISTINCT document_id)
-                      FILTER (WHERE document_id IS NOT NULL),
-                    '[]'::jsonb) AS linked_document_ids,
            coalesce(sum(usd_amount) FILTER (
              WHERE entry_type IN ('commitment', 'commitment_change')), 0) AS committed,
            coalesce(sum(usd_amount) FILTER (WHERE entry_type = 'capital_call_paid'), 0) AS sent,
@@ -399,8 +393,35 @@ const TOTALS_CTE = `
 
 const TOTALS_COLUMNS = `
   coalesce(u.entry_count, 0) AS entry_count,
-  coalesce(u.document_count, 0) AS document_count,
-  coalesce(u.linked_document_ids, '[]'::jsonb) AS linked_document_ids,
+  -- Documents are counted from the link table (migration 033), which holds
+  -- both entry-level links and investment-level ones (\`entry_id\` null: an
+  -- agreement, a K-1, a letter). Distinct SOURCE ITEMS, so one notice cited
+  -- by two entries is one document. An entry citation with no link behind it
+  -- (a pre-033 attachment \`syncEntryDocument\` could not adopt) still counts,
+  -- keyed by its source item or, when it has none, by the document itself.
+  (SELECT count(DISTINCT k.item_key) FROM (
+     SELECT l.source_item_id::text AS item_key
+       FROM kith.investment_document_links l
+      WHERE l.space_id = i.space_id AND l.investment_id = i.id
+        AND l.state IN ('auto_linked', 'confirmed')
+     UNION ALL
+     SELECT coalesce(d.source_item_id::text, 'document:' || e.document_id::text)
+       FROM kith.investment_entries e
+       LEFT JOIN kith.documents d
+         ON d.id = e.document_id AND d.space_id = e.space_id
+      WHERE e.space_id = i.space_id AND e.investment_id = i.id
+        AND e.document_id IS NOT NULL) k) AS document_count,
+  (SELECT coalesce(jsonb_agg(DISTINCT k.document_id), '[]'::jsonb) FROM (
+     SELECT l.document_id
+       FROM kith.investment_document_links l
+      WHERE l.space_id = i.space_id AND l.investment_id = i.id
+        AND l.state IN ('auto_linked', 'confirmed')
+        AND l.document_id IS NOT NULL
+     UNION ALL
+     SELECT e.document_id
+       FROM kith.investment_entries e
+      WHERE e.space_id = i.space_id AND e.investment_id = i.id
+        AND e.document_id IS NOT NULL) k) AS linked_document_ids,
   round(coalesce(u.committed, 0), 2)::text AS usd_committed,
   round(coalesce(u.sent, 0), 2)::text AS usd_sent,
   round(coalesce(u.fees, 0), 2)::text AS usd_fees,
@@ -426,7 +447,12 @@ const TOTALS_COLUMNS = `
       AND position(lower(i.name) in lower(d.title)) > 0
       AND NOT EXISTS (
         SELECT 1 FROM kith.investment_entries x
-         WHERE x.document_id = d.id AND x.space_id = d.space_id))
+         WHERE x.document_id = d.id AND x.space_id = d.space_id)
+      AND NOT EXISTS (
+        SELECT 1 FROM kith.investment_document_links l
+         WHERE l.space_id = d.space_id AND l.source_item_id = d.source_item_id
+           AND l.investment_id = i.id AND l.entry_id IS NULL
+           AND l.state IN ('auto_linked', 'confirmed')))
     AS unlinked_document_count`;
 
 type InvestmentDbRow = {

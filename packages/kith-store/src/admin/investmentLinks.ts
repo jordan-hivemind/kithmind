@@ -49,14 +49,22 @@ import {
   scheduleInvestmentLinksForEntry,
 } from "./investmentLinkWork.js";
 import {
+  calendarDays,
   dateInWindow,
+  decideInvestmentLevelLinks,
   decideLinks,
+  evidenceSpanIdOf,
+  isInvestmentLevelKind,
+  type LinkDecision,
   type LinkEvidence,
   type LinkSignalRecord,
   matchableKind,
   normalizeMatchName,
+  organizationMatchKey,
   pathNamesFromUri,
   scoreCandidate,
+  scoreInvestmentLevel,
+  SIGNED_ON_FIELD,
   type ScorableEntry,
   type ScorableStatement,
   type ScoredCandidate,
@@ -535,6 +543,10 @@ export type EvaluateLinksResult = {
     | "document_missing";
   kind: string | null;
   autoLinkedEntryId: string | null;
+  /** The investment an investment-level document was auto-linked to. */
+  autoLinkedInvestmentId: string | null;
+  /** Investments whose empty `signed_on` this pass filled from an agreement. */
+  signedOnFilled: string[];
   suggestedCount: number;
   /** Entries whose estimated date this pass replaced. */
   datesReplaced: string[];
@@ -570,6 +582,8 @@ export async function evaluateDocumentLinks(
     reason,
     kind,
     autoLinkedEntryId: null,
+    autoLinkedInvestmentId: null,
+    signedOnFilled: [],
     suggestedCount: 0,
     datesReplaced: [],
   });
@@ -628,11 +642,23 @@ export async function evaluateDocumentLinks(
     if (normalized) organizationNames.add(normalized);
   }
 
+  // Investment-level kinds compare `organizationMatchKey`s (legal-form words
+  // such as "Inc" dropped on both sides); the entry-level payment kinds keep
+  // their exact comparison unchanged.
+  const investmentLevel = isInvestmentLevelKind(kind);
+  const organizationKeys = new Set(
+    [...organizationNames].map(organizationMatchKey).filter(Boolean),
+  );
+  const pathKeys = new Set(pathNames.map(organizationMatchKey).filter(Boolean));
   const investments = await loadInvestmentNames(ctx, spaceId);
   const matched = investments.filter((investment) =>
-    investment.normalizedNames.some(
-      (name) => organizationNames.has(name) || pathNames.includes(name),
-    ),
+    investment.normalizedNames.some((name) => {
+      if (!investmentLevel) {
+        return organizationNames.has(name) || pathNames.includes(name);
+      }
+      const key = organizationMatchKey(name);
+      return key !== "" && (organizationKeys.has(key) || pathKeys.has(key));
+    }),
   );
 
   // Existing rows for this document: what has already been decided about it.
@@ -790,26 +816,34 @@ export async function evaluateDocumentLinks(
     );
   }
   // Investment-level candidates, for the kinds that have no entry to point at.
-  if (entryTypes.length === 0) {
+  // A settled pair is skipped here, which is what keeps a rejected pair from
+  // ever being proposed again.
+  if (investmentLevel) {
     for (const investment of matched) {
       if (settled.has(pairKey(investment.id, null))) continue;
       candidates.push(
-        scoreCandidate({
-          kind,
+        scoreInvestmentLevel({
           statements: extraction.statements,
           investment,
-          entry: null,
           pathNames,
         }),
       );
     }
   }
 
-  const decision = decideLinks({
-    kind,
-    candidates,
-    maxSuggestions: MAX_LINK_SUGGESTIONS,
-  });
+  const decision: LinkDecision = investmentLevel
+    ? decideInvestmentLevelLinks({
+        candidates,
+        hasConfirmedInvestmentLink: existing.some(
+          (link) => link.state === "confirmed" && link.entry_id === null,
+        ),
+        maxSuggestions: MAX_LINK_SUGGESTIONS,
+      })
+    : decideLinks({
+        kind,
+        candidates,
+        maxSuggestions: MAX_LINK_SUGGESTIONS,
+      });
 
   const written = new Map<string, { state: LinkState; candidate: ScoredCandidate }>();
   if (decision.autoLink) {
@@ -881,11 +915,42 @@ export async function evaluateDocumentLinks(
     await syncEntryDocument(ctx, spaceId, entryId);
   }
 
+  // An agreement live on an investment may date it. Every investment this
+  // document is live on is offered, including one the owner confirmed
+  // earlier: `fillSignedOnFromAgreements` itself refuses to touch a
+  // `signed_on` that is already set.
+  const signedOnFilled: string[] = [];
+  if (extraction.kind === "investment_agreement") {
+    const liveInvestments = new Set<string>();
+    for (const [, entry] of written) {
+      if (entry.state === "auto_linked" && entry.candidate.entryId === null) {
+        liveInvestments.add(entry.candidate.investmentId);
+      }
+    }
+    for (const link of existing) {
+      if (link.state === "confirmed" && link.entry_id === null) {
+        liveInvestments.add(link.investment_id);
+      }
+    }
+    for (const investmentId of [...liveInvestments].sort()) {
+      const filled = await fillSignedOnFromAgreements(ctx, {
+        spaceId,
+        investmentId,
+      });
+      if (filled !== null) signedOnFilled.push(investmentId);
+    }
+  }
+
   return {
     evaluated: !matchedNothing,
     reason: matchedNothing ? "no_investment_matched" : "scored",
     kind: extraction.kind,
     autoLinkedEntryId: decision.autoLink?.entryId ?? null,
+    autoLinkedInvestmentId:
+      decision.autoLink !== null && decision.autoLink.entryId === null
+        ? decision.autoLink.investmentId
+        : null,
+    signedOnFilled,
     suggestedCount: [...written.values()].filter(
       (entry) => entry.state === "suggested",
     ).length,
@@ -1043,7 +1108,7 @@ export async function syncEntryDocument(
   const primary = await primaryLink(ctx, spaceId, entryId);
   const documentId = primary?.document_id ?? null;
   const citedSpanId = Array.isArray(primary?.evidence)
-    ? ((primary.evidence as LinkEvidence[])[0]?.evidenceSpanId ?? null)
+    ? evidenceSpanIdOf((primary.evidence as LinkEvidence[])[0])
     : null;
   // Read before writing, so an UPDATE only happens when the mirror is
   // actually wrong. PostgreSQL fires an AFTER UPDATE trigger for every row it
@@ -1478,6 +1543,79 @@ async function refreshReplacedDate(
 }
 
 /**
+ * Fill an investment's EMPTY `signed_on` from the agreements linked to it.
+ *
+ * The date is the earliest day-precision `date_signed` stated by an
+ * `investment_agreement` holding a live (`auto_linked` or `confirmed`)
+ * investment-level link to this investment. The rules, each a guard against
+ * silent wrong data:
+ *
+ *   * `signed_on` must be NULL, and that is checked in the UPDATE's own
+ *     WHERE. A date the owner typed, imported, or that an earlier pass filled
+ *     is never overwritten.
+ *   * Only a DAY. A `year` or `month` precision value is never padded into a
+ *     day, the same rule the scorer applies to every window.
+ *   * Only an investment-level live link. A suggestion is not agreement, and
+ *     an entry-level link (confirmed against a commitment before 2026-09-26)
+ *     is about the entry.
+ *
+ * NOT REVERSIBLE YET. `kith.corrections.target_kind` does not admit
+ * `investment` (migration 033 widened it for `entry` only), so there is no
+ * provenance row to read a previous NULL back from, and rejecting the link
+ * afterwards leaves the filled date standing. The owner can clear or edit it
+ * like any other field. Recording it needs a migration and is follow-up work.
+ *
+ * Returns the date written, or null when nothing changed.
+ */
+export async function fillSignedOnFromAgreements(
+  ctx: IdentityCtx,
+  args: { spaceId: string; investmentId: string },
+): Promise<string | null> {
+  const investment = await row<{ signed_on: Date | string | null }>(
+    ctx,
+    `SELECT signed_on FROM kith.investments
+      WHERE id = $1 AND space_id = $2 AND archived_at IS NULL`,
+    [args.investmentId, args.spaceId],
+  );
+  if (!investment || investment.signed_on !== null) return null;
+  const live = await rows<{ source_item_id: string }>(
+    ctx,
+    `SELECT DISTINCT l.source_item_id
+       FROM kith.investment_document_links l
+       JOIN kith.document_extractions x
+         ON x.space_id = l.space_id AND x.source_item_id = l.source_item_id
+      WHERE l.space_id = $1 AND l.investment_id = $2 AND l.entry_id IS NULL
+        AND l.state IN ('auto_linked', 'confirmed')
+        AND x.kind = 'investment_agreement'
+      ORDER BY l.source_item_id
+      LIMIT $3`,
+    [args.spaceId, args.investmentId, MAX_LINK_CANDIDATES],
+  );
+  let earliest: string | null = null;
+  for (const link of live) {
+    const extraction = await readExtraction(ctx, args.spaceId, link.source_item_id);
+    if (!extraction || extraction.kind !== "investment_agreement") continue;
+    for (const statement of extraction.statements) {
+      if (statement.field !== SIGNED_ON_FIELD) continue;
+      const value = statement.value;
+      if (!value || value.type !== "date") continue;
+      if ((value.precision ?? "day") !== "day") continue;
+      if (calendarDays(value.value) === null) continue;
+      if (earliest === null || value.value < earliest) earliest = value.value;
+    }
+  }
+  if (earliest === null) return null;
+  const written = await row<{ id: string }>(
+    ctx,
+    `UPDATE kith.investments SET signed_on = $3::date
+      WHERE id = $1 AND space_id = $2 AND signed_on IS NULL
+      RETURNING id`,
+    [args.investmentId, args.spaceId, earliest],
+  );
+  return written ? earliest : null;
+}
+
+/**
  * Let go of every date claim on one entry, because the owner has just typed
  * a date of his own.
  *
@@ -1644,7 +1782,15 @@ export async function confirmInvestmentDocumentLink(
       WHERE id = $1 AND space_id = $2`,
     [link.id, link.space_id, args.principal.userId],
   );
-  if (link.entry_id === null) return { dateReplaced: false };
+  if (link.entry_id === null) {
+    // An agreement the owner confirms on an investment may date it, under
+    // the same rules as an auto-link: only an empty `signed_on`, only a day.
+    await fillSignedOnFromAgreements(ctx, {
+      spaceId: link.space_id,
+      investmentId: link.investment_id,
+    });
+    return { dateReplaced: false };
+  }
   await syncEntryDocument(ctx, link.space_id, link.entry_id);
   const dateReplaced = await replaceEstimatedDate(ctx, {
     spaceId: link.space_id,

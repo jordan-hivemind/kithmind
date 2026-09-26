@@ -1401,3 +1401,71 @@ test("the fan-out never scans past its own bound", { skip }, async (t) => {
     "a distribution notice is never about a capital call",
   );
 });
+
+test("letters and unclassified pages are jobs, and drain to investment-level links", { skip }, async (t) => {
+  const base = await fixture(t);
+  const investmentId = await createInvestment(base.ctx, {
+    principal: base.principal,
+    spaceId: base.spaceId,
+    name: FUND,
+  });
+  const letter = await seedDocument(base.ctx, base.spaceId, {
+    kind: "letter_or_notice",
+    uri: `fs://dropbox-investing/${FUND}/letter.pdf`,
+    statements: [org("sender", "Synthetic Administrator")],
+  });
+  const scan = await seedDocument(base.ctx, base.spaceId, {
+    kind: "other",
+    uri: `fs://dropbox-investing/${FUND}/scan.pdf`,
+    statements: [],
+  });
+  const agreement = await seedDocument(base.ctx, base.spaceId, {
+    kind: "investment_agreement",
+    statements: [org("company", `${FUND}, L.P.`), date("date_signed", "2025-02-03")],
+  });
+  for (const [document, kind] of [
+    [letter, "letter_or_notice"],
+    [scan, "other"],
+    [agreement, "investment_agreement"],
+  ]) {
+    const scheduled = await scheduleInvestmentLinkForExtraction(base.ctx, {
+      spaceId: base.spaceId,
+      sourceItemId: document.sourceItemId,
+      kind,
+    });
+    assert.notEqual(scheduled, null, `${kind} is a job`);
+  }
+  const summary = await run(base);
+  assert.equal(summary.completed, 3);
+  const links = await listInvestmentDocumentLinks(base.ctx, [base.spaceId], {});
+  assert.equal(links.length, 3);
+  for (const link of links) {
+    assert.equal(link.state, "auto_linked");
+    assert.equal(link.entryId, null);
+    assert.equal(link.investmentId, investmentId);
+  }
+
+  // The backfill selects these kinds too, and `--kind` still narrows it.
+  const all = await withKithTransaction(base.pool, (client) =>
+    scheduleInvestmentLinkBackfill(deferredCtx(client, NOW + 1_000), {
+      spaceId: base.spaceId,
+    }),
+  );
+  assert.equal(all.considered, 3);
+  const letters = await withKithTransaction(base.pool, (client) =>
+    scheduleInvestmentLinkBackfill(deferredCtx(client, NOW + 2_000), {
+      spaceId: base.spaceId,
+      kind: "letter_or_notice",
+    }),
+  );
+  assert.equal(letters.considered, 1);
+
+  // A rename wakes the letter through the investment fan-out as well.
+  const woken = await withKithTransaction(base.pool, (client) =>
+    scheduleInvestmentLinksFor(deferredCtx(client, NOW + 3_000), {
+      spaceId: base.spaceId,
+      investmentId,
+    }),
+  );
+  assert.equal(woken.linked, 3);
+});

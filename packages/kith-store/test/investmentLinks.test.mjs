@@ -33,6 +33,7 @@ import {
   getInvestment,
   listInvestmentDocumentLinks,
   listInvestmentEntries,
+  listInvestments,
   rejectInvestmentDocumentLink,
   syncEntryDocument,
   updateInvestmentEntry,
@@ -848,8 +849,10 @@ test("a document comes off an entry only through an explicit reject", { skip }, 
 // Slice 1b: the date replacement rule
 // ---------------------------------------------------------------------------
 
-/** An imported commitment with an estimated date, and the agreement that
- * states the real one. */
+/** A paid call with an estimated date, and a notice that states the real one.
+ * No amount on the notice, so it is a suggestion (party + date) the owner
+ * confirms. Agreements linked commitments here before 2026-09-26; they now link
+ * at the investment level, so the entry date rule is exercised by a notice. */
 async function estimatedDateFixture(t, overrides = {}) {
   const base = await fixture(t);
   const investmentId = await createInvestment(base.ctx, {
@@ -860,19 +863,18 @@ async function estimatedDateFixture(t, overrides = {}) {
   const entry = await createInvestmentEntry(base.ctx, {
     principal: base.principal,
     investmentId,
-    entryType: "commitment",
-    // Dated at the first payment, because the sheet had no signing date.
+    entryType: "capital_call_paid",
+    // An estimated payment date: the sheet did not say which day it went.
     entryDate: "2026-03-10",
-    amount: "250000.00",
+    amount: "25000.00",
     dateIsEstimated: overrides.dateIsEstimated ?? true,
     note: "date estimated from first payment",
   });
   const document = await seedDocument(base.ctx, base.spaceId, {
-    kind: "investment_agreement",
+    kind: "capital_call_notice",
     statements: overrides.statements ?? [
-      org("company", "Synthetic Growth Partners III"),
-      money("amount_committed", "250000.00"),
-      date("date_signed", "2026-01-15"),
+      org("fund", "Synthetic Growth Partners III"),
+      date("due_date", "2026-02-20"),
     ],
   });
   return { ...base, investmentId, entryId: entry.id, document };
@@ -899,8 +901,8 @@ async function dateCorrections(base) {
 
 test("an estimated date is replaced by the document's, once, with its provenance", { skip }, async (t) => {
   const base = await estimatedDateFixture(t);
-  // An agreement is never auto-linked, so the owner confirms it: that is the
-  // second half of "the link is confirmed or auto_linked".
+  // Party and date without an amount is a suggestion, so the owner confirms
+  // it: that is the second half of "the link is confirmed or auto_linked".
   await evaluateDocumentLinks(base.ctx, {
     spaceId: base.spaceId,
     sourceItemId: base.document.sourceItemId,
@@ -915,7 +917,7 @@ test("an estimated date is replaced by the document's, once, with its provenance
   });
   assert.equal(confirmed.dateReplaced, true);
   const entry = await entryRow(base);
-  assert.equal(entry.entryDate, "2026-01-15");
+  assert.equal(entry.entryDate, "2026-02-20");
   assert.equal(entry.dateIsEstimated, false);
 
   const rows = await dateCorrections(base);
@@ -924,10 +926,10 @@ test("an estimated date is replaced by the document's, once, with its provenance
   assert.equal(rows[0].target_id, base.entryId);
   assert.equal(rows[0].field_name, "entry_date");
   assert.equal(rows[0].original_value, "2026-03-10");
-  assert.equal(rows[0].corrected_value, "2026-01-15");
+  assert.equal(rows[0].corrected_value, "2026-02-20");
   assert.equal(rows[0].state, "resolved");
   // The cited observation and its span, so the change traces back to a line.
-  assert.match(rows[0].reason, /date_signed/);
+  assert.match(rows[0].reason, /due_date/);
   const stored = (await linksFor(base, {}))[0];
   assert.equal(typeof stored.dateCorrectionId, "string");
   await consistent(base.ctx);
@@ -979,9 +981,8 @@ test("a date the owner stated is never replaced", { skip }, async (t) => {
 test("a month-precision document date never replaces an estimate", { skip }, async (t) => {
   const base = await estimatedDateFixture(t, {
     statements: [
-      org("company", "Synthetic Growth Partners III"),
-      money("amount_committed", "250000.00"),
-      date("date_signed", "2026-01", "month"),
+      org("fund", "Synthetic Growth Partners III"),
+      date("due_date", "2026-02", "month"),
     ],
   });
   await evaluateDocumentLinks(base.ctx, {
@@ -1007,9 +1008,8 @@ test("a month-precision document date never replaces an estimate", { skip }, asy
 test("a document that agrees with the estimate clears the marker and records nothing", { skip }, async (t) => {
   const base = await estimatedDateFixture(t, {
     statements: [
-      org("company", "Synthetic Growth Partners III"),
-      money("amount_committed", "250000.00"),
-      date("date_signed", "2026-03-10"),
+      org("fund", "Synthetic Growth Partners III"),
+      date("due_date", "2026-03-10"),
     ],
   });
   await evaluateDocumentLinks(base.ctx, {
@@ -1039,7 +1039,7 @@ test("rejecting a link puts the date it moved back, and re-marks it estimated", 
     principal: base.principal,
     linkId: link.id,
   });
-  assert.equal((await entryRow(base)).entryDate, "2026-01-15");
+  assert.equal((await entryRow(base)).entryDate, "2026-02-20");
 
   const rejected = await rejectInvestmentDocumentLink(base.ctx, {
     principal: base.principal,
@@ -1052,7 +1052,7 @@ test("rejecting a link puts the date it moved back, and re-marks it estimated", 
   assert.equal(entry.documentId, null);
   const rows = await dateCorrections(base);
   assert.equal(rows.length, 2, "the reversal is recorded as clearly as the move");
-  assert.equal(rows[1].original_value, "2026-01-15");
+  assert.equal(rows[1].original_value, "2026-02-20");
   assert.equal(rows[1].corrected_value, "2026-03-10");
   assert.equal((await linksFor(base, {}))[0].dateCorrectionId, null);
   await consistent(base.ctx);
@@ -1201,7 +1201,10 @@ test("a K-1 links to the investment, not to a payment", { skip }, async (t) => {
   assert.equal(links.length, 1);
   assert.equal(links[0].entryId, null, "an investment-level link");
   assert.equal(links[0].investmentId, base.investmentId);
-  assert.equal(links[0].state, "suggested");
+  // The one investment the partnership names: auto-linked at the investment
+  // level (owner decision, 2026-09-26).
+  assert.equal(links[0].state, "auto_linked");
+  assert.equal(result.autoLinkedInvestmentId, base.investmentId);
   // The money on the page equals the entry's amount and is deliberately not
   // scored: a K-1 box figure is not a payment.
   assert.equal(links[0].score, 4);
@@ -1915,4 +1918,386 @@ test("deleting a correction under a link clears only the correction id", { skip 
   assert.equal(after.length, 1);
   assert.equal(after[0].dateCorrectionId, null);
   assert.equal(after[0].spaceId, base.spaceId);
+});
+
+// ---------------------------------------------------------------------------
+// Investment-level links (owner decision, 2026-09-26)
+// ---------------------------------------------------------------------------
+
+/** Named investments, each with the one commitment entry every investment
+ * carries. Synthetic names only. */
+async function investmentsFixture(t, names, options = {}) {
+  const base = await fixture(t);
+  const investments = {};
+  for (const name of names) {
+    const id = await createInvestment(base.ctx, {
+      principal: base.principal,
+      spaceId: base.spaceId,
+      name,
+      signedOn: options.signedOn?.[name] ?? null,
+    });
+    const commitment = await createInvestmentEntry(base.ctx, {
+      principal: base.principal,
+      investmentId: id,
+      entryType: "commitment",
+      entryDate: "2025-06-01",
+      amount: "50000.00",
+      dateIsEstimated: true,
+    });
+    investments[name] = { id, commitmentId: commitment.id };
+  }
+  return { ...base, investments };
+}
+
+async function evaluate(base, sourceItemId) {
+  return evaluateDocumentLinks(base.ctx, { spaceId: base.spaceId, sourceItemId });
+}
+
+async function signedOn(base, investmentId) {
+  const [row] = await listInvestments(base.ctx, [base.spaceId]).then((all) =>
+    all.filter((investment) => investment.id === investmentId),
+  );
+  return row.signedOn;
+}
+
+test("an agreement naming one investment auto-links to the investment, not its commitment", { skip }, async (t) => {
+  const base = await investmentsFixture(t, [
+    "Synthetic Robotics",
+    "Synthetic Orchards",
+  ]);
+  const robotics = base.investments["Synthetic Robotics"];
+  const agreement = await seedDocument(base.ctx, base.spaceId, {
+    kind: "investment_agreement",
+    uri: "fs://dropbox-investing/Complete_with_Docusign_Synthetic_SAFE.pdf",
+    statements: [
+      // The legal name carries a form word the investment's name does not.
+      org("company", "Synthetic Robotics, Inc."),
+      money("amount_committed", "50000.00"),
+      date("date_signed", "2025-05-20"),
+    ],
+  });
+  const result = await evaluate(base, agreement.sourceItemId);
+  assert.equal(result.autoLinkedInvestmentId, robotics.id);
+  assert.equal(result.autoLinkedEntryId, null);
+  const links = await linksFor(base, {});
+  assert.equal(links.length, 1, "no entry-level row against the commitment");
+  assert.equal(links[0].entryId, null);
+  assert.equal(links[0].investmentId, robotics.id);
+  assert.equal(links[0].state, "auto_linked");
+  assert.equal(links[0].decidedBy, "rule");
+  assert.equal(links[0].reason, "party");
+  assert.equal(links[0].evidence.length, 1);
+  assert.equal(links[0].evidence[0].field, "company");
+  assert.equal(typeof links[0].evidence[0].evidenceSpanId, "string");
+  // The commitment entry carries no document: the mirror is entry-level only.
+  const entries = await listInvestmentEntries(base.ctx, [base.spaceId], [robotics.id]);
+  assert.equal(entries[0].documentId, null);
+  // documentCount counts the investment-level link.
+  const all = await listInvestments(base.ctx, [base.spaceId]);
+  const counts = Object.fromEntries(all.map((row) => [row.id, row.documentCount]));
+  assert.equal(counts[robotics.id], 1);
+  assert.equal(counts[base.investments["Synthetic Orchards"].id], 0);
+  const row = all.find((investment) => investment.id === robotics.id);
+  assert.deepEqual(row.linkedDocumentIds, [agreement.documentId]);
+  await consistent(base.ctx);
+
+  // Idempotent: a second pass writes nothing.
+  const before = await base.ctx.client.query(
+    "SELECT count(*)::int AS n FROM kith.changes",
+  );
+  await evaluate(base, agreement.sourceItemId);
+  const after = await base.ctx.client.query(
+    "SELECT count(*)::int AS n FROM kith.changes",
+  );
+  assert.equal(after.rows[0].n, before.rows[0].n);
+});
+
+test("a page in a folder named for one investment links on the path alone", { skip }, async (t) => {
+  const base = await investmentsFixture(t, ["Synthetic Robotics"]);
+  const robotics = base.investments["Synthetic Robotics"];
+  const scan = await seedDocument(base.ctx, base.spaceId, {
+    kind: "other",
+    uri: "fs://dropbox-investing/Synthetic Robotics/scan-0001.pdf",
+    statements: [],
+  });
+  const result = await evaluate(base, scan.sourceItemId);
+  assert.equal(result.autoLinkedInvestmentId, robotics.id);
+  const [link] = await linksFor(base, {});
+  assert.equal(link.state, "auto_linked");
+  assert.equal(link.entryId, null);
+  assert.equal(link.reason, "path");
+  assert.equal(link.score, 1);
+  // The honest citation for a path match: the segment, no invented span.
+  assert.deepEqual(link.evidence, [
+    { field: "source_path", pathSegment: "synthetic robotics" },
+  ]);
+});
+
+test("a letter in a folder named for the investment links to it", { skip }, async (t) => {
+  const base = await investmentsFixture(t, ["Synthetic Robotics"]);
+  const robotics = base.investments["Synthetic Robotics"];
+  const letter = await seedDocument(base.ctx, base.spaceId, {
+    kind: "letter_or_notice",
+    uri: "fs://dropbox-investing/Synthetic Robotics/Updates/q3-letter.pdf",
+    statements: [
+      // Sent by an administrator whose name is not the investment's.
+      org("sender", "Synthetic Fund Services"),
+      date("letter_date", "2026-07-01"),
+    ],
+  });
+  const result = await evaluate(base, letter.sourceItemId);
+  assert.equal(result.autoLinkedInvestmentId, robotics.id);
+  const [link] = await linksFor(base, {});
+  assert.equal(link.state, "auto_linked");
+  assert.equal(link.reason, "path");
+  assert.equal(link.investmentId, robotics.id);
+});
+
+test("two investments that both match are suggested and neither is linked", { skip }, async (t) => {
+  const base = await investmentsFixture(t, [
+    "Synthetic Robotics",
+    "Synthetic Robotics LLC",
+    "Synthetic Orchards",
+  ]);
+  const letter = await seedDocument(base.ctx, base.spaceId, {
+    kind: "letter_or_notice",
+    statements: [org("sender", "Synthetic Robotics Inc")],
+  });
+  const result = await evaluate(base, letter.sourceItemId);
+  assert.equal(result.autoLinkedInvestmentId, null);
+  assert.equal(result.suggestedCount, 2);
+  const links = await linksFor(base, {});
+  assert.deepEqual(
+    links.map((link) => link.state).sort(),
+    ["suggested", "suggested"],
+  );
+  assert.deepEqual(
+    links.map((link) => link.investmentId).sort(),
+    [
+      base.investments["Synthetic Robotics"].id,
+      base.investments["Synthetic Robotics LLC"].id,
+    ].sort(),
+  );
+});
+
+test("a page naming one investment inside another's folder is only suggested", { skip }, async (t) => {
+  const base = await investmentsFixture(t, [
+    "Synthetic Robotics",
+    "Synthetic Orchards",
+  ]);
+  const agreement = await seedDocument(base.ctx, base.spaceId, {
+    kind: "investment_agreement",
+    uri: "fs://dropbox-investing/Synthetic Orchards/side-letter.pdf",
+    statements: [
+      org("company", "Synthetic Robotics"),
+      date("date_signed", "2025-05-20"),
+    ],
+  });
+  const result = await evaluate(base, agreement.sourceItemId);
+  assert.equal(result.autoLinkedInvestmentId, null);
+  assert.deepEqual(result.signedOnFilled, []);
+  const links = await linksFor(base, {});
+  assert.equal(links.length, 2);
+  assert.ok(links.every((link) => link.state === "suggested"));
+  assert.equal(
+    await signedOn(base, base.investments["Synthetic Robotics"].id),
+    null,
+    "a suggestion never dates an investment",
+  );
+});
+
+test("a rejected investment-level pair is never proposed again", { skip }, async (t) => {
+  const base = await investmentsFixture(t, ["Synthetic Robotics"]);
+  const robotics = base.investments["Synthetic Robotics"];
+  const letter = await seedDocument(base.ctx, base.spaceId, {
+    kind: "letter_or_notice",
+    uri: "fs://dropbox-investing/Synthetic Robotics/notice.pdf",
+    statements: [org("sender", "Synthetic Robotics")],
+  });
+  await evaluate(base, letter.sourceItemId);
+  const [link] = await linksFor(base, {});
+  assert.equal(link.state, "auto_linked");
+  await rejectInvestmentDocumentLink(base.ctx, {
+    principal: base.principal,
+    linkId: link.id,
+  });
+  const again = await evaluate(base, letter.sourceItemId);
+  assert.equal(again.autoLinkedInvestmentId, null);
+  assert.equal(again.suggestedCount, 0);
+  const links = await linksFor(base, {});
+  assert.equal(links.length, 1);
+  assert.equal(links[0].state, "rejected");
+  assert.equal(links[0].decidedBy, "owner");
+  const [row] = (await listInvestments(base.ctx, [base.spaceId])).filter(
+    (investment) => investment.id === robotics.id,
+  );
+  assert.equal(row.documentCount, 0, "a rejected link is not a document");
+});
+
+test("a linked agreement fills an empty signed_on with its earliest signed day", { skip }, async (t) => {
+  const base = await investmentsFixture(t, ["Synthetic Robotics"]);
+  const robotics = base.investments["Synthetic Robotics"];
+  const later = await seedDocument(base.ctx, base.spaceId, {
+    kind: "investment_agreement",
+    uri: "fs://dropbox-investing/Synthetic Robotics/amendment.pdf",
+    statements: [date("date_signed", "2025-09-01")],
+  });
+  const monthOnly = await seedDocument(base.ctx, base.spaceId, {
+    kind: "investment_agreement",
+    uri: "fs://dropbox-investing/Synthetic Robotics/undated.pdf",
+    statements: [date("date_signed", "2025-01", "month")],
+  });
+  // A month is never padded into a day.
+  const first = await evaluate(base, monthOnly.sourceItemId);
+  assert.equal(first.autoLinkedInvestmentId, robotics.id);
+  assert.deepEqual(first.signedOnFilled, []);
+  assert.equal(await signedOn(base, robotics.id), null);
+
+  const second = await evaluate(base, later.sourceItemId);
+  assert.deepEqual(second.signedOnFilled, [robotics.id]);
+  assert.equal(await signedOn(base, robotics.id), "2025-09-01");
+
+  // An earlier agreement arriving afterwards does not overwrite a set date.
+  const earlier = await seedDocument(base.ctx, base.spaceId, {
+    kind: "investment_agreement",
+    uri: "fs://dropbox-investing/Synthetic Robotics/safe.pdf",
+    statements: [date("date_signed", "2025-05-20")],
+  });
+  const third = await evaluate(base, earlier.sourceItemId);
+  assert.deepEqual(third.signedOnFilled, []);
+  assert.equal(await signedOn(base, robotics.id), "2025-09-01");
+  // The commitment entry's estimated date is not moved by an investment-level
+  // link: that rule acts through an entry's own primary link.
+  const entries = await listInvestmentEntries(base.ctx, [base.spaceId], [robotics.id]);
+  assert.equal(entries[0].entryDate, "2025-06-01");
+  assert.equal(entries[0].dateIsEstimated, true);
+});
+
+test("an owner-entered signed_on is never overwritten by an agreement", { skip }, async (t) => {
+  const base = await investmentsFixture(t, ["Synthetic Robotics"], {
+    signedOn: { "Synthetic Robotics": "2024-12-31" },
+  });
+  const robotics = base.investments["Synthetic Robotics"];
+  const agreement = await seedDocument(base.ctx, base.spaceId, {
+    kind: "investment_agreement",
+    statements: [
+      org("company", "Synthetic Robotics"),
+      date("date_signed", "2025-05-20"),
+    ],
+  });
+  const result = await evaluate(base, agreement.sourceItemId);
+  assert.equal(result.autoLinkedInvestmentId, robotics.id);
+  assert.deepEqual(result.signedOnFilled, []);
+  assert.equal(await signedOn(base, robotics.id), "2024-12-31");
+});
+
+test("confirming a suggested agreement fills an empty signed_on", { skip }, async (t) => {
+  const base = await investmentsFixture(t, [
+    "Synthetic Robotics",
+    "Synthetic Robotics LLC",
+  ]);
+  const robotics = base.investments["Synthetic Robotics"];
+  const agreement = await seedDocument(base.ctx, base.spaceId, {
+    kind: "investment_agreement",
+    statements: [
+      org("company", "Synthetic Robotics"),
+      date("date_signed", "2025-05-20"),
+    ],
+  });
+  await evaluate(base, agreement.sourceItemId);
+  const links = await linksFor(base, {});
+  assert.equal(links.length, 2);
+  const mine = links.find((link) => link.investmentId === robotics.id);
+  assert.equal(mine.state, "suggested");
+  await confirmInvestmentDocumentLink(base.ctx, {
+    principal: base.principal,
+    linkId: mine.id,
+  });
+  assert.equal(await signedOn(base, robotics.id), "2025-05-20");
+  assert.equal(
+    await signedOn(base, base.investments["Synthetic Robotics LLC"].id),
+    null,
+  );
+  // With the owner's confirmation standing, a re-evaluation auto-links
+  // nothing else for this document.
+  const again = await evaluate(base, agreement.sourceItemId);
+  assert.equal(again.autoLinkedInvestmentId, null);
+});
+
+test("a rule-made agreement suggestion on a commitment entry is swept on re-evaluation", { skip }, async (t) => {
+  const base = await investmentsFixture(t, ["Synthetic Robotics"]);
+  const robotics = base.investments["Synthetic Robotics"];
+  const agreement = await seedDocument(base.ctx, base.spaceId, {
+    kind: "investment_agreement",
+    statements: [org("company", "Synthetic Robotics")],
+  });
+  const confirmedElsewhere = await seedDocument(base.ctx, base.spaceId, {
+    kind: "investment_agreement",
+    statements: [org("company", "Synthetic Robotics")],
+  });
+  // The shape the old scorer left behind: an entry-level `suggested` row on
+  // the commitment, and one the owner confirmed.
+  for (const [document, state, decidedBy] of [
+    [agreement, "suggested", "rule"],
+    [confirmedElsewhere, "confirmed", "owner"],
+  ]) {
+    await base.ctx.client.query(
+      `INSERT INTO kith.investment_document_links
+         (id, space_id, investment_id, entry_id, document_id, source_item_id,
+          state, score, evidence, decided_by, reason)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,4,$8::jsonb,$9,'party')`,
+      [
+        newKithId(),
+        base.spaceId,
+        robotics.id,
+        robotics.commitmentId,
+        document.documentId,
+        document.sourceItemId,
+        state,
+        JSON.stringify(
+          decidedBy === "rule"
+            ? [{ field: "company", observationKey: "company", evidenceSpanId: newKithId() }]
+            : [],
+        ),
+        decidedBy,
+      ],
+    );
+  }
+  await syncEntryDocument(base.ctx, base.spaceId, robotics.commitmentId);
+
+  await evaluate(base, agreement.sourceItemId);
+  const mine = await linksFor(base, { sourceItemId: agreement.sourceItemId });
+  assert.equal(mine.length, 1, "the entry-level suggestion is gone");
+  assert.equal(mine[0].entryId, null);
+  assert.equal(mine[0].state, "auto_linked");
+
+  await evaluate(base, confirmedElsewhere.sourceItemId);
+  const owners = await linksFor(base, {
+    sourceItemId: confirmedElsewhere.sourceItemId,
+  });
+  const entryLevel = owners.find((link) => link.entryId !== null);
+  assert.equal(entryLevel.state, "confirmed", "the owner's row is never swept");
+  // Both documents count once each on the investment.
+  const [row] = (await listInvestments(base.ctx, [base.spaceId])).filter(
+    (investment) => investment.id === robotics.id,
+  );
+  assert.equal(row.documentCount, 2);
+  await consistent(base.ctx);
+});
+
+test("payment notices keep linking to their entry, not the investment", { skip }, async (t) => {
+  const base = await autoLinkFixture(t);
+  const result = await evaluateDocumentLinks(base.ctx, {
+    spaceId: base.spaceId,
+    sourceItemId: base.document.sourceItemId,
+  });
+  assert.equal(result.autoLinkedEntryId, base.entryId);
+  assert.equal(result.autoLinkedInvestmentId, null);
+  const links = await linksFor(base, {});
+  assert.equal(links.length, 1);
+  assert.equal(links[0].entryId, base.entryId);
+  assert.equal(links[0].reason, "party+amount+date+path");
+  // The entry-level evidence is statements only; the path adds no citation.
+  assert.ok(links[0].evidence.every((item) => typeof item.evidenceSpanId === "string"));
+  await consistent(base.ctx);
 });

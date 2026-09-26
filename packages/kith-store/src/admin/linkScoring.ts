@@ -178,16 +178,20 @@ export const MATCHABLE_DOCUMENT_KINDS: readonly MatchableKind[] = Object.freeze(
     dateReplacementFields: ["distribution_date"],
   },
   {
+    // An agreement is about the INVESTMENT, not about its commitment entry.
+    // Owner decision of 2026-09-26: the commitment is a property of the
+    // investment, stored as its one `commitment` entry, and the paper that
+    // created it links to the investment itself (`entry_id` null). So there
+    // is no amount to compare and no entry date to window against. The
+    // agreement's `date_signed` fills an empty `investments.signed_on`
+    // instead (`fillSignedOnFromAgreements` in `investmentLinks.ts`).
     kind: "investment_agreement",
-    amountField: "amount_committed",
-    dateFields: ["date_signed"],
-    dateWindow: { anchor: "investmentSignedOnElseEntry", days: 90 },
-    entryTypes: ["commitment", "commitment_change"],
-    // Not auto-linkable: section 2's decision table names only the three
-    // payment kinds, and an agreement's amount is a commitment that a later
-    // `commitment_change` may have moved away from.
+    amountField: null,
+    dateFields: [],
+    dateWindow: { anchor: "none" },
+    entryTypes: [],
     autoLinkable: false,
-    dateReplacementFields: ["date_signed"],
+    dateReplacementFields: [],
   },
   {
     kind: "schedule_k1",
@@ -210,7 +214,38 @@ export const MATCHABLE_DOCUMENT_KINDS: readonly MatchableKind[] = Object.freeze(
     autoLinkable: false,
     dateReplacementFields: [],
   },
+  // The two catch-all kinds. A side letter, a portal notice, or a scanned
+  // page the classifier could not place is still paper about ONE investment
+  // when it names it or sits in its folder. Investment level only: nothing on
+  // such a page is trusted to be "this payment".
+  {
+    kind: "letter_or_notice",
+    amountField: null,
+    dateFields: [],
+    dateWindow: { anchor: "none" },
+    entryTypes: [],
+    autoLinkable: false,
+    dateReplacementFields: [],
+  },
+  {
+    kind: "other",
+    amountField: null,
+    dateFields: [],
+    dateWindow: { anchor: "none" },
+    entryTypes: [],
+    autoLinkable: false,
+    dateReplacementFields: [],
+  },
 ]);
+
+/** The kinds that only ever link at the investment level (`entry_id` null).
+ * They are decided by `decideInvestmentLevelLinks`, not `decideLinks`. */
+export function isInvestmentLevelKind(kind: MatchableKind): boolean {
+  return kind.entryTypes.length === 0;
+}
+
+/** The agreement field whose day may fill an investment's empty `signed_on`. */
+export const SIGNED_ON_FIELD = "date_signed";
 
 const KINDS_BY_NAME = new Map(
   MATCHABLE_DOCUMENT_KINDS.map((kind) => [kind.kind, kind]),
@@ -273,6 +308,63 @@ export function pathNamesFromUri(uri: unknown): string[] {
     }
   });
   return [...names];
+}
+
+/**
+ * Trailing legal-form words an organization value may carry that an
+ * investment's name usually does not: "Acme Robotics, Inc." is the company
+ * the owner recorded as "Acme Robotics". Only whole trailing tokens are
+ * dropped, and never the last token, so "Co" is still "co".
+ *
+ * `fund`, `partners`, roman numerals and the like are deliberately NOT here.
+ * "Acme Fund II" and "Acme Fund III" are different investments, and so are
+ * "Acme" and "Acme Partners".
+ */
+const LEGAL_FORM_WORDS: ReadonlySet<string> = new Set([
+  "inc",
+  "incorporated",
+  "llc",
+  "lp",
+  "llp",
+  "lllp",
+  "ltd",
+  "limited",
+  "corp",
+  "corporation",
+  "co",
+  "plc",
+  "pbc",
+  "gmbh",
+  "sa",
+  "ag",
+  "bv",
+  "nv",
+]);
+
+/**
+ * The key an investment-level party or path match compares.
+ *
+ * `normalizeMatchName`, then dotted and comma punctuation removed (so
+ * "L.P." is "lp" and "Robotics, Inc." is "robotics inc"), then trailing
+ * legal-form words dropped. Applied to BOTH sides -- the investment's names
+ * and aliases and the document's value -- so it can only ever make two
+ * spellings of one legal name meet. Two investments whose keys collide are
+ * then both candidates, and `decideInvestmentLevelLinks` links neither.
+ *
+ * Used for investment-level links only. The entry-level scorer keeps its
+ * exact `normalizeMatchName` comparison unchanged.
+ */
+export function organizationMatchKey(value: unknown): string {
+  const normalized = normalizeMatchName(value);
+  if (!normalized) return "";
+  const tokens = normalized
+    .replace(/[.,'’"()]/g, "")
+    .split(" ")
+    .filter(Boolean);
+  while (tokens.length > 1 && LEGAL_FORM_WORDS.has(tokens[tokens.length - 1]!)) {
+    tokens.pop();
+  }
+  return tokens.join(" ");
 }
 
 function safeDecode(segment: string): string {
@@ -452,11 +544,43 @@ export type ScorableStatement = {
 };
 
 /** What a link cites: one statement of one document. */
-export type LinkEvidence = {
+export type StatementEvidence = {
   field: string;
   observationKey: string;
   evidenceSpanId: string;
 };
+
+export const PATH_EVIDENCE_FIELD = "source_path";
+
+/**
+ * What a PATH-ONLY investment-level link cites: the folder or file name
+ * segment of the source item's URI that names the investment.
+ *
+ * `field` is the fixed word `source_path`, which no seeded extraction kind
+ * declares. `pathSegment` is the normalized segment. There is no observation
+ * and no span, because the evidence is the file's own location rather than a
+ * line on its page, and inventing either would be a citation that points at
+ * nothing. `investment_document_links_evidence_required_check` asks for a
+ * non-empty array, and this is the honest element to satisfy it with.
+ * Readers that resolve a span (`syncEntryDocument`) read entry-level links,
+ * which never carry one of these.
+ */
+export type PathEvidence = {
+  field: typeof PATH_EVIDENCE_FIELD;
+  pathSegment: string;
+};
+
+export type LinkEvidence = StatementEvidence | PathEvidence;
+
+/** The span a piece of evidence cites, or null for a path citation. */
+export function evidenceSpanIdOf(
+  evidence: LinkEvidence | undefined,
+): string | null {
+  if (!evidence || !("evidenceSpanId" in evidence)) return null;
+  return typeof evidence.evidenceSpanId === "string"
+    ? evidence.evidenceSpanId
+    : null;
+}
 
 /** One signal that fired, with what it was computed from. */
 export type LinkSignalRecord = {
@@ -690,7 +814,10 @@ export type NoAutoLinkReason =
   | "no_qualifying_candidate"
   | "two_candidates_qualify"
   | "tie_within_margin"
-  | "entry_already_linked";
+  | "entry_already_linked"
+  | "several_investments_match"
+  | "party_and_path_disagree"
+  | "investment_already_confirmed";
 
 export type LinkDecision = {
   /** The one candidate to write as `auto_linked`, or null. */
@@ -763,4 +890,142 @@ export function decideLinks(input: {
       .slice(0, input.maxSuggestions),
     noAutoLinkReason: null,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Investment-level links (owner decision, 2026-09-26)
+// ---------------------------------------------------------------------------
+
+/**
+ * Score one investment as the subject of an investment-level document.
+ *
+ * Party: an organization statement whose `organizationMatchKey` is a key of
+ * the investment's name or an alias. Path: a URI segment whose key is. Both
+ * cite what they fired on -- the statement, or the path segment as a
+ * `PathEvidence` -- so every candidate that fired at all carries evidence.
+ */
+export function scoreInvestmentLevel(input: {
+  statements: readonly ScorableStatement[];
+  investment: ScorableInvestment;
+  pathNames: readonly string[];
+}): ScoredCandidate {
+  const keys = new Set(
+    input.investment.normalizedNames.map(organizationMatchKey).filter(Boolean),
+  );
+  const signals: LinkSignalRecord[] = [];
+  const evidence: LinkEvidence[] = [];
+  const fired: Record<LinkSignal, boolean> = {
+    party: false,
+    amount: false,
+    date: false,
+    path: false,
+  };
+  for (const statement of input.statements) {
+    if (statement.valueType !== "organization") continue;
+    const value = statement.value;
+    if (!value || value.type !== "text") continue;
+    const key = organizationMatchKey(value.value);
+    if (!key || !keys.has(key)) continue;
+    fired.party = true;
+    signals.push({
+      signal: "party",
+      points: LINK_SIGNAL_POINTS.party,
+      detail: { field: statement.field, name: key },
+    });
+    evidence.push({
+      field: statement.field,
+      observationKey: statement.observationKey,
+      evidenceSpanId: statement.evidenceSpanId,
+    });
+    break;
+  }
+  for (const name of input.pathNames) {
+    const key = organizationMatchKey(name);
+    if (!key || !keys.has(key)) continue;
+    fired.path = true;
+    signals.push({
+      signal: "path",
+      points: LINK_SIGNAL_POINTS.path,
+      detail: { segment: key },
+    });
+    evidence.push({ field: PATH_EVIDENCE_FIELD, pathSegment: key });
+    break;
+  }
+  const score = signals.reduce((total, signal) => total + signal.points, 0);
+  const order: LinkSignal[] = ["party", "amount", "date", "path"];
+  return {
+    investmentId: input.investment.id,
+    entryId: null,
+    score,
+    signals,
+    evidence,
+    fired,
+    reason: order.filter((signal) => fired[signal]).join("+") || "none",
+    dateReplacement: null,
+    entryHasLiveLink: false,
+  };
+}
+
+/**
+ * The investment-level decision.
+ *
+ *   * Exactly one investment matches on party, and no OTHER investment
+ *     matches on path: auto-link it.
+ *   * No investment matches on party and exactly one matches on path:
+ *     auto-link it. A folder named for the investment is the owner's own
+ *     filing, which is as strong a statement as a name on the page.
+ *   * Several match (two on party, two on path with no party, or a party
+ *     that names one investment while the folder names another): link
+ *     NOTHING and suggest each. A suggestion is not a nag -- nothing is
+ *     queued for attention; it sits on the investment for one click -- and
+ *     the disagreement is exactly the shape where a guess is silent wrong
+ *     data.
+ *   * The document already carries an owner-CONFIRMED investment-level link:
+ *     nothing further is auto-linked. The owner has said what it is about.
+ *
+ * `candidates` must already exclude pairs the owner settled (confirmed or
+ * rejected), so a rejected pair is never re-proposed.
+ */
+export function decideInvestmentLevelLinks(input: {
+  candidates: readonly ScoredCandidate[];
+  hasConfirmedInvestmentLink: boolean;
+  maxSuggestions: number;
+}): LinkDecision {
+  const fired = [...input.candidates]
+    .filter(
+      (candidate) =>
+        candidate.entryId === null &&
+        (candidate.fired.party || candidate.fired.path) &&
+        candidate.evidence.length > 0,
+    )
+    .sort(byRank);
+  const party = fired.filter((candidate) => candidate.fired.party);
+  const path = fired.filter((candidate) => candidate.fired.path);
+  const suggestOnly = (
+    reason: NoAutoLinkReason,
+    offered: readonly ScoredCandidate[],
+  ): LinkDecision => ({
+    autoLink: null,
+    suggestions: offered.slice(0, input.maxSuggestions),
+    noAutoLinkReason: reason,
+  });
+  let best: ScoredCandidate | null = null;
+  if (party.length === 1) {
+    const only = party[0]!;
+    if (path.some((candidate) => candidate.investmentId !== only.investmentId)) {
+      return suggestOnly("party_and_path_disagree", fired);
+    }
+    best = only;
+  } else if (party.length > 1) {
+    return suggestOnly("several_investments_match", party);
+  } else if (path.length === 1) {
+    best = path[0]!;
+  } else if (path.length > 1) {
+    return suggestOnly("several_investments_match", path);
+  }
+  if (best === null) return suggestOnly("no_qualifying_candidate", []);
+  if (input.hasConfirmedInvestmentLink) {
+    return suggestOnly("investment_already_confirmed", [best]);
+  }
+  return { autoLink: best, suggestions: [], noAutoLinkReason: null };
 }

@@ -73,6 +73,10 @@ test("a kind the scorer has no rules for is refused by name", () => {
     argumentsFor(["--kind", "schedule_k1"]).kind,
     "schedule_k1",
   );
+  // The investment-level catch-all kinds are selectable too (2026-09-26).
+  for (const kind of ["letter_or_notice", "other", "investment_agreement"]) {
+    assert.equal(argumentsFor(["--kind", kind]).kind, kind);
+  }
 });
 
 test("a malformed space, limit or flag exits 2 rather than guessing", () => {
