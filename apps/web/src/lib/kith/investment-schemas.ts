@@ -145,3 +145,12 @@ export const suggestSchema = z.object({
   amount: amountSchema.optional(),
   entryDate: isoDateSchema.optional(),
 });
+
+export const investmentDocumentActionSchema = z.object({
+  linkId: kithIdSchema,
+  action: z.enum(["confirm", "remove"]),
+});
+
+export const investmentUploadSchema = z.object({
+  filename: z.string().trim().min(1).max(255),
+});

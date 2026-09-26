@@ -193,7 +193,7 @@ export async function authorizedDocument(
 
 let tokenCache:
   { key: string; until: number; token: Promise<string> } | undefined;
-async function accessToken(config: DropboxDocumentConfig): Promise<string> {
+export async function accessToken(config: DropboxDocumentConfig): Promise<string> {
   const key = sha256(
     JSON.stringify([
       config.clientId,

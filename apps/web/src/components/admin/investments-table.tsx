@@ -39,6 +39,8 @@ import {
   EntryDrawer,
   type InvestmentDraft,
   InvestmentDrawer,
+  type InvestmentDrawerContext,
+  today,
 } from "@/components/admin/investment-drawers";
 import { ImportDrawer } from "@/components/admin/investment-import-drawer";
 import {
@@ -53,6 +55,10 @@ import {
   tableAccountingMoney,
   tableDecimal,
 } from "@/lib/kith/format";
+import {
+  COMMITMENT_ENTRY_TYPE,
+  commitmentWrite,
+} from "@/lib/kith/investment-commitment";
 import { entryPatchFields } from "@/lib/kith/investment-entry-patch";
 import {
   type ImportPreview,
@@ -79,7 +85,10 @@ type Row =
   | ({ kind: "investment"; children: Row[] } & Investment & {
         hasDocuments: "yes" | "no";
       })
-  | ({ kind: "entry" } & Entry);
+  | ({ kind: "entry" } & Entry)
+  /** Stands in for the entries of an expanded investment that has none, so
+   * that every investment row expands on click. */
+  | { kind: "empty"; id: string; investmentId: string };
 
 const STATUS_TONE: Record<string, "neutral" | "accent" | "warn"> = {
   active: "accent",
@@ -251,15 +260,33 @@ export function InvestmentsTable({
 
   const rows = useMemo<Row[]>(
     () =>
-      investments.map((investment) => ({
-        ...investment,
-        kind: "investment" as const,
-        hasDocuments:
-          investment.documentCount > 0 ? ("yes" as const) : ("no" as const),
-        children: (entries ?? [])
-          .filter((entry) => entry.investmentId === investment.id)
-          .map((entry) => ({ ...entry, kind: "entry" as const })),
-      })),
+      investments.map((investment) => {
+        // The commitment is a property of the investment, edited in its
+        // drawer and shown in the Committed column, not a ledger event.
+        const children: Row[] = (entries ?? [])
+          .filter(
+            (entry) =>
+              entry.investmentId === investment.id &&
+              entry.entryType !== COMMITMENT_ENTRY_TYPE,
+          )
+          .map((entry) => ({ ...entry, kind: "entry" as const }));
+        return {
+          ...investment,
+          kind: "investment" as const,
+          hasDocuments:
+            investment.documentCount > 0 ? ("yes" as const) : ("no" as const),
+          children:
+            children.length === 0 && entries !== undefined
+              ? [
+                  {
+                    kind: "empty" as const,
+                    id: `empty:${investment.id}`,
+                    investmentId: investment.id,
+                  },
+                ]
+              : children,
+        };
+      }),
     [investments, entries],
   );
 
@@ -333,13 +360,30 @@ export function InvestmentsTable({
   );
 
   const saveInvestment = useCallback(
-    async (draft: InvestmentDraft) => {
+    async (draft: InvestmentDraft, context: InvestmentDrawerContext) => {
       const body = {
         name: draft.name.trim(),
         category: draft.category.trim() === "" ? null : draft.category.trim(),
         signedOn: draft.signedOn === "" ? null : draft.signedOn,
         status: draft.status,
         notes: draft.notes.trim() === "" ? null : draft.notes.trim(),
+      };
+      // The commitment is stored as the investment's `commitment` entry;
+      // `commitmentWrite` picks the one entry write that makes it match.
+      const writeCommitment = async (investmentId: string) => {
+        const write = commitmentWrite({
+          entries: context.entries,
+          amount: draft.commitment,
+          currency: context.commitmentCurrency,
+          signedOn: body.signedOn,
+          today: today(),
+        });
+        if (write === null) return;
+        await send(
+          `/api/kith/investments/${investmentId}/entries`,
+          write.method,
+          write.body,
+        );
       };
       if (editingInvestmentId !== null) {
         const id = editingInvestmentId;
@@ -350,7 +394,10 @@ export function InvestmentsTable({
                 investment.id === id ? { ...investment, ...body } : investment,
               ),
             ),
-          run: () => send("/api/kith/investments", "PATCH", { id, ...body }),
+          run: async () => {
+            await send("/api/kith/investments", "PATCH", { id, ...body });
+            await writeCommitment(id);
+          },
         });
         return;
       }
@@ -360,7 +407,14 @@ export function InvestmentsTable({
         // totals are the server's to mint, and inventing a row without them
         // would flicker a different row than the one that lands.
         apply: () => {},
-        run: () => send("/api/kith/investments", "POST", { spaceId, ...body }),
+        run: async () => {
+          const response = await send("/api/kith/investments", "POST", {
+            spaceId,
+            ...body,
+          });
+          const { id } = (await response.json()) as { id: string };
+          await writeCommitment(id);
+        },
       });
     },
     [editingInvestmentId, optimistic, queryClient, spaceId],
@@ -425,38 +479,51 @@ export function InvestmentsTable({
       {
         id: "name",
         accessorFn: (row) =>
-          row.kind === "investment" ? row.name : row.entryDate,
+          row.kind === "investment"
+            ? row.name
+            : row.kind === "entry"
+              ? row.entryDate
+              : "",
         header: "Investment",
         cell: ({ row }) =>
           row.original.kind === "investment" ? (
             <Detail label={row.original.name} detail={row.original.notes} />
-          ) : (
-            <span className="block text-right tabular-nums text-gray-500">
+          ) : row.original.kind === "entry" ? (
+            // Inline, not a block: the table puts an indent span before a
+            // child row's first cell, and a block beside it drops to a second
+            // line and sits below the rest of the row.
+            <span className="tabular-nums text-gray-500">
               {archiveDate(row.original.entryDate)}
             </span>
+          ) : (
+            <span className="text-gray-400">No entries</span>
           ),
       },
       {
         id: "category",
         accessorFn: (row) =>
-          row.kind === "investment" ? (row.category ?? "") : row.entryType,
+          row.kind === "investment"
+            ? (row.category ?? "")
+            : row.kind === "entry"
+              ? row.entryType
+              : "",
         header: "Category",
         cell: ({ row }) =>
           row.original.kind === "investment" ? (
             row.original.category === null ? null : (
               <Tag>{row.original.category}</Tag>
             )
-          ) : (
+          ) : row.original.kind === "entry" ? (
             <Tag>{row.original.entryType}</Tag>
-          ),
+          ) : null,
       },
       {
         id: "amount",
-        accessorFn: (row) => (row.kind === "investment" ? "" : row.amount),
+        accessorFn: (row) => (row.kind === "entry" ? row.amount : ""),
         header: "Amount",
         meta: { nowrap: true, align: "right" },
         cell: ({ row }) =>
-          row.original.kind === "investment" ? null : (
+          row.original.kind !== "entry" ? null : (
             <Amount
               value={row.original.amount}
               currency={row.original.currency}
@@ -472,7 +539,8 @@ export function InvestmentsTable({
         cell: ({ row }) =>
           row.original.kind === "investment" ? (
             <Money value={row.original.totals.usd.committed} />
-          ) : row.original.currency === "USD" ? null : (
+          ) : row.original.kind !== "entry" ||
+            row.original.currency === "USD" ? null : (
             <Detail
               label={
                 <span className="tabular-nums text-gray-500">
@@ -497,11 +565,11 @@ export function InvestmentsTable({
               label={<Money value={row.original.totals.usd.sent} />}
               detail={`Capital calls only. Fees ${tableDecimal(row.original.totals.usd.fees)}.`}
             />
-          ) : (
+          ) : row.original.kind === "entry" ? (
             <span className="truncate text-gray-600">
               {row.original.note ?? ""}
             </span>
-          ),
+          ) : null,
       },
       {
         id: "outstanding",
@@ -550,7 +618,9 @@ export function InvestmentsTable({
         accessorFn: (row) =>
           row.kind === "investment"
             ? row.documentCount
-            : (row.documentId ?? ""),
+            : row.kind === "entry"
+              ? (row.documentId ?? "")
+              : "",
         cell: ({ row }) =>
           row.original.kind === "investment" ? (
             row.original.documentCount > 0 ? (
@@ -562,7 +632,8 @@ export function InvestmentsTable({
                 <Check className="size-4" aria-hidden="true" />
               </span>
             ) : null
-          ) : row.original.documentId === null ? null : (
+          ) : row.original.kind !== "entry" ||
+            row.original.documentId === null ? null : (
             <span
               role="img"
               aria-label="Has documents"
@@ -587,9 +658,10 @@ export function InvestmentsTable({
     [],
   );
 
-  // Shared by the kebab's Edit item and clicking the row: opening the same
-  // drawer either way is the point of making the row itself a target.
+  // The kebab's Edit item on any row, and a click on an entry row. A click on
+  // an investment row expands it instead (every investment row can expand).
   const openEdit = useCallback((row: Row) => {
+    if (row.kind === "empty") return;
     if (row.kind === "investment") {
       setEditingInvestmentId(row.id);
       setInvestmentDraft({
@@ -598,6 +670,8 @@ export function InvestmentsTable({
         signedOn: row.signedOn ?? "",
         status: row.status,
         notes: row.notes ?? "",
+        // Filled in by the drawer from the investment's entries.
+        commitment: "",
       });
     } else {
       setEditingEntryId(row.id);
@@ -627,6 +701,7 @@ export function InvestmentsTable({
     () => [
       {
         label: "Edit",
+        hidden: (row) => row.kind === "empty",
         onSelect: openEdit,
       },
       {
@@ -721,7 +796,7 @@ export function InvestmentsTable({
         getSubRows={(row) =>
           row.kind === "investment" ? row.children : undefined
         }
-        canExpand={(row) => row.kind === "investment" && row.entryCount > 0}
+        canExpand={(row) => row.kind === "investment"}
         onExpandChange={(row, expanded) => {
           if (row.kind !== "investment") return;
           setExpandedIds((current) =>

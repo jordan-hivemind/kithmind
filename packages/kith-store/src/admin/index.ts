@@ -14,6 +14,7 @@ export * from "./finAccounts.js";
 export * from "./finBanking.js";
 export * from "./finLedger.js";
 export * from "./health.js";
+export * from "./investmentDocuments.js";
 export * from "./investmentLinks.js";
 export * from "./investmentLinkWork.js";
 export * from "./investments.js";
